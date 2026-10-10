@@ -3,6 +3,8 @@
 //! verifies that 50 hard TerminateProcess kills are survived with 0 pipe deadlocks
 //! and 100% token accounting.
 
+#![cfg(windows)]
+
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
