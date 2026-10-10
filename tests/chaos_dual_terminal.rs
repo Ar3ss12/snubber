@@ -1,9 +1,7 @@
-//! Automated dual-terminal system kill test.
-//! Spawns Terminal 1 (Supervisor Bunker) and Terminal 2 (Chaos Sniper),
-//! verifies that 50 hard TerminateProcess kills are survived with 0 pipe deadlocks
-//! and 100% token accounting.
-
-#![cfg(windows)]
+//! Automated system kill stress test (Chaos Monkey).
+//! Spawns Supervisor Bunker and Chaos Sniper,
+//! verifies that hard process terminations (TerminateProcess on Windows, SIGKILL on Unix)
+//! are survived with 0 pipe deadlocks and 100% token accounting.
 
 use std::fs::File;
 use std::io::Read;
@@ -12,8 +10,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[test]
-#[cfg(windows)]
-#[ignore = "Spawns 2 real OS GUI windows and executes hundreds/thousands of TerminateProcess kills. Run explicitly: cargo test --test chaos_dual_terminal -- --ignored --nocapture"]
+#[ignore = "Spawns background supervisor & sniper and executes hundreds/thousands of hard OS kills. Run explicitly: cargo test --test chaos_dual_terminal -- --ignored --nocapture"]
 fn chaos_dual_terminal_system_kill_test() {
     let report_file = "target/chaos_report.json";
     if Path::new(report_file).exists() {
@@ -34,53 +31,88 @@ fn chaos_dual_terminal_system_kill_test() {
     let timeout_secs = (kills as u64 * 300 / 1000).max(60);
 
     println!(
-        "[TEST RUNNER] Spawning dual terminals on Windows via PowerShell (kills: {})...",
+        "[TEST RUNNER] Launching chaos supervisor and sniper (target kills: {})...",
         kills
     );
 
-    // 1. Spawn Terminal 1: Supervisor Bunker
-    let cmd1 = format!(
-        "$host.UI.RawUI.WindowTitle = 'SNUBBER BUNKER (TERMINAL 1)'; cargo run --example chaos_satellite -- --target-kills {} --report-path {}",
-        kills, report_file
-    );
+    #[cfg(windows)]
+    {
+        // 1. Spawn Terminal 1: Supervisor Bunker
+        let cmd1 = format!(
+            "$host.UI.RawUI.WindowTitle = 'SNUBBER BUNKER (TERMINAL 1)'; cargo run --example chaos_satellite -- --target-kills {} --report-path {}",
+            kills, report_file
+        );
+        let mut term1 = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Start-Process powershell -ArgumentList '-NoExit', '-Command', \"{}\"",
+                    cmd1
+                ),
+            ])
+            .spawn()
+            .expect("spawn terminal 1");
+        let _ = term1.wait();
 
-    let mut term1 = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "Start-Process powershell -ArgumentList '-NoExit', '-Command', \"{}\"",
-                cmd1
-            ),
-        ])
-        .spawn()
-        .expect("spawn terminal 1");
-    let _ = term1.wait();
+        std::thread::sleep(Duration::from_millis(1500));
 
-    // Give the bunker a moment to start the supervisor loop
-    std::thread::sleep(Duration::from_millis(1500));
+        // 2. Spawn Terminal 2: Chaos Sniper
+        let cmd2 = format!(
+            "powershell -ExecutionPolicy Bypass -File .\\chaos_sniper.ps1 -TargetProcess chaos_satellite -Kills {}",
+            kills
+        );
+        let mut term2 = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Start-Process powershell -ArgumentList '-NoExit', '-Command', \"{}\"",
+                    cmd2
+                ),
+            ])
+            .spawn()
+            .expect("spawn terminal 2");
+        let _ = term2.wait();
+    }
 
-    // 2. Spawn Terminal 2: Chaos Sniper
-    let cmd2 = format!(
-        "powershell -ExecutionPolicy Bypass -File .\\chaos_sniper.ps1 -TargetProcess chaos_satellite -Kills {}",
-        kills
-    );
+    #[cfg(not(windows))]
+    {
+        // 1. Spawn Supervisor Bunker in background
+        let mut bunker = Command::new("cargo")
+            .args([
+                "run",
+                "--example",
+                "chaos_satellite",
+                "--",
+                "--target-kills",
+                &kills.to_string(),
+                "--report-path",
+                report_file,
+            ])
+            .spawn()
+            .expect("spawn chaos bunker");
 
-    let mut term2 = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "Start-Process powershell -ArgumentList '-NoExit', '-Command', \"{}\"",
-                cmd2
-            ),
-        ])
-        .spawn()
-        .expect("spawn terminal 2");
-    let _ = term2.wait();
+        std::thread::sleep(Duration::from_millis(1500));
+
+        // 2. Run bash chaos sniper in background
+        let mut sniper = Command::new("bash")
+            .args([
+                "chaos_sniper.sh",
+                "chaos_satellite",
+                &kills.to_string(),
+                "0.001",
+            ])
+            .spawn()
+            .expect("spawn chaos sniper");
+
+        // Wait for processes
+        let _ = sniper.wait();
+        let _ = bunker.wait();
+    }
 
     println!(
-        "[TEST RUNNER] Both terminals launched! Waiting for report file: {}",
+        "[TEST RUNNER] Both processes launched! Waiting for report file: {}",
         report_file
     );
 
@@ -91,7 +123,6 @@ fn chaos_dual_terminal_system_kill_test() {
     let mut report_content = String::new();
     while start.elapsed() < timeout {
         if Path::new(report_file).exists() {
-            // Wait an extra 200ms to ensure file write flush
             std::thread::sleep(Duration::from_millis(200));
             if let Ok(mut f) = File::open(report_file) {
                 if f.read_to_string(&mut report_content).is_ok() && !report_content.is_empty() {
