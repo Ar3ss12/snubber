@@ -12,7 +12,7 @@
 Zero external dependencies. `#![forbid(unsafe_code)]`. Works everywhere from bare-metal firmware (`core`-only) to high-throughput servers (`std`).
 
 <p align="center">
-  <img src="assets/demo.gif" alt="snubber Chaos Monkey Terminal Demo" width="720"/>
+  <img src="assets/demo.gif" alt="snubber Chaos Monkey Terminal Demo" width="480"/>
 </p>
 
 ---
