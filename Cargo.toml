@@ -1,0 +1,41 @@
+[package]
+name = "snubber"
+version = "0.1.0"
+edition = "2026"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "Ultra-light transactional damper and RAII boundary shim: Drop-guaranteed rollback, monotonic-epoch ordering, bulkheads, circuit breaker and flight-recorder diagnostics."
+readme = "README.md"
+repository = "https://github.com/Ar3ss12/snubber"
+documentation = "https://docs.rs/snubber"
+keywords = ["transactions", "guard", "raii", "epoch", "bulkhead"]
+categories = ["concurrency", "no-std", "data-structures"]
+exclude = [
+    "chaos_sniper.ps1",
+    "chaos_sniper.sh",
+    "AGENTS.md",
+    "tech.md",
+    "docs/DECISION_MATRIX.md",
+    "docs/FUTURE_TRAPS.md",
+    "docs/WATCHDOG_PLAN.md",
+]
+
+[features]
+default = ["std", "alloc"]
+std = ["alloc"]
+alloc = []
+
+[lib]
+name = "snubber"
+path = "src/lib.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "admission_bench"
+harness = false
