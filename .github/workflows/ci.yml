@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 1. САНІТАРНИЙ КОНТРОЛЬ: Форматування, кліппі, no_std і документація
+  quality:
+    name: Code Quality & no_std Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Formatting (cargo fmt)
+        run: cargo fmt --check
+
+      - name: Clippy Zero-Warnings Gate
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Pure Bare-Metal Floor 1 Check (no-default-features)
+        run: cargo check --no-default-features
+
+      - name: Validate Documentation Links (cargo doc)
+        run: cargo doc --no-deps --all-features
+
+  # 2. КРОСПЛАТФОРМНИЙ ТЕСТОВИЙ ЗАЛП: Linux, Windows, macOS
+  test-matrix:
+    name: Test on ${{ matrix.os }}
+    needs: quality
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Full Test Suite (125 tests)
+        run: cargo test
+
+      - name: Verify Release Build Performance
+        run: cargo build --release
+
+      - name: Run Release Cycle Torture (40,000 transactions)
+        run: cargo test --release --test cycle_torture
+
+  # 3. ІНКВІЗИЦІЯ MIRI: Формальна перевірка моделі пам'яті (85 тестів без UB)
+  miri:
+    name: Miri Memory Model Verification
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nightly Rust with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Miri on Core Library
+        run: cargo miri test --lib
+
+      - name: Run Miri on Full Memory & Concurrency Suite
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks"
+        run: |
+          cargo miri test --test guard
+          cargo miri test --test scoped_ergonomics
+          cargo miri test --test erased
+          cargo miri test --test closure_policy
+          cargo miri test --test invariant
+          cargo miri test --test watchdog
+          cargo miri test --test memory_boundary
+          cargo miri test --test presets
+          cargo miri test --test process_died
+          cargo miri test --test armor
+          cargo miri test --test backpressure
+          cargo miri test --test field_rusty
+          cargo miri test --test policy
+          cargo miri test --test policy_alert
+          cargo miri test --test node_breaker
+          cargo miri test --test node_stats
+          cargo miri test --test reflex_breaker
+          cargo miri test --test async_gate
+          cargo miri test --test async_metal
+          cargo miri test --test task_engine
