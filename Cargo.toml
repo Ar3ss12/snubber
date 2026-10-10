@@ -19,6 +19,8 @@ exclude = [
     "docs/FUTURE_TRAPS.md",
     "docs/WATCHDOG_PLAN.md",
     "docs/RUSTY_AUTOCLICKER_ISSUES.md",
+    "docs/RUSTY_AUTOCLICKER_COMBINED_ISSUE.md",
+    "assets/",
 ]
 
 [features]
