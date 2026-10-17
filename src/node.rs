@@ -133,8 +133,8 @@ pub struct FlightSlot {
 ///
 /// Subscribe via [`SnubberNodeBuilder::telemetry_sink`]: the sink is
 /// wrapped as a hook. Execution stays in `emit` (outside the lock), each
-/// sink behind its own `watchdog::isolate_once` — one rotten sink never
-/// beheads the chain. The crate never learns what HTTP/Telegram is.
+/// sink behind its own `watchdog::isolate_once` — a failure in one sink
+/// never disrupts subsequent observers. The crate remains protocol-agnostic.
 ///
 /// Implement for a struct (blanket `Fn` impl is intentionally absent:
 /// higher-ranked `Fn(&_, &_, &_)` closures fail lifetime inference at
@@ -633,7 +633,7 @@ impl SnubberNodeBuilder {
     /// Subscribe a passive telemetry sink (thin over [`FaultHook`]).
     ///
     /// The sink runs in `emit`, outside the lock, behind its own panic
-    /// boundary. One rotten sink never silences the rest.
+    /// boundary. A failure in one sink never silences remaining observers.
     #[must_use]
     pub fn telemetry_sink<S>(mut self, sink: S) -> Self
     where
@@ -3098,8 +3098,8 @@ impl SnubberNode {
             }
         }
         // Policy COMMAND half, outside the lock: self-healing runs here.
-        // Isolation lives in `crate::watchdog::isolate_once`: one rotten
-        // hook must not silence the rest of the chain (or the console
+        // Isolation lives in `crate::watchdog::isolate_once`: a panic in one
+        // hook must not silence remaining observers (or the console
         // line after it). Under `std` each call gets its own panic
         // boundary; without `std` the contract is "hooks never panic".
         //

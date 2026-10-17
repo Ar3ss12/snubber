@@ -1,22 +1,27 @@
-//! Watchdog isolation: one rotten observer must never silence the rest.
+//! Fault-isolated callback execution (Panic Boundary).
 //!
-//! The rule is absolute: every FOREIGN call (custom command, hook) gets
-//! its own panic boundary under `std`. The node lock is already dropped
-//! at this point (open-call), so isolation here costs one `catch_unwind`
-//! per call and buys a chain that cannot be beheaded by a single rotten
-//! link — telemetry plugin dies, emergency reset still fires, console
-//! line still prints.
+//! Guarantees that a panic inside external or user-provided code
+//! (telemetry plugins, observers, diagnostic hooks) does not abort
+//! subsequent cleanups or compromise caller invariants.
 //!
-//! Without `std` the contract is "foreign code never panics" (documented
-//! on the guard types, enforced by nothing — `core` has no unwinder).
+//! # Architecture & Ordering
+//! - Open-Call Pattern: The node mutex is always released *before* calling
+//!   `isolate_once`, preventing lock poisoning across panic boundaries.
+//! - Overhead: In `std` environments, isolation incurs exactly one `catch_unwind`
+//!   per invocation.
+//! - Zero-Cost in `no_std`: In bare-metal environments without an unwinder,
+//!   the closure is invoked directly and the contract requires foreign code
+//!   to remain non-panicking.
 
 #[cfg(feature = "std")]
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-/// Run a foreign `FnOnce` command behind a panic boundary.
+/// Executes a foreign closure behind an isolated panic boundary.
 ///
-/// Returns `true` if the command ran clean, `false` if it was swallowed.
-/// Never unwinds under `std`; direct call without it.
+/// Returns `true` if the closure completed successfully, or `false`
+/// if execution panicked and was intercepted.
+///
+/// Guarantees that stack unwinding does not propagate past this call under `std`.
 #[inline]
 pub fn isolate_once<F: FnOnce()>(cmd: F) -> bool {
     #[cfg(feature = "std")]
