@@ -63,7 +63,7 @@ fn main() {
             .expect("spawn worker");
 
         let pid = child.id();
-        // Publish current worker PID for the sniper for sub-millisecond acquisition
+        // Publish current worker PID for the external process killer / fault injector
         let _ = std::fs::write(pid_file, pid.to_string());
 
         let reader = child.stdout.take().expect("piped stdout");
@@ -194,7 +194,7 @@ fn worker_main() {
             break;
         }
 
-        // Tiny window where token is actively armed (target for sniper)
+        // Tiny window where token is actively armed (target for external termination)
         std::thread::sleep(Duration::from_millis(3));
 
         // 2. Settle clean

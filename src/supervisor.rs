@@ -919,15 +919,12 @@ impl Supervisor {
 
         let mut clock = GenerationClock::new();
         let current_gen = clock.generation();
-        println!("============================================================");
-        println!(">>> [SNUBBER SUPERVISOR] Started! Generation = {current_gen}");
-        println!(">>> Spawning satellite worker ({worker_flag}) with anonymous pipe drain...");
-        println!("============================================================");
+        println!("[SUPERVISOR:START] gen={current_gen} worker_flag={worker_flag}");
 
         let current_exe = match std::env::current_exe() {
             Ok(exe) => exe,
             Err(e) => {
-                eprintln!(">>> [SNUBBER SUPERVISOR] Failed to get current_exe: {e}");
+                eprintln!("[SUPERVISOR:ERROR] action=get_current_exe error=\"{e}\"");
                 return true;
             }
         };
@@ -947,18 +944,18 @@ impl Supervisor {
         let mut child = match child_cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!(">>> [SNUBBER SUPERVISOR] Failed to spawn satellite child: {e}");
+                eprintln!("[SUPERVISOR:ERROR] action=spawn_child error=\"{e}\"");
                 return true;
             }
         };
 
         let pid = child.id();
-        println!(">>> [SNUBBER SUPERVISOR] Satellite running! PID: {pid}");
+        println!("[SUPERVISOR:SPAWN] child_pid={pid} gen={current_gen}");
 
         if let Some(stdout) = child.stdout.take() {
             let drain = PipeDrain::spawn(stdout);
             let status = child.wait();
-            println!("\n>>> [SNUBBER SUPERVISOR] Satellite reaped! Status: {status:?}");
+            println!("[SUPERVISOR:TERMINATED] child_pid={pid} status={status:?}");
 
             for _ in 0..50 {
                 if drain.eof() {
@@ -969,20 +966,19 @@ impl Supervisor {
 
             if let Some(token) = drain.take_armed() {
                 println!(
-                    ">>> [SNUBBER SUPERVISOR] Found un-settled token: opcode={}, task={}",
-                    token.opcode, token.task
+                    "[SUPERVISOR:RECOVER] child_pid={pid} rescue_token=0x{:X} opcode={} task={}",
+                    token.task, token.opcode, token.task
                 );
                 on_dead_token(token);
             } else {
-                println!(">>> [SNUBBER SUPERVISOR] All transactions settled cleanly.");
+                println!("[SUPERVISOR:CLEAN] child_pid={pid} status=all_settled");
             }
         } else {
             let _ = child.wait();
         }
 
         let next_gen = clock.restart();
-        println!(">>> [SNUBBER SUPERVISOR] Lineage bumped to gen={next_gen}. Done.");
-        println!("============================================================");
+        println!("[SUPERVISOR:RESTART] lineage_bump_gen={next_gen}");
         true
     }
 }

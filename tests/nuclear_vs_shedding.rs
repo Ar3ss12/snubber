@@ -3,7 +3,7 @@
 //! Pins the approved contour: `FaultKind::is_catastrophic` is the single
 //! source of truth for `report()` streak feeding. `ImplicitDrop` is
 //! nuclear but owned by `settle_implicit` (no double-feed via `report`).
-//! `ChannelDisconnected` is hydraulic (graceful drain, not hull breach).
+//! `ChannelDisconnected` is operational shedding (graceful drain, not unrecoverable failure).
 
 use snubber::{BreakerState, FaultKind, SnubberNode, TransactionHeader};
 

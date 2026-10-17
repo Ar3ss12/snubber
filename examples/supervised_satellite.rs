@@ -42,7 +42,7 @@ fn main() {
     if let Some(token) = drain.take_armed() {
         assert_eq!(token.opcode, 7, "last-armed opcode survives death");
         FIRED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Emergency release HERE (supervisor side, not the corpse).
+        // Emergency release HERE (supervisor side, outside the terminated child).
     }
     assert_eq!(FIRED.load(std::sync::atomic::Ordering::SeqCst), 1);
     // Path-1: bump generation, fresh worker re-handshakes, zombie cut.

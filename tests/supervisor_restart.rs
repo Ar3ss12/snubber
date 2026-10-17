@@ -57,7 +57,7 @@ fn storm_guard_trips_after_three_fast_crashes() {
 
 #[test]
 fn policy_matrix_never_oncrash_always() {
-    // Never: even a segfault stays a corpse.
+    // Never: even abnormal termination is not restarted.
     let mut never = RestartTracker::new(
         RestartPolicy::Never,
         Backoff::exponential(50, 1000),

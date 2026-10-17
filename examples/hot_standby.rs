@@ -5,7 +5,7 @@
 //! The crate gives primitives (GenerationClock, RestartTracker,
 //! StateDigest, gateway, Priority). THIS file shows how an APP
 //! assembles them: flat `[WorkerSlot; N]` array, N+1 shadow,
-//! round-robin over free slots, corpse утилизація without stopping.
+//! round-robin over free slots, dead worker reclamation without stopping.
 //! No Kubernetes in the crate: warmup, balancing, OOM live HERE.
 use snubber::{
     Backoff, GenerationClock, RestartPolicy, RestartTracker, RestartWindow, StateDigest,

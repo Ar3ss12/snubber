@@ -318,7 +318,7 @@ pub const DEFAULT_POLICIES: [FaultPolicy; FaultKind::COUNT] = [
         "implicit_drops_total",
     ),
     // Panic — self-heal by default? No: isolate first, let the
-    // supervisor decide. TripBreaker stops the bleeding in one step.
+    // supervisor decide. TripBreaker stops fault propagation immediately.
     FaultPolicy::arm(
         FaultAction::TripBreaker,
         LogLevel::Critical,

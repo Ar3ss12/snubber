@@ -1,5 +1,5 @@
-//! Automated system kill stress test (Chaos Monkey).
-//! Spawns Supervisor Bunker and Chaos Sniper,
+//! Automated system kill stress test (Hard process termination harness).
+//! Spawns Supervisor and Stress Killer Harness,
 //! verifies that hard process terminations (TerminateProcess on Windows, SIGKILL on Unix)
 //! are survived with 0 pipe deadlocks and 100% token accounting.
 
@@ -10,7 +10,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[test]
-#[ignore = "Spawns background supervisor & sniper and executes hundreds/thousands of hard OS kills. Run explicitly: cargo test --test chaos_dual_terminal -- --ignored --nocapture"]
+#[ignore = "Spawns background supervisor & killer and executes hundreds/thousands of hard OS kills. Run explicitly: cargo test --test chaos_dual_terminal -- --ignored --nocapture"]
 fn chaos_dual_terminal_system_kill_test() {
     let report_file = "target/chaos_report.json";
     if Path::new(report_file).exists() {
@@ -31,15 +31,15 @@ fn chaos_dual_terminal_system_kill_test() {
     let timeout_secs = (kills as u64 * 300 / 1000).max(60);
 
     println!(
-        "[TEST RUNNER] Launching chaos supervisor and sniper (target kills: {})...",
+        "[TEST RUNNER] Launching supervisor and termination harness (target kills: {})...",
         kills
     );
 
     #[cfg(windows)]
     {
-        // 1. Spawn Terminal 1: Supervisor Bunker
+        // 1. Spawn Terminal 1: Supervisor Instance
         let cmd1 = format!(
-            "$host.UI.RawUI.WindowTitle = 'SNUBBER BUNKER (TERMINAL 1)'; cargo run --example chaos_satellite -- --target-kills {} --report-path {}",
+            "$host.UI.RawUI.WindowTitle = 'SNUBBER SUPERVISOR (TERMINAL 1)'; cargo run --example chaos_satellite -- --target-kills {} --report-path {}",
             kills, report_file
         );
         let mut term1 = Command::new("powershell")
@@ -57,9 +57,9 @@ fn chaos_dual_terminal_system_kill_test() {
 
         std::thread::sleep(Duration::from_millis(1500));
 
-        // 2. Spawn Terminal 2: Chaos Sniper
+        // 2. Spawn Terminal 2: Process Killer Harness
         let cmd2 = format!(
-            "powershell -ExecutionPolicy Bypass -File .\\chaos_sniper.ps1 -TargetProcess chaos_satellite -Kills {}",
+            "powershell -ExecutionPolicy Bypass -File .\\stress_harness.ps1 -TargetProcess chaos_satellite -Kills {}",
             kills
         );
         let mut term2 = Command::new("powershell")
@@ -78,8 +78,8 @@ fn chaos_dual_terminal_system_kill_test() {
 
     #[cfg(not(windows))]
     {
-        // 1. Spawn Supervisor Bunker in background
-        let mut bunker = Command::new("cargo")
+        // 1. Spawn Supervisor Instance in background
+        let mut supervisor = Command::new("cargo")
             .args([
                 "run",
                 "--example",
@@ -91,24 +91,24 @@ fn chaos_dual_terminal_system_kill_test() {
                 report_file,
             ])
             .spawn()
-            .expect("spawn chaos bunker");
+            .expect("spawn supervisor");
 
         std::thread::sleep(Duration::from_millis(1500));
 
-        // 2. Run bash chaos sniper in background
-        let mut sniper = Command::new("bash")
+        // 2. Run stress harness in background
+        let mut killer = Command::new("bash")
             .args([
-                "chaos_sniper.sh",
+                "stress_harness.sh",
                 "chaos_satellite",
                 &kills.to_string(),
                 "0.001",
             ])
             .spawn()
-            .expect("spawn chaos sniper");
+            .expect("spawn stress harness");
 
         // Wait for processes
-        let _ = sniper.wait();
-        let _ = bunker.wait();
+        let _ = killer.wait();
+        let _ = supervisor.wait();
     }
 
     println!(
