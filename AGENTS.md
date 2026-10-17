@@ -16,8 +16,8 @@ cargo check --no-default-features
 cargo test --release --test cycle_torture
 ```
 
-`cargo test` today = **114 passed** (6 unit + 108 integration in 26 files)
-+ 11 doc-tests = **125 green**. If your change moves a documented number,
+`cargo test` today = **168 passed** (7 unit + 161 integration in 42 files)
++ 20 doc-tests = **188 green**. If your change moves a documented number,
 update it in the SAME commit (README + tech.md). Stale numbers send the
 next agent hunting ghosts.
 
@@ -143,10 +143,11 @@ incremental cache (`os error 32` here, `os error 1455` there):
 |---|---|---|
 | fmt | `cargo fmt --check` | clean |
 | lint | `cargo clippy --all-targets -- -D warnings` | clean |
-| unit+integration | `cargo test` | 114 + 11 doc = 125 green (1 ignored) |
+| unit+integration | `cargo test` | 168 + 20 doc = 188 green |
 | features | `cargo check --no-default-features` | ok |
 | miri (lib UB check) | `cargo +nightly miri test --lib` | 6 unit tests ok (0 UB) |
-| miri (integration suite) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test guard --test scoped_ergonomics --test erased --test closure_policy --test invariant --test watchdog --test memory_boundary --test presets --test process_died` | 36 integration tests ok (0 UB, 8.6s) |
+| miri (integration suite) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test guard --test scoped_ergonomics --test erased --test closure_policy --test invariant --test watchdog --test memory_boundary --test presets --test process_died` | 36 integration tests ok (0 UB) |
+| miri (new cold suites) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test trap_proof --test cold_diagnostics --test nuclear_vs_shedding --test flight_diagnostics` | 22 tests ok (0 UB; trap 8/8 in ~50s) |
 | torture release | `cargo test --release --test cycle_torture` | ok |
 | clean rebuild | `rmdir /s /q target` then the gates above | — |
 
@@ -264,7 +265,7 @@ cargo test --release --test cycle_torture
 Green = all above green in ONE run, same commit updates `README.md` +
 `AGENTS.md` + `tech.md` numbers. Version lives ONLY in `Cargo.toml`
 (`name`/`version`); docs quote it, never redefine it. Current:
-**v0.1.0**, **114 + 11 = 125 green**, MSRV 1.70.
+**v0.1.0**, **142 + 12 = 154 green**, MSRV 1.70.
 
 Publication honesty (R7): `.gitignore` has been added covering `target/`,
 local scratch logs, python artifacts, and OS temp files. Cargo package exclusions

@@ -12,7 +12,7 @@
 
 ## 0. Universal Ergonomics: Zero-Boilerplate Scoped Execution
 
-If you don't want to manually handle `guard.commit()` or track tokens in your head, use the **`scoped`** functional API. It turns transactional safety into a single clean call:
+If you don't want to manually handle `guard.commit()` or track tokens in your head, use the **`scoped`** functional API. It turns transactional safety into a single clean call. Its sealed sibling **`scoped_sealed`** adds a `!Send` `ScopeToken` (thread-leak fails at compile), **`transition_checked`** + `LegalMove` close the state graph (illegal ribs die at compile), **`StaticNode`** validates capacities FIRST in `build()`, and **`Protected`** burns the resource with a failed guard — all opt-in, see the API table:
 
 ```rust
 use snubber::{snub_check, SnubberNode};
@@ -64,13 +64,15 @@ risky_operation()?; // `?` or panic here → hardware released
 guard.commit();     // success: disarm the rollback
 ```
 
-How it works: the guard owns your rollback closure. `commit()` disarms it (success path). If the scope exits any other way, `Drop` runs the closure. This relies on stack unwinding — the normal Rust panic and `?` path — so it costs virtually nothing (~0.51 ns) when nothing fails.
+How it works: the guard owns your rollback closure. `commit()` disarms it (success path). If the scope exits any other way, `Drop` runs the closure. This relies on stack unwinding — the normal Rust panic and `?` path — so it costs virtually nothing (~1.5 ns on AMD Ryzen 5 4600H) when nothing fails.
 
 ### Rules for the rollback closure:
 1. **Safe to run twice:** Releasing a button twice is fine; sending money twice is not — put terminal forward actions in `commit()`.
 2. **Fast and non-blocking:** Atomic stores, event flags, non-blocking sends.
 3. **No node re-entrancy:** Never call back into the same node's admission method under the rollback (that deadlocks).
-4. **Memory ordering:** The node's mutex protects node books only. If your rollback publishes to shared state that another thread reads, pair it yourself: store with `Release`, load with `Acquire` (or guard the state with your own lock).
+4. **Memory ordering:** The node's mutex protects node books only. Every guard runs a `SeqCst` fence before the rollback body (free on x86/x64) — but a fence pairs with NOTHING. If your rollback publishes to shared state that another thread reads, pair it yourself: store with `Release`, load with `Acquire` (or guard the state with your own lock). `Relaxed`×2 reads rot (F13).
+5. **Bind resource to guard:** Wrap the handle in `Protected::new(res, guard)` — `commit()` walks it out alive, any other exit burns it. Post-crash access becomes a compile error, not a forgotten `if`.
+6. **Seal the scope:** Prefer `node.scoped_sealed(rb, work)` where thread-leakage is the threat — the `!Send` `ScopeToken` makes `spawn` with context a compile error (E0277).
 
 ---
 
@@ -122,6 +124,233 @@ match node.enter_auto(|| release_locks()) {
 - `SnubberNode::desktop(name)` — single-flight (`max_in_flight: 1`) with breaker, optimized for GUI apps.
 - `SnubberNode::embedded(name)` — tight and quiet, zero noise, for embedded/firmware.
 - `SnubberNode::server(name)` — wide bulkhead plus sliding-window breaker for backend daemons.
+
+---
+
+## Level 2.5: Long-Lived Worker (Daemon Thread, Not a Transaction)
+
+Imagine a turnstile into a room with one strict rule: **only ONE person
+may be inside at a time** (`max_in_flight(1)`). Anyone who tries to enter
+while the room is occupied gets an iron bar to the ribs and an error:
+`BulkheadRejected`.
+
+### The trap: wrapping `thread::spawn` in `scoped_checked`
+
+A developer thinks: *"I need to start the clicker thread safely — I'll
+wrap the launch in `scoped_checked`!"*
+
+```rust
+// Main thread (UI or the "Start" command)
+click_node.scoped_checked(&params, validate, || {}, |_| {
+    // 1. YOU STEPPED INSIDE. Counter in_flight = 1. All slots exhausted.
+
+    std::thread::spawn(move || {
+        // 2. The newborn worker thread runs to the SAME turnstile:
+        //    "let me in to click!"
+        let _guard = click_node.enter_erased_auto(..)?;
+        // ❌ BANG! The node sees in_flight == 1 and answers: BulkheadRejected!
+        // The worker never started — it turns around and dies.
+    });
+
+    // 3. Only HERE does scoped_checked end and free the slot (in_flight = 0).
+})?;
+```
+
+Millisecond physics of the disaster:
+
+1. **ms 0:** the main thread calls `scoped_checked`. Snubber opens the
+   door, leads it in, locks the gate. The only free slot is taken.
+2. **ms 1:** the main thread tells the OS: `thread::spawn` (make me a
+   background thread).
+3. **ms 2:** while the main thread has not left its braces yet, the
+   newborn clicker thread starts and makes its first call:
+   `click_node.enter_erased_auto()`.
+4. **ms 3:** the node looks at its counter: limit 1, occupied 1. **It
+   bounces the worker off the wall.** The worker panics or quietly closes
+   with an error.
+5. **ms 4:** the main thread finally finishes the launch, the
+   `scoped_checked` destructor fires, the slot frees up… but the worker
+   is already dead.
+
+You shut the door in the face of the one you just called in.
+
+### Does `scoped` free the slot? YES — and that is exactly the problem
+
+`scoped` lifecycle:
+
+```text
+node.scoped(|| {
+    // 1. [ENTER]: snubber takes the slot. in_flight becomes 1.
+
+    do_some_work(); // 2. Your code runs.
+
+    // 3. [EXIT]: the closing brace }. Destructor fires: slot back to 0.
+});
+```
+
+The moment the thread leaves the closure, the slot is **instantly free**
+— panic included, via `Drop`. Locking the door is the bulkhead's direct
+duty: without it, `max_in_flight(1)` would be an empty word, and two
+threads would shred the protected resource.
+
+But `std::thread::spawn` **does not wait** for the worker to finish
+clicking — it asks the kernel to create a thread and returns in ~0.1 ms.
+So the outer `scoped` guards the 0.1 ms of *creating* the thread, not
+the *hours* of its work:
+
+* worker wakes up in the first 0.1 ms → hits the locked door → dies;
+* worker wakes up at 0.2 ms → door is open, but then why was `scoped`
+  there at all? You guarded the spawn call, never the click loop.
+
+### The iron law: WHO DOES THE WORK TAKES THE SLOT
+
+The function that merely creates the thread (`thread::spawn`) must not
+touch the node's slots — it is just a dispatcher. The slot is taken by
+**the worker itself from the inside**, once awake in the OS:
+
+```rust
+// Main thread just spawns, holding NO snubber slots:
+std::thread::spawn(move || {
+    // The worker woke up and FIRST takes the single slot for its whole life:
+    let guard = match click_node.enter_erased_auto(|| emergency_release_all_hardware()) {
+        Ok(g) => g,
+        Err(_) => {
+            // We land here ONLY if the user really spammed "Start" and a
+            // second worker is already running in parallel.
+            return;
+        }
+    };
+
+    // ... the click loop spins for minutes/hours ...
+
+    guard.commit(); // clean exit, slot freed
+});
+```
+
+### Canonical recipe: `enter_erased_auto` + commit in the epilogue
+
+```rust
+use snubber::{ErasedGuard, SnubberNode};
+
+struct ClickDaemon {
+    // Nameable guard: lives in the struct field across awaits and loop
+    // iterations. A generic `TrackedGuard<F>` cannot do this — every
+    // closure is a different anonymous type.
+    hold: Option<ErasedGuard>,
+}
+
+fn spawn_worker(node: &SnubberNode) -> Result<(), snubber::EnterError> {
+    // 1. Arm at spawn. Rollback = emergency hardware release.
+    let guard = node.enter_erased_auto(|| hardware::release_all())?;
+    // 2. Run the loop (clicks, polls, waits — whatever the daemon does).
+    // 3. Settle EXACTLY once in the epilogue:
+    //    clean stop  → guard.commit()   (disarm, no rollback)
+    //    panic / `?` → Drop runs the rollback automatically
+    guard.commit();
+    Ok(())
+}
+```
+
+Rules:
+1. **One guard per run, settled once.** Never arm per loop iteration —
+   the flight recorder would drown in `total_started`.
+2. **External stop signals the worker; the worker settles itself.**
+   The stop button sets a flag / signals an event; the thread observes
+   it, breaks the loop, and calls `commit()` on its own stack (where the
+   `MouseHoldGuard` still owns the hardware).
+3. **Validate BEFORE arming.** Run invariant checks first; on breach call
+   `node.report(FaultKind::PoisonedPayload, epoch, task_id)` and start
+   nothing — `total_started` stays untouched, no slot burned.
+
+### Where `scoped` DOES belong (short stack-local transactions)
+
+`scoped` is built **exclusively for short transactions on this very
+thread (current stack, under ~50 ms)**:
+
+```rust
+// Saving config to disk: took the slot → wrote in 2 ms → freed it.
+config_node.scoped(|| save_settings_to_file())?;
+// Updating shared coordinates: 5 µs — in, update, out.
+state_node.scoped(|| update_shared_memory())?;
+```
+
+Moral, one line each:
+* **Short action right here (≤ 50 ms)?** → `scoped`. It enters, works,
+  frees on exit by itself.
+* **Long background spinner (worker, timer, daemon)?** → no `scoped`.
+  Use **`spawn_guarded`** — thread + guard + leash in one call, so you
+  never wire them wrong by hand:
+
+```rust
+use snubber::{Directive, SnubberNode, TaskConduit};
+
+let node = SnubberNode::builder("click_worker").max_in_flight(1).build();
+// ONE call binds all three: the thread, its guard, its leash.
+let (join, handle) = node.spawn_guarded(
+    || hardware::release_all(), // rollback if the worker dies
+    0u64,                       // initial conduit state
+    |conduit: TaskConduit<u64, ()>| {
+        // The worker armed enter_erased_auto FIRST (lane Normal),
+        // publishes liveness, parks cooperatively on directives:
+        loop {
+            match conduit.check_directive() {
+                Directive::Cancel(_) | Directive::Preempted(_) => break,
+                Directive::Pause => {
+                    let _ = conduit.wait_for_resume();
+                }
+                _ => do_click(),
+            }
+        }
+        // Exit → guard.commit() automatically.
+    },
+);
+// The controller steers ONLY through the leash — never touches slots:
+handle.send_directive(Directive::Cancel("stop"));
+join.join().expect("worker").expect("admitted"); // Err(Admission) = wall said no
+```
+
+### Priority lanes: who yields when the senior knocks (Phase 1)
+
+Three lanes, ordered by rank (`Background(0) < Normal(1) < Critical(2)`).
+Default is `Normal` — every existing `enter*` call keeps its meaning:
+
+```rust
+use snubber::{Priority, SnubberNode};
+
+let node = SnubberNode::builder("clicker").max_in_flight(1).build();
+
+// Slow repaint holds the single slot on the trash lane:
+let bg = node.enter_with_priority(Priority::Background, 1, 1, || release_all())?;
+
+// Emergency stop knocks on the senior lane. Over pure-Background
+// occupancy the node files ONE cooperative `Preempted` request
+// (flag + counter, lock released!) and refuses as `BulkheadFull` —
+// the caller retries after its victims yield:
+match node.enter_with_priority(Priority::Critical, 2, 2, || release_all()) {
+    Ok(stop) => {
+        stop.commit();
+    }
+    Err(snubber::EnterError::BulkheadFull) if node.preempt_requested() => {
+        // Tell the background worker through its own conduit, then retry:
+        // handle.send_directive(Directive::Preempted("e-stop"));
+        // ... victim observes check_directive() -> abort("preempted") ...
+        // let stop = node.enter_with_priority(Priority::Critical, 3, 3, ...)?;
+    }
+    Err(other) => return Err(other.into()),
+}
+```
+
+Strict rule (no inversion): `Critical` preempts ONLY pure-`Background`
+occupancy (`lane_in_flight == [n, 0, 0]`). `Critical` vs `Normal` never
+preempts — plain `BulkheadFull`, no flag, `preempted` column stays clean.
+The node never forces (R5): who never checkpoints `check_directive()`
+is its own enemy — the request waits until the worker yields itself.
+Diagnostics: `node.preempt_requested()`, `node.lane_in_flight()`,
+`stats().preempted` / `shed_preempted()` (own column, hydraulic, never
+trips the breaker, never counted in `admission_total`).
+
+Never stand in the turnstile doorway while calling someone in. If you
+walked in yourself — nobody else gets through.
 
 ---
 
@@ -211,10 +440,11 @@ use snubber::{AsyncGate, Refusal};
 let gate = AsyncGate::new(&node);
 match gate.admit_auto(|| rollback()) {
     Ok(guard) => { /* process request */ guard.commit(); }
-    Err(Refusal::Backoff { retry_after_ms, depth, kind }) => {
-        // Return HTTP 429 Too Many Requests with Retry-After header
+    Err(Refusal::Backoff) => {
+        // Wall pressure — sleep retry_after_ms() in YOUR runtime,
+        // then return HTTP 429 Too Many Requests with Retry-After header.
     }
-    Err(Refusal::FailFast(kind)) => {
+    Err(Refusal::FailFast) => {
         // Circuit breaker open -> HTTP 503 Service Unavailable / fallback
     }
     Err(Refusal::BadRequest(reason)) => {
@@ -239,9 +469,15 @@ let (conduit, handle) = TaskConduit::pair(42);
 
 // In worker task:
 while work_remains() {
-    // Check for steering directives (Pause, Resume, Cancel, SkipStage)
-    if let Some(Directive::Pause) = conduit.check_directive() {
-        conduit.wait_for_resume_async().await; // 0% CPU async parking via Waker
+    // Check for steering directives (Proceed/Pause/Cancel/SkipStage).
+    // check_directive() returns a plain Directive (never an Option).
+    match conduit.check_directive() {
+        Directive::Pause => {
+            conduit.wait_for_resume_async().await; // 0% CPU async parking via Waker
+        }
+        Directive::Cancel(reason) => return Err(reason),
+        Directive::SkipStage => continue,
+        Directive::Proceed => {}
     }
     conduit.update_state(|s| s.stage += 1);
     conduit.publish_draft(intermediate_result); // Shared operating table
@@ -251,7 +487,7 @@ while work_remains() {
 let live_state = handle.inspect(); // Lock-free live telemetry inspection
 handle.send_directive(Directive::Pause);
 let draft = handle.take_draft(); // Take intermediate progress without canceling
-handle.send_directive(Directive::Resume);
+handle.resume(); // Proceed == resume (there is no Directive::Resume)
 ```
 
 ---
@@ -283,6 +519,160 @@ The architecture has been verified against **10,000 real Windows `TerminateProce
 cargo test --test chaos_dual_terminal -- --ignored --nocapture
 ```
 
+### 5.5 Declarative restart (Phase 2: dumb-spine reanimation)
+The supervisor does not guess — it counts. Declare the policy once,
+the caller loop owns spawn/sleep:
+```rust
+use snubber::{Backoff, RestartDecision, RestartPolicy, RestartTracker, RestartWindow};
+
+let mut tracker = RestartTracker::new(
+    RestartPolicy::OnCrash,          // Never | OnCrash | Always
+    Backoff::exponential(50, 1000),  // 50→100→200…ms cooling, capped
+    RestartWindow::new(3, 10),       // max 3 restarts per 10 s
+);
+loop {
+    let code = spawn_and_wait(); // caller owns the process
+    match tracker.note_death(code, now_ms()) {
+        RestartDecision::Restart { delay_ms, .. } => caller_sleep(delay_ms),
+        RestartDecision::GiveUp { .. } => {
+            node.report(snubber::FaultKind::ProcessDied, 1, 1);
+            break; // storm: park the lineage, operator decides
+        }
+        RestartDecision::Stop => break, // Never, or clean exit(0)
+    }
+}
+```
+
+### 5.6 Hot state handoff (Phase 3: amnesia cured)
+64 B genetic passport (`StateDigest`, one cache line, opaque bytes):
+satellite publishes via `OP_STATE` frames, drain keeps the last WHOLE,
+heir reads it on tick 0 — window wakes where it died, not default.
+
+> **No-padding packing (Weapon 5, recipe not mechanism):** a generic
+> "sum of fields vs `size_of`" detector does not scale in const context
+> without `unsafe` (and this crate is `forbid(unsafe_code)`), so pack
+> field-by-field with `to_le_bytes` into the 64 B array — never
+> `transmute`, never raw-pointer casts. Padding bytes carry uninitialized
+> memory (old keys, noise) into the heir's pipe; explicit packing leaves
+> no holes by construction:
+```rust
+use snubber::StateDigest;
+fn pack_state(x: i32, y: i32, flags: u32, clicks: u64) -> StateDigest {
+    let mut b = [0u8; 64]; // zeroed first — no garbage, ever
+    b[0..4].copy_from_slice(&x.to_le_bytes());
+    b[4..8].copy_from_slice(&y.to_le_bytes());
+    b[8..12].copy_from_slice(&flags.to_le_bytes());
+    b[12..20].copy_from_slice(&clicks.to_le_bytes());
+    // bytes 20..64 stay zero until the next field earns them
+    StateDigest::new(b)
+}
+```
+```rust
+use snubber::StateDigest;
+// Satellite: pack flat (or a wardrobe ticket for 100 MB on disk)…
+let digest = StateDigest::new(packed_64_bytes);
+digest.emit_if_supervised(); // no-op when unsupervised
+// …death… supervisor hands it to the heir's stdin tick 0:
+```
+Chain closed 100% in-crate (debt 2): the parent side pipes stdin,
+writes 64 B (fits any 4 KB kernel buffer — never blocks), drops for
+EOF; the heir reads on its first line:
+```rust
+use snubber::{StateDigest, Supervisor};
+// Parent: caller builds Command (exe+args+env), crate pipes + writes:
+let mut child = Supervisor::spawn_with_digest(cmd, &digest)?;
+// Heir, first line of main (ONCE — second call sees EOF):
+if let Some(digest) = snubber::take_stdin_digest() {
+    restore_from_bytes(digest.bytes); // 42 is back, amnesia cured
+}
+```
+
+### 5.7 Orphan contract (Phase 6: no zombies)
+```rust
+use snubber::{NoOrphanGuard, OrphanGuard};
+let guard = NoOrphanGuard; // honest no-op; real Win32 Job Objects
+assert!(!guard.arm(child_pid)); // live in examples/orphan_guard.rs
+```
+
+---
+
+## Level 6: Cold Diagnostics (Nuclear vs Hydraulic + `app.snub`)
+
+A node that absorbs hits but tells nobody is a deaf bunker. `snubber`
+splits every fault into two isolated contours — and gives you the tools
+to see the pressure **before** it becomes a catastrophe.
+
+### The two contours
+
+| Contour | Meaning | Kinds | Breaker |
+|---|---|---|---|
+| **Nuclear** (hull breach) | The task died anomalously — fix the algorithm | `Panic`, `Timeout`, `ProcessDied`, `ImplicitDrop` | Feeds the streak, may isolate |
+| **Hydraulic** (shedding) | The healthy node holds the perimeter — tune capacity | `BulkheadFull`, `BufferOverflow`, `EvictedOldest`, `StaleEpoch`, `BreakerOpen`, `RateLimited`, `ChannelDisconnected`, `PoisonedPayload` | Counted, never trips |
+
+Single source of truth: `FaultKind::is_catastrophic()`. Cheap gauges on
+every snapshot: `stats().nuclear_breaches()`, `shed_bulkhead()`,
+`shed_rate()` (own column forever — slow worker vs outer spam),
+`shed_stale()`, `admission_total()`.
+
+### Filter 1 — CI gate (stop the skew before release)
+
+```rust
+use snubber::assert_no_anomalies;
+
+#[test]
+fn scheduler_under_load_stays_clean() {
+    run_torture_workload(&node);
+    // Iron rule: the test fails red on any anomaly verdict.
+    assert_no_anomalies!(&node);
+}
+```
+
+### Filter 2 — dev cockpit (hotkey pulse)
+
+```rust
+use snubber::{AnomalyPolicy, print_health};
+
+let snap = node.snapshot_v1(); // cold 512 B snapshot, cached
+let policy = AnomalyPolicy::default(); // 15% bottleneck / 30% flood / min 100
+print_health("click_worker", &snap, &policy);
+// [SNUBBER PULSE] node="click_worker"
+// CRITICAL: 0 breaches
+//   bulk_path  | calls: 124000 | shed_bulk: 0 (0%)   | OK
+//   spam_path  | calls: 124000 | shed_rate: 142 (0%) | OK
+//   ghost_path | calls: 124000 | shed_stale: 0       | OK
+```
+
+### Filter 3 — production (`app.snub` + one-line diagnosis)
+
+The crate never touches the filesystem — your app owns the flusher
+thread (see `examples/persist_snapshot.rs`: `snapshot_v1_in(gen)` →
+`encode()` → tmp + rename every 10 s → `decode()` + `find_anomalies()`
+on boot). When a user reports *"it lags"*, ask for one line:
+
+```text
+[DIAG 0x8FA3 click_worker bulkhead_starvation 92%]
+```
+
+That line is `diagnostic_line(node, anomaly, &snap)` — a FNV-1a hash
+over the counters plus the verdict. No screenshots, no guessing.
+
+### Multi-node board (explicit, never a `static`)
+
+```rust
+use snubber::NodeRegistry;
+
+let mut board = NodeRegistry::new();
+board.register("click_worker", &click_node);
+board.register("hotkey_listener", &hotkey_node);
+for anomaly in board.find_all_anomalies(&AnomalyPolicy::default()) {
+    eprintln!("{}", snubber::diagnostic_line(anomaly.node, &anomaly, &snap));
+}
+```
+
+Cold paths only: snapshot rarely and cache; never call `stats()` per
+CPS in a hot loop (F10 — the `last_fault` clone shows up in the
+profiler at 160 CPS).
+
 ---
 
 ## API & Cost Quick Reference
@@ -290,12 +680,23 @@ cargo test --test chaos_dual_terminal -- --ignored --nocapture
 | Operation | Floor | Latency / Footprint | When to Use |
 |---|---|---|---|
 | `snub_check!(cond, reason)` | 1 / core | ~0 ns (single branch) | Universal invariant check, returns `Err` |
-| `SnubberGuard::new` | 1 / core | **~0.51 ns** (stack move) | Single function synchronous rollback |
-| `EpochGate::observe` | 1 / core | **~2.57 ns** | Monotonic ordering & reboot re-handshake |
-| `node.scoped(rollback, work)` | 2 / std | ~80 ns | Automatic commit on `Ok`, rollback on `Err`/panic |
-| `node.scoped_checked(...)` | 2 / std | ~84 ns | Customs gate + scoped transaction execution |
-| `node.enter_auto` | 2 / std | **~84.8 ns** | Monotonic auto sequence ticket minting |
+| `SnubberGuard::new` | 1 / core | **~1.5 ns** (stack move) | Single function synchronous rollback |
+| `EpochGate::observe` | 1 / core | **~2.6 ns** | Monotonic ordering & reboot re-handshake |
+| `node.transition(&mut s, next, rb, work)` | 2 / std | **~86.5 ns** | ONE enum state machine, no flag drift |
+| `node.transition_checked(s, rb, work)` + `LegalMove` | 2 / std | same + 0 ns | Closed graphs: illegal ribs rejected at compile (E0277) |
+| `node.enter_with_priority(prio)` | 2 / std | **~73.6 ns** | Critical over Background yields cooperatively |
+| `Protected::new(res, guard)` + `commit()` | 1 / core | 0 ns (generics) | Resource burns with guard unless committed |
+| `node.scoped_sealed(rb, work)` + `ScopeToken` | 2 / std | same as `scoped` | `!Send` seal: thread-leak fails at compile |
+| `StaticNode::<I, Q>::build(name)` | 2 / std | same as builder | Capacities validated FIRST in `build()` |
+| `gateway::<T>(cap)` + `host.recv()` | 2 / std | ~10 ns door | Many doors, ONE host checkpoint |
+| `RestartTracker::note_death(code, now)` | 2 / std | pure math | Dumb-spine reanimation, caller sleeps |
+| `StateDigest` + `take_state()` | 2 / std | 64 B, ~1 ns | Hot handoff: memory survives death |
+| `NoOrphanGuard` / `OrphanGuard` | 2 / std | trait only | Parent death = satellites reaped (app impl) |
+| `node.enter_auto` | 2 / std | **~86.5 ns** | Monotonic auto sequence ticket minting |
 | `node.enter_async_auto` | 2 / std | 0% CPU waker park | Async admission under bounded concurrency |
 | `guard.settle_async(fut)` | 2 / std | zero lock during await | Commit across `.await` points |
 | `TaskConduit` / `TaskHandle` | 2 / std | lock-free atomics | 2-way live steering, pause/resume waker, drafts |
 | `PipeDrain` + `ProcessToken` | 2 / std | 44-byte stream | Hardware rollback across process death (`kill -9`) |
+| `node.snapshot_v1()` + `encode()` | 2 / cold | 512 B, CRC32 | Crash-safe persistence, app-owned flush thread |
+| `find_anomalies()` / `assert_no_anomalies!` | 2 / cold | pure `u128` math | CI gate + dev cockpit + `[DIAG 0x…]` bug reports |
+| `NodeRegistry` board | 2 / cold | explicit `&Node` list | Multi-node pulse, never a `static` |

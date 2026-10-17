@@ -82,18 +82,25 @@ pub mod async_gate;
 #[cfg(feature = "std")]
 pub mod intercom;
 
+#[cfg(feature = "std")]
+pub mod gateway;
+
 pub mod policy;
 
 pub mod contract;
 
 pub mod watchdog;
 
+pub mod diagnostics;
+
+pub mod protect;
+
 #[cfg(feature = "alloc")]
 pub mod closure;
 
 pub use policy::{
     Backpressure, BackpressurePolicy, FaultAction, FaultDetail, FaultKind, FaultPolicy, FrictionFn,
-    LogLevel, MetricSample, PressureFn,
+    LogLevel, MetricSample, PressureFn, Priority,
 };
 
 #[cfg(feature = "alloc")]
@@ -101,15 +108,36 @@ pub use closure::{ClosurePolicy, ErasedGuard};
 
 #[cfg(feature = "std")]
 pub use node::{
-    BreakerState, EnterError, FaultHook, FaultRecord, GuardSnapshot, OverflowPolicy, SnubberError,
-    SnubberNode, SnubberNodeBuilder, SnubberStats, StorageKind, TimeoutCheck, TrackedGuard,
+    BreakerState, EnterError, FaultHook, FaultRecord, FlightSlot, GuardSnapshot, LegalMove,
+    OverflowPolicy, ScopeToken, SnubberError, SnubberNode, SnubberNodeBuilder, SnubberStats,
+    SpawnedGuard, StaticNode, StorageKind, TelemetrySink, TimeoutCheck, TrackedGuard,
     DEFAULT_POLICIES,
 };
 
 #[cfg(feature = "std")]
+pub use diagnostics::{
+    diagnostic_line, find_anomalies, print_health, Anomaly, AnomalyKind, AnomalyPolicy,
+    NodeRegistry, SnapshotError, SnapshotV1, SNAPSHOT_CRC_RANGE, SNAPSHOT_LEN, SNAPSHOT_MAGIC,
+    SNAPSHOT_VERSION,
+};
+
+#[cfg(not(feature = "std"))]
+pub use diagnostics::{
+    Anomaly, AnomalyKind, AnomalyPolicy, SnapshotError, SnapshotV1, SNAPSHOT_CRC_RANGE,
+    SNAPSHOT_LEN, SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
+};
+
+pub use diagnostics::{
+    crc32_ieee, diagnostic_hash, find_anomalies_for_snapshot, write_diagnostic_line, write_health,
+};
+
+pub use protect::Protected;
+
+#[cfg(feature = "std")]
 pub use supervisor::{
-    DeathCause, GenerationClock, PipeDrain, ProcessToken, Supervisor, TokenRollback, OP_COMMIT,
-    OP_HEARTBEAT,
+    take_stdin_digest, Backoff, DeathCause, GenerationClock, NoOrphanGuard, OrphanGuard, PipeDrain,
+    ProcessToken, RestartDecision, RestartPolicy, RestartTracker, RestartWindow, StateDigest,
+    Supervisor, TokenRollback, OP_COMMIT, OP_HEARTBEAT, OP_SNAPSHOT, OP_STATE, STATE_LEN,
 };
 
 #[cfg(feature = "std")]
@@ -131,6 +159,12 @@ pub use async_gate::{
 
 #[cfg(feature = "std")]
 pub use intercom::{Directive, ResumeFuture, TaskConduit, TaskHandle};
+
+#[cfg(feature = "std")]
+pub use gateway::{
+    gateway, gateway_with_overflow, GatewayHost, GatewayRecvError, GatewaySendError, GatewaySender,
+    GatewayStats,
+};
 
 use core::fmt;
 use core::mem;
@@ -247,8 +281,6 @@ impl<T> SnubberEvent<T> {
     }
 
     /// Map the `Progress` payload, passing the other three variants through.
-    #[inline]
-    #[must_use]
     pub fn map_payload<U, F: FnOnce(T) -> U>(self, f: F) -> SnubberEvent<U> {
         match self {
             Self::Ack { header } => SnubberEvent::Ack { header },
@@ -342,6 +374,30 @@ impl EpochGate {
         self.current_generation
     }
 }
+
+// COMPILE-TIME GATES (Floor 1 wire math, always compiled, `core`-only):
+// header = 3×u64 (24 B), gate = 2×u64 (16 B); `usize` floor keeps the
+// auto-sequence ticket minting off 16-bit microcontrollers.
+// Pointer-width independence is PROVEN (sums of fixed primitives), not
+// merely pinned: no `usize` field may ever enter a wire-crossing struct.
+const _: () = {
+    assert!(
+        core::mem::size_of::<TransactionHeader>() == 24,
+        "CRITICAL: TransactionHeader must be exactly 24 bytes (3x u64)"
+    );
+    assert!(
+        core::mem::size_of::<TransactionHeader>() == core::mem::size_of::<u64>() * 3,
+        "PORTABILITY: TransactionHeader must be 3 fixed u64, never usize"
+    );
+    assert!(
+        core::mem::size_of::<EpochGate>() == 16,
+        "CRITICAL: EpochGate must be exactly 16 bytes (2x u64)"
+    );
+    assert!(
+        core::mem::size_of::<usize>() >= 4,
+        "CRITICAL: snubber requires at least 32-bit usize for ticket minting"
+    );
+};
 /// RAII transaction guard: owns exactly one rollback.
 ///
 /// Drop semantics (the whole point of the crate):
@@ -373,9 +429,12 @@ impl EpochGate {
 ///
 ///   5. Ground your own shared memory: the node's lock guards ONLY node
 ///      books. A rollback runs outside it (Floor-1 guards own no lock at
-///      all), so publishing to foreign state needs `Release` and observing
+///      all). Every guard runs a `SeqCst` fence before the rollback body
+///      (and before the `commit` disarm) — that narrows the reordering
+///      window for free on x86/x64, but a fence alone pairs with NOTHING:
+///      publishing to foreign state still needs `Release` and observing
 ///      it needs `Acquire` — or your own lock. `Relaxed` on both ends may
-///      read rot on another core.
+///      read rot on another core (F13).
 ///
 /// The guard itself is `core`-only and `unsafe`-free; the `Drop` runs on
 /// the language stack, independent of any node bookkeeping.
@@ -403,8 +462,6 @@ impl<F: FnOnce()> SnubberGuard<F> {
     }
 
     /// Emit the `Ack` event for this transaction (locks resources).
-    #[inline]
-    #[must_use]
     pub fn ack<T>(&self) -> SnubberEvent<T> {
         SnubberEvent::Ack {
             header: self.header,
@@ -412,8 +469,6 @@ impl<F: FnOnce()> SnubberGuard<F> {
     }
 
     /// Emit a `Progress` event carrying a live payload.
-    #[inline]
-    #[must_use]
     pub fn progress<T>(&self, payload: T) -> SnubberEvent<T> {
         SnubberEvent::Progress {
             header: self.header,
@@ -424,10 +479,14 @@ impl<F: FnOnce()> SnubberGuard<F> {
     /// Success path: disarm the destructor, report `Committed`.
     ///
     /// The rollback is taken out and `self` is forgotten so `Drop` never
-    /// runs for a committed transaction.
+    /// runs for a committed transaction. A `SeqCst` fence orders this
+    /// thread's prior writes before any read after `commit` — but foreign
+    /// state shared across threads still needs its own `Release`/`Acquire`
+    /// pair or lock (see rule 5 below); a lone fence pairs with nothing.
     #[inline]
     pub fn commit(mut self) -> SnubberEvent<()> {
         let _ = self.rollback.take();
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         let event = SnubberEvent::Committed {
             header: self.header,
         };
@@ -437,11 +496,18 @@ impl<F: FnOnce()> SnubberGuard<F> {
 
     /// Explicit failure path: run the rollback NOW, report `Aborted`.
     ///
+    /// A `SeqCst` fence runs before the rollback body so this thread's
+    /// prior writes are visible to the rollback's reads. Cross-thread
+    /// publishing still needs `Release` on the writer and `Acquire` on
+    /// the reader (or a lock) — the fence narrows the window, it does
+    /// not invent the pairing.
+    ///
     /// Use it when the fallible work returned an error value (as opposed to
     /// panicking / early-dropping, where `Drop` covers you implicitly).
     #[inline]
     pub fn abort(mut self, reason: &'static str) -> SnubberEvent<()> {
         if let Some(rollback) = self.rollback.take() {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             rollback();
         }
         let event = SnubberEvent::Aborted {
@@ -457,10 +523,16 @@ impl<F: FnOnce()> Drop for SnubberGuard<F> {
     #[inline]
     fn drop(&mut self) {
         if let Some(rollback) = self.rollback.take() {
+            // Memory hygiene: a `SeqCst` fence before the emergency body
+            // orders this thread's prior writes ahead of the rollback's
+            // reads. Same honesty as `abort` above — the fence narrows the
+            // reordering window (free on x86/x64); cross-thread sharing
+            // still needs a real `Release`/`Acquire` pair or a lock (F13).
             // Bullet 1 — double-panic abort: if the worker is already
             // unwinding AND the idiot's rollback panics too, Rust aborts
             // the whole process. Under `std` we swallow the second panic;
             // without `std` there is no catcher — documented, not hidden.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             #[cfg(feature = "std")]
             {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));

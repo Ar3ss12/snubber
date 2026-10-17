@@ -1,21 +1,21 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use snubber::{EpochGate, SnubberGuard, SnubberNode, TransactionHeader};
-use std::sync::atomic::{AtomicBool, Ordering};
-
-fn bench_floor1_guard_commit(c: &mut Criterion) {
-    c.bench_function("floor1_guard_commit", |b| {
-        let rolled_back = AtomicBool::new(false);
+use snubber::{EpochGate, Priority, SnubberGuard, SnubberNode, TransactionHeader};
+use std::time::Duration;
+fn fast() -> Criterion {
+    Criterion::default()
+        .warm_up_time(Duration::from_millis(800))
+        .measurement_time(Duration::from_secs(2))
+        .sample_size(50)
+}
+fn bench_floor1(c: &mut Criterion) {
+    let mut g = c.benchmark_group("floor1_core");
+    g.bench_function("guard_new_commit", |b| {
         b.iter(|| {
-            let guard = SnubberGuard::new(black_box(1), black_box(1), || {
-                rolled_back.store(true, Ordering::Relaxed);
-            });
-            guard.commit();
+            let guard = SnubberGuard::new(black_box(1), black_box(1), || {});
+            black_box(guard.commit());
         });
     });
-}
-
-fn bench_floor1_epoch_gate(c: &mut Criterion) {
-    c.bench_function("floor1_epoch_gate_observe", |b| {
+    g.bench_function("epoch_gate_observe", |b| {
         let mut gate = EpochGate::new();
         let mut epoch = 1u64;
         b.iter(|| {
@@ -29,59 +29,74 @@ fn bench_floor1_epoch_gate(c: &mut Criterion) {
             black_box(res);
         });
     });
+    g.finish();
 }
-
-fn bench_floor2_node_enter_commit(c: &mut Criterion) {
-    let node = SnubberNode::builder("bench_node")
-        .max_in_flight(1024)
-        .build();
-
-    use std::sync::atomic::AtomicU64;
-    let epoch_gen = AtomicU64::new(1);
-
-    c.bench_function("floor2_node_enter_commit", |b| {
+fn bench_floor2(c: &mut Criterion) {
+    let mut g = c.benchmark_group("floor2_std");
+    g.bench_function("node_enter_commit", |b| {
+        let node = SnubberNode::builder("bench_node")
+            .max_in_flight(1024)
+            .build();
+        let mut seq = 1u64;
         b.iter(|| {
-            let ep = epoch_gen.fetch_add(1, Ordering::Relaxed);
+            seq = seq.wrapping_add(1);
+            let guard = node.enter(black_box(seq), black_box(1), || {}).expect("a");
+            black_box(guard.commit());
+        });
+    });
+    g.bench_function("node_enter_auto_commit", |b| {
+        let node = SnubberNode::builder("bench_auto")
+            .max_in_flight(1024)
+            .build();
+        b.iter(|| {
+            let guard = node.enter_auto(|| {}).expect("a");
+            black_box(guard.commit());
+        });
+    });
+    g.bench_function("node_enter_critical_priority", |b| {
+        let node = SnubberNode::builder("bench_prio")
+            .max_in_flight(1024)
+            .build();
+        let mut e = 1u64;
+        b.iter(|| {
+            e = e.wrapping_add(1);
             let guard = node
-                .enter(black_box(ep), black_box(1), || {})
-                .expect("admitted");
-            guard.commit();
+                .enter_with_priority(Priority::Critical, black_box(e), black_box(1), || {})
+                .expect("a");
+            black_box(guard.commit());
         });
     });
-}
-
-fn bench_floor2_node_enter_auto_commit(c: &mut Criterion) {
-    let node = SnubberNode::builder("bench_node_auto")
-        .max_in_flight(1024)
-        .build();
-
-    c.bench_function("floor2_node_enter_auto_commit", |b| {
+    g.bench_function("node_transition", |b| {
+        let node = SnubberNode::builder("bench_sm").max_in_flight(1024).build();
+        let mut st = 0u8;
         b.iter(|| {
-            let guard = node.enter_auto(|| {}).expect("admitted");
-            guard.commit();
+            node.transition(
+                &mut st,
+                black_box(1),
+                || {},
+                |s| {
+                    *s = 1;
+                    Ok::<(), &str>(())
+                },
+            )
+            .expect("t");
+            black_box(st);
         });
     });
+    g.finish();
 }
-
-fn bench_floor3_erased_enter_auto_commit(c: &mut Criterion) {
+fn bench_floor3(c: &mut Criterion) {
+    let mut g = c.benchmark_group("floor3_alloc");
     let node = SnubberNode::builder("bench_erased")
         .max_in_flight(1024)
         .build();
-
-    c.bench_function("floor3_node_enter_erased_auto_commit", |b| {
+    g.bench_function("erased_enter_auto_commit", |b| {
         b.iter(|| {
-            let guard = node.enter_erased_auto(|| {}).expect("admitted");
+            let guard = node.enter_erased_auto(|| {}).expect("a");
             guard.commit();
         });
     });
+    g.finish();
 }
-
-criterion_group!(
-    benches,
-    bench_floor1_guard_commit,
-    bench_floor1_epoch_gate,
-    bench_floor2_node_enter_commit,
-    bench_floor2_node_enter_auto_commit,
-    bench_floor3_erased_enter_auto_commit
-);
+criterion_group!(name = benches; config = fast(); targets = bench_floor1, bench_floor2, bench_floor3);
 criterion_main!(benches);

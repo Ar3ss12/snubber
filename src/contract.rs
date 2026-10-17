@@ -12,10 +12,13 @@
 //!   `enter` from a rollback is a deadlock smell).
 //! * MUST **ground its own shared memory**: the node's internal mutex
 //!   synchronizes ONLY node books (counters, breaker, slots). Rollbacks
-//!   run OUTSIDE that lock, and Floor-1 guards own no lock at all — so a
-//!   rollback that touches foreign shared state MUST publish with
-//!   `Release` and the observer MUST read with `Acquire` (or guard the
-//!   state with its own primitive). `Relaxed` on both ends reads rot.
+//!   run OUTSIDE that lock, and Floor-1 guards own no lock at all.
+//!   Every guard runs a `SeqCst` fence before the rollback body (free on
+//!   x86/x64) — that narrows the reordering window, but a fence alone
+//!   pairs with NOTHING: a rollback that touches foreign shared state
+//!   MUST publish with `Release` and the observer MUST read with
+//!   `Acquire` (or guard the state with its own primitive).
+//!   `Relaxed` on both ends reads rot.
 //!
 //! Violate any MUST and the watchdog (meta-guard) will still fire your
 //! rollback twice —nobly, and with witnesses (see `examples/meta_guard.rs`).

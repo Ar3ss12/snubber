@@ -13,14 +13,30 @@
 //! On `EOF` an un-cleared token fires the emergency rollback.
 //!
 //! Dumb as a rail: spawn / drain / wait / emit / restart. No policies.
+//!
+//! Phase 2 adds the declarative restart half (still dumb-spine): the
+//! caller owns spawn/wait/sleep, the crate owns ONLY the decision math
+//! (`RestartPolicy` + `Backoff` + `RestartTracker`). The tracker never
+//! sleeps, never spawns, never touches a pipe — it returns a `delay_ms`
+//! the CALLER sleeps (injected sleeper, same contract as
+//! [`crate::AsyncSleeper`]: Tokio callers `tokio::time::sleep`, sync
+//! callers `std::thread::sleep`, tests sleep nothing and assert deltas).
+//!
+//! Phase 6 adds the orphan contract ([`OrphanGuard`]): the crate names
+//! the guarantee (parent death = satellites reaped), the APP implements
+//! it (Win32 Job Objects need `unsafe` + `windows-sys` — forbidden in
+//! this crate by `forbid(unsafe_code)` + zero-dep). Portable no-op
+//! included ([`NoOrphanGuard`]); real impl lives in
+//! `examples/orphan_guard.rs` as documented pattern.
 
 use super::{SnubberEvent, TransactionHeader};
+use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Monotonic generation clock for ONE supervised lineage.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GenerationClock {
     generation: u64,
     next_epoch: u64,
@@ -92,6 +108,289 @@ impl DeathCause {
     }
 }
 
+/// When the supervisor reanimates a dead satellite (Phase 2).
+///
+/// Plain `Copy` data — no logic lives here. The [`RestartTracker`]
+/// interprets it against the storm window:
+/// * `Never` — one-shot tasks (export, migration): the corpse stays.
+/// * `OnCrash` — clean `exit(0)` is a planned landing (no restart);
+///   any other death (`exit(1)`, segfault, `TerminateProcess`,
+///   `HangTimeout`) is a crash worth one reanimation.
+/// * `Always` — daemons that must live forever: even `exit(0)`
+///   is re-spawned (operator stop = `Never` at a higher layer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RestartPolicy {
+    /// Never re-spawn (one-shot tasks).
+    Never,
+    /// Re-spawn on crash only (`exit_code != 0` or hang/kill).
+    #[default]
+    OnCrash,
+    /// Re-spawn on every death, including clean `exit(0)`.
+    Always,
+}
+
+impl RestartPolicy {
+    /// `true` if this death deserves a reanimation attempt.
+    /// `exit_code: None` = killed/hung from outside (always a crash).
+    #[inline]
+    #[must_use]
+    pub const fn wants_restart(self, exit_code: Option<i32>) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Always => true,
+            Self::OnCrash => !matches!(exit_code, Some(0)),
+        }
+    }
+}
+
+/// Pause between reanimations (Phase 2).
+///
+/// `Copy`, `const`-friendly. [`Backoff::delay_for_attempt`] is pure
+/// math (`saturating` shifts, no clock, no sleep): attempt 0 waits
+/// `base_ms`, each next attempt doubles, capped at `max_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Backoff {
+    /// First pause, ms. `0` = no cooling (explicit hammer).
+    pub base_ms: u64,
+    /// Ceiling for the exponential growth, ms.
+    pub max_ms: u64,
+}
+
+impl Backoff {
+    /// No cooling: re-spawn immediately (explicit, never default).
+    #[inline]
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            base_ms: 0,
+            max_ms: 0,
+        }
+    }
+
+    /// Exponential cooling: `base_ms, 2*base, 4*base, …`, capped.
+    #[inline]
+    #[must_use]
+    pub const fn exponential(base_ms: u64, max_ms: u64) -> Self {
+        Self {
+            base_ms,
+            max_ms: if max_ms < base_ms { base_ms } else { max_ms },
+        }
+    }
+
+    /// Pause before reanimation attempt `n` (0-based), ms.
+    /// Pure saturating math: `base << n`, capped at `max_ms`.
+    /// `n >= 63` saturates (never panics, MSRV 1.70-safe loop).
+    #[inline]
+    #[must_use]
+    pub const fn delay_for_attempt(self, attempt: u32) -> u64 {
+        if self.base_ms == 0 {
+            return 0;
+        }
+        let mut grown = self.base_ms;
+        let mut i = 0u32;
+        while i < attempt {
+            grown = grown.saturating_mul(2);
+            if grown >= self.max_ms {
+                return self.max_ms;
+            }
+            i += 1;
+        }
+        if grown > self.max_ms {
+            self.max_ms
+        } else {
+            grown
+        }
+    }
+}
+
+impl Default for Backoff {
+    #[inline]
+    fn default() -> Self {
+        Self::exponential(50, 1000)
+    }
+}
+
+/// Storm-guard window: at most `max` restarts per `within_ms` (Phase 2).
+///
+/// `Copy`. `max = 0` = guard open (restart every crash — explicit, for
+/// daemons behind an outer supervisor). The [`RestartTracker`] holds
+/// the timestamp deque; this struct is the declarative half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RestartWindow {
+    /// Max reanimations inside the window (`0` = unlimited).
+    pub max_restarts: u32,
+    /// Window length, ms.
+    pub within_ms: u64,
+}
+
+impl RestartWindow {
+    /// `max` restarts per `within_secs` seconds. Saturates, never panics.
+    #[inline]
+    #[must_use]
+    pub const fn new(max_restarts: u32, within_secs: u64) -> Self {
+        Self {
+            max_restarts,
+            within_ms: within_secs.saturating_mul(1000),
+        }
+    }
+
+    /// Unlimited restarts (explicit — outer supervisor owns the guard).
+    #[inline]
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            max_restarts: 0,
+            within_ms: 0,
+        }
+    }
+}
+
+impl Default for RestartWindow {
+    #[inline]
+    fn default() -> Self {
+        Self::new(3, 10)
+    }
+}
+
+/// What the tracker decided after one death report (Phase 2).
+///
+/// The caller owns sleep + spawn; the crate owns the math. `delay_ms`
+/// is ADVICE the caller sleeps with its own sleeper.
+#[must_use = "a RestartDecision orders the lineage (Stop/GiveUp/Restart) — match it, never drop it"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RestartDecision {
+    /// Do not re-spawn: `Never`, clean exit under `OnCrash`, or storm.
+    Stop,
+    /// Storm guard tripped: caller MUST NOT spawn — `report(ProcessDied)`
+    /// + `RollbackAndAlert` on its node, park the lineage.
+    GiveUp {
+        /// Deaths counted inside the window (always `>= max`).
+        deaths_in_window: u32,
+    },
+    /// Re-spawn after `delay_ms` (caller sleeps with its own sleeper).
+    Restart {
+        /// Caller-owned cooling pause, ms (`0` = immediate).
+        delay_ms: u64,
+        /// Which reanimation this is (0-based, for logging).
+        attempt: u32,
+    },
+}
+
+/// Dumb-spine restart accountant (Phase 2).
+///
+/// Owns: storm-window timestamps (`VecDeque<u64>`, pruned per report),
+/// attempt counter, generation clock. Owns NOT: spawning, sleeping,
+/// pipes, threads. Caller loop:
+///
+/// ```text
+/// loop {
+///     let status = spawn_and_wait();          // caller owns
+///     match tracker.note_death(exit_code, now_ms()) {
+///         Stop => break,
+///         GiveUp { .. } => { node.report(ProcessDied,…); break; }
+///         Restart { delay_ms, .. } => { caller_sleep(delay_ms); }
+///     }
+/// }
+/// ```
+///
+/// `now_ms` is caller-supplied (tests inject a fake clock — zero real
+/// sleeps). Timestamps need only be monotonic, never wall-clock.
+#[derive(Debug, Clone)]
+pub struct RestartTracker {
+    policy: RestartPolicy,
+    backoff: Backoff,
+    window: RestartWindow,
+    deaths_ms: VecDeque<u64>,
+    attempts: u32,
+    restarts: u32,
+    giveups: u32,
+    clock: GenerationClock,
+}
+
+impl RestartTracker {
+    /// Build from declarative parts. The deque is preallocated at
+    /// `max_restarts.max(1)` and pruned — never grown past `max+1`.
+    #[must_use]
+    pub fn new(policy: RestartPolicy, backoff: Backoff, window: RestartWindow) -> Self {
+        let cap = window.max_restarts.max(1) as usize;
+        Self {
+            policy,
+            backoff,
+            window,
+            deaths_ms: VecDeque::with_capacity(cap),
+            attempts: 0,
+            restarts: 0,
+            giveups: 0,
+            clock: GenerationClock::new(),
+        }
+    }
+
+    /// Default spine: `OnCrash`, `50ms→1s` cooling, `3 per 10s` guard.
+    #[must_use]
+    pub fn default_spine() -> Self {
+        Self::new(
+            RestartPolicy::OnCrash,
+            Backoff::default(),
+            RestartWindow::default(),
+        )
+    }
+
+    /// Report one death at `now_ms` (caller clock, monotonic).
+    /// `exit_code: None` = killed/hung from outside (always a crash).
+    /// Returns the decision; the CALLER sleeps/spawns/reports.
+    pub fn note_death(&mut self, exit_code: Option<i32>, now_ms: u64) -> RestartDecision {
+        self.attempts = self.attempts.saturating_add(1);
+        if !self.policy.wants_restart(exit_code) {
+            return RestartDecision::Stop;
+        }
+        if self.window.max_restarts > 0 {
+            let cutoff = now_ms.saturating_sub(self.window.within_ms);
+            while self.deaths_ms.front().is_some_and(|&t| t < cutoff) {
+                self.deaths_ms.pop_front();
+            }
+            self.deaths_ms.push_back(now_ms);
+            while self.deaths_ms.len() > self.window.max_restarts as usize + 1 {
+                self.deaths_ms.pop_front();
+            }
+            if self.deaths_ms.len() > self.window.max_restarts as usize {
+                self.giveups = self.giveups.saturating_add(1);
+                return RestartDecision::GiveUp {
+                    deaths_in_window: self.deaths_ms.len() as u32,
+                };
+            }
+        }
+        let attempt = self.restarts;
+        let delay_ms = self.backoff.delay_for_attempt(attempt);
+        self.restarts = self.restarts.saturating_add(1);
+        self.clock.restart();
+        RestartDecision::Restart { delay_ms, attempt }
+    }
+
+    /// Total death reports seen (restarts + stops + giveups).
+    #[must_use]
+    pub fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    /// Reanimations authorized so far.
+    #[must_use]
+    pub fn restarts(&self) -> u32 {
+        self.restarts
+    }
+
+    /// Storm-guard trips so far.
+    #[must_use]
+    pub fn giveups(&self) -> u32 {
+        self.giveups
+    }
+
+    /// Current supervised generation (bumped per authorized restart).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.clock.generation()
+    }
+}
+
 /// Last-armed 40-byte token: `[task u64 | opcode u32 | payload [u8;28]]`.
 ///
 /// `OP_COMMIT` clears the armed token (settled clean). Any other opcode
@@ -119,6 +418,18 @@ pub const OP_COMMIT: u32 = 0;
 /// `last_seen` like any traffic, arms nothing. Traffic-is-liveness:
 /// any 40 B frame (token/commit/heartbeat) proves the worker pumps.
 pub const OP_HEARTBEAT: u32 = 1;
+
+/// Cold snapshot marker: worker flushed a 512 B `SnapshotV1` out of band
+/// (file, sidecar pipe, crash dump). The supervisor treats it as
+/// diagnostics, never as an armed token — arms nothing, clears nothing.
+pub const OP_SNAPSHOT: u32 = 2;
+
+/// Hot state handoff (Phase 3): the 40 B body carries a chunk of the
+/// 64 B `StateDigest` (2 frames: seq 0 = bytes `0..28` + CRC, seq 1 =
+/// bytes `28..64`). The drain keeps the LAST valid digest in its own
+/// slot — never armed as a token, never rolled back. The supervisor
+/// hands it to the next generation on tick 0 (`take_state()`).
+pub const OP_STATE: u32 = 3;
 
 impl ProcessToken {
     /// Build from parts (worker side, no alloc).
@@ -222,10 +533,172 @@ impl ProcessToken {
     }
 }
 
+/// State digest payload: exactly 64 bytes (one CPU cache line).
+pub const STATE_LEN: usize = 64;
+
+// COMPILE-TIME GATES (hot-handoff wire math; this module is `std`-gated,
+// so `no_std` builds never see these — `cargo check --no-default-features`
+// stays green):
+// * passport = exactly one L1 cache line (64 B);
+// * token BODY = 8 (task) + 4 (opcode) + 28 (payload) = 40 B;
+// * token WIRE = 40 B body + 4 B `SNUB` magic = 44 B (NOT 44 in-struct!);
+// * digest split = 24 + 24 + 16 chunks = 64 B (`to_frames` arithmetic);
+// * opcodes pairwise distinct (drain dispatch never confuses a chunk).
+const _: () = {
+    assert!(
+        STATE_LEN == 64,
+        "CRITICAL: STATE_LEN must be exactly one 64-byte cache line"
+    );
+    assert!(
+        core::mem::size_of::<StateDigest>() == 64,
+        "CRITICAL: StateDigest must be exactly 64 bytes (one cache line)"
+    );
+    assert!(
+        core::mem::size_of::<ProcessToken>() == 40,
+        "CRITICAL: ProcessToken body must be exactly 40 bytes (8+4+28)"
+    );
+    // PORTABILITY: the body is proven pointer-width-independent (8+4+28
+    // of FIXED primitives), not merely pinned at 40. No `usize` may ever
+    // enter a wire struct — `u32/u64/u8` only, on any target.
+    assert!(
+        core::mem::size_of::<ProcessToken>()
+            == core::mem::size_of::<u64>() + core::mem::size_of::<u32>() + 28,
+        "PORTABILITY: ProcessToken size must not depend on pointer width"
+    );
+    assert!(
+        core::mem::size_of::<ProcessToken>() + TOKEN_MAGIC.len() == 44,
+        "CRITICAL: wire frame must be exactly 44 bytes (40 body + 4 SNUB)"
+    );
+    assert!(
+        24 + 24 + 16 == STATE_LEN,
+        "CRITICAL: OP_STATE chunk split must cover the whole digest"
+    );
+    assert!(
+        OP_COMMIT != OP_HEARTBEAT
+            && OP_COMMIT != OP_SNAPSHOT
+            && OP_COMMIT != OP_STATE
+            && OP_HEARTBEAT != OP_SNAPSHOT
+            && OP_HEARTBEAT != OP_STATE
+            && OP_SNAPSHOT != OP_STATE,
+        "CRITICAL: supervisor opcodes must be pairwise distinct"
+    );
+    // LE WIRE CANON (universal, platform-blind): every multi-byte integer
+    // on the wire is explicit little-endian (`to_le_bytes` /
+    // `from_le_bytes` ONLY). No `to_be` / `to_ne`, no `transmute`, no
+    // pointer casts on the wire path — a big-endian peer decodes the same
+    // bytes identically, because the bytes never depend on host order.
+    // (`to_le_bytes` is `const` but `==` on arrays is not const-stable on
+    // MSRV 1.70, so the full-vector proof lives in the `wire_is_le_canon`
+    // unit test below; here we pin the scalar first byte, which IS const.)
+    assert!(
+        0x12345678u32.to_le_bytes()[0] == 0x78,
+        "WIRE PROTOCOL: explicit little-endian encoding broken"
+    );
+};
+
+/// Hot state digest (Phase 3): the satellite's genetic passport.
+///
+/// Fixed 64 B of OPAQUE bytes + CRC32 — one cache line, ~1 ns copy.
+/// The crate NEVER interprets the payload: flat-packed coordinates
+/// (38 B cover x/y/w/h/cps/flags/clicks/preset) or a wardrobe ticket
+/// (checkpoint id + file offset + hash) for 100 MB states on disk.
+/// The crate is the armored postman — encode, CRC, deliver.
+///
+/// Wire: THREE `OP_STATE` frames (`task` = seq 0/1/2). Each body =
+/// `[seq u64 | chunk | crc u32]` where chunk = 28/28/8 digest bytes.
+/// Frame CRC covers its own chunk; full-digest CRC verified on
+/// reassembly. Torn frames dropped — heir gets the last WHOLE
+/// passport or nothing, never a half-chewed corpse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StateDigest {
+    /// Opaque state bytes (user-packed, user-read).
+    pub bytes: [u8; STATE_LEN],
+}
+
+impl Default for StateDigest {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            bytes: [0; STATE_LEN],
+        }
+    }
+}
+
+/// CRC32-IEEE over digest bytes (same table as `SnapshotV1`).
+fn state_crc(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data.iter() {
+        crc ^= b as u32;
+        let mut i = 0;
+        while i < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            i += 1;
+        }
+    }
+    !crc
+}
+
+impl StateDigest {
+    /// Wrap raw bytes (user-packed flat struct or wardrobe ticket).
+    #[inline]
+    #[must_use]
+    pub const fn new(bytes: [u8; STATE_LEN]) -> Self {
+        Self { bytes }
+    }
+
+    /// CRC32 of the full 64 B payload (integrity seal).
+    #[inline]
+    #[must_use]
+    pub fn crc(&self) -> u32 {
+        state_crc(&self.bytes)
+    }
+
+    /// Split into three `OP_STATE` wire frames (seq in `task`).
+    /// Body layout per frame: `[chunk | crc u32]` where chunk =
+    /// 24/24/16 digest bytes at `payload[0..take]`, CRC of that chunk
+    /// at `payload[24..28]` (frames 0/1 carry 24 B data + CRC; frame 2
+    /// carries 16 B data + 8 B zero pad + CRC of its 16 B).
+    /// CRC covers that frame's chunk only; torn frames drop silently.
+    #[must_use]
+    pub fn to_frames(self) -> [ProcessToken; 3] {
+        let mut frames = [ProcessToken::tagged(OP_STATE, 0); 3];
+        let mut off = 0usize;
+        for (seq, frame) in frames.iter_mut().enumerate() {
+            let take = if seq < 2 { 24 } else { 16 };
+            let mut payload = [0u8; 28];
+            payload[0..take].copy_from_slice(&self.bytes[off..off + take]);
+            let crc = state_crc(&self.bytes[off..off + take]);
+            payload[24..28].copy_from_slice(&crc.to_le_bytes());
+            *frame = ProcessToken {
+                task: seq as u64,
+                opcode: OP_STATE,
+                payload,
+            };
+            off += take;
+        }
+        frames
+    }
+
+    /// Publish to stdout under a supervisor (satellite side).
+    /// No-op when unsupervised. Flushes — drain reads in real time.
+    pub fn emit_if_supervised(&self) {
+        if ProcessToken::is_supervised() {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            for f in self.to_frames() {
+                let _ = lock.write_all(&f.to_bytes());
+            }
+            let _ = lock.flush();
+        }
+    }
+}
+
 /// Build the `Aborted` death event (Path-1 emit).
 /// v0.4 honest: death is `ProcessDied`, never masked (D3 closed).
+/// Return is `SnubberEvent` (already `#[must_use]` at the type).
 #[inline]
-#[must_use]
 pub fn death_event(header: TransactionHeader, cause: DeathCause) -> SnubberEvent<()> {
     SnubberEvent::Aborted {
         header,
@@ -233,15 +706,22 @@ pub fn death_event(header: TransactionHeader, cause: DeathCause) -> SnubberEvent
     }
 }
 
-/// Drain state: exactly ONE slot (last un-settled token) + liveness clock.
+/// Drain state: exactly ONE slot (last un-settled token) + liveness clock
+/// + hot handoff (last WHOLE `StateDigest` + 3-frame reassembly scratch).
 ///
 /// `last_seen_ms`: wall-clock of the last valid 40 B frame (token,
-/// commit OR heartbeat — any traffic proves the worker pumps).
+/// commit, heartbeat OR state — any traffic proves the worker pumps).
 /// `0` = nothing seen yet.
 #[derive(Debug, Default)]
 struct DrainState {
     armed: Option<ProcessToken>,
     last_seen_ms: u64,
+    /// Last WHOLE verified digest (heir reads it on tick 0).
+    state: Option<StateDigest>,
+    /// Reassembly scratch: chunks per seq (28/28/8) + got-mask.
+    /// `got == 0b111` + CRC trio clean → promote to `state`.
+    scratch: [[u8; 28]; 3],
+    scratch_got: u8,
 }
 
 /// Monotonic millisecond clock (supervisor side, `std`).
@@ -296,6 +776,32 @@ impl PipeDrain {
                             if token.opcode == OP_COMMIT {
                                 st.armed = None;
                             }
+                        } else if token.opcode == OP_STATE {
+                            // Hot handoff chunk: seq = task (0/1/2).
+                            // Layout: payload[0..take] = data (24/24/16),
+                            // payload[24..28] = frame CRC of that chunk.
+                            let seq = (token.task.min(2)) as usize;
+                            let take = if seq < 2 { 24 } else { 16 };
+                            let mut want = [0u8; 4];
+                            want.copy_from_slice(&token.payload[24..28]);
+                            let want = u32::from_le_bytes(want);
+                            if state_crc(&token.payload[0..take]) == want {
+                                st.scratch[seq][0..take].copy_from_slice(&token.payload[0..take]);
+                                st.scratch_got |= 1 << seq;
+                                if st.scratch_got == 0b111 {
+                                    let mut bytes = [0u8; STATE_LEN];
+                                    bytes[0..24].copy_from_slice(&st.scratch[0][0..24]);
+                                    bytes[24..48].copy_from_slice(&st.scratch[1][0..24]);
+                                    bytes[48..64].copy_from_slice(&st.scratch[2][0..16]);
+                                    st.state = Some(StateDigest::new(bytes));
+                                    // Fresh passport starts here: reset the
+                                    // mask so a torn tail of the NEXT digest
+                                    // can never mix with this one's chunks.
+                                    st.scratch_got = 0;
+                                }
+                            }
+                            // Torn frame: dropped silently, scratch keeps
+                            // the older halves — heir gets last whole.
                         } else {
                             st.armed = Some(token);
                         }
@@ -312,6 +818,21 @@ impl PipeDrain {
     #[must_use]
     pub fn take_armed(&self) -> Option<ProcessToken> {
         self.state.lock().ok().and_then(|mut st| st.armed.take())
+    }
+
+    /// Take the last WHOLE verified `StateDigest`, if any (Phase 3).
+    /// Call after reap, hand the bytes to the heir on tick 0 (child
+    /// stdin/env/file — the crate delivers, the app injects). `Copy`
+    /// out under one short lock — no alloc, never panics.
+    #[must_use]
+    pub fn take_state(&self) -> Option<StateDigest> {
+        self.state.lock().ok().and_then(|st| st.state)
+    }
+
+    /// Peek without taking (supervisor polls before spawning the heir).
+    #[must_use]
+    pub fn last_state(&self) -> Option<StateDigest> {
+        self.state.lock().ok().and_then(|st| st.state)
     }
 
     /// `true` once the reader hit `EOF`/error.
@@ -350,9 +871,32 @@ impl PipeDrain {
 pub type TokenRollback = fn(u32, [u8; 28]);
 
 /// Turnkey process supervisor managing satellite lifecycle and dead-token emergency rescue.
+///
+/// Phase 6 orphan contract lives below ([`OrphanGuard`]).
 pub struct Supervisor;
 
 impl Supervisor {
+    /// Spawn `cmd` with `digest` on the heir's stdin tick 0 (debt 2).
+    ///
+    /// Caller builds the `Command` (exe + args + env — the crate never
+    /// guesses); we pipe stdin, `write_all` the 64 B (fits any 4 KB
+    /// kernel pipe buffer — never blocks), `drop(stdin)` for EOF, and
+    /// hand back the live `Child`. The heir reads it on its first line
+    /// via [`take_stdin_digest`]. Chain closed 100% in-crate.
+    pub fn spawn_with_digest(
+        mut cmd: std::process::Command,
+        digest: &StateDigest,
+    ) -> std::io::Result<std::process::Child> {
+        use std::io::Write;
+        cmd.stdin(std::process::Stdio::piped());
+        let mut child = cmd.spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&digest.bytes);
+            // EOF: heir's read_exact lands, no deadlock.
+        }
+        Ok(child)
+    }
+
     /// Inspect command line args and run the satellite supervisor loop if `--supervisor` is present.
     ///
     /// Flow:
@@ -440,5 +984,82 @@ impl Supervisor {
         println!(">>> [SNUBBER SUPERVISOR] Lineage bumped to gen={next_gen}. Done.");
         println!("============================================================");
         true
+    }
+}
+
+/// Orphan contract (Phase 6): parent death = satellites reaped.
+///
+/// The crate NAMES the guarantee; the APP implements it. Win32 needs
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`unsafe` + `windows-sys`) —
+/// forbidden here by `forbid(unsafe_code)` + zero-dep. Unix needs
+/// `prctl(PR_SET_PDEATHSIG)` (`libc`) — same veto. So the crate ships
+/// the trait + a portable no-op; the real impl is a documented pattern
+/// in `examples/orphan_guard.rs` (osmotic docs, not dead code).
+///
+/// Owner (R1): the APP's supervisor setup. The crate never calls it —
+/// it only types the promise so every satellite binary shares one.
+pub trait OrphanGuard: Send + Sync {
+    /// Arm: from now on, if THIS process dies, the OS reaps `pid`.
+    /// Returns `false` when the platform cannot promise (caller logs).
+    fn arm(&self, pid: u32) -> bool;
+    /// Human name for logs (`"win32-job-object"`, `"prctl-pdeathsig"`).
+    fn backend_name(&self) -> &'static str;
+}
+
+/// Portable no-op guard: promises nothing, says so honestly.
+/// Parent death orphans satellites — same as raw `Command::spawn`.
+/// Use when the deployment owns reaping (systemd, k8s, outer daemon).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct NoOrphanGuard;
+
+impl OrphanGuard for NoOrphanGuard {
+    #[inline]
+    fn arm(&self, _pid: u32) -> bool {
+        false
+    }
+    #[inline]
+    fn backend_name(&self) -> &'static str {
+        "none (portable no-op: orphans possible)"
+    }
+}
+
+/// Read the heir's passport from stdin tick 0 (debt 2, heir side).
+///
+/// Dumb + reliable `read_exact`: 64 B delivered → `Some`, fewer bytes
+/// (torn write) or no stdin at all (Windows GUI) → `None`, never a
+/// panic. Call ONCE on the first line of `main` — second call sees EOF.
+#[must_use]
+pub fn take_stdin_digest() -> Option<StateDigest> {
+    use std::io::Read;
+    let mut buf = [0u8; STATE_LEN];
+    if std::io::stdin().read_exact(&mut buf).is_ok() {
+        Some(StateDigest::new(buf))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    /// Full-vector LE canon: `to_le_bytes` is `const`, but `==` on arrays
+    /// is not const-stable on MSRV 1.70 — so the byte-exact vector proof
+    /// lives here at runtime (the scalar first byte is pinned in the
+    /// `const` gate above; both must hold).
+    #[test]
+    fn wire_is_le_canon() {
+        assert_eq!(0x12345678u32.to_le_bytes(), [0x78, 0x56, 0x34, 0x12]);
+        assert_eq!(
+            0x0102030405060708u64.to_le_bytes(),
+            [8, 7, 6, 5, 4, 3, 2, 1]
+        );
+        // Round-trip: the drain decodes exactly what the satellite encoded.
+        let token = ProcessToken::new(0x0102030405060708, 0x12345678, [0xAB; 28]);
+        let wire = token.to_bytes();
+        assert_eq!(&wire[0..4], b"SNUB");
+        let body: [u8; 40] = wire[4..44].try_into().expect("40 B body");
+        let back = ProcessToken::from_body_bytes(&body);
+        assert_eq!(back, token, "LE round-trip must be bit-exact");
     }
 }

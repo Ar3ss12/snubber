@@ -121,9 +121,13 @@ impl ErasedGuard {
     }
 
     /// Success path: disarm the rollback, invoke commit hook if registered, no-op on drop.
+    ///
+    /// Same `SeqCst` hygiene as [`SnubberGuard`](crate::SnubberGuard): fence
+    /// before the disarm; foreign sharing still needs `Release`/`Acquire`.
     #[inline]
     pub fn commit(mut self) {
         let _ = self.rollback.take();
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         if let Some(on_commit) = self.on_commit.take() {
             #[cfg(feature = "std")]
             {
@@ -138,10 +142,13 @@ impl ErasedGuard {
     }
 
     /// Planned failure path: rollback NOW, then forget.
+    ///
+    /// `SeqCst` fence before the body (same honesty as the core guard).
     #[inline]
     pub fn abort(mut self, _reason: &'static str) {
         let _ = self.on_commit.take();
         if let Some(rollback) = self.rollback.take() {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             rollback();
         }
         core::mem::forget(self);
@@ -160,6 +167,8 @@ impl ErasedGuard {
 impl Drop for ErasedGuard {
     fn drop(&mut self) {
         if let Some(rollback) = self.rollback.take() {
+            // Same `SeqCst` hygiene as the core guard (narrows, not pairs).
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             #[cfg(feature = "std")]
             {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

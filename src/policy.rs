@@ -55,11 +55,18 @@ pub enum FaultKind {
     /// via `report` — NEVER masked as `ChannelDisconnected` (v0.4:
     /// death is infrastructure catastrophe, not a flaky wire).
     ProcessDied,
+    /// Live slot evicted by a higher-priority admission (Phase 1
+    /// preemption): a `Priority::Critical` entry asked for a slot held
+    /// only by `Priority::Background` work. The victim observes
+    /// `Directive::Preempted` on its `TaskConduit` and settles itself
+    /// (abort/drop); the newcomer is counted here. Hydraulic shedding,
+    /// never nuclear — the node is healthy, the junior yielded.
+    Preempted,
 }
 
 impl FaultKind {
     /// Number of variants — sizes the policy table and metric counters.
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 12;
 
     /// Dense index for table lookup (matches declaration order).
     #[must_use]
@@ -76,6 +83,7 @@ impl FaultKind {
             Self::BreakerOpen => 8,
             Self::PoisonedPayload => 9,
             Self::ProcessDied => 10,
+            Self::Preempted => 11,
         }
     }
 
@@ -92,7 +100,96 @@ impl FaultKind {
         Self::BreakerOpen,
         Self::PoisonedPayload,
         Self::ProcessDied,
+        Self::Preempted,
     ];
+
+    /// Nuclear (hull-breach) vs hydraulic (pressure-shedding) contour.
+    ///
+    /// * `true` — catastrophic: the task died anomalously
+    ///   (`Panic`, `Timeout`, `ProcessDied`) or the transaction was
+    ///   abandoned without settle (`ImplicitDrop` — silent panic / `?` /
+    ///   forgotten `commit`). Feeds the breaker streak, may isolate.
+    /// * `false` — hydraulic shedding / entry hygiene: the node is healthy
+    ///   and holding the perimeter (`BulkheadFull`, `BufferOverflow`,
+    ///   `EvictedOldest`, `StaleEpoch`, `BreakerOpen`, `RateLimited`
+    ///   mapped onto bulkhead counters), or the input/wire was at fault
+    ///   (`ChannelDisconnected` graceful drain, `PoisonedPayload` membrane
+    ///   cut, queue TTL / payload budget). Counted, never trips the streak.
+    ///
+    /// Single source of truth for [`crate::SnubberNode::report`]: the old
+    /// hardcoded `feeds_streak` match is this method. `const`, core-only.
+    #[must_use]
+    pub const fn is_catastrophic(self) -> bool {
+        match self {
+            Self::ImplicitDrop | Self::Panic | Self::Timeout | Self::ProcessDied => true,
+            Self::ChannelDisconnected
+            | Self::BufferOverflow
+            | Self::StaleEpoch
+            | Self::BulkheadFull
+            | Self::EvictedOldest
+            | Self::BreakerOpen
+            | Self::PoisonedPayload
+            | Self::Preempted => false,
+        }
+    }
+}
+
+/// Admission priority lane (Phase 1 preemption).
+///
+/// Core-only `Copy` data — no logic lives here. The node interprets it:
+/// * `Background(0)` — trash lane: logs, presets, slow UI repaints.
+///   Yields to `Critical` on demand (cooperative `Preempted`).
+/// * `Normal(1)` — ordinary commands. Never preempts, never preempted
+///   by anyone except `Critical` (and only when the whole node holds
+///   nothing but `Background` — strict condition, no inversion).
+/// * `Critical(2)` — emergency stop, panic recovery, operator kill.
+///   When the bulkhead is full of pure `Background`, requests one
+///   cooperative yield instead of bouncing as `BulkheadFull`.
+///
+/// Ordering is the discriminant: higher outranks lower. Default is
+/// `Normal` — every existing `enter*` call keeps its meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum Priority {
+    /// Slow background work, first to yield.
+    Background = 0,
+    /// Ordinary commands (default).
+    #[default]
+    Normal = 1,
+    /// Emergency lane: stop / recovery / operator override.
+    Critical = 2,
+}
+
+impl Priority {
+    /// Discriminant as a `u8` code (for lock-held handoffs — `Copy` only).
+    #[inline]
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Background => 0,
+            Self::Normal => 1,
+            Self::Critical => 2,
+        }
+    }
+
+    /// Rebuild from a code (`>= 2` saturates to `Critical` — never panics).
+    #[inline]
+    #[must_use]
+    pub const fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Background,
+            1 => Self::Normal,
+            _ => Self::Critical,
+        }
+    }
+
+    /// Strict preemption rule: ONLY `Critical` over pure `Background`
+    /// may ask for a yield. `Critical` vs `Normal` does NOT preempt
+    /// (no inversion), `Normal` never preempts anyone.
+    #[inline]
+    #[must_use]
+    pub const fn may_preempt(self) -> bool {
+        matches!(self, Self::Critical)
+    }
 }
 
 /// Static-or-owned fault detail: `no_std` firmware passes `&'static str`
@@ -160,10 +257,43 @@ impl fmt::Display for FaultDetail {
     }
 }
 
+// COMPILE-TIME GATES (zero runtime, zero deps, MSRV 1.70-safe):
+// `panic!` in const context is stable since 1.57, `size_of` const since
+// 1.24 — this block is a build-time guillotine, not a test. Break the
+// catalog and the build dies with the CRITICAL line, not a silent drift.
+const _: () = {
+    assert!(
+        FaultKind::COUNT == 12,
+        "CRITICAL: FaultKind::COUNT drifted — update policy tables + SnapshotV1::reported"
+    );
+    assert!(
+        FaultKind::COUNT == FaultKind::ALL.len(),
+        "CRITICAL: FaultKind::ALL out of sync with COUNT"
+    );
+    assert!(
+        FaultKind::Preempted.index() + 1 == FaultKind::COUNT,
+        "CRITICAL: Preempted must stay the last dense index"
+    );
+    assert!(
+        Priority::Background as u8 == 0,
+        "CRITICAL: Background lane code drifted from 0"
+    );
+    assert!(
+        Priority::Normal as u8 == 1,
+        "CRITICAL: Normal lane code drifted from 1"
+    );
+    assert!(
+        Priority::Critical as u8 == 2,
+        "CRITICAL: Critical lane code drifted from 2"
+    );
+};
+
 /// Metric sample for one fault firing: static tag + static node name.
 /// Exporters (Prometheus/OpenMetrics/ETW) poll [`crate::SnubberNode::stats`]
 /// and [`crate::SnubberNode::reported`]; this struct is the single-row
 /// unit they iterate: `(tag, node, kind_index, count)`.
+/// `kind: usize` is deliberate: samples NEVER go on the wire as bytes
+/// (in-memory exporter rows only). Wire structs are `u32/u64/u8` only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MetricSample {
     /// Static metric tag from the policy (`"stale_packets_dropped"`).

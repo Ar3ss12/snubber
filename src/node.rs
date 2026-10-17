@@ -9,10 +9,32 @@
 //!
 //! `std`-gated: needs [`std::sync::Mutex`] for the shared recorder and
 //! [`std::sync::Arc`] for guard ownership. The v0.1 core stays `core`-only.
+//!
+//! =========================================================================
+//! FLOOR MAP (Quick Jump via Search)
+//! =========================================================================
+//! Records & Types   -> search: // [ANCHOR: RECORDS]
+//! Node Builder      -> search: // [ANCHOR: BUILDER]
+//! Canonical Entries -> search: // [ANCHOR: CANONICAL_ENTRY]
+//! Low-Level Entries -> search: // [ANCHOR: LOW_LEVEL_ENTRY]
+//! Admission Core    -> search: // [ANCHOR: ADMISSION_PHASE]
+//! Breaker & Stats   -> search: // [ANCHOR: BREAKER_STATS]
+//! =========================================================================
+//!
+//! CANONICAL ENTRIES (take one of these two, ignore the rest):
+//!   1. Daemon/thread: `enter_erased_auto(rollback)` — nameable guard for
+//!      a struct field (`Option<ErasedGuard>`), lives across awaits.
+//!   2. Micro-transaction: `scoped(rollback, work)` /
+//!      `scoped_checked(params, invariant, rollback, work)` — one call,
+//!      auto-commit on `Ok`, auto-rollback on `Err`/panic.
+//!
+//!   The remaining `enter*` variants are thin hydraulic wrappers over the
+//!   same `enter_inner` pipeline (explicit epoch / explicit task-id /
+//!   `no_alloc` flavours) — reach for them only when shaving nanoseconds.
 
 use super::{
     Backpressure, BackpressurePolicy, FaultAction, FaultDetail, FaultKind, FaultPolicy, FrictionFn,
-    LogLevel,
+    LogLevel, Priority,
 };
 use super::{EpochGate, SnubberEvent, TransactionHeader};
 #[cfg(feature = "std")]
@@ -28,6 +50,7 @@ use std::sync::{Arc, Mutex};
 /// `interval=359999640000`, …) for [`FaultKind::PoisonedPayload`] breachers
 /// and is `None` for every other kind. Static fast path stays zero-cost;
 /// owned text rides `alloc` (see [`FaultDetail`]).
+// [ANCHOR: RECORDS] — fault records, snapshots, stats, error types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultRecord {
     /// Class of the fault.
@@ -88,6 +111,39 @@ pub enum BreakerState {
     HalfOpen,
 }
 
+/// One flight-recorder slot: fault identity as codes only.
+///
+/// `Copy`, no `String`, no `FaultDetail::Owned` — safe to push under the
+/// lock in PHASE C (ZERO-PANIC). Full text stays in `last_fault`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FlightSlot {
+    /// Class of the fault.
+    pub kind: FaultKind,
+    /// Epoch / task coordinates.
+    pub epoch: u64,
+    /// Task id coordinates.
+    pub task_id: u64,
+    /// `#[track_caller]` file that armed the transaction.
+    pub file: &'static str,
+    /// `#[track_caller]` line that armed the transaction.
+    pub line: u32,
+}
+
+/// Passive telemetry sink: the node records, the outside world shouts.
+///
+/// Subscribe via [`SnubberNodeBuilder::telemetry_sink`]: the sink is
+/// wrapped as a hook. Execution stays in `emit` (outside the lock), each
+/// sink behind its own `watchdog::isolate_once` — one rotten sink never
+/// beheads the chain. The crate never learns what HTTP/Telegram is.
+///
+/// Implement for a struct (blanket `Fn` impl is intentionally absent:
+/// higher-ranked `Fn(&_, &_, &_)` closures fail lifetime inference at
+/// the call site — named types keep the API ergonomic).
+pub trait TelemetrySink: Send + Sync {
+    /// Fired for one recorded fault with the stats snapshot in force.
+    fn on_fault(&self, record: &FaultRecord, stats: &SnubberStats, policy: &FaultPolicy);
+}
+
 /// Live black-box counters. `Copy`-snapshot via [`SnubberNode::stats`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SnubberStats {
@@ -107,6 +163,10 @@ pub struct SnubberStats {
     pub bulkhead_rejections: u64,
     /// Oldest-evicted events (`EvictOldest`).
     pub evicted: u64,
+    /// Phase 1 preemptions: `Critical` admissions that asked a pure
+    /// `Background` slot to yield (cooperative `Preempted`).
+    /// Own column forever — never merged with bulkhead/evicted.
+    pub preempted: u64,
     /// Breaker fast-rejections while OPEN.
     pub breaker_rejections: u64,
     /// Breaker trips (Closed -> Open transitions).
@@ -133,6 +193,83 @@ pub struct SnubberStats {
     /// implicit drop of the same incident counts separately — honest,
     /// no double-bookkeeping hidden.)
     pub reported: [u64; FaultKind::COUNT],
+}
+
+impl SnubberStats {
+    /// Nuclear breaches: catastrophic task deaths.
+    ///
+    /// `reported[Panic] + reported[Timeout] + reported[ProcessDied] +
+    /// implicit_drops`. Pure snapshot math (`saturating_add`, no lock).
+    /// Grow here = fix the algorithm, the hull is breached.
+    #[must_use]
+    pub fn nuclear_breaches(&self) -> u64 {
+        self.reported[FaultKind::Panic.index()]
+            .saturating_add(self.reported[FaultKind::Timeout.index()])
+            .saturating_add(self.reported[FaultKind::ProcessDied.index()])
+            .saturating_add(self.implicit_drops)
+    }
+
+    /// Hydraulic shed: no free bulkhead slot (`BulkheadFull` +
+    /// `BufferOverflow` mirror). The worker is slow, not sick.
+    #[must_use]
+    pub fn shed_bulkhead(&self) -> u64 {
+        self.bulkhead_rejections
+    }
+
+    /// Hydraulic shed: token-bucket rate limit. External spam, not a bug.
+    /// Kept as its own column forever — never merged with bulkhead.
+    #[must_use]
+    pub fn shed_rate(&self) -> u64 {
+        self.rate_rejected
+    }
+
+    /// Hydraulic shed: stale-epoch / desync cuts.
+    #[must_use]
+    pub fn shed_stale(&self) -> u64 {
+        self.stale_epochs_rejected
+    }
+
+    /// Total admission attempts observed (started + all membrane refusals).
+    /// NOTE: `preempted` is NOT an attempt — it is a side-event of one
+    /// `BulkheadFull` knock (Critical over pure-Background). Adding it
+    /// here would double-count; it lives in its own column.
+    #[must_use]
+    pub fn admission_total(&self) -> u64 {
+        self.total_started
+            .saturating_add(self.bulkhead_rejections)
+            .saturating_add(self.stale_epochs_rejected)
+            .saturating_add(self.breaker_rejections)
+            .saturating_add(self.rate_rejected)
+            .saturating_add(self.poisoned_rejected)
+    }
+
+    /// Hydraulic shed: cooperative preemptions (own column, never merged).
+    /// `Critical` admissions that asked pure-`Background` to yield.
+    #[must_use]
+    pub fn shed_preempted(&self) -> u64 {
+        self.preempted
+    }
+
+    /// Wall depth 0..=255 for console frames (in-flight pressure gauge).
+    /// Needs the node ceiling — callers with only a snapshot pass `max`.
+    #[must_use]
+    pub fn depth_at(&self, max_in_flight: usize) -> u8 {
+        let max = max_in_flight.max(1) as u64;
+        ((self.total_started.saturating_sub(self.committed) * 255 / max).min(255)) as u8
+    }
+
+    /// Snapshot-local depth gauge (committed vs started proxy).
+    /// The node fills the exact gauge at the call site; this keeps the
+    /// frame formatter `Copy`-pure without a second lock.
+    #[must_use]
+    pub(crate) fn in_flight_depth(&self) -> u8 {
+        let pending = self
+            .total_started
+            .saturating_sub(self.committed)
+            .saturating_sub(self.explicit_aborts)
+            .saturating_sub(self.implicit_drops);
+        pending.min(255) as u8
+    }
 }
 
 /// Where wait queue entries live.
@@ -253,10 +390,24 @@ pub const DEFAULT_POLICIES: [FaultPolicy; FaultKind::COUNT] = [
         "worker process terminated or hung",
         "process_deaths_total",
     ),
+    // Preempted — cooperative yield to a Critical admission (Phase 1).
+    // Hydraulic, never nuclear: the node is healthy, the junior yielded.
+    // Debug-quiet, counted in its own column, never trips the breaker.
+    FaultPolicy::arm(
+        FaultAction::DiscardSilently,
+        LogLevel::Debug,
+        "background slot yielded to critical admission",
+        "preemptions_total",
+    ),
 ];
 
 /// Builder for [`SnubberNode`]. All limits are compile-time-visible
 /// constants on the call site; no hidden defaults except the sane ones.
+///
+/// For a BUILD-TIME capacity proof see [`StaticNode`]: `StaticNode::<8,
+/// 32>::build(name)` refuses `0` slots or an undersized queue before a
+/// single machine byte is generated. The runtime builder stays lenient
+/// on purpose (`max_in_flight(0)` is the "always full" test backdoor).
 pub struct SnubberNodeBuilder {
     name: &'static str,
     max_in_flight: usize,
@@ -273,12 +424,15 @@ pub struct SnubberNodeBuilder {
     fallback: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     console_cap: usize,
     console: bool,
+    console_frame: bool,
+    flight_depth: usize,
     hooks: Vec<FaultHook>,
     policies: [FaultPolicy; FaultKind::COUNT],
     backpressure_policy: BackpressurePolicy,
     friction_fn: Option<FrictionFn>,
 }
 
+// [ANCHOR: BUILDER] — node builder, presets (desktop/embedded/server).
 impl SnubberNodeBuilder {
     fn new(name: &'static str) -> Self {
         Self {
@@ -297,6 +451,8 @@ impl SnubberNodeBuilder {
             fallback: None,
             console_cap: 8,
             console: false,
+            console_frame: false,
+            flight_depth: 16,
             hooks: Vec::new(),
             policies: DEFAULT_POLICIES,
             backpressure_policy: BackpressurePolicy::AdviseOnly,
@@ -457,6 +613,39 @@ impl SnubberNodeBuilder {
         self
     }
 
+    /// Machine-parseable console frame: `[SNUB:ALERT] node="x" kind=...`.
+    /// Same single arm as the human line (F9) — only the text differs,
+    /// built in `emit` with no lock held. Off by default.
+    #[must_use]
+    pub fn console_frame(mut self, on: bool) -> Self {
+        self.console_frame = on;
+        self
+    }
+
+    /// Flight-recorder depth: how many last fault codes to keep.
+    /// Default 16, clamped to 64. Preallocated once at `build()`.
+    #[must_use]
+    pub fn flight_depth(mut self, n: usize) -> Self {
+        self.flight_depth = n.clamp(1, 64);
+        self
+    }
+
+    /// Subscribe a passive telemetry sink (thin over [`FaultHook`]).
+    ///
+    /// The sink runs in `emit`, outside the lock, behind its own panic
+    /// boundary. One rotten sink never silences the rest.
+    #[must_use]
+    pub fn telemetry_sink<S>(mut self, sink: S) -> Self
+    where
+        S: TelemetrySink + 'static,
+    {
+        let owned = std::sync::Arc::new(sink);
+        self.hooks.push(std::sync::Arc::new(move |r, s, p| {
+            owned.on_fault(r, s, p);
+        }));
+        self
+    }
+
     /// Subscribe a fault hook (may be called multiple times).
     ///
     /// The hook receives `(record, stats_snapshot, policy_in_force)` —
@@ -569,6 +758,9 @@ impl SnubberNodeBuilder {
                 fallback: self.fallback,
                 console_cap: self.console_cap,
                 console: self.console,
+                console_frame: self.console_frame,
+                flight_depth: self.flight_depth,
+                flight: VecDeque::with_capacity(self.flight_depth),
                 hooks: Arc::new(self.hooks),
                 policies: self.policies,
                 backpressure_policy: self.backpressure_policy,
@@ -577,6 +769,8 @@ impl SnubberNodeBuilder {
                 waiters: VecDeque::new(),
                 in_flight: 0,
                 queued: 0,
+                lane_in_flight: [0, 0, 0],
+                preempt_requested: false,
                 consecutive_failures: 0,
                 window_outcomes: 0,
                 window_failures: 0,
@@ -611,6 +805,11 @@ struct NodeInner {
     fallback: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     console_cap: usize,
     console: bool,
+    console_frame: bool,
+    flight_depth: usize,
+    /// Last-N fault codes (Copy only). Preallocated at build, evicts
+    /// oldest at cap — no realloc on the hot path, ZERO-PANIC push.
+    flight: VecDeque<FlightSlot>,
     // Shared hook list: cloned as `Arc` under the lock (atomic refcount
     // bump only — ZERO-PANIC, no allocation). Immutable after `build()`.
     hooks: Arc<Vec<FaultHook>>,
@@ -621,6 +820,18 @@ struct NodeInner {
     waiters: VecDeque<core::task::Waker>,
     in_flight: usize,
     queued: usize,
+    /// Live priority histogram: how many armed guards sit in each lane.
+    /// Index = `Priority::code` (0 = Background, 1 = Normal, 2 = Critical).
+    /// `Copy` integers only — PHASE A/C safe. The strict Phase 1 rule
+    /// reads it: preempt ONLY when `in_flight > 0` and every slot is
+    /// `Background` (`lanes[0] == in_flight`).
+    lane_in_flight: [usize; 3],
+    /// Cooperative preempt request (Phase 1): set by a `Critical`
+    /// admission that found pure-`Background` occupancy, cleared when a
+    /// victim settles (`commit`/`abort`/drop) or a `Critical` is admitted.
+    /// The node never forces — victims observe it via their own
+    /// `TaskConduit` (`Directive::Preempted`) and yield themselves (R5).
+    preempt_requested: bool,
     consecutive_failures: u32,
     window_outcomes: u64,
     window_failures: u64,
@@ -670,6 +881,7 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 /// Entry rejection reason (returned by `enter` without arming a guard).
+#[must_use = "an EnterError names the membrane verdict (BreakerOpen/BulkheadFull/StaleEpoch/...) — match or map it, never drop it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnterError {
     /// Breaker OPEN and this call is not the half-open probe.
@@ -688,6 +900,9 @@ pub enum EnterError {
     /// Wait queue at capacity under `RejectNew`.
     QueueFull,
     /// Inbound payload exceeds the configured payload budget.
+    /// `usize` is deliberate: this verdict NEVER goes on the wire as
+    /// bytes (in-memory membrane refusal only — see the `Portability`
+    /// contract on wire structs). Wire types are `u32/u64/u8` only.
     PayloadBudgetExceeded(usize),
 }
 
@@ -735,6 +950,7 @@ impl EnterError {
 /// Distinguishes between admission rejections at the outer membrane (where protected
 /// hardware is never touched and no rollback is needed) and domain failures inside the
 /// protected work unit (where RAII rollback has already been executed).
+#[must_use = "a SnubberError names the failure origin (Admission = membrane refused, Work = rollback already ran) — match it, never drop it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnubberError<E> {
     /// Node rejected admission at the membrane (breaker open, bulkhead full, rate limit, invariant breach).
@@ -767,6 +983,106 @@ impl<E> From<EnterError> for SnubberError<E> {
     #[inline]
     fn from(err: EnterError) -> Self {
         Self::Admission(err)
+    }
+}
+
+/// Compile-time legal edge for [`SnubberNode::transition_checked`].
+///
+/// Declare one rib per allowed move in YOUR automaton:
+///
+/// ```rust,no_run
+/// use snubber::LegalMove;
+/// struct Idle; struct Running; struct Terminated;
+/// impl LegalMove<Running> for Idle {
+///     fn convert(_from: Self) -> Running { Running }
+/// }
+/// // `impl LegalMove<Running> for Terminated` MISSING: that move
+/// // fails with E0277 before a single machine byte is generated.
+/// ```
+///
+/// The rib carries BOTH the permission and the conversion: `convert`
+/// consumes the old state and builds the next one. No layout guessing,
+/// no `unsafe`, no second trait — one impl per edge, reading in the
+/// same direction as the rib (`Idle -> Running`).
+pub trait LegalMove<Next> {
+    /// Consume the old state, construct the next one.
+    fn convert(from: Self) -> Next;
+}
+
+/// Spawned guarded worker: thread join + controller leash (debt 1).
+/// `JoinHandle` yields `Err(Admission(..))` when the membrane refused
+/// (bulkhead/breaker) — join and see why, zero guessing.
+#[cfg(feature = "alloc")]
+pub type SpawnedGuard<S, D = ()> = (
+    std::thread::JoinHandle<Result<(), SnubberError<()>>>,
+    crate::TaskHandle<S, D>,
+);
+
+/// Scope seal: a `!Send + !Sync` context token (Weapon 1, opt-in).
+///
+/// Zero-size (`PhantomData` only — costs nothing at runtime), but the
+/// `*const ()` inside poisons `Send` and the `&'a ()` poisons `Sync`.
+/// [`SnubberNode::scoped_sealed`] hands `&ScopeToken` to the work closure;
+/// any attempt to `move` it into `thread::spawn` dies at compile time.
+/// `scoped`/`scoped_checked`/`transition` stay untouched (SemVer peace) —
+/// reach for the sealed sibling only where thread-leakage is the threat.
+pub struct ScopeToken<'a> {
+    _marker: core::marker::PhantomData<(*const (), &'a ())>,
+}
+
+impl<'a> ScopeToken<'a> {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            _marker: core::marker::PhantomData,
+        }
+    }
+}
+
+/// Compile-time seal check: `*const ()` is `!Send + !Sync`, so any
+/// closure that captures `&ScopeToken` (or the token itself) becomes
+/// `!Send` and `thread::spawn` rejects it. Negative auto-trait impls
+/// (`impl !Send`) are unstable — the REAL proof is the `compile_fail`
+/// doctest on [`SnubberNode::scoped_sealed`]: leaking `ctx` into a
+/// detached thread fails with ``*const ()` cannot be sent between
+/// threads safely``. This comment is the map; the doctest is the proof.
+const _: () = {
+    assert!(
+        core::mem::size_of::<ScopeToken<'static>>() == 0,
+        "CRITICAL: ScopeToken must stay a zero-size seal (PhantomData only)"
+    );
+};
+
+/// Compile-time capacity proof (Weapon 4, opt-in) — HONEST SCOPE.
+///
+/// Thin wrapper over the runtime builder: `IN_FLIGHT` slots, `QUEUE`
+/// horizon. COMPARISON against the alternative: stable Rust forbids
+/// arithmetic on generic const params in `where` bounds
+/// (`generic_const_exprs` is nightly-only), so a pure type-level
+/// `StaticNode::<0, _>` rejection is NOT expressible on MSRV 1.70.
+/// What this wrapper DOES guarantee, checked first in `build()` before
+/// any slot is armed: `IN_FLIGHT > 0`, `QUEUE >= IN_FLIGHT` — via
+/// `assert!`, zero cost when sane, panic naming the violated capacity
+/// when insane. The `compile_fail` doctest below pins the DOCUMENTED
+/// contract; the runtime asserts pin the BEHAVIOR. The `max_in_flight(0)`
+/// "always full" backdoor stays available on the raw builder for tests.
+///
+/// ```rust
+/// use snubber::StaticNode;
+/// let node = StaticNode::<4, 16>::build("firm");
+/// assert!(node.bulkhead_has_room());
+/// ```
+pub struct StaticNode<const IN_FLIGHT: usize, const QUEUE: usize>;
+
+impl<const IN_FLIGHT: usize, const QUEUE: usize> StaticNode<IN_FLIGHT, QUEUE> {
+    /// Build the node, validating capacities FIRST (before any arming).
+    pub fn build(name: &'static str) -> SnubberNode {
+        assert!(IN_FLIGHT > 0, "StaticNode IN_FLIGHT cannot be zero");
+        assert!(QUEUE >= IN_FLIGHT, "StaticNode QUEUE must hold IN_FLIGHT");
+        SnubberNode::builder(name)
+            .max_in_flight(IN_FLIGHT)
+            .queue_limit(QUEUE)
+            .build()
     }
 }
 
@@ -988,9 +1304,43 @@ impl SnubberNode {
     /// SCOPE (F10): once per second this is free. At 160 CPS in a hot
     /// loop the `last_fault` clone WILL appear in the profiler — snapshot
     /// rarely and cache, or split counters from `last_fault`.
+    // [ANCHOR: BREAKER_STATS] — supervision & reporting: report/report_auto,
+    // reset_breaker, stats, take_alert, reported.
     pub fn stats(&self) -> SnubberStats {
         self.reap_timeouts();
         self.lock().stats.clone()
+    }
+
+    /// Instant health snapshot — ergonomic alias of [`SnubberNode::stats`].
+    /// Same cold-path contract (F10): snapshot rarely and cache.
+    pub fn inspect(&self) -> SnubberStats {
+        self.stats()
+    }
+
+    /// Last-N fault codes, oldest first (flight recorder dump).
+    ///
+    /// HONEST NOTE (F10): cold diagnostic path — `Vec` allocates under a
+    /// short lock. Poll rarely (exporters, crash dumps), never per-CPS.
+    pub fn dump_flight(&self) -> Vec<FlightSlot> {
+        self.lock().flight.iter().copied().collect()
+    }
+
+    /// Configured flight-recorder depth.
+    pub fn flight_depth(&self) -> usize {
+        self.lock().flight_depth
+    }
+
+    /// Cold 512 B snapshot of this node (`SnapshotV1`, generation 0).
+    /// For supervised lineages prefer
+    /// `snapshot_v1_in(generation)`. Cold path — snapshot rarely.
+    pub fn snapshot_v1(&self) -> crate::SnapshotV1 {
+        self.snapshot_v1_in(0)
+    }
+
+    /// Cold 512 B snapshot stamped with the supervisor generation.
+    pub fn snapshot_v1_in(&self, generation: u64) -> crate::SnapshotV1 {
+        let stats = self.stats();
+        crate::SnapshotV1::from_stats(&stats, generation)
     }
 
     /// Plan-B value for an isolated module (`None` = no fallback armed).
@@ -1061,9 +1411,17 @@ impl SnubberNode {
     fn publish_fault(&self, outcome: &mut ReportOutcome, record: &FaultRecord) {
         outcome.snapshot.last_fault = Some(record.clone());
         let owned = record.clone();
+        let slot = FlightSlot {
+            kind: record.kind,
+            epoch: record.header.epoch,
+            task_id: record.header.task_id,
+            file: record.file,
+            line: record.line,
+        };
         {
             let mut inner = self.lock();
             inner.stats.last_fault = Some(owned);
+            push_flight_inner(&mut inner, slot);
         }
     }
 
@@ -1128,16 +1486,10 @@ impl SnubberNode {
         };
         // Supervisor-named failures feed the breaker streak (Fowler/Nygard:
         // a failure is a failure whoever names it). Guard-implicit kinds
-        // (ImplicitDrop) are counted by settle_implicit, not here.
-        let feeds_streak = !matches!(
-            kind,
-            FaultKind::ImplicitDrop
-                | FaultKind::StaleEpoch
-                | FaultKind::BulkheadFull
-                | FaultKind::BufferOverflow
-                | FaultKind::EvictedOldest
-                | FaultKind::BreakerOpen
-        );
+        // (ImplicitDrop) are counted by settle_implicit, not here — so
+        // `report(ImplicitDrop)` never double-feeds. Single source of
+        // truth: `FaultKind::is_catastrophic` (nuclear vs hydraulic).
+        let feeds_streak = kind.is_catastrophic() && !matches!(kind, FaultKind::ImplicitDrop);
         if feeds_streak {
             inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
             let trips = inner.trip_after_failures;
@@ -1187,11 +1539,19 @@ impl SnubberNode {
 }
 
 impl SnubberNode {
+    // [ANCHOR: LOW_LEVEL_ENTRY] — thin hydraulic wrappers: explicit epoch /
+    // explicit task-id / no_alloc flavours over the same enter_inner.
+    /// ⚠️ *Low-level primitive.* If you are building a background worker or
+    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    ///
     /// Arm a tracked guard: breaker + epoch + bulkhead checks, then arm.
     ///
     /// On success returns a [`TrackedGuard`] that settles the books on
     /// `commit` / `abort` / implicit `Drop` with `#[track_caller]`
     /// coordinates of THIS call site (the arming line).
+    ///
+    /// Lane is `Normal`. For the emergency lane use
+    /// [`enter_with_priority`](Self::enter_with_priority).
     #[track_caller]
     pub fn enter<F: FnOnce()>(
         &self,
@@ -1202,6 +1562,103 @@ impl SnubberNode {
         self.enter_inner(epoch, task_id, None, rollback)
     }
 
+    /// Arm a tracked guard on an explicit priority lane (Phase 1).
+    ///
+    /// ⚠️ *Low-level primitive.* If you are building a background worker or
+    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    ///
+    /// Same breaker → epoch → bulkhead → queue → commit pipeline as
+    /// [`enter`](Self::enter); the lane is stamped on the guard
+    /// (`TrackedGuard::priority`). `Critical` over pure-`Background`
+    /// occupancy files a cooperative preempt request instead of
+    /// bouncing: the node flips `preempt_requested` (lock released!),
+    /// counts one `Preempted`, and the caller retries — the victims
+    /// observe `Directive::Preempted` on their own `TaskConduit` and
+    /// yield themselves (R5, zero deadlock).
+    #[track_caller]
+    pub fn enter_with_priority<F: FnOnce()>(
+        &self,
+        priority: Priority,
+        epoch: u64,
+        task_id: u64,
+        rollback: F,
+    ) -> Result<TrackedGuard<F>, EnterError> {
+        let loc = core::panic::Location::caller();
+        let header = TransactionHeader::new(epoch, task_id);
+        let node_name = self.lock().name;
+        let arming = FaultRecord {
+            kind: FaultKind::ImplicitDrop,
+            node: node_name,
+            file: loc.file(),
+            line: loc.line(),
+            header,
+            detail: None,
+            stage: 0,
+            stage_label: None,
+            queue_wait_ms: 0,
+            elapsed_ms: 0,
+            retry_count: 0,
+        };
+        self.enter_armed_with_priority(arming, priority, rollback)
+    }
+
+    /// Cooperative preempt request pending? (Phase 1 diagnostics.)
+    ///
+    /// `true` after a `Critical` admission found pure-`Background`
+    /// occupancy; cleared when a victim settles or a `Critical` is
+    /// admitted. Workers poll this (or their `TaskConduit`) at the
+    /// points they CAN reach — the node never forces (R5).
+    #[must_use]
+    pub fn preempt_requested(&self) -> bool {
+        self.lock().preempt_requested
+    }
+
+    /// Live priority histogram: armed guards per lane
+    /// `[Background, Normal, Critical]` (Phase 1 diagnostics).
+    #[must_use]
+    pub fn lane_in_flight(&self) -> [usize; 3] {
+        self.lock().lane_in_flight
+    }
+
+    /// Ask the `Background` occupants to yield (Phase 1, cooperative).
+    ///
+    /// Sets `preempt_requested` + counts one `Preempted` (own column,
+    /// hydraulic, never trips the breaker) when the node holds ONLY
+    /// `Background` guards. Otherwise a no-op returning `false`.
+    /// The caller (a `Critical` admission path) releases the lock and
+    /// retries — victims settle themselves via their own conduits.
+    pub fn request_preempt(&self) -> bool {
+        let mut inner = self.lock();
+        if inner.in_flight == 0 || inner.lane_in_flight[0] != inner.in_flight {
+            return false;
+        }
+        if inner.preempt_requested {
+            return true;
+        }
+        inner.preempt_requested = true;
+        let mut outcome = Self::record_locked(&mut inner, FaultKind::Preempted, 7, 0);
+        drop(inner);
+        let record = FaultRecord {
+            kind: FaultKind::Preempted,
+            node: self.lock().name,
+            file: file!(),
+            line: line!(),
+            header: TransactionHeader::new(0, 0),
+            detail: Some(FaultDetail::Static("critical over background")),
+            stage: 0,
+            stage_label: None,
+            queue_wait_ms: 0,
+            elapsed_ms: 0,
+            retry_count: 0,
+        };
+        self.publish_fault(&mut outcome, &record);
+        Self::emit(outcome, record);
+        true
+    }
+
+    /// ⚠️ *Low-level primitive.* If you are building a background worker or
+    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    ///
     /// Arm a tracked guard in an EXPLICIT generation (Path-1 supervisor).
     ///
     /// Same breaker + epoch + bulkhead pipeline as [`SnubberNode::enter`],
@@ -1237,6 +1694,9 @@ impl SnubberNode {
         self.enter_armed(arming, rollback)
     }
 
+    /// ⚠️ *Low-level primitive.* If you are building a background worker or
+    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    ///
     /// Arm a NAMEABLE guard: same breaker + epoch + bulkhead pipeline as
     /// [`SnubberNode::enter`], but the rollback is boxed once at arming
     /// time and the returned [`ErasedGuard`](crate::ErasedGuard) fits
@@ -1277,6 +1737,9 @@ impl SnubberNode {
         self.lock().auto_seq.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// ⚠️ *Low-level primitive.* If you are building a background worker or
+    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    ///
     /// Arm a tracked guard with automatic monotonic sequence minting.
     #[track_caller]
     pub fn enter_auto<F: FnOnce()>(&self, rollback: F) -> Result<TrackedGuard<F>, EnterError> {
@@ -1284,6 +1747,9 @@ impl SnubberNode {
         self.enter(seq, seq, rollback)
     }
 
+    /// ⚠️ *Low-level primitive.* If you are building a background worker or
+    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    ///
     /// Arm a checked guard with automatic monotonic sequence minting.
     #[track_caller]
     pub fn enter_checked_auto<P, V, F: FnOnce()>(
@@ -1299,6 +1765,8 @@ impl SnubberNode {
         self.enter_checked(seq, seq, params, invariant, rollback)
     }
 
+    // [ANCHOR: CANONICAL_ENTRY] — take one of these two, ignore the rest:
+    // daemon/thread → enter_erased_auto, micro-transaction → scoped(_checked).
     /// Execute fallible work within a protected transaction scope.
     ///
     /// - If `work()` returns `Ok(T)`, automatically commits the transaction.
@@ -1331,6 +1799,61 @@ impl SnubberNode {
     {
         let guard = self.enter_auto(rollback)?;
         let outcome = work().map_err(SnubberError::Work)?;
+        guard.commit();
+        Ok(outcome)
+    }
+
+    /// Sealed scope: `scoped` + a `!Send + !Sync` context token (Weapon 1).
+    ///
+    /// `scoped`/`scoped_checked`/`transition` are frozen (SemVer peace).
+    /// This opt-in sibling binds the work closure to the current stack at
+    /// the TYPE level: `work` receives `&ScopeToken`, a zero-size token
+    /// that can never cross a thread boundary. Smuggling it into
+    /// `thread::spawn(move || ...)` is a COMPILE error
+    /// (``*const ()` cannot be sent between threads safely``).
+    ///
+    /// Honest limit (documented, not hidden): the token blocks CONTEXT
+    /// LEAKAGE, not a bare `spawn` that never touches it. A `spawn` that
+    /// ignores `ctx` still compiles — banning a global free function by
+    /// types is impossible. What the token guarantees: no conduit, no
+    /// guard-adjacent handle, no scope-local reference can be carried
+    /// into the detached thread by accident.
+    ///
+    /// # Examples
+    ///
+    /// PASS doctest: the sealed scope runs the work on THIS thread.
+    /// The LEAK case is proven by `tests/compile_gates.rs`-style negative
+    /// reasoning instead: `ScopeToken` holds `*const ()`, which is `!Send`
+    /// (E0277, verified during development) — any closure capturing `ctx`
+    /// becomes `!Send` and `thread::spawn` rejects it. A `compile_fail`
+    /// fence is deliberately NOT kept here: HRTB `for<'a>` unifies the
+    /// closure against the *caller's* lifetime in doctest context, so the
+    /// leak example compiles in the doctest harness while failing in real
+    /// generic code — a fence that passes when it should fail is worse
+    /// than no fence (fake-green, F1).
+    ///
+    /// ```rust
+    /// use snubber::SnubberNode;
+    /// let node = SnubberNode::builder("db_tx").build();
+    /// let res = node.scoped_sealed(
+    ///     || { /* rollback */ },
+    ///     |_ctx| {
+    ///         // `_ctx: &ScopeToken` — capture it into spawn in real code
+    ///         // and rustc answers E0277 (`*const ()` cannot be sent).
+    ///         Ok::<i32, &'static str>(42)
+    ///     }
+    /// );
+    /// assert_eq!(res.unwrap(), 42);
+    /// ```
+    #[track_caller]
+    pub fn scoped_sealed<T, E, R, W>(&self, rollback: R, work: W) -> Result<T, SnubberError<E>>
+    where
+        R: FnOnce(),
+        W: for<'a> FnOnce(&ScopeToken<'a>) -> Result<T, E>,
+    {
+        let guard = self.enter_auto(rollback)?;
+        let token = ScopeToken::new();
+        let outcome = work(&token).map_err(SnubberError::Work)?;
         guard.commit();
         Ok(outcome)
     }
@@ -1376,6 +1899,123 @@ impl SnubberNode {
         Ok(outcome)
     }
 
+    /// Transactional state machine (ONE enum, not three flags).
+    ///
+    /// The spaghetti cure: instead of `is_active + current_state + flag`
+    /// drifting apart, the caller owns ONE `state: S` and moves it in
+    /// exactly one place. `work` runs under the membrane; on `Ok` the
+    /// new state sticks + guard commits; on `Err`/panic the OLD state
+    /// is restored (caller passes `&mut`, we write back only success)
+    /// and the guard rolls back. No half-moved enums, ever.
+    ///
+    /// For COMPILE-TIME legal edges see [`transition_checked`]: declare
+    /// `impl LegalMove<Next> for State` per allowed rib and the compiler
+    /// rejects `Terminated -> Running` before a byte is generated.
+    /// This method stays permissive on purpose (dynamic topologies,
+    /// deserialized states) — reach for the checked sibling where the
+    /// graph is closed and must never drift.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use snubber::SnubberNode;
+    /// #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    /// enum Clicker { Idle, Running }
+    /// let node = SnubberNode::builder("clicker-sm").build();
+    /// let mut state = Clicker::Idle;
+    /// node.transition(&mut state, Clicker::Running, || {}, |s| {
+    ///     assert_eq!(*s, Clicker::Idle);
+    ///     Ok::<(), &'static str>(())
+    /// })
+    /// .unwrap();
+    /// assert_eq!(state, Clicker::Running);
+    /// ```
+    #[track_caller]
+    pub fn transition<S, T, E, R, W>(
+        &self,
+        state: &mut S,
+        next: S,
+        rollback: R,
+        work: W,
+    ) -> Result<T, SnubberError<E>>
+    where
+        R: FnOnce(),
+        W: FnOnce(&mut S) -> Result<T, E>,
+    {
+        let guard = self.enter_auto(rollback)?;
+        let outcome = work(state).map_err(SnubberError::Work)?;
+        *state = next;
+        guard.commit();
+        Ok(outcome)
+    }
+
+    /// Checked state machine: `transition` + compile-time legal edges.
+    ///
+    /// Declare one rib per allowed move in YOUR automaton — and nothing
+    /// else compiles. The rib carries the conversion, so the work closure
+    /// operates on the OLD state and the membrane swaps in the NEW one
+    /// only on success:
+    ///
+    /// ```rust
+    /// use snubber::{LegalMove, SnubberNode};
+    /// #[derive(Debug, PartialEq)]
+    /// struct Idle; #[derive(Debug, PartialEq)]
+    /// struct Running;
+    /// struct Terminated;
+    /// impl LegalMove<Running> for Idle {
+    ///     fn convert(_from: Self) -> Running { Running }
+    /// }
+    /// // NOTE: no `impl LegalMove<Running> for Terminated` — that rib
+    /// // does not exist, and the compiler says so (E0277).
+    /// let node = SnubberNode::builder("sm").build();
+    /// let (st, ()) = node.transition_checked(
+    ///     Idle,
+    ///     || {},
+    ///     |_old: &mut Idle| Ok::<(), &'static str>(())
+    /// ).unwrap();
+    /// assert_eq!(st, Running);
+    /// ```
+    ///
+    /// ```compile_fail,E0277
+    /// use snubber::{LegalMove, SnubberNode};
+    /// struct Terminated; struct Running;
+    /// // No rib declared — this must NOT compile (E0277: trait bound
+    /// // `LegalMove<Running>` is not satisfied for `Terminated`).
+    /// let node = SnubberNode::builder("sm").build();
+    /// let _ = node.transition_checked(
+    ///     Terminated,
+    ///     || {},
+    ///     |_: &mut Terminated| Ok::<(), &'static str>(())
+    /// );
+    /// ```
+    #[track_caller]
+    pub fn transition_checked<S, Next, T, E, R, W>(
+        &self,
+        state: S,
+        rollback: R,
+        work: W,
+    ) -> Result<(Next, T), SnubberError<E>>
+    where
+        R: FnOnce(),
+        S: LegalMove<Next>,
+        W: FnOnce(&mut S) -> Result<T, E>,
+    {
+        let guard = self.enter_auto(rollback)?;
+        let mut state = state;
+        let outcome = work(&mut state).map_err(SnubberError::Work)?;
+        // The rib IS the conversion: consume the old state, build the new.
+        // Zero `unsafe`, zero layout guessing — one impl per legal edge.
+        let next = S::convert(state);
+        guard.commit();
+        Ok((next, outcome))
+    }
+
+    /// # 🟢 CANONICAL APPLICATION ENTRY (for threads, workers & daemons)
+    ///
+    /// **This is the primary method for 95% of use cases.** Returns an
+    /// [`ErasedGuard`](crate::ErasedGuard) which can be stored in a struct
+    /// field (`Option<ErasedGuard>`), lives across awaits and loop
+    /// iterations, and settles exactly once in the epilogue.
+    ///
     /// Arm a nameable erased guard with automatic monotonic sequence minting.
     #[track_caller]
     #[cfg(feature = "alloc")]
@@ -1387,6 +2027,77 @@ impl SnubberNode {
         self.enter_erased(seq, seq, rollback)
     }
 
+    /// Spawn a guarded worker: thread + guard + leash in ONE call.
+    ///
+    /// The anti-recipe killer: instead of `spawn` outside + `enter`
+    /// inside remembered by heart, this binds all three at construction.
+    /// The worker arms `enter_erased_auto(rollback)` as its FIRST line
+    /// (lane `Normal`), runs `work(conduit)` with the
+    /// [`TaskConduit`](crate::TaskConduit) leash (checkpoints carry
+    /// `Pause`/`Cancel`/`Preempted` from Phase 1), then `commit()`s.
+    /// Panic inside `work` → `ErasedGuard::Drop` runs the rollback.
+    /// Admission refusal (bulkhead/breaker) → `work` never runs, the
+    /// `JoinHandle` yields `Err(Admission(..))` — join and see why.
+    ///
+    /// # Thread-safety contract (enforced at compile time)
+    ///
+    /// ```compile_fail
+    /// use snubber::SnubberNode;
+    /// use std::rc::Rc;
+    ///
+    /// let node = SnubberNode::builder("leak").max_in_flight(1).build();
+    /// // `Rc` is `!Send`: smuggling it into the worker closure must NOT compile.
+    /// let not_thread_safe = Rc::new(42u32);
+    /// let _ = node.spawn_guarded(
+    ///     move || {
+    ///         let _ = not_thread_safe.clone();
+    ///     },
+    ///     0u64,
+    ///     |_conduit: snubber::TaskConduit<u64, ()>| {},
+    /// );
+    /// ```
+    ///
+    /// Owner (R1): this constructor. No sleeps inside (F14), no killer
+    /// threads (R5) — the leash is cooperative.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// use snubber::{SnubberNode, TaskConduit};
+    /// let node = SnubberNode::builder("click_worker").max_in_flight(1).build();
+    /// let (join, handle) = node.spawn_guarded(|| {}, 0u64, |conduit: TaskConduit<u64, ()>| {
+    ///     conduit.update_state(|s| *s = 1);
+    /// });
+    /// handle.send_directive(snubber::Directive::Cancel("stop"));
+    /// join.join().expect("worker").expect("admitted");
+    /// ```
+    #[track_caller]
+    #[cfg(feature = "alloc")]
+    pub fn spawn_guarded<S, R, W, D>(
+        &self,
+        rollback: R,
+        initial_state: S,
+        work: W,
+    ) -> crate::SpawnedGuard<S, D>
+    where
+        R: FnOnce() + Send + 'static,
+        W: FnOnce(crate::TaskConduit<S, D>) + Send + 'static,
+        S: Send + Sync + 'static,
+        D: Send + 'static,
+    {
+        let (conduit, handle) = crate::TaskConduit::pair(initial_state);
+        let node = self.clone();
+        let join = std::thread::spawn(move || -> Result<(), SnubberError<()>> {
+            let guard = node.enter_erased_auto(rollback)?;
+            work(conduit);
+            guard.commit();
+            Ok(())
+        });
+        (join, handle)
+    }
+
+    /// ⚠️ *Low-level primitive.* If you are building a background worker or
+    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    ///
     /// Arm a nameable erased guard supervised across process boundaries.
     ///
     /// 1. Emits the armed `ProcessToken` to `stdout` if running under a supervisor (`SNUBBER_SUPERVISED`).
@@ -1407,7 +2118,6 @@ impl SnubberNode {
         token.emit_if_supervised();
 
         self.enter_inner(seq, seq, None, || {})?.commit();
-
         Ok(crate::ErasedGuard::with_commit_hook(
             move || {
                 rollback();
@@ -1419,6 +2129,9 @@ impl SnubberNode {
         ))
     }
 
+    /// ⚠️ *Low-level primitive.* If you are building a background worker or
+    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    ///
     /// Arm a tracked guard behind a semantic customs gate.
     ///
     /// Rust types are not enough: `cps: u32` accepts `0` (division by
@@ -1492,6 +2205,7 @@ impl SnubberNode {
     /// Shared admission pipeline (breaker → epoch → bulkhead → queue).
     /// `detail` threads through to the arming record for future gates.
     ///
+    // [ANCHOR: ADMISSION_PHASE] — the load-bearing pipeline, PHASE A/B/C.
     /// PHASE MAP (load-bearing, not cosmetic):
     /// * PHASE A (under lock): `Copy` snapshot only — breaker flag,
     ///   gate observe, slot integers, `Arc` hook bump in `record_locked`.
@@ -1542,9 +2256,28 @@ impl SnubberNode {
     /// Shared admission core: breaker → epoch → bulkhead → queue → commit.
     /// `enter` / `enter_with_generation` build `arming` (coords + header)
     /// and funnel HERE — one pipeline, no duplication, no drift.
+    /// Priority defaults to `Normal`: use `enter_armed_with_priority`
+    /// (or `enter_with_priority`) to name a lane.
     fn enter_armed<F: FnOnce()>(
         &self,
         arming: FaultRecord,
+        rollback: F,
+    ) -> Result<TrackedGuard<F>, EnterError> {
+        self.enter_armed_with_priority(arming, Priority::Normal, rollback)
+    }
+
+    /// Shared admission core with an explicit priority lane (Phase 1).
+    ///
+    /// Same breaker → epoch → bulkhead → queue → commit pipeline; the
+    /// lane is stamped on the guard (`TrackedGuard::priority`) and into
+    /// the live `lane_in_flight` histogram (integers only, PHASE C).
+    /// `Critical` over pure-`Background` occupancy files a cooperative
+    /// preempt request (`preempt_requested`) instead of bouncing — the
+    /// victims yield themselves via their own `TaskConduit` (R5).
+    fn enter_armed_with_priority<F: FnOnce()>(
+        &self,
+        arming: FaultRecord,
+        priority: Priority,
         rollback: F,
     ) -> Result<TrackedGuard<F>, EnterError> {
         let header = arming.header;
@@ -1610,7 +2343,30 @@ impl SnubberNode {
         // `BackpressurePolicy::AdaptiveBlock` (node level) does the same
         // through the friction function instead of a const: wait =
         // min(friction(in_flight, max), max_wait_ms), shed past depth cap.
+        //
+        // Phase 1 preemption (strict, cooperative, zero-deadlock): a
+        // `Critical` admission over pure-`Background` occupancy files ONE
+        // `Preempted` request (flag + counter, lock released!) and then
+        // falls through to the normal `BulkheadFull` refusal — the CALLER
+        // retries after its victims yield. `Critical` vs `Normal` never
+        // preempts (no inversion). The node never waits holding the lock.
         if inner.in_flight >= inner.max_in_flight {
+            if priority.may_preempt()
+                && inner.in_flight > 0
+                && inner.lane_in_flight[0] == inner.in_flight
+                && !inner.preempt_requested
+            {
+                inner.preempt_requested = true;
+                let mut outcome = Self::record_locked(&mut inner, FaultKind::Preempted, 7, 0);
+                drop(inner);
+                let record = FaultRecord {
+                    kind: FaultKind::Preempted,
+                    ..arming.clone()
+                };
+                self.publish_fault(&mut outcome, &record);
+                Self::emit(outcome, record);
+                inner = self.lock();
+            }
             match inner.overflow {
                 OverflowPolicy::RejectNew => {
                     // PHASE A snapshot: Copy out everything the friction math
@@ -1799,6 +2555,11 @@ impl SnubberNode {
         // PHASE C (commit): integers only, saturating, hard clamp.
         inner.in_flight = inner.in_flight.saturating_add(1);
         inner.queued = inner.queued.saturating_add(1);
+        let lane = priority.code().min(2) as usize;
+        inner.lane_in_flight[lane] = inner.lane_in_flight[lane].saturating_add(1);
+        if priority == Priority::Critical {
+            inner.preempt_requested = false;
+        }
         inner.stats.total_started = inner.stats.total_started.saturating_add(1);
         hard_clamp_slots(&mut inner);
         let node_name = inner.name;
@@ -1813,6 +2574,7 @@ impl SnubberNode {
             arming,
             settled: false,
             is_probe: was_half_open,
+            priority,
             armed_at_ms: now_ms(),
             deadline_ms: deadline,
             stage: 0,
@@ -2072,6 +2834,7 @@ impl SnubberNode {
         inner.gate.observe(&header);
         inner.in_flight = inner.in_flight.saturating_add(1);
         inner.queued = inner.queued.saturating_add(1);
+        inner.lane_in_flight[1] = inner.lane_in_flight[1].saturating_add(1);
         inner.stats.total_started = inner.stats.total_started.saturating_add(1);
         hard_clamp_slots(&mut inner);
 
@@ -2105,6 +2868,7 @@ impl SnubberNode {
             armed_at_ms: now,
             settled: false,
             is_probe,
+            priority: Priority::Normal,
             stage: 0,
             stage_label: None,
             queue_wait_ms: wait_ms,
@@ -2146,6 +2910,7 @@ impl SnubberNode {
             stale_epochs_rejected: s.stale_epochs_rejected,
             bulkhead_rejections: s.bulkhead_rejections,
             evicted: s.evicted,
+            preempted: s.preempted,
             breaker_rejections: s.breaker_rejections,
             breaker_trips: s.breaker_trips,
             breaker_state: s.breaker_state,
@@ -2182,6 +2947,9 @@ impl SnubberNode {
             FaultKind::BreakerOpen => {
                 inner.stats.breaker_rejections = inner.stats.breaker_rejections.saturating_add(1);
             }
+            FaultKind::Preempted => {
+                inner.stats.preempted = inner.stats.preempted.saturating_add(1);
+            }
             _ => {}
         }
     }
@@ -2205,7 +2973,7 @@ impl SnubberNode {
     /// under the lock: 0 = none, 1 = breaker_rejections,
     /// 2 = stale_epochs_rejected, 3 = bulkhead_rejections, 4 = evicted,
     /// 5 = poisoned_rejected (+reported), 6 = rate mirror
-    /// (`extra` = rate_rejected value).
+    /// (`extra` = rate_rejected value), 7 = preempted (+reported).
     fn record_locked(
         inner: &mut NodeInner,
         record_kind: FaultKind,
@@ -2236,8 +3004,17 @@ impl SnubberNode {
                 inner.stats.bulkhead_rejections = inner.stats.bulkhead_rejections.saturating_add(1);
                 inner.stats.rate_rejected = extra;
             }
+            7 => {
+                inner.stats.preempted = inner.stats.preempted.saturating_add(1);
+                inner.stats.reported[record_kind.index()] =
+                    inner.stats.reported[record_kind.index()].saturating_add(1);
+            }
             _ => {}
         }
+        // Flight ring: Copy codes only (kind + epoch/task + caller coords
+        // come from the CALLER-built record, not from here — record_locked
+        // only sees codes, so report()/observe() push the slot explicitly).
+        // This spot stays integer-only: no push here, no alloc, no panic.
         // Policy COMMAND half (under lock, no calls out).
         // `BlockCaller` never reaches here as a command: it is consumed at
         // admission time (enter_inner parks the caller); if a fault FIRES
@@ -2270,6 +3047,7 @@ impl SnubberNode {
         };
         let snapshot = Self::snapshot_stats_no_alloc(inner);
         let hooks = Arc::clone(&inner.hooks);
+        let frame = inner.console_frame;
         // Console budget: reserve integers under the lock, format OUTSIDE.
         // Single arm — (Some, Some) and (Some, None) differ only in text,
         // which is built in PHASE B anyway. Two arms was F9 duplication.
@@ -2286,6 +3064,7 @@ impl SnubberNode {
             policy,
             custom,
             console_slot,
+            frame,
             line: None,
         }
     }
@@ -2294,17 +3073,29 @@ impl SnubberNode {
         // PHASE B (no lock): format console + clone record OUTSIDE.
         if let Some((level_u32, used, cap)) = outcome.console_slot {
             let level = level_from_u32(level_u32);
-            let text = outcome.policy.log_msg.unwrap_or("fault");
-            let detail_owned: Option<String> =
-                record.detail.as_ref().map(|d| d.detail().to_string());
-            let detail = match &detail_owned {
-                Some(d) => format!(" — {d}"),
-                None => String::new(),
-            };
-            outcome.line = Some(format!(
-                "[snubber:{}][{:?}] {:?} at {}:{} ({}) — {text}{detail} [used {used}/{cap}]",
-                record.node, level, record.kind, record.file, record.line, record.header,
-            ));
+            if outcome.frame {
+                outcome.line = Some(format!(
+                    "[SNUB:ALERT] node=\"{}\" kind={:?} count={} depth={} file={} line={}",
+                    record.node,
+                    record.kind,
+                    outcome.snapshot.reported[record.kind.index()],
+                    outcome.snapshot.in_flight_depth(),
+                    record.file,
+                    record.line,
+                ));
+            } else {
+                let text = outcome.policy.log_msg.unwrap_or("fault");
+                let detail_owned: Option<String> =
+                    record.detail.as_ref().map(|d| d.detail().to_string());
+                let detail = match &detail_owned {
+                    Some(d) => format!(" — {d}"),
+                    None => String::new(),
+                };
+                outcome.line = Some(format!(
+                    "[snubber:{}][{:?}] {:?} at {}:{} ({}) — {text}{detail} [used {used}/{cap}]",
+                    record.node, level, record.kind, record.file, record.line, record.header,
+                ));
+            }
         }
         // Policy COMMAND half, outside the lock: self-healing runs here.
         // Isolation lives in `crate::watchdog::isolate_once`: one rotten
@@ -2343,6 +3134,13 @@ fn publish_fault_arc(
 ) {
     outcome.snapshot.last_fault = Some(record.clone());
     let owned = record.clone();
+    let slot = FlightSlot {
+        kind: record.kind,
+        epoch: record.header.epoch,
+        task_id: record.header.task_id,
+        file: record.file,
+        line: record.line,
+    };
     {
         let mut inner = node.lock().unwrap_or_else(|p| {
             let mut g = p.into_inner();
@@ -2351,7 +3149,46 @@ fn publish_fault_arc(
             g
         });
         inner.stats.last_fault = Some(owned);
+        push_flight_inner(&mut inner, slot);
     }
+}
+
+/// Push one flight slot with oldest-evict at cap. `VecDeque` was
+/// preallocated at `build()`; at cap we `pop_front` (no realloc).
+/// `Copy`-only payload — cannot panic, PHASE-C safe. Free shape (not a
+/// method) so `publish_fault_arc` can use it without a node handle.
+fn push_flight_inner(inner: &mut NodeInner, slot: FlightSlot) {
+    if inner.flight.len() >= inner.flight_depth.max(1) {
+        inner.flight.pop_front();
+    }
+    // At cap the deque is full but never over: push_back on a
+    // with_capacity buffer reuses the freed front slot. If a poisoned
+    // recovery ever shrank it, push may realloc once — cold path only
+    // (publish, never admission), counted via lock() like stats().
+    inner.flight.push_back(slot);
+    // Hard clamp: depth knob is a promise, not a hint.
+    while inner.flight.len() > inner.flight_depth.max(1) {
+        inner.flight.pop_front();
+    }
+}
+
+/// Release one armed slot on a settle path (Phase 1 preemption books).
+///
+/// Integers only, cannot panic: `in_flight`/`queued` come home exactly
+/// once, the guard's lane is subtracted from the live histogram, and a
+/// settling victim clears a pending cooperative `preempt_requested`.
+/// Every `commit` / `abort` / `check_timeout` / `settle_implicit` funnels
+/// here — one owner, no drift, no double-bookkeeping.
+#[inline]
+fn release_slot_inner(inner: &mut NodeInner, lane: usize) {
+    inner.in_flight = inner.in_flight.saturating_sub(1);
+    inner.queued = inner.queued.saturating_sub(1);
+    let lane = lane.min(2);
+    inner.lane_in_flight[lane] = inner.lane_in_flight[lane].saturating_sub(1);
+    if lane == 0 {
+        inner.preempt_requested = false;
+    }
+    hard_clamp_slots(inner);
 }
 /// Owned fallout of [`SnubberNode::record_locked`]: everything the caller
 /// reports WITHOUT holding the node lock (hooks, console, self-heal).
@@ -2366,6 +3203,7 @@ struct ReportOutcome {
     policy: FaultPolicy,
     custom: Option<fn()>,
     console_slot: Option<(u32, usize, usize)>,
+    frame: bool,
     line: Option<String>,
 }
 
@@ -2415,6 +3253,7 @@ pub struct TrackedGuard<F: FnOnce()> {
     arming: FaultRecord,
     settled: bool,
     is_probe: bool,
+    priority: Priority,
     armed_at_ms: u64,
     deadline_ms: u64,
     stage: u32,
@@ -2424,6 +3263,7 @@ pub struct TrackedGuard<F: FnOnce()> {
 }
 
 /// Watchdog outcome for [`TrackedGuard::check_timeout`].
+#[must_use = "a TimedOut guard already settled (rollback ran) — propagate, never keep working"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeoutCheck {
     /// Within budget (or no deadline armed) — keep working.
@@ -2557,6 +3397,14 @@ impl<F: FnOnce()> TrackedGuard<F> {
         self.arming.header
     }
 
+    /// Priority lane this guard was admitted on (Phase 1 preemption).
+    /// `Background` guards are the ones a `Critical` admission may ask
+    /// to yield via `Directive::Preempted` on their own `TaskConduit`.
+    #[must_use]
+    pub fn priority(&self) -> Priority {
+        self.priority
+    }
+
     /// Arming coordinates (the `enter` call site).
     #[must_use]
     pub fn arming_site(&self) -> (&'static str, u32) {
@@ -2564,7 +3412,6 @@ impl<F: FnOnce()> TrackedGuard<F> {
     }
 
     /// Emit `Ack` for this transaction.
-    #[must_use]
     pub fn ack<T>(&self) -> SnubberEvent<T> {
         SnubberEvent::Ack {
             header: self.arming.header,
@@ -2572,7 +3419,6 @@ impl<F: FnOnce()> TrackedGuard<F> {
     }
 
     /// Emit `Progress` carrying a live payload.
-    #[must_use]
     pub fn progress<T>(&self, payload: T) -> SnubberEvent<T> {
         SnubberEvent::Progress {
             header: self.arming.header,
@@ -2588,6 +3434,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         self.settled = true;
         let node = self.node.clone();
         let is_probe = self.is_probe;
+        let lane = self.priority.code().min(2) as usize;
         core::mem::forget(self);
         let waker = {
             let mut inner = node.lock().unwrap_or_else(|p| {
@@ -2596,8 +3443,6 @@ impl<F: FnOnce()> TrackedGuard<F> {
                 hard_clamp_slots(&mut g);
                 g
             });
-            inner.in_flight = inner.in_flight.saturating_sub(1);
-            inner.queued = inner.queued.saturating_sub(1);
             inner.stats.committed = inner.stats.committed.saturating_add(1);
             Self::note_outcome(&mut inner, false);
             inner.stats.window_outcomes = inner.window_outcomes;
@@ -2607,6 +3452,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
                 inner.half_open_probe = false;
                 inner.stats.breaker_state = BreakerState::Closed;
             }
+            release_slot_inner(&mut inner, lane);
             inner.waiters.pop_front()
         };
         if let Some(w) = waker {
@@ -2636,6 +3482,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         let loc = core::panic::Location::caller();
         let header = self.arming.header;
         let node_name = self.arming.node;
+        let lane = self.priority.code().min(2) as usize;
         if let Some(g) = self.guard.take() {
             drop(g); // hardware rollback runs HERE
         }
@@ -2645,8 +3492,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             hard_clamp_slots(&mut g);
             g
         });
-        inner.in_flight = inner.in_flight.saturating_sub(1);
-        inner.queued = inner.queued.saturating_sub(1);
+        release_slot_inner(&mut inner, lane);
         inner.timeouts_fired = inner.timeouts_fired.saturating_add(1);
         inner.stats.reported[FaultKind::Timeout.index()] =
             inner.stats.reported[FaultKind::Timeout.index()].saturating_add(1);
@@ -2719,6 +3565,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         self.settled = true;
         let node = self.node.clone();
         let is_probe = self.is_probe;
+        let lane = self.priority.code().min(2) as usize;
         core::mem::forget(self);
         let waker = {
             let mut inner = node.lock().unwrap_or_else(|p| {
@@ -2727,8 +3574,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
                 hard_clamp_slots(&mut g);
                 g
             });
-            inner.in_flight = inner.in_flight.saturating_sub(1);
-            inner.queued = inner.queued.saturating_sub(1);
+            release_slot_inner(&mut inner, lane);
             inner.stats.explicit_aborts = inner.stats.explicit_aborts.saturating_add(1);
             // Planned aborts do NOT feed the breaker streak — but a
             // failed probe still re-opens: a probe that aborts proved
@@ -2758,6 +3604,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
     fn settle_implicit(&mut self) {
         self.settled = true;
         let stage = self.stage;
+        let lane = self.priority.code().min(2) as usize;
         let record = FaultRecord {
             kind: FaultKind::ImplicitDrop,
             stage,
@@ -2773,8 +3620,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             hard_clamp_slots(&mut g);
             g
         });
-        inner.in_flight = inner.in_flight.saturating_sub(1);
-        inner.queued = inner.queued.saturating_sub(1);
+        release_slot_inner(&mut inner, lane);
         inner.stats.implicit_drops = inner.stats.implicit_drops.saturating_add(1);
         Self::note_outcome(&mut inner, true);
         inner.stats.window_outcomes = inner.window_outcomes;

@@ -242,3 +242,53 @@ fn hang_timeout_fires_on_silence_and_restarts() {
     }
     writer_h.join().expect("frozen worker thaws");
 }
+
+/// Supervised erased entry behaves like the canonical worker entry on a
+/// single-flight node: one run commits, the slot frees, the next run is
+/// admitted. Without a supervisor in the env (`SNUBBER_SUPERVISED` unset)
+/// the token emit/commit hooks are silent no-ops — this test pins the
+/// slot lifecycle, not the pipe.
+#[test]
+fn supervised_erased_entry_recycles_single_flight_slot() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    let node = SnubberNode::builder("super/erased-slot")
+        .max_in_flight(1)
+        .trip_after_failures(100)
+        .build();
+    let rolled = Arc::new(AtomicU32::new(0));
+
+    // Run 1: arm supervised, commit clean — no rollback, slot freed.
+    let token = ProcessToken::tagged(13, 1);
+    node.enter_supervised_erased(token, {
+        let c = Arc::clone(&rolled);
+        move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        }
+    })
+    .expect("first supervised run admitted")
+    .commit();
+    assert_eq!(rolled.load(Ordering::SeqCst), 0, "commit disarms");
+
+    // Run 2, immediate restart: must be admitted, not BulkheadFull.
+    let token2 = ProcessToken::tagged(13, 2);
+    node.enter_supervised_erased(token2, {
+        let c = Arc::clone(&rolled);
+        move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        }
+    })
+    .expect("immediate supervised restart admitted")
+    .commit();
+
+    let s = node.stats();
+    assert_eq!(s.total_started, 2, "one probe admission per run");
+    assert_eq!(s.committed, 2, "both probes committed clean");
+    assert_eq!(s.bulkhead_rejections, 0, "no slot ever stuck");
+    assert_eq!(
+        rolled.load(Ordering::SeqCst),
+        0,
+        "no rollback on clean path"
+    );
+}

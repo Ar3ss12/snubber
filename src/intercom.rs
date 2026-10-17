@@ -16,6 +16,7 @@ use core::task::{Context, Poll, Waker};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 /// Directives sent by the caller/observer to the executing worker.
+#[must_use = "IGNORING DIRECTIVES INVITES DEADLOCK: match Proceed/Pause/Cancel/SkipStage/Preempted — never drop the verdict sight unseen"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Directive {
     /// Normal flight: proceed execution.
@@ -26,12 +27,20 @@ pub enum Directive {
     Cancel(&'static str),
     /// Skip current iteration or stage and jump ahead.
     SkipStage,
+    /// Phase 1 preemption: a `Priority::Critical` admission asked this
+    /// `Background` task to yield its slot NOW. Cooperative (R5 — no
+    /// killer threads): the worker observes this on its next
+    /// `check_directive()` / `wait_for_resume_async()` and settles
+    /// itself (`abort("preempted")` / `commit` the partial + drop).
+    /// Who never checkpoints is its own enemy — the node never forces.
+    Preempted(&'static str),
 }
 
 const DIR_PROCEED: u8 = 0;
 const DIR_PAUSE: u8 = 1;
 const DIR_CANCEL: u8 = 2;
 const DIR_SKIP_STAGE: u8 = 3;
+const DIR_PREEMPTED: u8 = 4;
 
 struct IntercomInner<S, D> {
     directive: AtomicU8,
@@ -43,16 +52,23 @@ struct IntercomInner<S, D> {
 }
 
 /// The worker's cockpit gateway inside the executing task.
-pub struct TaskConduit<S: Clone, D = ()> {
+///
+/// `S`/`D` carry NO `Clone` bound here on purpose: sharing the intercom
+/// (cloning the inner `Arc`) must work for any payload, including
+/// non-`Clone` drafts. Methods that actually duplicate the payload
+/// (`TaskHandle::inspect`) declare `S: Clone` locally on themselves.
+pub struct TaskConduit<S, D = ()> {
     inner: Arc<IntercomInner<S, D>>,
 }
 
 /// The caller/observer's control console for inspecting and steering the task.
-pub struct TaskHandle<S: Clone, D = ()> {
+///
+/// Same zero-bound contract as the conduit above.
+pub struct TaskHandle<S, D = ()> {
     inner: Arc<IntercomInner<S, D>>,
 }
 
-impl<S: Clone, D> TaskConduit<S, D> {
+impl<S, D> TaskConduit<S, D> {
     /// Create a connected pair: conduit for the worker and handle for the caller.
     pub fn pair(initial_state: S) -> (Self, TaskHandle<S, D>) {
         let inner = Arc::new(IntercomInner {
@@ -97,6 +113,16 @@ impl<S: Clone, D> TaskConduit<S, D> {
                 self.inner.directive.store(DIR_PROCEED, Ordering::Release);
                 Directive::SkipStage
             }
+            DIR_PREEMPTED => {
+                let reason = self
+                    .inner
+                    .cancel_reason
+                    .lock()
+                    .ok()
+                    .and_then(|r| *r)
+                    .unwrap_or("preempted");
+                Directive::Preempted(reason)
+            }
             _ => Directive::Proceed,
         }
     }
@@ -115,10 +141,9 @@ impl<S: Clone, D> TaskConduit<S, D> {
                 .wait(reason_guard)
                 .unwrap_or_else(|p| p.into_inner());
         }
-        if self.inner.directive.load(Ordering::Acquire) == DIR_CANCEL {
-            Err(reason_guard.unwrap_or("cancelled"))
-        } else {
-            Ok(())
+        match self.inner.directive.load(Ordering::Acquire) {
+            DIR_CANCEL | DIR_PREEMPTED => Err(reason_guard.unwrap_or("cancelled")),
+            _ => Ok(()),
         }
     }
 
@@ -142,9 +167,36 @@ impl<S: Clone, D> TaskConduit<S, D> {
     }
 }
 
-impl<S: Clone, D> TaskHandle<S, D> {
+impl<S, D> Clone for TaskConduit<S, D> {
+    /// Shared-ownership clone: bumps the `Arc` refcount only. No `Clone`
+    /// bound on `S`/`D` — deliberately NOT `#[derive(Clone)]`, which would
+    /// demand `S: Clone, D: Clone` even though cloning the `Arc` never
+    /// touches the payload. A non-`Clone` directive type must never block
+    /// handing control to another thread.
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<S, D> Clone for TaskHandle<S, D> {
+    /// Same as above: the handle is a second view of the same intercom.
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<S, D> TaskHandle<S, D> {
     /// Read an instant snapshot of the worker's live state.
-    pub fn inspect(&self) -> S {
+    pub fn inspect(&self) -> S
+    where
+        S: Clone,
+    {
         self.inner
             .state
             .read()
@@ -174,6 +226,14 @@ impl<S: Clone, D> TaskHandle<S, D> {
                 self.inner.condvar.notify_all();
                 self.wake_async();
             }
+            Directive::Preempted(reason) => {
+                if let Ok(mut lock) = self.inner.cancel_reason.lock() {
+                    *lock = Some(reason);
+                }
+                self.inner.directive.store(DIR_PREEMPTED, Ordering::Release);
+                self.inner.condvar.notify_all();
+                self.wake_async();
+            }
         }
     }
 
@@ -199,11 +259,13 @@ impl<S: Clone, D> TaskHandle<S, D> {
 }
 
 /// Future for asynchronous pause/resume waiting.
-pub struct ResumeFuture<S: Clone, D> {
+///
+/// Zero-bound like the intercom itself: polling never duplicates `S`.
+pub struct ResumeFuture<S, D> {
     inner: Arc<IntercomInner<S, D>>,
 }
 
-impl<S: Clone, D> Future for ResumeFuture<S, D> {
+impl<S, D> Future for ResumeFuture<S, D> {
     type Output = Result<(), &'static str>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -213,7 +275,7 @@ impl<S: Clone, D> Future for ResumeFuture<S, D> {
                 wakers.push(cx.waker().clone());
             }
             Poll::Pending
-        } else if dir == DIR_CANCEL {
+        } else if dir == DIR_CANCEL || dir == DIR_PREEMPTED {
             let reason = self
                 .inner
                 .cancel_reason

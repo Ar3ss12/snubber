@@ -1,0 +1,119 @@
+//! Nuclear vs hydraulic: shed never trips the breaker, nuclear does.
+//!
+//! Pins the approved contour: `FaultKind::is_catastrophic` is the single
+//! source of truth for `report()` streak feeding. `ImplicitDrop` is
+//! nuclear but owned by `settle_implicit` (no double-feed via `report`).
+//! `ChannelDisconnected` is hydraulic (graceful drain, not hull breach).
+
+use snubber::{BreakerState, FaultKind, SnubberNode, TransactionHeader};
+
+#[test]
+fn catastrophic_table_pins_every_variant() {
+    let nuclear = [
+        FaultKind::ImplicitDrop,
+        FaultKind::Panic,
+        FaultKind::Timeout,
+        FaultKind::ProcessDied,
+    ];
+    for kind in FaultKind::ALL {
+        let expect = nuclear.contains(&kind);
+        assert_eq!(
+            kind.is_catastrophic(),
+            expect,
+            "contour moved for {kind:?} — update report() + docs together"
+        );
+    }
+}
+
+#[test]
+fn shed_never_trips_breaker() {
+    let node = SnubberNode::builder("shed_wall")
+        .max_in_flight(1)
+        .trip_after_failures(3)
+        .rate_per_sec(1)
+        .build();
+    // Hold the single slot so every enter sheds.
+    let _held = node.enter(1, 1, || {}).expect("slot held");
+    let mut bulk: u64 = 0;
+    let mut rate: u64 = 0;
+    let mut stale: u64 = 0;
+    for i in 2..5002u64 {
+        match node.enter(i, i, || {}) {
+            Err(snubber::EnterError::BulkheadFull) => bulk += 1,
+            Err(snubber::EnterError::RateLimited) => rate += 1,
+            _ => {}
+        }
+    }
+    for i in 9000..9100u64 {
+        // Epochs behind the gate: stale cuts.
+        if !node.observe(&TransactionHeader::new(1, i)) {
+            stale += 1;
+        }
+    }
+    // Hydraulic reports must not feed the streak either.
+    for i in 0..10u64 {
+        node.report(FaultKind::BulkheadFull, 50_000 + i, i);
+        node.report(FaultKind::BufferOverflow, 51_000 + i, i);
+        node.report(FaultKind::EvictedOldest, 52_000 + i, i);
+        node.report(FaultKind::BreakerOpen, 53_000 + i, i);
+        node.report(FaultKind::StaleEpoch, 54_000 + i, i);
+        node.report(FaultKind::PoisonedPayload, 55_000 + i, i);
+    }
+    let s = node.stats();
+    assert_eq!(
+        s.breaker_state,
+        BreakerState::Closed,
+        "shed must not isolate"
+    );
+    assert_eq!(s.breaker_trips, 0);
+    assert_eq!(s.nuclear_breaches(), 0, "no nuclear fired");
+    assert!(s.shed_bulkhead() >= bulk);
+    assert_eq!(s.shed_rate(), s.rate_rejected);
+    assert!(s.shed_stale() >= stale);
+    assert_eq!(s.poison_recoveries, 0);
+    let _ = (bulk, rate);
+}
+
+#[test]
+fn nuclear_trips_breaker() {
+    let node = SnubberNode::builder("nuclear")
+        .trip_after_failures(3)
+        .build();
+    node.report(FaultKind::Panic, 1, 1);
+    node.report(FaultKind::Timeout, 2, 2);
+    node.report(FaultKind::ProcessDied, 3, 3);
+    let s = node.stats();
+    assert_eq!(s.nuclear_breaches(), 3);
+    assert_ne!(s.breaker_state, BreakerState::Closed, "3 nuclear must trip");
+    assert!(s.breaker_trips >= 1);
+    assert_eq!(s.poison_recoveries, 0);
+
+    // Implicit drops feed the streak via settle (guard path).
+    let node2 = SnubberNode::builder("implicit_nuclear")
+        .trip_after_failures(3)
+        .build();
+    for i in 1..=3u64 {
+        let g = node2.enter(i, i, || {}).expect("admit");
+        drop(g); // implicit drop: nuclear via settle_implicit
+    }
+    let s2 = node2.stats();
+    assert_eq!(s2.implicit_drops, 3);
+    assert_eq!(s2.nuclear_breaches(), 3);
+    assert_ne!(s2.breaker_state, BreakerState::Closed);
+}
+
+#[test]
+fn channel_disconnect_is_hydraulic() {
+    let node = SnubberNode::builder("graceful_drain")
+        .trip_after_failures(3)
+        .build();
+    for i in 0..10u64 {
+        node.report(FaultKind::ChannelDisconnected, 100 + i, i);
+    }
+    let s = node.stats();
+    assert_eq!(s.breaker_state, BreakerState::Closed);
+    assert_eq!(s.breaker_trips, 0);
+    assert_eq!(s.nuclear_breaches(), 0, "drain is not a breach");
+    assert_eq!(s.reported[FaultKind::ChannelDisconnected.index()], 10);
+    assert_eq!(s.poison_recoveries, 0);
+}

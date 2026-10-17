@@ -92,6 +92,10 @@ fn main() {
                     println!("[PILOT] Mission cancelled: {reason}!");
                     return Err(reason);
                 }
+                Directive::Preempted(reason) => {
+                    println!("[PILOT] Yielding slot to critical admission: {reason}!");
+                    return Err(reason);
+                }
             }
             thread::sleep(Duration::from_millis(25));
             conduit.update_state(|s| {

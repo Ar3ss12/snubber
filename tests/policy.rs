@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 #[test]
 fn default_table_covers_every_kind() {
     use snubber::DEFAULT_POLICIES;
-    assert_eq!(snubber::FaultKind::COUNT, 11);
-    assert_eq!(DEFAULT_POLICIES.len(), 11);
+    assert_eq!(snubber::FaultKind::COUNT, 12);
+    assert_eq!(DEFAULT_POLICIES.len(), 12);
     // Spot-check philosophy: lag is Debug, death is Critical.
     assert_eq!(
         DEFAULT_POLICIES[FaultKind::StaleEpoch.index()].log_level,
@@ -23,6 +23,15 @@ fn default_table_covers_every_kind() {
         DEFAULT_POLICIES[FaultKind::Panic.index()].action,
         FaultAction::TripBreaker
     ));
+    // Phase 1 preemption: hydraulic, debug-quiet, own metric column.
+    assert_eq!(
+        DEFAULT_POLICIES[FaultKind::Preempted.index()].log_level,
+        Some(LogLevel::Debug)
+    );
+    assert_eq!(
+        DEFAULT_POLICIES[FaultKind::Preempted.index()].metric_tag,
+        Some("preemptions_total")
+    );
 }
 
 #[test]

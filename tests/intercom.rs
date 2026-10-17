@@ -38,7 +38,7 @@ fn sync_intercom_live_inspection_and_directives() {
                 Directive::Pause => {
                     let _ = conduit.wait_for_resume();
                 }
-                Directive::Cancel(_) => return Err("cancelled"),
+                Directive::Cancel(_) | Directive::Preempted(_) => return Err("cancelled"),
                 Directive::SkipStage => break,
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -168,4 +168,39 @@ fn fake_waker() -> Waker {
     unsafe fn drop(_: *const ()) {}
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
     unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+}
+
+/// Dragon-tooth regression: hand-written `Clone` on the intercom pair must
+/// carry NO bounds. `#[derive(Clone)]` would demand `S: Clone, D: Clone`
+/// even though cloning the inner `Arc` never touches the payload — a
+/// non-`Clone` draft/directive type would then forbid handing control to
+/// another thread. This test pins the zero-bound contract at compile time:
+///
+/// ```text
+/// struct NoClone; // deliberately NOT Clone
+/// let (c, h) = TaskConduit::<PilotState, NoClone>::pair(...);
+/// let _ = c.clone(); // must compile
+/// ```
+#[test]
+fn intercom_clone_needs_no_payload_bounds() {
+    struct NoCloneDraft {
+        _opaque: core::cell::Cell<u64>,
+    }
+    // NOTE: `NoCloneDraft` deliberately does NOT implement `Clone`. If the
+    // `Clone` impl on the intercom ever gains `D: Clone` (e.g. via derive),
+    // the two `.clone()` lines below stop compiling and this test goes red.
+    let (conduit, handle) = TaskConduit::<PilotState, NoCloneDraft>::pair(PilotState::default());
+    // Clone BEFORE any draft exists — exercises the Arc bump only.
+    let _conduit2 = conduit.clone();
+    let handle2 = handle.clone();
+    // Both views still observe the same shared table.
+    conduit.update_state(|s| s.progress = 7);
+    assert_eq!(handle.inspect().progress, 7);
+    assert_eq!(handle2.inspect().progress, 7);
+    // Publish a non-Clone draft through one view, take it through the clone.
+    conduit.publish_draft(NoCloneDraft {
+        _opaque: core::cell::Cell::new(0xC10C),
+    });
+    assert!(handle2.take_draft().is_some());
+    assert!(handle.take_draft().is_none());
 }

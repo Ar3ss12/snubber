@@ -104,6 +104,7 @@ impl AsyncGate {
 }
 
 /// Why the gate refused to wrap / admit.
+#[must_use = "a GateError forbids parking a thread under async — rebuild AdviseOnly, never drop it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GateError {
     /// Node would park a thread (`BlockCaller`/`AdaptiveBlock` armed).
@@ -126,8 +127,8 @@ pub trait AsyncSleeper {
 }
 
 /// Classify a refusal for an HTTP/gRPC mapper (exhaustive, no `_`).
+/// Return is `Refusal` (already `#[must_use]` at the type).
 #[inline]
-#[must_use]
 pub fn classify(err: &EnterError) -> Refusal {
     match *err {
         EnterError::BreakerOpen => Refusal::FailFast,
@@ -142,6 +143,7 @@ pub fn classify(err: &EnterError) -> Refusal {
 }
 
 /// Async outcome of one admission attempt.
+#[must_use = "a Refusal maps to an HTTP verdict (FailFast/Backoff/Ignore/BadRequest) — handle it, never drop it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Refusal {
     /// Sick downstream — serve fallback, `200` with degraded body.

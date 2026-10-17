@@ -43,6 +43,7 @@ impl LeaseChannel {
     /// Fire from `Drop`: never blocks; on `Full` count `BufferOverflow`,
     /// on `Disconnected` count `ChannelDisconnected`. Returns `true` if
     /// the reaper will see it.
+    #[must_use = "LeaseChannel::fire reports whether the reaper will see the event — count the false leg, never drop it"]
     pub fn fire(
         tx: &SyncSender<LeaseEvent>,
         ev: LeaseEvent,
