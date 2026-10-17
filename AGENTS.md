@@ -183,7 +183,7 @@ Owner table (R1 — one owner, no improvisation):
 Veto: a new builder flag without exactly one consumer + one test is a
 review-blocking defect (dead setting).
 
-## 10. F-catalog: documented corpses (symptom → autopsy → veto)
+## 10. F-catalog: Documented Postmortems (symptom → root cause → mitigation)
 
 - **F1 fake-green (`1 = 1+0+0`).** 40k attempts, `started=1`, test green.
   Veto: conservation + hard floor + per-kind counters (§4). Ref: `cycle_torture`.
@@ -265,7 +265,7 @@ cargo test --release --test cycle_torture
 Green = all above green in ONE run, same commit updates `README.md` +
 `AGENTS.md` + `tech.md` numbers. Version lives ONLY in `Cargo.toml`
 (`name`/`version`); docs quote it, never redefine it. Current:
-**v0.1.0**, **142 + 12 = 154 green**, MSRV 1.70.
+**v0.5.0**, **188 green**, MSRV 1.70.
 
 Publication honesty (R7): `.gitignore` has been added covering `target/`,
 local scratch logs, python artifacts, and OS temp files. Cargo package exclusions
@@ -284,8 +284,8 @@ Radius: snubber guards a SYNCHRONOUS perimeter with unwinding
   `stats()` + `last_fault` → heartbeat lost → `TerminateProcess` on the
   satellite. NEVER `TerminateThread` in-process (heap/loader lock stays
   wedged — see `docs/FUTURE_TRAPS.md` Trap 2). Satellite pattern
-  (Chrome/DAW): the worker is a disposable; the parent releases iron
-  itself and reaps the corpse from outside.
+  (Chrome/DAW): the worker is disposable; the parent releases iron
+  itself and reaps the terminated process from outside.
 - **Dead wall: `panic = "abort"` / SIGKILL / D-state (R6).** No tables,
   no `Drop`, no guard moves a micron — the process is gone in one tick.
   Inside the fallen process you are powerless; survival is ONLY an

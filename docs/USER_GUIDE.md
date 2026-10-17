@@ -49,7 +49,7 @@ let receipt = node.scoped_checked(
 
 ---
 
-## Level 1: Rollback for a single function (zero setup)
+## Layer 1: Core RAII Guard (Stack Rollback & Universal Ergonomics)
 
 No nodes, no config. Three lines:
 
@@ -76,7 +76,7 @@ How it works: the guard owns your rollback closure. `commit()` disarms it (succe
 
 ---
 
-## Level 2: Protecting a Daemon (Queues, Failures, Backpressure)
+## Layer 2: Concurrency Bulkhead (Bounded Queues & Backpressure)
 
 Wrap long-lived services, drivers, and background workers in a `SnubberNode`. The node is a bounded bulkhead with a flight recorder: it counts every path, remembers the last fault with caller file/line coordinates, and stops hammering dead hardware.
 
@@ -127,7 +127,7 @@ match node.enter_auto(|| release_locks()) {
 
 ---
 
-## Level 2.5: Long-Lived Worker (Daemon Thread, Not a Transaction)
+### 2.5 Long-Lived Worker Daemon (Autonomous Slot Claiming)
 
 Imagine a turnstile into a room with one strict rule: **only ONE person
 may be inside at a time** (`max_in_flight(1)`). Anyone who tries to enter
@@ -346,7 +346,7 @@ preempts — plain `BulkheadFull`, no flag, `preempted` column stays clean.
 The node never forces (R5): who never checkpoints `check_directive()`
 is its own enemy — the request waits until the worker yields itself.
 Diagnostics: `node.preempt_requested()`, `node.lane_in_flight()`,
-`stats().preempted` / `shed_preempted()` (own column, hydraulic, never
+`stats().preempted` / `shed_preempted()` (own column, operational shedding, never
 trips the breaker, never counted in `admission_total`).
 
 Never stand in the turnstile doorway while calling someone in. If you
@@ -354,7 +354,7 @@ walked in yourself — nobody else gets through.
 
 ---
 
-## Level 3: Async Architecture (Tokio, Axum, gRPC)
+## Layer 3: Runtime-Agnostic Async (Tokio, Axum, gRPC)
 
 `snubber` is completely runtime-agnostic: it requires **zero external dependencies** and uses pure `core::task::Waker` parking. It works identically in Tokio, async-std, smol, or bare-metal executors.
 
@@ -458,9 +458,9 @@ match gate.admit_auto(|| rollback()) {
 
 ---
 
-## Level 4: Cockpit Protocol (2-Way Live Intercom)
+## Layer 2 Subsystem: Bi-directional Task Steering (`TaskConduit` & `TaskHandle`)
 
-Traditional functions run blindly once invoked. The **Cockpit Protocol** (`TaskConduit` and `TaskHandle`) provides zero-dependency, two-way intercom between the invoker and the worker:
+Traditional functions run blindly once invoked. **Bi-directional Task Steering** (`TaskConduit` and `TaskHandle`) provides zero-dependency, two-way intercom between the invoker and the worker:
 
 ```rust
 use snubber::{Directive, TaskConduit};
@@ -492,7 +492,7 @@ handle.resume(); // Proceed == resume (there is no Directive::Resume)
 
 ---
 
-## Level 5: Surviving Process Death (Supervisor & Framed Tokens)
+## Layer 4: Process Supervisor & Crash Recovery (Surviving `kill -9`)
 
 When a process is vaporized instantly (`kill -9`, `Stop-Process -Force`, `std::process::abort()`, SIGKILL, or hung Win32 drivers), **no destructors (`Drop`) execute in that process**. Rescue must come from an out-of-process supervisor.
 
@@ -519,7 +519,7 @@ The architecture has been verified against **10,000 real Windows `TerminateProce
 cargo test --test chaos_dual_terminal -- --ignored --nocapture
 ```
 
-### 5.5 Declarative restart (Phase 2: dumb-spine reanimation)
+### 4.5 Declarative restart (Phase 2: dumb-spine reanimation)
 The supervisor does not guess — it counts. Declare the policy once,
 the caller loop owns spawn/sleep:
 ```rust
@@ -543,7 +543,7 @@ loop {
 }
 ```
 
-### 5.6 Hot state handoff (Phase 3: amnesia cured)
+### 4.6 Hot state handoff (Phase 3: amnesia cured)
 64 B genetic passport (`StateDigest`, one cache line, opaque bytes):
 satellite publishes via `OP_STATE` frames, drain keeps the last WHOLE,
 heir reads it on tick 0 — window wakes where it died, not default.
@@ -587,7 +587,7 @@ if let Some(digest) = snubber::take_stdin_digest() {
 }
 ```
 
-### 5.7 Orphan contract (Phase 6: no zombies)
+### 4.7 Orphan contract (Phase 6: no zombies)
 ```rust
 use snubber::{NoOrphanGuard, OrphanGuard};
 let guard = NoOrphanGuard; // honest no-op; real Win32 Job Objects
@@ -596,20 +596,20 @@ assert!(!guard.arm(child_pid)); // live in examples/orphan_guard.rs
 
 ---
 
-## Level 6: Cold Diagnostics (Nuclear vs Hydraulic + `app.snub`)
+## Layer 5: Diagnostics & Health (Catastrophic Faults vs Capacity Shedding + `app.snub`)
 
-A node that absorbs hits but tells nobody is a deaf bunker. `snubber`
+A node that absorbs hits but tells nobody is an opaque black box. `snubber`
 splits every fault into two isolated contours — and gives you the tools
-to see the pressure **before** it becomes a catastrophe.
+to see operational backpressure **before** it becomes an unrecoverable failure.
 
 ### The two contours
 
 | Contour | Meaning | Kinds | Breaker |
 |---|---|---|---|
-| **Nuclear** (hull breach) | The task died anomalously — fix the algorithm | `Panic`, `Timeout`, `ProcessDied`, `ImplicitDrop` | Feeds the streak, may isolate |
-| **Hydraulic** (shedding) | The healthy node holds the perimeter — tune capacity | `BulkheadFull`, `BufferOverflow`, `EvictedOldest`, `StaleEpoch`, `BreakerOpen`, `RateLimited`, `ChannelDisconnected`, `PoisonedPayload` | Counted, never trips |
+| **Catastrophic Fault** (Unrecoverable) | The task died anomalously — algorithmic defect | `Panic`, `Timeout`, `ProcessDied`, `ImplicitDrop` | Feeds the streak, trips breaker |
+| **Capacity Shedding** (Operational Backpressure) | The healthy node holds the perimeter — tune capacity | `BulkheadFull`, `BufferOverflow`, `EvictedOldest`, `StaleEpoch`, `BreakerOpen`, `RateLimited`, `ChannelDisconnected`, `PoisonedPayload` | Counted, never trips breaker |
 
-Single source of truth: `FaultKind::is_catastrophic()`. Cheap gauges on
+Single source of truth: `FaultKind::is_catastrophic()`. Diagnostic counters on
 every snapshot: `stats().nuclear_breaches()`, `shed_bulkhead()`,
 `shed_rate()` (own column forever — slow worker vs outer spam),
 `shed_stale()`, `admission_total()`.
@@ -621,13 +621,13 @@ use snubber::assert_no_anomalies;
 
 #[test]
 fn scheduler_under_load_stays_clean() {
-    run_torture_workload(&node);
+    run_stress_workload(&node);
     // Iron rule: the test fails red on any anomaly verdict.
     assert_no_anomalies!(&node);
 }
 ```
 
-### Filter 2 — dev cockpit (hotkey pulse)
+### Filter 2 — Diagnostics Console (Telemetry Pulse)
 
 ```rust
 use snubber::{AnomalyPolicy, print_health};
@@ -698,5 +698,5 @@ profiler at 160 CPS).
 | `TaskConduit` / `TaskHandle` | 2 / std | lock-free atomics | 2-way live steering, pause/resume waker, drafts |
 | `PipeDrain` + `ProcessToken` | 2 / std | 44-byte stream | Hardware rollback across process death (`kill -9`) |
 | `node.snapshot_v1()` + `encode()` | 2 / cold | 512 B, CRC32 | Crash-safe persistence, app-owned flush thread |
-| `find_anomalies()` / `assert_no_anomalies!` | 2 / cold | pure `u128` math | CI gate + dev cockpit + `[DIAG 0x…]` bug reports |
+| `find_anomalies()` / `assert_no_anomalies!` | 2 / cold | pure `u128` math | CI gate + diagnostics console + `[DIAG 0x…]` bug reports |
 | `NodeRegistry` board | 2 / cold | explicit `&Node` list | Multi-node pulse, never a `static` |
