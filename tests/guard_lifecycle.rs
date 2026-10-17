@@ -79,7 +79,7 @@ fn node_rehandshakes_new_generation() {
     // A gen-1 header must be fresh even at epoch 1 < 50.
     let fresh = TransactionHeader::with_generation(1, 1, 2);
     assert!(node.observe(&fresh), "new generation re-handshakes");
-    // Zombie from gen 0 is a phantom even with a HIGHER epoch.
-    let zombie = TransactionHeader::with_generation(0, 999, 1);
-    assert!(!node.observe(&zombie), "zombie generation rejected");
+    // Stale packet from gen 0 is rejected even with a HIGHER epoch.
+    let stale = TransactionHeader::with_generation(0, 999, 1);
+    assert!(!node.observe(&stale), "stale generation rejected");
 }

@@ -1,5 +1,5 @@
-//! Chaos Satellite: Supervisor bunker + disposable worker.
-//! Hardened for continuous multi-thousand TerminateProcess kills.
+//! Supervisor process termination stress loop: Supervisor + disposable worker.
+//! Hardened for continuous multi-thousand external process terminations.
 
 use snubber::{GenerationClock, PipeDrain, ProcessToken, SnubberNode};
 use std::fs::File;
@@ -35,12 +35,7 @@ fn main() {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    println!("============================================================");
-    println!(">>> [SNUBBER BUNKER (TERMINAL 1)] SUPERVISOR ONLINE");
-    println!(">>> Target Kills to survive: {target_kills}");
-    println!(">>> Protocol: Framed 44-byte b\"SNUB\" tokens via anonymous pipe");
-    println!(">>> Running until target kills or FIRST defect");
-    println!("============================================================");
+    println!("[SUPERVISOR:ONLINE] target_kills={target_kills} protocol=framed_pipe_snub_token");
 
     let mut clock = GenerationClock::new();
     let start_time = Instant::now();
@@ -95,7 +90,7 @@ fn main() {
             tokens_rescued += 1;
             if total_reaped % 100 == 0 || total_reaped <= 10 || total_reaped == target_kills {
                 println!(
-                    "[BUNKER #{total_reaped}/{target_kills}] SLAIN PID: {pid} | Gen: {gen} | RESCUED TOKEN: task={}, op={} (Emergency Release Executed)",
+                    "[SUPERVISOR:REAP] cycle={total_reaped}/{target_kills} pid={pid} gen={gen} token_rescued=true task={} op={}",
                     token.task, token.opcode
                 );
             }
@@ -103,7 +98,7 @@ fn main() {
             clean_settles += 1;
             if total_reaped % 100 == 0 || total_reaped <= 10 || total_reaped == target_kills {
                 println!(
-                    "[BUNKER #{total_reaped}/{target_kills}] SLAIN PID: {pid} | Gen: {gen} | Clean commit at death point ({status:?})"
+                    "[SUPERVISOR:REAP] cycle={total_reaped}/{target_kills} pid={pid} gen={gen} token_rescued=false status={status:?}"
                 );
             }
         }
@@ -117,8 +112,8 @@ fn main() {
             std::process::exit(102);
         }
 
-        // Verify fresh node rejects zombie generational lineage
-        let node = SnubberNode::builder("super/bunker").build();
+        // Verify fresh node rejects stale generational lineage
+        let node = SnubberNode::builder("super/supervisor").build();
         if let Err(e) = node
             .enter_with_generation(next_gen, 1, 1, || {})
             .map(|g| g.commit())
@@ -134,22 +129,10 @@ fn main() {
     // Clean up PID marker
     let _ = std::fs::remove_file(pid_file);
 
-    println!("============================================================");
-    println!(">>> [SNUBBER BUNKER] 100% OF TARGET KILLS SURVIVED WITH ZERO DEFECTS!");
-    println!(">>> Total Kills: {total_reaped} / {target_kills}");
-    println!(">>> Rescued Armed Tokens: {tokens_rescued}");
-    println!(">>> Clean Settles at Death: {clean_settles}");
-    println!(">>> Final Generation: {final_gen}");
-    println!(">>> Total Time: {:?}", elapsed);
-    if total_reaped > 0 {
-        let avg_ms = elapsed.as_millis() as f64 / total_reaped as f64;
-        println!(
-            ">>> Average cycle time: {:.2} ms/kill ({:.1} kills/sec)",
-            avg_ms,
-            1000.0 / avg_ms
-        );
-    }
-    println!("============================================================");
+    println!(
+        "[SUPERVISOR:SUMMARY] total_reaped={total_reaped} target_kills={target_kills} tokens_rescued={tokens_rescued} clean_settles={clean_settles} final_gen={final_gen} elapsed_ms={}",
+        elapsed.as_millis()
+    );
 
     if let Some(parent) = std::path::Path::new(&report_path).parent() {
         let _ = std::fs::create_dir_all(parent);

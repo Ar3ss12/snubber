@@ -1,5 +1,5 @@
-//! Path-1 spine + Path-2 scalpel: generation bump cuts zombies,
-//! pipe EOF fires the last-armed token. Dumb supervisor, honest counters.
+//! Path-1 spine + Path-2 token recovery: generation bump drops stale packets,
+//! pipe EOF fires the last-armed token. Deterministic supervisor, honest counters.
 
 use snubber::{
     DeathCause, EnterError, GenerationClock, PipeDrain, ProcessToken, SnubberEvent, SnubberNode,
@@ -7,9 +7,9 @@ use snubber::{
 };
 
 #[test]
-fn supervisor_restart_cuts_zombies() {
+fn supervisor_restart_rejects_stale_generation() {
     // gen0 lives to epoch 1420, then dies. gen1 re-handshakes at epoch 1;
-    // zombie packets from the dead lineage are cut even with HIGHER epoch.
+    // stale packets from the superseded generation are rejected even with HIGHER epoch.
     let node = SnubberNode::builder("super/lineage").build();
     let mut clock = GenerationClock::new();
     assert_eq!(clock.generation(), 1);
@@ -25,15 +25,15 @@ fn supervisor_restart_cuts_zombies() {
     node.enter_with_generation(g1, e1, 2, || {})
         .expect("gen2 re-handshake")
         .commit();
-    // Zombie from the dead lineage — higher epoch, old generation: cut.
+    // Stale packet from the superseded generation — higher epoch, old generation: rejected.
     match node.enter_with_generation(g0, 9999, 3, || {}) {
         Err(EnterError::StaleEpoch) => {}
         Err(_) => panic!("wrong refusal kind"),
-        Ok(_) => panic!("zombie must be cut"),
+        Ok(_) => panic!("stale packet must be rejected"),
     }
     let s = node.stats();
     assert_eq!(s.total_started, 2, "only live generations armed");
-    assert_eq!(s.stale_epochs_rejected, 1, "zombie counted");
+    assert_eq!(s.stale_epochs_rejected, 1, "stale packet counted");
     assert_eq!(s.committed, 2);
 }
 
@@ -230,7 +230,7 @@ fn hang_timeout_fires_on_silence_and_restarts() {
     let gen2 = clock.restart();
     assert_eq!(gen2, 2);
     assert_eq!(FIRED.load(std::sync::atomic::Ordering::SeqCst), 1);
-    // Fresh lineage re-handshakes; zombie of gen1 cut.
+    // Fresh lineage re-handshakes; stale packet of gen1 rejected.
     let node = SnubberNode::builder("super/hang").build();
     node.enter_with_generation(gen2, 1, 1, || {})
         .expect("gen2 live")
@@ -238,7 +238,7 @@ fn hang_timeout_fires_on_silence_and_restarts() {
     match node.enter_with_generation(1, 9999, 2, || {}) {
         Err(EnterError::StaleEpoch) => {}
         Err(_) => panic!("wrong refusal"),
-        Ok(_) => panic!("zombie must be cut"),
+        Ok(_) => panic!("stale generation must be rejected"),
     }
     writer_h.join().expect("frozen worker thaws");
 }

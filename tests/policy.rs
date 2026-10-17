@@ -23,7 +23,7 @@ fn default_table_covers_every_kind() {
         DEFAULT_POLICIES[FaultKind::Panic.index()].action,
         FaultAction::TripBreaker
     ));
-    // Phase 1 preemption: hydraulic, debug-quiet, own metric column.
+    // Phase 1 preemption: operational shedding, debug-quiet, own metric column.
     assert_eq!(
         DEFAULT_POLICIES[FaultKind::Preempted.index()].log_level,
         Some(LogLevel::Debug)

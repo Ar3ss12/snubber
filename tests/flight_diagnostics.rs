@@ -1,4 +1,4 @@
-//! Flight diagnostics: ring buffer, rotten-sink isolation, frame format.
+//! Flight recorder diagnostics: ring buffer, panicking-sink isolation, frame format.
 //!
 //! Cold paths only (F10): `dump_flight` allocates under a short lock —
 //! poll rarely, never per-CPS. Admission (`enter_inner`/`record_locked`)
@@ -14,10 +14,10 @@ impl TelemetrySink for Counter {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
 }
-struct Rotten;
-impl TelemetrySink for Rotten {
+struct PanickingSink;
+impl TelemetrySink for PanickingSink {
     fn on_fault(&self, _r: &FaultRecord, _s: &SnubberStats, _p: &FaultPolicy) {
-        panic!("rotten telemetry plugin died");
+        panic!("telemetry plugin simulated failure");
     }
 }
 
@@ -51,10 +51,10 @@ fn flight_depth_clamps() {
 }
 
 #[test]
-fn rotten_sink_does_not_behead_chain() {
+fn panicking_sink_does_not_break_chain() {
     let hits = Arc::new(AtomicU64::new(0));
     let node = SnubberNode::builder("sinks")
-        .telemetry_sink(Rotten)
+        .telemetry_sink(PanickingSink)
         .telemetry_sink(Counter(Arc::clone(&hits)))
         .build();
     node.report(FaultKind::Panic, 1, 1);

@@ -50,7 +50,7 @@ fn shed_never_trips_breaker() {
             stale += 1;
         }
     }
-    // Hydraulic reports must not feed the streak either.
+    // Operational shedding reports must not feed the streak either.
     for i in 0..10u64 {
         node.report(FaultKind::BulkheadFull, 50_000 + i, i);
         node.report(FaultKind::BufferOverflow, 51_000 + i, i);
@@ -66,7 +66,7 @@ fn shed_never_trips_breaker() {
         "shed must not isolate"
     );
     assert_eq!(s.breaker_trips, 0);
-    assert_eq!(s.nuclear_breaches(), 0, "no nuclear fired");
+    assert_eq!(s.nuclear_breaches(), 0, "no catastrophic fault recorded");
     assert!(s.shed_bulkhead() >= bulk);
     assert_eq!(s.shed_rate(), s.rate_rejected);
     assert!(s.shed_stale() >= stale);

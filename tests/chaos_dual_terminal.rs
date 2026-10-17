@@ -119,7 +119,7 @@ fn chaos_dual_terminal_system_kill_test() {
         report_file
     );
 
-    // 3. Wait for the bunker to complete and write the JSON report
+    // 3. Wait for the supervisor to complete and write the JSON report
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 

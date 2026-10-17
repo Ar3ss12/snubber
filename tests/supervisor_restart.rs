@@ -5,7 +5,7 @@
 //! a FAKE clock (plain `u64` numbers, zero real sleeps) and asserts:
 //! * crash `exit(1)` x5 fast → `restarts == 3`, `giveups == 1`;
 //! * backoff deltas double honestly (`50 → 100 → 200`);
-//! * clean `exit(0)` under `OnCrash` = `Stop` (planned landing);
+//! * clean `exit(0)` under `OnCrash` = `Stop` (graceful shutdown);
 //! * `Never` never restarts; `Always` restarts even `exit(0)`;
 //! * generation bumps once per authorized restart.
 
@@ -71,12 +71,12 @@ fn policy_matrix_never_oncrash_always() {
     assert_eq!(never.restarts(), 0);
     assert_eq!(never.giveups(), 0);
 
-    // OnCrash: clean exit(0) is a planned landing.
+    // OnCrash: clean exit(0) is a graceful shutdown.
     let mut oncrash = RestartTracker::default_spine();
     assert_eq!(
         oncrash.note_death(Some(0), 1000),
         RestartDecision::Stop,
-        "exit(0) is a landing, not a crash"
+        "exit(0) is a graceful shutdown, not a crash"
     );
     assert_eq!(oncrash.restarts(), 0);
     // Kill/hang from outside (no code) is always a crash.

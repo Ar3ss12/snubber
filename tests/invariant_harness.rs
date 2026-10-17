@@ -36,7 +36,7 @@ fn verify_slot_containment_and_single_shot_rollback() {
                 }) {
                     Ok(g) => g,
                     Err(_) => {
-                        // Rejection is a valid hydraulic state; no slots leaked
+                        // Rejection is a valid capacity shedding state; no slots leaked
                         continue;
                     }
                 };

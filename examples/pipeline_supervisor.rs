@@ -1,27 +1,31 @@
-//! Autopilot assembly (all phases): gateway + priority + restart + handoff.
+//! Pipeline supervisor assembly (all phases): gateway + priority + restart + handoff.
 //!
-//! Run: `cargo run --example autopilot`
+//! Run: `cargo run --example pipeline_supervisor`
 //!
-//! One file showing every primitive wired together: doors send intents
+//! Demonstrates every primitive wired together: doors send intents
 //! through the gateway, the host mutates ONE enum via transition,
 //! Critical preempts Background, tracker guards the storm, digest
-//! survives death. Steel thread, no framework.
+//! survives process termination.
+
 use snubber::{
     gateway, Backoff, Priority, RestartDecision, RestartPolicy, RestartTracker, RestartWindow,
     SnubberNode, StateDigest,
 };
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cmd {
     Start,
     Stop,
 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Idle,
     Running,
 }
+
 fn main() {
-    let node = SnubberNode::builder("autopilot")
+    let node = SnubberNode::builder("pipeline_supervisor")
         .max_in_flight(4)
         .trip_after_failures(0)
         .build();
@@ -38,13 +42,15 @@ fn main() {
             .expect("host");
     }
     assert_eq!(state, State::Idle);
-    println!("AUTOPILOT: gateway drained, state=Idle");
+    println!("[PIPELINE:GATEWAY] state=Idle status=drained");
+
     let bg = node
         .enter_with_priority(Priority::Background, 100, 100, || {})
         .expect("bg");
     assert!(node.lane_in_flight() == [1, 0, 0]);
     drop(bg);
-    println!("AUTOPILOT: priority lanes live");
+    println!("[PIPELINE:PRIORITY] lanes=active in_flight=[0,0,0]");
+
     let mut tracker = RestartTracker::new(
         RestartPolicy::OnCrash,
         Backoff::exponential(50, 1000),
@@ -52,13 +58,14 @@ fn main() {
     );
     match tracker.note_death(Some(1), 1000) {
         RestartDecision::Restart { delay_ms, .. } => {
-            println!("AUTOPILOT: restart delay={delay_ms}ms")
+            println!("[PIPELINE:RESTART] action=restart delay_ms={delay_ms}")
         }
-        other => panic!("must restart: {other:?}"),
+        other => panic!("expected restart decision, got: {other:?}"),
     }
+
     let mut bytes = [0u8; 64];
     bytes[0] = 42;
     let digest = StateDigest::new(bytes);
     assert_eq!(digest.bytes[0], 42);
-    println!("AUTOPILOT: digest mark=42, all phases wired");
+    println!("[PIPELINE:DIGEST] mark=42 status=verified");
 }

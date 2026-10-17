@@ -1,4 +1,4 @@
-//! Field regression: `rusty-autoclicker` autopsy scenes as permanent tests.
+//! Field regression: postmortem regression scenarios as permanent tests.
 //! Investigation only — the foreign repo is untouched; formulas mirrored.
 
 use snubber::{EnterError, SnubberNode};

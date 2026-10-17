@@ -1,23 +1,19 @@
-//! Closure-capturing self-healing commands behind `alloc`.
+//! Closure-capturing dynamic commands and type-erased rollback slots.
 //!
-//! Core `FaultAction::Custom(fn())` stays `Copy` and heap-free for firmware.
-//! When the binary CAN allocate, this module adds the missing half:
-//! `ClosurePolicy` — a `Box<dyn Fn()>` command with captured context
-//! (driver handle, resubscribe closure, backoff state), executed OUTSIDE
-//! the node lock with the same contract as every hook: fast,
-//! non-panicking, lock-free on real-time paths.
+//! While core `FaultAction::Custom(fn())` remains `Copy` and zero-allocation
+//! for bare-metal firmware, this module provides heap-backed capturing commands
+//! when the `alloc` feature is available.
 //!
-//! Since 0.3 `alloc` rides with `default` (`std = ["alloc"]`): desktop and
-//! server binaries get capturing commands out of the box; `no_std`
-//! firmware opts out with `default-features = false`.
+//! # Components
+//! - [`ClosurePolicy`]: Capturing `Box<dyn Fn() + Send + Sync>` executed outside
+//!   the node lock with non-panicking, real-time safety guarantees.
+//! - [`ErasedGuard`]: Type-erased rollback guard. Generic `SnubberGuard<F>`
+//!   cannot be held directly in struct fields due to unique anonymous closure types.
+//!   `ErasedGuard` boxes the rollback closure once at initialization, exposing a
+//!   concrete, nameable type suitable for long-lived workers and structs.
 //!
-//! Also home of [`ErasedGuard`]: the type-erased rollback slot. Generic
-//! `SnubberGuard<F>` / `TrackedGuard<F>` cannot live in a struct field
-//! (every closure is a different anonymous type — the `HOLD_SLOTS`
-//! registry dance from the field integration proved it). `ErasedGuard`
-//! boxes the rollback once at arming time, then behaves like any guard:
-//! `commit()` disarms, `Drop` rolls back, and it fits in
-//! `struct App { hold: Option<ErasedGuard> }` with zero user registries.
+//! Enabled by default via the `std` feature (`std = ["alloc"]`).
+//! Bare-metal firmware targets opt out via `default-features = false`.
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -25,17 +21,20 @@ extern crate alloc;
 #[cfg(feature = "alloc")]
 use alloc::boxed::Box;
 
-/// Boxed self-healing command with captured context.
+/// Boxed command with captured context.
 ///
 /// ```rust
 /// use snubber::ClosurePolicy;
-/// let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-/// let c = attempts.clone();
+/// use std::sync::atomic::{AtomicU32, Ordering};
+/// use std::sync::Arc;
+///
+/// let counter = Arc::new(AtomicU32::new(0));
+/// let c = counter.clone();
 /// let policy = ClosurePolicy::new(move || {
-///     c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+///     c.fetch_add(1, Ordering::SeqCst);
 /// });
 /// policy.run();
-/// assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+/// assert_eq!(counter.load(Ordering::SeqCst), 1);
 /// ```
 #[cfg(feature = "alloc")]
 pub struct ClosurePolicy {
@@ -44,7 +43,7 @@ pub struct ClosurePolicy {
 
 #[cfg(feature = "alloc")]
 impl ClosurePolicy {
-    /// Box a capturing closure as a node-executed command.
+    /// Boxes a capturing closure as an executable node command.
     pub fn new<F>(f: F) -> Self
     where
         F: Fn() + Send + Sync + 'static,
@@ -52,7 +51,7 @@ impl ClosurePolicy {
         Self { cmd: Box::new(f) }
     }
 
-    /// Execute OUTSIDE the node lock (called by `SnubberNode::emit`).
+    /// Executes the captured command outside the node lock.
     #[inline]
     pub fn run(&self) {
         (self.cmd)();
@@ -66,30 +65,29 @@ impl core::fmt::Debug for ClosurePolicy {
     }
 }
 
-/// Type-erased rollback slot: `Box<dyn FnOnce()>` behind a guard face.
+/// Type-erased rollback guard for struct storage and long-lived tasks.
 ///
-/// Arming erases the closure type ONCE (`Box::new`), so the guard itself
-/// is a concrete, nameable type that fits struct fields, `Option`, `Vec`,
-/// statics — no per-user registries, no task-id plumbing:
+/// Erases the closure type once via heap allocation, providing a concrete,
+/// nameable type that fits into struct fields, collections, and state machines:
 ///
 /// ```rust,no_run
 /// use snubber::{ErasedGuard, SnubberNode};
-/// struct App {
-///     hold: Option<ErasedGuard>, // ← was impossible with TrackedGuard<F>
-/// }
-/// let node = SnubberNode::builder("drv").build();
-/// let mut app = App { hold: None };
-/// app.hold = Some(node.enter_erased(1, 7, || release_all_buttons()).unwrap());
-/// // … thread death here still releases the buttons via Drop …
-/// app.hold.take().map(|g| g.commit()); // clean stop
-/// # fn release_all_buttons() {}
-/// ```
 ///
-/// Semantics mirror [`crate::SnubberGuard`]: `commit()` consumes and
-/// disarms, `abort(reason)` rolls back NOW, `Drop` without settle rolls
-/// back. Requires `alloc` (the box); `no_std` firmware keeps the generic
-/// zero-cost guards.
+/// struct DaemonState {
+///     hold: Option<ErasedGuard>, // Feasible without generic type parameters
+/// }
+///
+/// let node = SnubberNode::builder("worker").build();
+/// let mut state = DaemonState { hold: None };
+///
+/// state.hold = Some(node.enter_erased(1, 1, || release_hardware()).unwrap());
+/// // If the task fails or drops here, hardware is released via Drop.
+/// state.hold.take().map(|g| g.commit()); // Clean completion
+///
+/// # fn release_hardware() {}
+/// ```
 #[cfg(feature = "alloc")]
+#[must_use = "Dropping an ErasedGuard immediately executes rollback! Bind to a named variable: `let _guard = ...`, NEVER use `let _ = ...`"]
 pub struct ErasedGuard {
     rollback: Option<Box<dyn FnOnce() + Send + 'static>>,
     on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
@@ -97,7 +95,7 @@ pub struct ErasedGuard {
 
 #[cfg(feature = "alloc")]
 impl ErasedGuard {
-    /// Box a rollback closure into a nameable guard.
+    /// Creates a type-erased guard owning a single rollback closure.
     pub fn new<F>(rollback: F) -> Self
     where
         F: FnOnce() + Send + 'static,
@@ -108,7 +106,7 @@ impl ErasedGuard {
         }
     }
 
-    /// Box a rollback closure and an optional clean-commit hook.
+    /// Creates a type-erased guard with both a rollback closure and a success-path commit hook.
     pub fn with_commit_hook<R, C>(rollback: R, on_commit: C) -> Self
     where
         R: FnOnce() + Send + 'static,
@@ -120,10 +118,9 @@ impl ErasedGuard {
         }
     }
 
-    /// Success path: disarm the rollback, invoke commit hook if registered, no-op on drop.
+    /// Disarms the rollback, executes the optional commit hook, and consumes the guard.
     ///
-    /// Same `SeqCst` hygiene as [`SnubberGuard`](crate::SnubberGuard): fence
-    /// before the disarm; foreign sharing still needs `Release`/`Acquire`.
+    /// Memory ordering: emits a `SeqCst` fence prior to disarming, matching [`crate::SnubberGuard`].
     #[inline]
     pub fn commit(mut self) {
         let _ = self.rollback.take();
@@ -138,12 +135,11 @@ impl ErasedGuard {
                 on_commit();
             }
         }
+        // Bypass Drop; resources are already explicitly settled
         core::mem::forget(self);
     }
 
-    /// Planned failure path: rollback NOW, then forget.
-    ///
-    /// `SeqCst` fence before the body (same honesty as the core guard).
+    /// Immediately triggers the rollback closure and consumes the guard.
     #[inline]
     pub fn abort(mut self, _reason: &'static str) {
         let _ = self.on_commit.take();
@@ -151,11 +147,14 @@ impl ErasedGuard {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             rollback();
         }
+        // Bypass Drop; rollback has already executed
         core::mem::forget(self);
     }
 
-    /// `true` once settled out-of-band (always `false` here — settling
-    /// consumes; kept for API symmetry with node-tracked guards).
+    /// Returns `true` if the guard has been settled.
+    ///
+    /// Always returns `false` on a live instance since settling consumes `self`.
+    /// Maintained for interface symmetry across guard implementations.
     #[inline]
     #[must_use]
     pub fn is_settled(&self) -> bool {
@@ -167,7 +166,6 @@ impl ErasedGuard {
 impl Drop for ErasedGuard {
     fn drop(&mut self) {
         if let Some(rollback) = self.rollback.take() {
-            // Same `SeqCst` hygiene as the core guard (narrows, not pairs).
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             #[cfg(feature = "std")]
             {

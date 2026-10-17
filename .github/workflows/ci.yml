@@ -11,7 +11,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 1. САНІТАРНИЙ КОНТРОЛЬ: Форматування, кліппі, no_std і документація
+  # 1. QUALITY GATE: Formatting, clippy, no_std, docs
   quality:
     name: Code Quality & no_std Gate
     runs-on: ubuntu-latest
@@ -38,7 +38,7 @@ jobs:
       - name: Validate Documentation Links (cargo doc)
         run: cargo doc --no-deps --all-features
 
-  # 2. КРОСПЛАТФОРМНИЙ ТЕСТОВИЙ ЗАЛП: Linux, Windows, macOS
+  # 2. CROSS-PLATFORM TEST SUITE: Linux, Windows, macOS
   test-matrix:
     name: Test on ${{ matrix.os }}
     needs: quality
@@ -56,7 +56,7 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Run Full Test Suite (125 tests)
+      - name: Run Full Test Suite
         run: cargo test
 
       - name: Verify Release Build Performance
@@ -65,7 +65,7 @@ jobs:
       - name: Run Release Cycle Torture (40,000 transactions)
         run: cargo test --release --test cycle_torture
 
-  # 3. ІНКВІЗИЦІЯ MIRI: Формальна перевірка моделі пам'яті (85 тестів без UB)
+  # 3. MIRI VERIFICATION: Formal memory model verification
   miri:
     name: Miri Memory Model Verification
     needs: quality
@@ -97,7 +97,7 @@ jobs:
           cargo miri test --test memory_boundary
           cargo miri test --test presets
           cargo miri test --test process_died
-          cargo miri test --test armor
+          cargo miri test --test guard_lifecycle
           cargo miri test --test backpressure
           cargo miri test --test input_boundary
           cargo miri test --test policy

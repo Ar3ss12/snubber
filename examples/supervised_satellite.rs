@@ -7,7 +7,7 @@
 //! * `PipeDrain` drains 40-byte tokens in real time (no 64 KB choke);
 //! * worker arms a token, then dies via `std::process::abort()` mid-flight;
 //! * supervisor sees `EOF`, runs the opcode handler, bumps generation,
-//! * a fresh worker re-handshakes at `gen+1, epoch=1` — zombies cut.
+//! * a fresh worker re-handshakes at `gen+1, epoch=1` — stale generation packets rejected.
 
 use snubber::{GenerationClock, PipeDrain, ProcessToken, SnubberNode};
 use std::io::Write;
@@ -45,14 +45,14 @@ fn main() {
         // Emergency release HERE (supervisor side, outside the terminated child).
     }
     assert_eq!(FIRED.load(std::sync::atomic::Ordering::SeqCst), 1);
-    // Path-1: bump generation, fresh worker re-handshakes, zombie cut.
+    // Path-1: bump generation, fresh worker re-handshakes, stale generation rejected.
     let gen2 = clock.restart();
     assert_eq!(gen2, gen + 1);
     let node = SnubberNode::builder("super/satellite").build();
     node.enter_with_generation(gen2, 1, 1, || {})
         .expect("fresh lineage")
         .commit();
-    println!("SUPERVISED: death reaped, token fired, gen={gen2} live");
+    println!("[SUPERVISOR:REAP] exit_status=terminated token_fired=true generation={gen2}");
 }
 
 /// Worker mode: arm ONE token on stdout, die mid-flight (no commit).

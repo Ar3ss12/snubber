@@ -1,4 +1,4 @@
-//! Integration tests for Intercom / Cockpit Protocol (TaskConduit & TaskHandle).
+//! Integration tests for Task Steering Protocol (TaskConduit & TaskHandle).
 
 use core::future::Future;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct PilotState {
+struct WorkerState {
     stage: &'static str,
     progress: u32,
     items: usize,
@@ -16,7 +16,7 @@ struct PilotState {
 
 #[test]
 fn sync_intercom_live_inspection_and_directives() {
-    let (conduit, handle) = TaskConduit::<PilotState>::pair(PilotState::default());
+    let (conduit, handle) = TaskConduit::<WorkerState>::pair(WorkerState::default());
 
     let finished = Arc::new(AtomicBool::new(false));
     let finished_clone = finished.clone();
@@ -78,7 +78,7 @@ fn sync_intercom_live_inspection_and_directives() {
 
 #[test]
 fn sync_intercom_cancel_directive_aborts_immediately() {
-    let (conduit, handle) = TaskConduit::<PilotState>::pair(PilotState::default());
+    let (conduit, handle) = TaskConduit::<WorkerState>::pair(WorkerState::default());
 
     let worker = std::thread::spawn(move || -> Result<(), &'static str> {
         conduit.update_state(|s| s.stage = "Running");
@@ -107,7 +107,7 @@ fn shared_table_draft_handover_between_stages() {
         signature: u64,
     }
 
-    let (conduit, handle) = TaskConduit::<PilotState, MatrixDraft>::pair(PilotState::default());
+    let (conduit, handle) = TaskConduit::<WorkerState, MatrixDraft>::pair(WorkerState::default());
 
     // Stage 1 (Generator): builds draft and places on shared table
     conduit.update_state(|s| s.stage = "GeneratingMatrix");
@@ -129,7 +129,7 @@ fn shared_table_draft_handover_between_stages() {
 
 #[test]
 fn async_intercom_pause_and_resume_waking() {
-    let (conduit, handle) = TaskConduit::<PilotState>::pair(PilotState::default());
+    let (conduit, handle) = TaskConduit::<WorkerState>::pair(WorkerState::default());
 
     let mut fut = Box::pin(conduit.wait_for_resume_async());
     let waker = fake_waker();
@@ -178,7 +178,7 @@ fn fake_waker() -> Waker {
 ///
 /// ```text
 /// struct NoClone; // deliberately NOT Clone
-/// let (c, h) = TaskConduit::<PilotState, NoClone>::pair(...);
+/// let (c, h) = TaskConduit::<WorkerState, NoClone>::pair(...);
 /// let _ = c.clone(); // must compile
 /// ```
 #[test]
@@ -189,7 +189,7 @@ fn intercom_clone_needs_no_payload_bounds() {
     // NOTE: `NoCloneDraft` deliberately does NOT implement `Clone`. If the
     // `Clone` impl on the intercom ever gains `D: Clone` (e.g. via derive),
     // the two `.clone()` lines below stop compiling and this test goes red.
-    let (conduit, handle) = TaskConduit::<PilotState, NoCloneDraft>::pair(PilotState::default());
+    let (conduit, handle) = TaskConduit::<WorkerState, NoCloneDraft>::pair(WorkerState::default());
     // Clone BEFORE any draft exists — exercises the Arc bump only.
     let _conduit2 = conduit.clone();
     let handle2 = handle.clone();

@@ -19,20 +19,20 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 #[must_use = "IGNORING DIRECTIVES INVITES DEADLOCK: match Proceed/Pause/Cancel/SkipStage/Preempted — never drop the verdict sight unseen"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Directive {
-    /// Normal flight: proceed execution.
+    /// Continue execution.
     Proceed,
-    /// Hold engine: pause execution until resumed.
+    /// Pause execution until resumed.
     Pause,
-    /// Abort mission: cancel immediately with a static reason code.
+    /// Cancel execution immediately with a static reason code.
     Cancel(&'static str),
     /// Skip current iteration or stage and jump ahead.
     SkipStage,
-    /// Phase 1 preemption: a `Priority::Critical` admission asked this
-    /// `Background` task to yield its slot NOW. Cooperative (R5 — no
-    /// killer threads): the worker observes this on its next
+    /// Phase 1 preemption: a `Priority::Critical` admission requested this
+    /// `Background` task to yield its slot. Cooperative (R5 — no
+    /// external thread termination): the worker observes this on its next
     /// `check_directive()` / `wait_for_resume_async()` and settles
     /// itself (`abort("preempted")` / `commit` the partial + drop).
-    /// Who never checkpoints is its own enemy — the node never forces.
+    /// Workers must poll cooperative checkpoints periodically; the node does not forcibly preempt.
     Preempted(&'static str),
 }
 

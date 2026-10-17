@@ -315,8 +315,8 @@ impl<T> fmt::Display for SnubberEvent<T> {
 ///   (or a fresh client appeared). The gate re-handshakes on the fly:
 ///   adopts the generation, resets `last_seen` to this epoch, returns
 ///   `true`. No backend restart, no manual epoch reset.
-/// * OLD generation (`header.generation < current`) — a zombie packet from
-///   a dead client surfacing from a queue. Rejected flat, state untouched.
+/// * OLD generation (`header.generation < current`) — a stale packet from
+///   a superseded generation surfacing from a queue. Rejected flat, state untouched.
 /// * SAME generation — classic monotonic check: `epoch > last_seen`.
 ///
 /// Starts at `(0, 0)`; generation `0` is the boot session, epoch `0`
@@ -341,7 +341,7 @@ impl EpochGate {
 
     /// Observe one header. `true` + advance on fresh epochs (or on a
     /// newer generation — re-handshake), `false` + keep state on stale
-    /// or zombie packets.
+    /// packets or superseded generations.
     #[inline]
     pub fn observe(&mut self, header: &TransactionHeader) -> bool {
         if header.generation > self.current_generation {
@@ -420,7 +420,7 @@ const _: () = {
 ///      `commit()` branch, never in a rollback.
 ///
 ///   3. Time-bounded: atomics, `SetEvent`, non-blocking sends. A rollback
-///      that hangs in a driver turns the process into a zombie (see
+///      that hangs in a driver leaves the process in an unkillable hung state (see
 ///      `docs/FUTURE_TRAPS.md` Trap 2) — no crate can preempt kernel.
 ///
 ///   4. Lock-free vs the node: never call back into the same `SnubberNode`
@@ -598,10 +598,10 @@ mod unit_tests {
         );
         assert_eq!(gate.generation(), 1);
         assert_eq!(gate.last_seen(), 1);
-        // Zombie packet from the dead generation surfaces from a queue.
-        let zombie = TransactionHeader::with_generation(0, 1421, 1);
-        assert!(!gate.observe(&zombie), "old generation is a phantom");
-        assert_eq!(gate.last_seen(), 1, "zombie must not move state");
+        // Stale packet from the dead generation surfaces from a queue.
+        let stale = TransactionHeader::with_generation(0, 1421, 1);
+        assert!(!gate.observe(&stale), "old generation is rejected");
+        assert_eq!(gate.last_seen(), 1, "stale packet must not move state");
         // Same-generation duplicates still cut.
         assert!(!gate.observe(&reborn), "replay inside generation cut");
         assert!(gate.observe(&TransactionHeader::with_generation(1, 2, 1)));

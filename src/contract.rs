@@ -5,7 +5,7 @@
 //!   `laser_off` twice is safe; send-money / send-packet twice is NOT.
 //!   Non-idempotent work belongs ONLY in the `commit()` branch.
 //! * MUST be **time-bounded**: atomics, `SetEvent`, non-blocking sends.
-//!   A rollback that hangs in a driver turns the process into a zombie
+//!   A rollback that hangs in a driver leaves the process in an unkillable hung state
 //!   (`docs/FUTURE_TRAPS.md` Trap 2) — no userspace crate preempts kernel.
 //! * MUST be **lock-free vs the node**: never call back into the same
 //!   `SnubberNode` from inside a rollback (open-call rule — re-entrant
@@ -18,10 +18,10 @@
 //!   pairs with NOTHING: a rollback that touches foreign shared state
 //!   MUST publish with `Release` and the observer MUST read with
 //!   `Acquire` (or guard the state with its own primitive).
-//!   `Relaxed` on both ends reads rot.
+//!   `Relaxed` on both ends reads stale or torn data.
 //!
 //! Violate any MUST and the watchdog (meta-guard) will still fire your
-//! rollback twice —nobly, and with witnesses (see `examples/meta_guard.rs`).
+//! rollback twice — deterministically and with telemetry (see `examples/meta_guard.rs`).
 
 /// Assert idempotency in tests: run `f` twice, check the witness.
 ///

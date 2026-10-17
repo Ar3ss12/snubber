@@ -2,7 +2,7 @@
 //!
 //! PATH-1 (spine, 90%): death/hang = reap the process + emit
 //! `SnubberEvent::Aborted { ProcessDied }` + restart at `generation + 1`.
-//! [`EpochGate`](crate::EpochGate) cuts the zombie packets itself.
+//! [`EpochGate`](crate::EpochGate) rejects stale generation packets itself.
 //!
 //! PATH-2 (scalpel, 10%): last-armed 40-byte token over an anonymous
 //! `std::process` pipe (ZERO `unsafe`, ZERO deps).

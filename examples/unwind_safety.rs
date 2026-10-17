@@ -10,7 +10,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 fn main() {
-    println!("--- Unwind Safety: panic mid-flight recovery ---");
+    println!("[UNWIND:START] scenario=panic_recovery");
     static HW: AtomicBool = AtomicBool::new(false);
     static ROLLBACKS: AtomicU32 = AtomicU32::new(0);
 
@@ -21,7 +21,7 @@ fn main() {
         });
         HW.store(true, Ordering::SeqCst);
         // ... 99% of the work happens here ...
-        panic!("remote detonation");
+        panic!("simulated_task_panic");
     });
     let caught = catch_unwind(probe).expect_err("must unwind");
     let msg = caught
@@ -30,15 +30,18 @@ fn main() {
         .or_else(|| caught.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("<non-string panic>");
     assert!(
-        msg.contains("remote detonation"),
+        msg.contains("simulated_task_panic"),
         "wrong panic payload: {msg}"
     );
-    assert!(!HW.load(Ordering::SeqCst), "hardware STUCK after unwind");
+    assert!(
+        !HW.load(Ordering::SeqCst),
+        "hardware retained active state after unwind"
+    );
+    let rollbacks = ROLLBACKS.load(Ordering::SeqCst);
     assert_eq!(
-        ROLLBACKS.load(Ordering::SeqCst),
-        1,
+        rollbacks, 1,
         "rollback must run exactly once, not zero, not twice"
     );
-    println!("ok: panic caught, rollback ran exactly once, hardware clean");
-    println!("SCENARIO 3 PASSED");
+    println!("[UNWIND:RECOVERY] status=clean caught=true rollbacks={rollbacks}");
+    println!("[TEST:RESULT] scenario=unwind_safety status=passed");
 }

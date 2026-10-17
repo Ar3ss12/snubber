@@ -33,7 +33,7 @@ fn test_node_floor_map_anchors_exist() {
 
 /// Every low-level entry must carry the scare-strip pointing at the
 /// canonical worker entry. A newcomer hovering over `enter` in an IDE must
-/// see "prefer enter_erased_auto" before touching the hydraulics.
+/// see "prefer enter_erased_auto" before invoking low-level primitives.
 #[test]
 fn test_low_level_entries_point_at_canonical() {
     let source =

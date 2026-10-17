@@ -1665,7 +1665,7 @@ impl SnubberNode {
     /// but the header carries `generation` from the supervisor's
     /// [`GenerationClock`](crate::GenerationClock): a restarted worker
     /// re-handshakes (`gen+1, epoch=1`) instead of wedging on the dead
-    /// lineage's `last_seen`. Zombies of the old generation are cut by
+    /// lineage's `last_seen`. Packets from previous generations are rejected by
     /// the gate itself. Coordinates are THIS call site.
     #[track_caller]
     pub fn enter_with_generation<F: FnOnce()>(
