@@ -55,7 +55,7 @@ pub struct SnapshotV1 {
     pub committed: u64,
     /// Planned aborts.
     pub explicit_aborts: u64,
-    /// Implicit drops (nuclear: bug/panic path).
+    /// Implicit drops (catastrophic: bug/panic path).
     pub implicit_drops: u64,
     /// Membrane poison cuts.
     pub poisoned_rejected: u64,
@@ -91,7 +91,7 @@ pub struct SnapshotV1 {
 }
 
 impl SnapshotV1 {
-    /// Nuclear breaches (derived, saturating): panic + timeout +
+    /// Catastrophic fault count (derived, saturating): panic + timeout +
     /// process-died reports + implicit drops.
     #[must_use]
     pub fn nuclear_breaches(&self) -> u64 {
@@ -101,25 +101,25 @@ impl SnapshotV1 {
             .saturating_add(self.implicit_drops)
     }
 
-    /// Hydraulic shed: bulkhead + evicted (slow worker, not sick).
+    /// Capacity shedding: bulkhead + evicted (slow worker, not sick).
     #[must_use]
     pub fn shed_bulkhead(&self) -> u64 {
         self.bulkhead_rejections.saturating_add(self.evicted)
     }
 
-    /// Hydraulic shed: cooperative preemptions (own column, never merged).
+    /// Operational shedding: cooperative preemptions (own column, never merged).
     #[must_use]
     pub fn shed_preempted(&self) -> u64 {
         self.preempted
     }
 
-    /// Hydraulic shed: token-bucket spam (own column forever).
+    /// Operational shedding: token-bucket spam (own column forever).
     #[must_use]
     pub fn shed_rate(&self) -> u64 {
         self.rate_rejected
     }
 
-    /// Hydraulic shed: stale / desync cuts.
+    /// Operational shedding: stale / desync cuts.
     #[must_use]
     pub fn shed_stale(&self) -> u64 {
         self.stale_epochs_rejected
@@ -358,11 +358,11 @@ pub enum AnomalyKind {
     Flood,
     /// `shed_stale > 0`: ghost task on a dead epoch/generation.
     Desync,
-    /// `nuclear_breaches > 0`: hull breach — fix the algorithm.
+    /// `nuclear_breaches > 0`: catastrophic failure — algorithmic defect.
     Nuclear,
     /// `shed_preempted / total > flood_pct`: seniors constantly evict
     /// juniors — either the Background lane is starved by design or
-    /// priorities are inverted upstream. Hydraulic, never nuclear.
+    /// priorities are inverted upstream. Operational shedding, never catastrophic.
     PreemptStorm,
 }
 
@@ -586,7 +586,7 @@ pub fn write_health<W: fmt::Write>(
 }
 
 /// Std convenience: print the pulse table to stderr (dev hotkey /
-/// cockpit action). Cold path — snapshot first, render outside the lock.
+/// telemetry console trigger). Cold path — snapshot first, render outside the lock.
 #[cfg(feature = "std")]
 pub fn print_health(node: &'static str, snap: &SnapshotV1, policy: &AnomalyPolicy) {
     let mut buf = StdBuf;

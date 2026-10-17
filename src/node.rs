@@ -28,7 +28,7 @@
 //!      `scoped_checked(params, invariant, rollback, work)` — one call,
 //!      auto-commit on `Ok`, auto-rollback on `Err`/panic.
 //!
-//!   The remaining `enter*` variants are thin hydraulic wrappers over the
+//!   The remaining `enter*` variants are thin low-level wrappers over the
 //!   same `enter_inner` pipeline (explicit epoch / explicit task-id /
 //!   `no_alloc` flavours) — reach for them only when shaving nanoseconds.
 
@@ -196,11 +196,11 @@ pub struct SnubberStats {
 }
 
 impl SnubberStats {
-    /// Nuclear breaches: catastrophic task deaths.
+    /// Catastrophic fault count: unrecoverable task deaths.
     ///
     /// `reported[Panic] + reported[Timeout] + reported[ProcessDied] +
     /// implicit_drops`. Pure snapshot math (`saturating_add`, no lock).
-    /// Grow here = fix the algorithm, the hull is breached.
+    /// Growth here indicates algorithmic defects.
     #[must_use]
     pub fn nuclear_breaches(&self) -> u64 {
         self.reported[FaultKind::Panic.index()]
@@ -209,21 +209,21 @@ impl SnubberStats {
             .saturating_add(self.implicit_drops)
     }
 
-    /// Hydraulic shed: no free bulkhead slot (`BulkheadFull` +
+    /// Capacity shedding: no free bulkhead slot (`BulkheadFull` +
     /// `BufferOverflow` mirror). The worker is slow, not sick.
     #[must_use]
     pub fn shed_bulkhead(&self) -> u64 {
         self.bulkhead_rejections
     }
 
-    /// Hydraulic shed: token-bucket rate limit. External spam, not a bug.
+    /// Operational shedding: token-bucket rate limit. External spam, not a bug.
     /// Kept as its own column forever — never merged with bulkhead.
     #[must_use]
     pub fn shed_rate(&self) -> u64 {
         self.rate_rejected
     }
 
-    /// Hydraulic shed: stale-epoch / desync cuts.
+    /// Operational shedding: stale-epoch / desync cuts.
     #[must_use]
     pub fn shed_stale(&self) -> u64 {
         self.stale_epochs_rejected
@@ -243,7 +243,7 @@ impl SnubberStats {
             .saturating_add(self.poisoned_rejected)
     }
 
-    /// Hydraulic shed: cooperative preemptions (own column, never merged).
+    /// Operational shedding: cooperative preemptions (own column, never merged).
     /// `Critical` admissions that asked pure-`Background` to yield.
     #[must_use]
     pub fn shed_preempted(&self) -> u64 {
@@ -391,7 +391,7 @@ pub const DEFAULT_POLICIES: [FaultPolicy; FaultKind::COUNT] = [
         "process_deaths_total",
     ),
     // Preempted — cooperative yield to a Critical admission (Phase 1).
-    // Hydraulic, never nuclear: the node is healthy, the junior yielded.
+    // Capacity shedding, never catastrophic: the node is healthy, the junior yielded.
     // Debug-quiet, counted in its own column, never trips the breaker.
     FaultPolicy::arm(
         FaultAction::DiscardSilently,
@@ -1488,7 +1488,7 @@ impl SnubberNode {
         // a failure is a failure whoever names it). Guard-implicit kinds
         // (ImplicitDrop) are counted by settle_implicit, not here — so
         // `report(ImplicitDrop)` never double-feeds. Single source of
-        // truth: `FaultKind::is_catastrophic` (nuclear vs hydraulic).
+        // truth: `FaultKind::is_catastrophic` (catastrophic vs shedding).
         let feeds_streak = kind.is_catastrophic() && !matches!(kind, FaultKind::ImplicitDrop);
         if feeds_streak {
             inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
@@ -1539,7 +1539,7 @@ impl SnubberNode {
 }
 
 impl SnubberNode {
-    // [ANCHOR: LOW_LEVEL_ENTRY] — thin hydraulic wrappers: explicit epoch /
+    // [ANCHOR: LOW_LEVEL_ENTRY] — thin low-level wrappers: explicit epoch /
     // explicit task-id / no_alloc flavours over the same enter_inner.
     /// ⚠️ *Low-level primitive.* If you are building a background worker or
     /// daemon, prefer the canonical [`Self::enter_erased_auto`].
@@ -1623,7 +1623,7 @@ impl SnubberNode {
     /// Ask the `Background` occupants to yield (Phase 1, cooperative).
     ///
     /// Sets `preempt_requested` + counts one `Preempted` (own column,
-    /// hydraulic, never trips the breaker) when the node holds ONLY
+    /// operational shedding, never trips the breaker) when the node holds ONLY
     /// `Background` guards. Otherwise a no-op returning `false`.
     /// The caller (a `Critical` admission path) releases the lock and
     /// retries — victims settle themselves via their own conduits.
@@ -3029,7 +3029,7 @@ impl SnubberNode {
             }
             FaultAction::TripBreaker => {
                 // Policy trip honors the OFF switch: `trip_after_failures(0)`
-                // + `failure_window(0)` = breaker fully disabled (torture /
+                // + `failure_window(0)` = breaker fully disabled (heavy stress /
                 // server nodes). A policy that trips while disabled would
                 // isolate a node that asked for no isolation — the "1 of
                 // 40000" trap: 416 Panic reports with default TripBreaker

@@ -112,7 +112,7 @@ impl DeathCause {
 ///
 /// Plain `Copy` data — no logic lives here. The [`RestartTracker`]
 /// interprets it against the storm window:
-/// * `Never` — one-shot tasks (export, migration): the corpse stays.
+/// * `Never` — one-shot tasks (export, migration): no re-spawn.
 /// * `OnCrash` — clean `exit(0)` is a planned landing (no restart);
 ///   any other death (`exit(1)`, segfault, `TerminateProcess`,
 ///   `HangTimeout`) is a crash worth one reanimation.
@@ -608,7 +608,7 @@ const _: () = {
 /// `[seq u64 | chunk | crc u32]` where chunk = 28/28/8 digest bytes.
 /// Frame CRC covers its own chunk; full-digest CRC verified on
 /// reassembly. Torn frames dropped — heir gets the last WHOLE
-/// passport or nothing, never a half-chewed corpse.
+/// passport or nothing, never a corrupt fragment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StateDigest {
     /// Opaque state bytes (user-packed, user-read).

@@ -1,7 +1,7 @@
-//! Bidirectional Intercom / Cockpit Protocol between Caller and Callee.
+//! Bidirectional Intercom / Task Steering Protocol between Caller and Callee.
 //!
 //! Separates execution into two roles:
-//! * **[`TaskConduit`] (Worker / Callee / Pilot):** operates inside the running function,
+//! * **[`TaskConduit`] (Worker / Callee):** operates inside the running function,
 //!   publishes live state updates, probes directives, and can sleep/resume or hand over drafts.
 //! * **[`TaskHandle`] (Caller / Observer / Controller):** inspects state snapshots on demand,
 //!   issues runtime directives (`Pause`, `Cancel`, `SkipStage`), and reads drafts.
@@ -51,7 +51,7 @@ struct IntercomInner<S, D> {
     wakers: Mutex<Vec<Waker>>,
 }
 
-/// The worker's cockpit gateway inside the executing task.
+/// The worker's task conduit gateway inside the executing task.
 ///
 /// `S`/`D` carry NO `Clone` bound here on purpose: sharing the intercom
 /// (cloning the inner `Arc`) must work for any payload, including

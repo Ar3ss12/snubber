@@ -59,8 +59,8 @@ pub enum FaultKind {
     /// preemption): a `Priority::Critical` entry asked for a slot held
     /// only by `Priority::Background` work. The victim observes
     /// `Directive::Preempted` on its `TaskConduit` and settles itself
-    /// (abort/drop); the newcomer is counted here. Hydraulic shedding,
-    /// never nuclear — the node is healthy, the junior yielded.
+    /// (abort/drop); the newcomer is counted here. Capacity shedding,
+    /// never catastrophic — the node is healthy, the junior yielded.
     Preempted,
 }
 
@@ -103,13 +103,13 @@ impl FaultKind {
         Self::Preempted,
     ];
 
-    /// Nuclear (hull-breach) vs hydraulic (pressure-shedding) contour.
+    /// Catastrophic fault vs capacity-shedding contour.
     ///
     /// * `true` — catastrophic: the task died anomalously
     ///   (`Panic`, `Timeout`, `ProcessDied`) or the transaction was
     ///   abandoned without settle (`ImplicitDrop` — silent panic / `?` /
     ///   forgotten `commit`). Feeds the breaker streak, may isolate.
-    /// * `false` — hydraulic shedding / entry hygiene: the node is healthy
+    /// * `false` — operational shedding / entry hygiene: the node is healthy
     ///   and holding the perimeter (`BulkheadFull`, `BufferOverflow`,
     ///   `EvictedOldest`, `StaleEpoch`, `BreakerOpen`, `RateLimited`
     ///   mapped onto bulkhead counters), or the input/wire was at fault
