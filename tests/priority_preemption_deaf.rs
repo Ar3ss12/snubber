@@ -1,9 +1,9 @@
-//! IRON PROOF: deaf background never forced by Critical.
+//! Priority preemption verification: non-responsive background worker is never forcibly evicted.
 //!
-//! Background holds the only slot and NEVER polls its conduit
-//! (no checkpoint — its own enemy, R5). Critical knocks 5x: every
-//! knock bounces `BulkheadFull`, exactly ONE `Preempted` is filed,
-//! the flag stays up until the deaf worker settles itself, then the
+//! Background holds the only slot and does not poll its conduit
+//! (no checkpoint — cooperative yield model). Critical knocks 5x: every
+//! knock returns `BulkheadFull`, exactly ONE `Preempted` request is recorded,
+//! the flag stays up until the background worker settles itself, then the
 //! retry is admitted. No deadlock, no forced eviction, books balance.
 
 use snubber::{EnterError, Priority, SnubberNode};

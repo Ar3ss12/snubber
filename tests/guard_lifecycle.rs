@@ -1,4 +1,4 @@
-//! Node tests G: armor audit — slot lifecycle on every exit path,
+//! Node tests: guard and slot lifecycle on every exit path,
 //! re-entrant hooks (open-call, no deadlock), generation re-handshake
 //! through the node. Public API only.
 

@@ -1,4 +1,4 @@
-//! Cockpit / Intercom Protocol: Two-way communication between caller and worker.
+//! Task Conduit Steering Protocol: Two-way communication between caller and worker.
 //!
 //! Demonstrates:
 //! - Worker (`TaskConduit`) reporting live telemetry state & stage.
@@ -8,7 +8,7 @@
 //!
 //! Run with:
 //! ```powershell
-//! cargo run --example cockpit_intercom
+//! cargo run --example task_conduit_steering
 //! ```
 
 use snubber::{Directive, TaskConduit};

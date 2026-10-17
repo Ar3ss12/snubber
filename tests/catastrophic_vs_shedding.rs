@@ -1,22 +1,22 @@
-//! Nuclear vs hydraulic: shed never trips the breaker, nuclear does.
+//! Catastrophic vs capacity shedding: shed never trips the breaker, catastrophic faults do.
 //!
 //! Pins the approved contour: `FaultKind::is_catastrophic` is the single
 //! source of truth for `report()` streak feeding. `ImplicitDrop` is
-//! nuclear but owned by `settle_implicit` (no double-feed via `report`).
+//! catastrophic but owned by `settle_implicit` (no double-feed via `report`).
 //! `ChannelDisconnected` is operational shedding (graceful drain, not unrecoverable failure).
 
 use snubber::{BreakerState, FaultKind, SnubberNode, TransactionHeader};
 
 #[test]
 fn catastrophic_table_pins_every_variant() {
-    let nuclear = [
+    let catastrophic_faults = [
         FaultKind::ImplicitDrop,
         FaultKind::Panic,
         FaultKind::Timeout,
         FaultKind::ProcessDied,
     ];
     for kind in FaultKind::ALL {
-        let expect = nuclear.contains(&kind);
+        let expect = catastrophic_faults.contains(&kind);
         assert_eq!(
             kind.is_catastrophic(),
             expect,
@@ -75,8 +75,8 @@ fn shed_never_trips_breaker() {
 }
 
 #[test]
-fn nuclear_trips_breaker() {
-    let node = SnubberNode::builder("nuclear")
+fn catastrophic_faults_trip_breaker() {
+    let node = SnubberNode::builder("catastrophic")
         .trip_after_failures(3)
         .build();
     node.report(FaultKind::Panic, 1, 1);
@@ -84,17 +84,21 @@ fn nuclear_trips_breaker() {
     node.report(FaultKind::ProcessDied, 3, 3);
     let s = node.stats();
     assert_eq!(s.nuclear_breaches(), 3);
-    assert_ne!(s.breaker_state, BreakerState::Closed, "3 nuclear must trip");
+    assert_ne!(
+        s.breaker_state,
+        BreakerState::Closed,
+        "3 catastrophic faults must trip"
+    );
     assert!(s.breaker_trips >= 1);
     assert_eq!(s.poison_recoveries, 0);
 
     // Implicit drops feed the streak via settle (guard path).
-    let node2 = SnubberNode::builder("implicit_nuclear")
+    let node2 = SnubberNode::builder("implicit_catastrophic")
         .trip_after_failures(3)
         .build();
     for i in 1..=3u64 {
         let g = node2.enter(i, i, || {}).expect("admit");
-        drop(g); // implicit drop: nuclear via settle_implicit
+        drop(g); // implicit drop: catastrophic via settle_implicit
     }
     let s2 = node2.stats();
     assert_eq!(s2.implicit_drops, 3);
@@ -103,7 +107,7 @@ fn nuclear_trips_breaker() {
 }
 
 #[test]
-fn channel_disconnect_is_hydraulic() {
+fn channel_disconnect_is_operational_shedding() {
     let node = SnubberNode::builder("graceful_drain")
         .trip_after_failures(3)
         .build();
