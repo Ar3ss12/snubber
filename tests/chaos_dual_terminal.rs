@@ -22,7 +22,10 @@ fn chaos_dual_terminal_system_kill_test() {
         .args(["build", "--example", "process_termination_loop"])
         .status()
         .expect("cargo build --example process_termination_loop");
-    assert!(status.success(), "failed to build process_termination_loop example");
+    assert!(
+        status.success(),
+        "failed to build process_termination_loop example"
+    );
 
     let kills: u32 = std::env::var("CHAOS_KILLS")
         .ok()
