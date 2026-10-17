@@ -4,22 +4,21 @@ version = "0.5.0"
 edition = "2021"
 rust-version = "1.70"
 license = "MIT OR Apache-2.0"
-description = "Ultra-light transactional damper and RAII boundary shim: Drop-guaranteed rollback, monotonic-epoch ordering, bulkheads, circuit breaker and flight-recorder diagnostics."
+description = "Transactional safety fuse and failure-recovery engine for Rust: Drop-guaranteed rollback, monotonic-epoch ordering, bulkheads, circuit breaker and flight-recorder diagnostics."
 readme = "README.md"
 repository = "https://github.com/Ar3ss12/snubber"
 documentation = "https://docs.rs/snubber"
 keywords = ["transactions", "guard", "raii", "epoch", "bulkhead"]
 categories = ["concurrency", "no-std", "data-structures"]
 exclude = [
-    "chaos_sniper.ps1",
-    "chaos_sniper.sh",
+    "stress_harness.ps1",
+    "stress_harness.sh",
     "AGENTS.md",
     "tech.md",
     "docs/DECISION_MATRIX.md",
     "docs/FUTURE_TRAPS.md",
     "docs/WATCHDOG_PLAN.md",
     "docs/RUSTY_AUTOCLICKER_ISSUES.md",
-    "docs/RUSTY_AUTOCLICKER_COMBINED_ISSUE.md",
     "assets/",
 ]
 

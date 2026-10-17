@@ -6,13 +6,13 @@
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
 [![Tests](https://img.shields.io/badge/tests-188%20passed-brightgreen.svg)]()
 
-> **Transactional safety fuse and boundary shim for Rust.**  
-> Guarantees that if your function fails — through a panic, a `?` early return, or process death — your hardware, database transactions, or memory resources automatically reset to a safe state via `Drop`.
+> **Transactional safety fuse and failure-recovery engine for Rust.**  
+> Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
 
-Zero external dependencies. `#![forbid(unsafe_code)]`. Works everywhere from bare-metal firmware (`core`-only) to high-throughput servers (`std`).
+Zero external dependencies. `#![forbid(unsafe_code)]`. Compatible from bare-metal embedded firmware (`core`-only) to high-throughput multi-threaded servers (`std`).
 
 <p align="center">
-  <img src="assets/demo.gif" alt="snubber Chaos Monkey Terminal Demo" width="480"/>
+  <img src="assets/demo.gif" alt="snubber Terminal Stress Demo" width="480"/>
 </p>
 
 ---
@@ -22,7 +22,7 @@ Zero external dependencies. `#![forbid(unsafe_code)]`. Works everywhere from bar
 Add to `Cargo.toml`:
 ```toml
 [dependencies]
-snubber = "0.1"
+snubber = "0.5"
 ```
 
 Wrap critical work in **`scoped`** — commits on `Ok`, automatically rolls back on `Err` or `panic!`:
@@ -45,16 +45,16 @@ let receipt = node.scoped_checked(
 
 ---
 
-## 🛡️ Why snubber?
+## 🛡️ Architecture & Guarantees
 
-* **Zero-Boilerplate Rollback:** No manual token tracking. Scoped executions auto-commit on success and trigger RAII cleanup on any failure.
-* **Pure Iron Latency:** Floor 1 stack guard costs **~1.5 ns**. Full concurrency node processes over **13.8M ops/sec** (`1e9 / 72.6 ns`).
-* **Zero External Dependencies:** Built strictly on `core` and `std`. Floor 1 adds **+0 bytes** to executable size; complete node adds only **3.3 KiB** of machine code.
-* **Newton's 3rd Law (Backpressure):** Refusals carry physical telemetry (`retry_after_ms`, `depth 0..255`) so callers pace themselves instead of hammering dead hardware.
-* **Zero-Runtime Async:** Bounded waker queue at **0% CPU** without pulling in the Tokio runtime or spinning.
-* **10,000 OS Kills Tested:** Verified by automated Chaos Monkey surviving 10,000 hard Windows `TerminateProcess` (`kill -9`) executions with zero pipe deadlocks and 100% token rescue.
-* **Nuclear vs Hydraulic Telemetry:** `FaultKind::is_catastrophic()` splits hull-breach faults (Panic/Timeout/ProcessDied/ImplicitDrop) from pressure shedding (bulkhead/rate/stale/drain) — shed never trips the breaker. Flight recorder keeps the last 16 fault codes, passive `TelemetrySink` shouts outside the lock.
-* **Cold Diagnostics (zero-dep):** 512 B `SnapshotV1` codec (`SNUB` magic + CRC32, app-owned flush thread — see `examples/persist_snapshot.rs`), pure `find_anomalies()` over cached snapshots, `assert_no_anomalies!()` CI gate, `print_health()` pulse table, `diagnostic_line()` one-liner for bug reports (`[DIAG 0x8FA3 ...]`), explicit `NodeRegistry` board (never a `static`).
+* **Zero-Boilerplate RAII Rollback:** No manual token tracking. Scoped executions auto-commit on success and guarantee resource release via `Drop` on panics, errors, or early returns.
+* **Sub-Nanosecond Overhead:** Base stack guard costs **~1.5 ns** and adds **+0 bytes** to executable size. Concurrency-limited nodes process over **13.8M ops/sec** (`core`-only / `std`).
+* **Strict Determinism:** `#![forbid(unsafe_code)]`, zero external dependencies. Predictable behavior across bare-metal microcontrollers and multi-socket servers alike.
+* **Runtime-Agnostic Async:** Bounded waker queue built on `core::task::Waker` consuming **0% CPU** without depending on Tokio, async-std, or background threads.
+* **Adaptive Backpressure & Pacing:** Refusals carry physical telemetry (`retry_after_ms`, queue depth 0..255) allowing clients to pace incoming traffic instead of overwhelming dead hardware.
+* **Out-of-Process Crash Recovery:** Automated stress harness verifies resilience through 10,000 hard Windows `TerminateProcess` (`kill -9`) executions with zero pipe deadlocks and 100% token rescue.
+* **Isolated Error Domains:** `FaultKind::is_catastrophic()` cleanly separates unrecoverable failures (Panic, Timeout, ProcessDied, ImplicitDrop) from routine capacity shedding (bulkhead limits, rate limits, stale epochs). Shedding pressure never trips circuit breakers.
+* **Zero-Allocation Telemetry:** 512-byte diagnostic snapshots with CRC32 integrity, zero heap allocations on the hot path, and CI validation via `assert_no_anomalies!()`.
 
 ---
 
@@ -64,31 +64,38 @@ Measured on AMD Ryzen 5 4600H release build
 (`cargo bench --bench admission_bench`, Criterion: 800 ms warmup,
 2 s measurement, 50 samples, isolated node per bench):
 
-| Operation | Level | Average Latency | Notes |
+| Operation | Architecture Layer | Average Latency | Notes |
 |---|---|---|---|
-| `SnubberGuard::new` + `commit` | Floor 1 (`core`) | **~1.5 ns** | Pure stack move, zero heap allocation |
-| `EpochGate::observe` | Floor 1 (`core`) | **~2.6 ns** | 2-D generation + monotonic epoch filter |
-| `node.enter + commit` | Floor 2 (`std`) | **~72.6 ns** | Full bulkhead, circuit breaker, auto-commit |
-| `node.enter_auto + commit` | Floor 2 (`std`) | **~86.5 ns** | + atomic sequence minting |
-| `node.enter_with_priority(Critical)` | Floor 2 (`std`) | **~73.6 ns** | Priority lane: +1 ns over plain enter |
-| `node.transition` | Floor 2 (`std`) | **~86.5 ns** | ONE-enum state machine, no flag drift |
-| `node.transition_checked` + `LegalMove` | Floor 2 (`std`) | same + 0 ns | Closed graphs: illegal ribs die at compile (E0277) |
-| `enter_erased_auto` | Floor 3 (`alloc`) | **~85.6 ns** | Boxed rollback for struct fields |
-| `enter_async_auto` | Floor 2 (`std`) | **0% CPU** | Pure `core::task::Waker` parking, no runtime deps |
+| `SnubberGuard::new` + `commit` | Layer 1 (`core`) | **~1.5 ns** | Pure stack move, zero heap allocation |
+| `EpochGate::observe` | Layer 1 (`core`) | **~2.6 ns** | 2-D generation + monotonic epoch filter |
+| `node.enter + commit` | Layer 2 (`std`) | **~72.6 ns** | Full bulkhead, circuit breaker, auto-commit |
+| `node.enter_auto + commit` | Layer 2 (`std`) | **~86.5 ns** | + atomic sequence minting |
+| `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~73.6 ns** | Priority lane: +1 ns over plain enter |
+| `node.transition` | Layer 2 (`std`) | **~86.5 ns** | ONE-enum state machine, zero flag drift |
+| `node.transition_checked` + `LegalMove` | Layer 2 (`std`) | same + 0 ns | Closed state graphs: illegal moves fail at compile time (E0277) |
+| `enter_erased_auto` | Layer 2 (`alloc`) | **~85.6 ns** | Boxed rollback for dynamic struct fields |
+| `enter_async_auto` | Layer 3 (`std`) | **0% CPU** | Pure `core::task::Waker` parking, no runtime deps |
 
 ---
 
-## 📖 Documentation
+## 📖 Documentation & Architecture Layers
 
-* 📘 **[User Guide (`docs/USER_GUIDE.md`)](docs/USER_GUIDE.md)** — Complete developer guide:
-  * **Level 0:** Universal Ergonomics (`scoped`, `scoped_checked`, `scoped_sealed` + `ScopeToken`, `transition`, `transition_checked` + `LegalMove`, `StaticNode`, `Protected`, `snub_check!`, `SnubberError<E>`)
-  * **Level 1:** Single function RAII rollback & `EpochGate`
-  * **Level 2:** Daemon protection (`SnubberNode`, presets, token buckets, sliding-window breakers, `Priority` preemption, `gateway` checkpoint)
-  * **Level 3:** Runtime-agnostic async (`enter_async_auto`, `settle_async`, `enter_paced_async`, `checkpoint`)
-  * **Level 4:** Cockpit Protocol (2-way live telemetry, pause/resume wakers, draft table)
-  * **Level 5:** Out-of-process supervisor (`b"SNUB"` framed tokens, `PipeDrain`, generation bumps, `RestartTracker`, `StateDigest` handoff, `OrphanGuard`)
-  * **Level 6:** Cold diagnostics (nuclear vs hydraulic, `app.snub`, `assert_no_anomalies!`, `[DIAG 0x…]`)
-* 🧪 **Patterns, not frameworks:** `examples/hot_standby.rs` (N+1 shadow pool), `examples/orphan_guard.rs` (Win32 Job Objects recipe), `examples/cockpit_intercom.rs` (intercom steering)
+* 📘 **[Invariants & Verification Protocol (`docs/INVARIANTS.md`)](docs/INVARIANTS.md)** — Formal mathematical guarantees, admission conservation, zero slot leak proofs.
+* 📘 **[User Guide (`docs/USER_GUIDE.md`)](docs/USER_GUIDE.md)** — Comprehensive architecture manual:
+  * **Layer 1: Core RAII Guard:** Stack rollback, `EpochGate`, and universal ergonomics (`scoped`, `scoped_checked`, `snub_check!`).
+  * **Layer 2: Concurrency Bulkhead:** `SnubberNode`, presets, token buckets, sliding-window breakers, and priority preemption.
+  * **Layer 3: Async Waker Queue:** Runtime-agnostic async execution (`enter_async_auto`, `settle_async`, `enter_paced_async`).
+  * **Layer 4: Process Supervisor:** Out-of-process process supervisor, framed IPC tokens, `PipeDrain`, and generation bumps.
+  * **Layer 5: Diagnostics & Health:** Zero-allocation telemetry, `SnapshotV1`, anomaly detection, and CI verification gates.
+
+---
+
+## 🧪 Production Patterns
+
+* **[Hardware Fuse (`examples/pattern_hardware_fuse.rs`)](examples/pattern_hardware_fuse.rs):** Zero-allocation physical interlock safety.
+* **[Worker Daemon (`examples/pattern_worker_daemon.rs`)](examples/pattern_worker_daemon.rs):** Autonomous slot claiming for background workers.
+* **[Database Bulkhead (`examples/pattern_database_bulkhead.rs`)](examples/pattern_database_bulkhead.rs):** Concurrency limits and adaptive backpressure.
+* **[Process Supervisor (`examples/pattern_process_supervisor.rs`)](examples/pattern_process_supervisor.rs):** Surviving abnormal child process termination (`kill -9`).
 
 ---
 
