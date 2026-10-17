@@ -17,12 +17,12 @@ fn chaos_dual_terminal_system_kill_test() {
         let _ = std::fs::remove_file(report_file);
     }
 
-    // Ensure the chaos_satellite example is compiled
+    // Ensure the process_termination_loop example is compiled
     let status = Command::new("cargo")
-        .args(["build", "--example", "chaos_satellite"])
+        .args(["build", "--example", "process_termination_loop"])
         .status()
-        .expect("cargo build --example chaos_satellite");
-    assert!(status.success(), "failed to build chaos_satellite example");
+        .expect("cargo build --example process_termination_loop");
+    assert!(status.success(), "failed to build process_termination_loop example");
 
     let kills: u32 = std::env::var("CHAOS_KILLS")
         .ok()
@@ -39,7 +39,7 @@ fn chaos_dual_terminal_system_kill_test() {
     {
         // 1. Spawn Terminal 1: Supervisor Instance
         let cmd1 = format!(
-            "$host.UI.RawUI.WindowTitle = 'SNUBBER SUPERVISOR (TERMINAL 1)'; cargo run --example chaos_satellite -- --target-kills {} --report-path {}",
+            "$host.UI.RawUI.WindowTitle = 'SNUBBER SUPERVISOR (TERMINAL 1)'; cargo run --example process_termination_loop -- --target-kills {} --report-path {}",
             kills, report_file
         );
         let mut term1 = Command::new("powershell")
@@ -59,7 +59,7 @@ fn chaos_dual_terminal_system_kill_test() {
 
         // 2. Spawn Terminal 2: Process Killer Harness
         let cmd2 = format!(
-            "powershell -ExecutionPolicy Bypass -File .\\stress_harness.ps1 -TargetProcess chaos_satellite -Kills {}",
+            "powershell -ExecutionPolicy Bypass -File .\\stress_harness.ps1 -TargetProcess process_termination_loop -Kills {}",
             kills
         );
         let mut term2 = Command::new("powershell")
@@ -83,7 +83,7 @@ fn chaos_dual_terminal_system_kill_test() {
             .args([
                 "run",
                 "--example",
-                "chaos_satellite",
+                "process_termination_loop",
                 "--",
                 "--target-kills",
                 &kills.to_string(),
@@ -99,7 +99,7 @@ fn chaos_dual_terminal_system_kill_test() {
         let mut killer = Command::new("bash")
             .args([
                 "stress_harness.sh",
-                "chaos_satellite",
+                "process_termination_loop",
                 &kills.to_string(),
                 "0.001",
             ])
