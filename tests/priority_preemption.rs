@@ -37,6 +37,7 @@ fn critical_preempts_pure_background_cooperatively() {
     // Wave 1: Background holds the single slot, checkpoints its conduit.
     let (conduit, handle) = TaskConduit::<u64>::pair(0);
     let n_bg = Arc::clone(&node);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
     let bg = std::thread::spawn(move || {
         ATTEMPTS.fetch_add(1, Ordering::SeqCst);
         match n_bg.enter_with_priority(Priority::Background, 1, 1, || {
@@ -45,14 +46,8 @@ fn critical_preempts_pure_background_cooperatively() {
             Ok(guard) => {
                 STARTED.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(guard.priority(), Priority::Background);
-                let mut ticks = 0u32;
+                let _ = started_tx.send(());
                 loop {
-                    ticks = ticks.saturating_add(1);
-                    if ticks > 10_000 {
-                        guard.commit();
-                        SETTLED.fetch_add(1, Ordering::SeqCst);
-                        return;
-                    }
                     match conduit.check_directive() {
                         Directive::Preempted(_) | Directive::Cancel(_) => {
                             guard.abort("preempted");
@@ -60,7 +55,7 @@ fn critical_preempts_pure_background_cooperatively() {
                             SETTLED.fetch_add(1, Ordering::SeqCst);
                             return;
                         }
-                        _ => std::thread::yield_now(),
+                        _ => std::thread::sleep(std::time::Duration::from_millis(1)),
                     }
                 }
             }
@@ -68,12 +63,9 @@ fn critical_preempts_pure_background_cooperatively() {
         }
     });
 
-    for _ in 0..500 {
-        if node.lane_in_flight() == [1, 0, 0] {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("background started in time");
     assert_eq!(node.lane_in_flight(), [1, 0, 0]);
 
     // Wave 2: Critical knocks — files the request + bounces, then the
