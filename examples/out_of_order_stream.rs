@@ -1,11 +1,10 @@
-//! Torture scenario 1: "Drunk dispatcher".
+//! Stream ordering scenario: "Out-of-order dispatcher".
 //!
-//! 10 threads fire epochs 1..=50 through one channel with LCG jitter.
-//! The compiler sees perfect types + Send; the runtime delivers pure mush.
-//! [`snubber::EpochGate`] must let through exactly the increasing
-//! subsequence — nothing stale.
+//! 10 threads fire epochs 1..=50 through one channel with random jitter.
+//! The compiler sees valid types + Send; the runtime delivers shuffled ordering.
+//! [`snubber::EpochGate`] admits strictly the increasing subsequence — no stale frames.
 //!
-//! Run: `cargo run --example torture_drunk_dispatcher`
+//! Run: `cargo run --example out_of_order_stream`
 
 #[path = "common/mod.rs"]
 mod common;

@@ -97,7 +97,7 @@ torture/stress test MUST assert:
 
 `tests/cycle_torture.rs` (CAMP 1, reflexes OFF) + `tests/reflex_breaker.rs`
 + `tests/reflex_bulkhead.rs` (CAMP 2, reflexes ON) are the reference shape.
-`field_rusty.rs::hotkey_flap` (`admitted == 100` + `stale == 100`) is the
+`input_boundary.rs::hotkey_flap` (`admitted == 100` + `stale == 100`) is the
 small-scale shape. Copy them, do not invent quieter ones.
 
 ## 5. Invariants: hard math, never debug_assert
@@ -291,3 +291,22 @@ Radius: snubber guards a SYNCHRONOUS perimeter with unwinding
   Inside the fallen process you are powerless; survival is ONLY an
   external daemon + shared-memory heartbeat that releases iron from
   outside. Do not sell the knife as a spaceship.
+
+## 14. 🚫 Anti-Pattern & Tone Contract: Zero-Theatrics Policy
+
+### 1. Заборона на підлітковий "Grimdark" та кітч (No Edge-Lord Naming)
+- **СУВОРО ЗАБОРОНЕНО** використовувати анатомічні, криваві або хоррор-метафори в назвах файлів, функцій, прикладів, коммітів та документації (`aorta`, `blood`, `autopsy`, `corpse`, `flesh`, `meat`, `deathmatch`).
+- **СУВОРО ЗАБОРОНЕНО** іменувати стрес-тести або верифікаційні стенди як гладіаторські бої (`Gauntlet`, `Thunderdome`, `Arena`, `Gladiator`).
+- **Стандарт:** Мова документації та прикладів має відповідати стандартам авіоніки, баз даних та ядра Linux/SQLite:
+  - Замість `torture_ruptured_aorta` → `heavy_pipeline_stress`
+  - Замість `field_rusty_autopsy` → `flight_recorder_diagnostics`
+  - Замість `Gauntlet` → `Formal Invariant Verification` / `INVARIANTS.md`
+
+### 2. Заборона на фальшиві фічі та привласнення std (No Bogus Patterns)
+- **СУВОРО ЗАБОРОНЕНО** видавати можливості стандартної бібліотеки Rust (`std::sync::Mutex`, `PoisonError::into_inner()`, `std::panic::catch_unwind`) за унікальні винаходи чи фічі `snubber` (як-от псевдо-патерни "Snubber SafeLock").
+- Кожен приклад в `examples/` зобов'язаний вирішувати реальну практичну проблему суто через публічні примітиви `snubber` (`SnubberGuard`, `SnubberNode`, `scoped`, `TaskConduit`, `Supervisor`).
+
+### 3. Тон комунікації: Інженерна Тверезість (Quiet Power)
+- `snubber` — це критичний інфраструктурний запобіжник. Сила бібліотеки доводиться 176+ зеленими тестами, детермінованим фаззером на 1 МБ шуму та апаратними бар'єрами, а не знаками оклику чи зухвалими заявами «Зламай нас, якщо зможеш».
+- Тон документації — стриманий, точний, важкий, практичний.
+

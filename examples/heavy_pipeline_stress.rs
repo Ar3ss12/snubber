@@ -1,17 +1,17 @@
-//! Torture scenario 2: "Ruptured aorta".
+//! Pipeline Stress Scenario: Broken consumer channel.
 //!
-//! Backend clamps virtual hardware (atomic flag), then the UI drops its
-//! `Receiver` (crashed WebView / pulled cable). `send` fails with
-//! `SendError`, the `?` bails early — `Drop` must release the hardware.
+//! Backend clamps hardware resource, then the receiving end drops unexpectedly
+//! (crashed worker / closed connection). `send` fails with `SendError`, the `?`
+//! returns early — RAII `Drop` must guarantee the resource is safely released.
 //!
-//! Run: `cargo run --example torture_ruptured_aorta`
+//! Run: `cargo run --example heavy_pipeline_stress`
 
 use snubber::SnubberGuard;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 fn main() {
-    println!("--- scenario 2: ruptured aorta (receiver dropped mid-action) ---");
+    println!("--- Pipeline Stress: broken channel recovery ---");
     static HW: AtomicBool = AtomicBool::new(false);
 
     fn backend(tx: mpsc::Sender<u32>) -> Result<(), mpsc::SendError<u32>> {

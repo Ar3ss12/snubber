@@ -1,13 +1,12 @@
-//! Field autopsy of `rusty-autoclicker` logic, mirrored 1:1 (copied formulas,
-//! NOT a dependency on their crate — investigation only, their code untouched).
+//! Flight recorder diagnostics and input boundary validation.
 //!
-//! Four combat scenes, each mapping to a dossier diagnosis:
-//! * D-3 zero interval flood      -> `InvariantBreach`, zero clicks reach core
-//! * D-2 hour=99999 clock poison  -> `InvariantBreach` BEFORE `checked_sub.unwrap()`
-//! * D-4 50 Hz hotkey flapping    -> front edge passes, duplicates cut by gate
-//! * D-1 hold + abort             -> rollback releases the button exactly once
+//! Four production scenarios demonstrating edge validation and deterministic recovery:
+//! * Scenario 1: Zero interval flood       -> `InvariantBreach`, zero events reach core
+//! * Scenario 2: Clock overflow prevention  -> `InvariantBreach` caught at membrane boundary
+//! * Scenario 3: High-frequency flapping    -> Leading edge admitted, duplicates rejected
+//! * Scenario 4: Resource hold with abort   -> Single-shot rollback releases resource
 //!
-//! Run: `cargo run --example field_rusty_autopsy`
+//! Run: `cargo run --example flight_recorder_diagnostics`
 
 use snubber::{EnterError, SnubberNode};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

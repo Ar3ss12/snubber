@@ -99,7 +99,7 @@ jobs:
           cargo miri test --test process_died
           cargo miri test --test armor
           cargo miri test --test backpressure
-          cargo miri test --test field_rusty
+          cargo miri test --test input_boundary
           cargo miri test --test policy
           cargo miri test --test policy_alert
           cargo miri test --test node_breaker

@@ -1,17 +1,16 @@
-//! Torture scenario 3: "Mine in the stack".
+//! Unwind safety scenario: "Panic mid-execution".
 //!
-//! Resources clamped, 99% of the way done, then `panic!`. Unwind must run
-//! the rollback exactly once and leave the hardware clean — and a rollback
-//! that panics itself would abort the process, so it must be plain stores.
+//! Resources acquired, operation in-flight, then an unexpected panic occurs.
+//! Stack unwinding must trigger the rollback exactly once and leave resources clean.
 //!
-//! Run: `cargo run --example torture_mine_in_stack`
+//! Run: `cargo run --example unwind_safety`
 
 use snubber::SnubberGuard;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 fn main() {
-    println!("--- scenario 3: mine in the stack (panic at 99%) ---");
+    println!("--- Unwind Safety: panic mid-flight recovery ---");
     static HW: AtomicBool = AtomicBool::new(false);
     static ROLLBACKS: AtomicU32 = AtomicU32::new(0);
 
