@@ -298,8 +298,9 @@ fn abort_runs_rollback_and_preserves_authentic_header() {
         ROLLBACKS.fetch_add(1, Ordering::SeqCst);
     });
     let p = Protected::new(7u32, guard);
-    let ev = p.abort("plan-b");
+    let ev = p.abort("degraded-mode");
     assert!(ev.is_terminal(), "abort returns terminal event");
+
     assert_eq!(ev.header().epoch, 3, "preserves authentic epoch");
     assert_eq!(ev.header().task_id, 42, "preserves authentic task_id");
     assert_eq!(

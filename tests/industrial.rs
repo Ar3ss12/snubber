@@ -23,7 +23,9 @@ fn watchdog_fires_on_hung_guard() {
 
 #[test]
 fn watchdog_quiet_within_budget() {
-    let node = SnubberNode::builder("patient").timeout_ms(5000).build();
+    let node = SnubberNode::builder("nominal_watchdog")
+        .timeout_ms(5000)
+        .build();
     let g = node.enter(1, 1, || {}).expect("enter");
     let g = match g.check_timeout() {
         Ok(g) => g,
@@ -35,8 +37,8 @@ fn watchdog_quiet_within_budget() {
 }
 
 #[test]
-fn fallback_serves_plan_b_when_open() {
-    let node = SnubberNode::builder("plan_b")
+fn fallback_serves_degraded_mode_when_open() {
+    let node = SnubberNode::builder("fallback_strategy")
         .trip_after_failures(1)
         .fallback(|| 120)
         .build();
@@ -45,9 +47,13 @@ fn fallback_serves_plan_b_when_open() {
         let _g = node.enter(1, 1, || {}).expect("enter");
     }
     assert_eq!(node.stats().breaker_state, snubber::BreakerState::HalfOpen);
-    // Force fully open via a failed probe for the Netflix path.
+    // Force fully open via a failed probe for the circuit_open_fallback_path.
     node.report(FaultKind::Panic, 2, 2);
-    assert_eq!(node.fallback_value(), Some(120), "open: plan B serves");
+    assert_eq!(
+        node.fallback_value(),
+        Some(120),
+        "open: fallback strategy serves degraded value"
+    );
 }
 
 #[test]

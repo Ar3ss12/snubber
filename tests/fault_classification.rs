@@ -27,7 +27,7 @@ fn catastrophic_table_pins_every_variant() {
 
 #[test]
 fn shed_never_trips_breaker() {
-    let node = SnubberNode::builder("shed_wall")
+    let node = SnubberNode::builder("bulkhead_saturation")
         .max_in_flight(1)
         .trip_after_failures(3)
         .rate_per_sec(1)
@@ -69,9 +69,12 @@ fn shed_never_trips_breaker() {
     assert_eq!(s.catastrophic_faults(), 0, "no catastrophic fault recorded");
     assert!(s.shed_bulkhead() >= bulk);
     assert_eq!(s.shed_rate(), s.rate_rejected);
+    assert!(
+        s.shed_rate() >= rate,
+        "rate rejections must be >= loop hits"
+    );
     assert!(s.shed_stale() >= stale);
     assert_eq!(s.poison_recoveries, 0);
-    let _ = (bulk, rate);
 }
 
 #[test]
@@ -84,10 +87,10 @@ fn catastrophic_faults_trip_breaker() {
     node.report(FaultKind::ProcessDied, 3, 3);
     let s = node.stats();
     assert_eq!(s.catastrophic_faults(), 3);
-    assert_ne!(
+    assert_eq!(
         s.breaker_state,
-        BreakerState::Closed,
-        "3 catastrophic faults must trip"
+        BreakerState::Open,
+        "3 catastrophic reports trip breaker directly to Open state"
     );
     assert!(s.breaker_trips >= 1);
     assert_eq!(s.poison_recoveries, 0);
@@ -103,7 +106,11 @@ fn catastrophic_faults_trip_breaker() {
     let s2 = node2.stats();
     assert_eq!(s2.implicit_drops, 3);
     assert_eq!(s2.catastrophic_faults(), 3);
-    assert_ne!(s2.breaker_state, BreakerState::Closed);
+    assert_eq!(
+        s2.breaker_state,
+        BreakerState::HalfOpen,
+        "3 implicit drops trip breaker to HalfOpen probe"
+    );
 }
 
 #[test]

@@ -212,13 +212,13 @@ fn fake_waker() -> Waker {
 /// even though cloning the inner `Arc` never touches the payload — a
 /// non-`Clone` draft/directive type would then forbid handing control to
 /// another thread. This test pins the zero-bound contract at compile time:
-
 ///
 /// ```text
 /// struct NoClone; // deliberately NOT Clone
 /// let (c, h) = TaskConduit::<WorkerState, NoClone>::pair(...);
 /// let _ = c.clone(); // must compile
 /// ```
+
 #[test]
 fn intercom_clone_needs_no_payload_bounds() {
     struct NoCloneDraft {

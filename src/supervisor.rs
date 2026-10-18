@@ -841,9 +841,82 @@ impl PipeDrain {
         Self { state, done }
     }
 
+    /// Synchronously process a reader to EOF without spawning a background OS thread.
+    /// Ideal for in-memory byte buffers, fuzzing sweeps, and synchronous parsers.
+    #[must_use]
+    pub fn drain_sync<R: Read>(reader: R) -> Self {
+        let state = Arc::new(Mutex::new(DrainState::default()));
+        let done = Arc::new(AtomicU64::new(0));
+        let mut reader = std::io::BufReader::with_capacity(4096, reader);
+        let mut window = [0u8; 4];
+        let mut one = [0u8; 1];
+
+        while let Ok(()) = reader.read_exact(&mut one) {
+            window[0] = window[1];
+            window[1] = window[2];
+            window[2] = window[3];
+            window[3] = one[0];
+
+            if window == TOKEN_MAGIC {
+                let mut body = [0u8; 40];
+                if reader.read_exact(&mut body).is_err() {
+                    break;
+                }
+                let token = ProcessToken::from_body_bytes(&body);
+                if let Ok(mut st) = state.lock() {
+                    st.last_seen_ms = now_ms();
+                    if token.opcode == OP_COMMIT || token.opcode == OP_HEARTBEAT {
+                        if token.opcode == OP_COMMIT {
+                            st.armed = None;
+                        }
+                    } else if token.opcode == OP_STATE {
+                        let seq = (token.task.min(2)) as usize;
+                        let take = if seq < 2 { 24 } else { 16 };
+                        let mut want = [0u8; 4];
+                        want.copy_from_slice(&token.payload[24..28]);
+                        let want = u32::from_le_bytes(want);
+
+                        let valid_chunk = if seq == 2 {
+                            state_crc(&token.payload[0..20]) == want
+                        } else {
+                            state_crc(&token.payload[0..take]) == want
+                        };
+
+                        if valid_chunk {
+                            st.scratch[seq][0..take].copy_from_slice(&token.payload[0..take]);
+                            if seq == 2 {
+                                let mut fcrc = [0u8; 4];
+                                fcrc.copy_from_slice(&token.payload[16..20]);
+                                st.scratch_full_crc = u32::from_le_bytes(fcrc);
+                            }
+                            st.scratch_got |= 1 << seq;
+                            if st.scratch_got == 0b111 {
+                                let mut bytes = [0u8; STATE_LEN];
+                                bytes[0..24].copy_from_slice(&st.scratch[0][0..24]);
+                                bytes[24..48].copy_from_slice(&st.scratch[1][0..24]);
+                                bytes[48..64].copy_from_slice(&st.scratch[2][0..16]);
+                                let candidate = StateDigest::new(bytes);
+                                if candidate.crc() == st.scratch_full_crc {
+                                    st.state = Some(candidate);
+                                }
+                                st.scratch_got = 0;
+                            }
+                        }
+                    } else {
+                        st.armed = Some(token);
+                    }
+                }
+                window = [0u8; 4];
+            }
+        }
+        done.store(1, Ordering::SeqCst);
+        Self { state, done }
+    }
+
     /// Take the last un-settled token, if any (call AFTER `EOF`/reap).
     #[must_use]
     pub fn take_armed(&self) -> Option<ProcessToken> {
+
         self.state.lock().ok().and_then(|mut st| st.armed.take())
     }
 
