@@ -270,7 +270,11 @@ pub enum LogLevel {
 }
 
 /// Action executed by the node upon encountering a classified fault.
-#[derive(Debug, Clone, Copy)]
+///
+/// NOTE: Intentionally does not implement `PartialEq` or `Eq` due to `Custom(fn())`.
+/// Function pointer comparisons under Identical Code Folding (ICF) and across codegen
+/// units do not guarantee stable identity. Use [`FaultAction::kind_name`] or `matches!`.
+#[derive(Clone, Copy)]
 pub enum FaultAction {
     /// Suppress action; increment internal telemetry counters only.
     DiscardSilently,
@@ -290,21 +294,33 @@ pub enum FaultAction {
     BlockCaller(u64),
 }
 
-impl PartialEq for FaultAction {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::DiscardSilently, Self::DiscardSilently) => true,
-            (Self::BreakerOpen, Self::BreakerOpen) => true,
-            (Self::RollbackAndAlert, Self::RollbackAndAlert) => true,
-            (Self::TripBreaker, Self::TripBreaker) => true,
-            (Self::BlockCaller(a), Self::BlockCaller(b)) => a == b,
-            (Self::Custom(a), Self::Custom(b)) => (*a as usize) == (*b as usize),
-            _ => false,
+impl FaultAction {
+    /// Returns the variant name for testing and diagnostics.
+    #[must_use]
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::DiscardSilently => "DiscardSilently",
+            Self::BreakerOpen => "BreakerOpen",
+            Self::RollbackAndAlert => "RollbackAndAlert",
+            Self::TripBreaker => "TripBreaker",
+            Self::Custom(_) => "Custom",
+            Self::BlockCaller(_) => "BlockCaller",
         }
     }
 }
 
-impl Eq for FaultAction {}
+impl fmt::Debug for FaultAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DiscardSilently => write!(f, "DiscardSilently"),
+            Self::BreakerOpen => write!(f, "BreakerOpen"),
+            Self::RollbackAndAlert => write!(f, "RollbackAndAlert"),
+            Self::TripBreaker => write!(f, "TripBreaker"),
+            Self::Custom(_) => write!(f, "Custom(..)"),
+            Self::BlockCaller(ms) => write!(f, "BlockCaller({ms}ms)"),
+        }
+    }
+}
 
 /// Configured policy triad mapping fault kinds to actions, logs, and metrics.
 #[derive(Debug, Clone, Copy)]
