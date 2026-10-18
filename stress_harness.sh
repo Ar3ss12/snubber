@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# snubber chaos sniper for Linux / macOS
-# High-frequency SIGKILL (-9) stress runner
+# snubber process termination stress harness for Linux / macOS
+# High-frequency SIGKILL (-9) lifecycle verification
 
-TARGET_PROCESS="${1:-chaos_satellite}"
+TARGET_PROCESS="${1:-process_termination_loop}"
 KILLS="${2:-10000}"
 MIN_SLEEP_SEC="${3:-0.001}"
 
@@ -11,9 +11,9 @@ EXECUTED=0
 LAST_KILLED_PID=0
 
 echo "=========================================================="
-echo "   SNUBBER CHAOS SNIPER (POSIX): HIGH-FREQUENCY SIGKILL   "
+echo "   SNUBBER STRESS HARNESS: FORCED PROCESS TERMINATION     "
 echo "=========================================================="
-echo "Target: $TARGET_PROCESS ($KILLS kills)"
+echo "Target: $TARGET_PROCESS ($KILLS termination cycles)"
 echo "Signal: kill -9 (SIGKILL)"
 echo "----------------------------------------------------------"
 
@@ -38,13 +38,13 @@ while [ "$EXECUTED" -lt "$KILLS" ]; do
         fi
     fi
 
-    # 3. Fire SIGKILL
+    # 3. Deliver SIGKILL
     if [ "$TARGET_PID" -ne 0 ]; then
         if kill -9 "$TARGET_PID" 2>/dev/null; then
             EXECUTED=$((EXECUTED + 1))
             LAST_KILLED_PID="$TARGET_PID"
             if [ $((EXECUTED % 500)) -eq 0 ] || [ "$EXECUTED" -le 10 ] || [ "$EXECUTED" -eq "$KILLS" ]; then
-                echo "[SNIPER] Executed #$EXECUTED / $KILLS | Slain PID: $TARGET_PID"
+                echo "[HARNESS] Progress: #$EXECUTED / $KILLS | Terminated PID: $TARGET_PID"
             fi
         fi
     fi
@@ -53,5 +53,5 @@ while [ "$EXECUTED" -lt "$KILLS" ]; do
 done
 
 echo "=========================================================="
-echo ">>> [SNIPER] Completed $EXECUTED kills. Mission accomplished."
+echo "[HARNESS] Completed $EXECUTED terminations. Verification clean."
 echo "=========================================================="

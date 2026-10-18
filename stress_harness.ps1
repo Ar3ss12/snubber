@@ -1,17 +1,17 @@
 param (
-    [string]$TargetProcess = "chaos_satellite",
+    [string]$TargetProcess = "process_termination_loop",
     [int]$Kills = 10000,
     [int]$MinSleepMs = 0,
     [int]$MaxSleepMs = 4
 )
 
-$host.UI.RawUI.WindowTitle = "SNUBBER CHAOS SNIPER (TERMINAL 2)"
-Write-Host "==========================================================" -ForegroundColor Red
-Write-Host "   SNUBBER CHAOS SNIPER: HIGH-FREQUENCY TERMINATEPROCESS  " -ForegroundColor Red
-Write-Host "==========================================================" -ForegroundColor Red
-Write-Host "Ціль: розстріляти воркерів $Kills разів (до першого збою)" -ForegroundColor Yellow
-Write-Host "Метод: Stop-Process -Id <pid> -Force (Windows TerminateProcess)" -ForegroundColor Yellow
-Write-Host "Затримка: $MinSleepMs-$MaxSleepMs ms (максимальна кулеметна черга)" -ForegroundColor Yellow
+$host.UI.RawUI.WindowTitle = "SNUBBER STRESS HARNESS"
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host "   SNUBBER STRESS HARNESS: FORCED PROCESS TERMINATION     " -ForegroundColor Cyan
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host "Target: $TargetProcess ($Kills termination cycles)"
+Write-Host "Method: Stop-Process -Force (Windows TerminateProcess API)"
+Write-Host "Interval: $MinSleepMs-$MaxSleepMs ms"
 Write-Host "----------------------------------------------------------" -ForegroundColor DarkGray
 
 $pidFile = "target/chaos_worker.pid"
@@ -22,13 +22,12 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 while ($executed -lt $Kills) {
     $targetPid = 0
 
-    # 1. Швидкий пошук через опублікований PID-файл (sub-millisecond)
+    # 1. Fast lookup via published PID file
     if (Test-Path $pidFile) {
         try {
             $raw = [System.IO.File]::ReadAllText($pidFile).Trim()
             $parsed = 0
             if ([int]::TryParse($raw, [ref]$parsed) -and $parsed -ne $lastKilledPid) {
-                # Перевіримо, чи процес ще живий
                 $p = Get-Process -Id $parsed -ErrorAction SilentlyContinue
                 if ($p -and $p.ProcessName -like "*$TargetProcess*") {
                     $targetPid = $parsed
@@ -37,7 +36,7 @@ while ($executed -lt $Kills) {
         } catch {}
     }
 
-    # 2. Фолбек: прямий пошук процесу за іменем
+    # 2. Fallback: query process by executable name
     if ($targetPid -eq 0) {
         $procs = Get-Process -Name $TargetProcess -ErrorAction SilentlyContinue
         if ($procs -and $procs.Count -ge 2) {
@@ -50,15 +49,14 @@ while ($executed -lt $Kills) {
 
     if ($targetPid -ne 0) {
         try {
-            # ВДАР КУВАЛДОЮ: миттєве стирання процесу на рівні ядра Windows
+            # Immediate process termination via OS kernel
             Stop-Process -Id $targetPid -Force -ErrorAction Stop
             $lastKilledPid = $targetPid
             $executed++
 
-            # Регулярна телеметрія снайпера
-            if ($executed % 100 -eq 0 -or $executed -eq $Kills -or $executed -le 10) {
+            if ($executed % 500 -eq 0 -or $executed -eq $Kills -or $executed -le 10) {
                 $rate = [math]::Round($executed / [math]::Max($sw.Elapsed.TotalSeconds, 0.001), 1)
-                Write-Host "[CHAOS SNIPER] Убито: $executed / $Kills | Розстріляно PID: $targetPid | Швидкість: $rate kills/sec" -ForegroundColor Cyan
+                Write-Host "[HARNESS] Progress: $executed / $Kills | Terminated PID: $targetPid | Rate: $rate terminations/sec" -ForegroundColor Green
             }
         } catch {}
     } else {
@@ -75,6 +73,6 @@ while ($executed -lt $Kills) {
 
 $sw.Stop()
 Write-Host "==========================================================" -ForegroundColor Green
-Write-Host "   СНАЙПЕР ФІНІШУВАВ: $executed успішних системних вбивств!  " -ForegroundColor Green
-Write-Host "   Час: $($sw.Elapsed.ToString())                         " -ForegroundColor Green
+Write-Host "   HARNESS COMPLETE: $executed terminations verified cleanly. " -ForegroundColor Green
+Write-Host "   Duration: $($sw.Elapsed.ToString())                       " -ForegroundColor Green
 Write-Host "==========================================================" -ForegroundColor Green
