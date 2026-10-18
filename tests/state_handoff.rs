@@ -1,4 +1,4 @@
-//! Phase 3 test
+//! State handoff and digest verification: CRC integrity and chunk reassembly.
 use snubber::STATE_LEN;
 #[test]
 fn len_is_cache_line() {
@@ -26,11 +26,13 @@ fn digest_42_survives() {
     let (reader, _) = listener.accept().expect("a");
     let drain = snubber::PipeDrain::spawn(reader);
     wh.join().expect("w");
-    for _ in 0..5000 {
-        if drain.eof() {
-            break;
-        }
-        std::thread::yield_now();
+    let start = std::time::Instant::now();
+    while !drain.eof() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "timeout waiting for EOF"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     let recovered = drain.take_state().expect("kept");
     assert_eq!(recovered.bytes[0], 42);
@@ -64,17 +66,19 @@ fn torn_half_dropped_last_whole_kept() {
     let (reader, _) = listener.accept().expect("a");
     let drain = snubber::PipeDrain::spawn(reader);
     wh.join().expect("w");
-    for _ in 0..5000 {
-        if drain.eof() {
-            break;
-        }
-        std::thread::yield_now();
+    let start = std::time::Instant::now();
+    while !drain.eof() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "timeout waiting for EOF"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     let recovered = drain.last_state().expect("initial");
     assert_eq!(recovered.bytes[0], 7);
 }
 #[test]
-fn bitten_frame_crc_dropped() {
+fn corrupted_frame_crc_rejected() {
     use snubber::StateDigest;
     use std::io::Write;
     use std::net::{TcpListener, TcpStream};
@@ -95,11 +99,13 @@ fn bitten_frame_crc_dropped() {
     let (reader, _) = listener.accept().expect("a");
     let drain = snubber::PipeDrain::spawn(reader);
     wh.join().expect("w");
-    for _ in 0..5000 {
-        if drain.eof() {
-            break;
-        }
-        std::thread::yield_now();
+    let start = std::time::Instant::now();
+    while !drain.eof() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "timeout waiting for EOF"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert!(drain.last_state().is_none());
 }
@@ -139,14 +145,16 @@ fn mismatched_generation_chunks_rejected_by_full_crc() {
     let drain = snubber::PipeDrain::spawn(reader);
     wh.join().expect("w");
 
-    for _ in 0..5000 {
-        if drain.eof() {
-            break;
-        }
-        std::thread::yield_now();
+    let start = std::time::Instant::now();
+    while !drain.eof() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "timeout waiting for EOF"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 
-    // Full CRC mismatch MUST reject the Franken-state
+    // Full CRC mismatch MUST reject the hybrid interleaved revision state
     assert!(
         drain.last_state().is_none(),
         "Mismatched chunks from different revisions must NOT be promoted to valid state"

@@ -46,7 +46,7 @@ fn orphan_contract_is_typed_and_honest() {
     is_send_sync::<NoOrphanGuard>();
 }
 #[test]
-fn preempt_storm_verdict_fires_on_senior_abuse() {
+fn preempt_storm_on_critical_flood() {
     use snubber::{find_anomalies, AnomalyKind, AnomalyPolicy, Priority, SnubberNode};
     let node = SnubberNode::builder("preempt/storm").build();
     // Simulate: 200 admissions, 150 of them filed preempt requests.
@@ -60,6 +60,6 @@ fn preempt_storm_verdict_fires_on_senior_abuse() {
     let hits = find_anomalies("preempt/storm", &node.stats(), &AnomalyPolicy::default());
     assert!(
         hits.iter().any(|h| h.kind == AnomalyKind::PreemptStorm),
-        "senior abuse must shout, got {hits:?}"
+        "critical preemption flood must trigger anomaly verdict, got {hits:?}"
     );
 }

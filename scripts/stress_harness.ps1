@@ -14,7 +14,7 @@ Write-Host "Method: Stop-Process -Force (Windows TerminateProcess API)"
 Write-Host "Interval: $MinSleepMs-$MaxSleepMs ms"
 Write-Host "----------------------------------------------------------" -ForegroundColor DarkGray
 
-$pidFile = "target/chaos_worker.pid"
+$pidFiles = @("target/supervised_worker.pid", "target/chaos_worker.pid")
 $executed = 0
 $lastKilledPid = 0
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -23,17 +23,20 @@ while ($executed -lt $Kills) {
     $targetPid = 0
 
     # 1. Fast lookup via published PID file
-    if (Test-Path $pidFile) {
-        try {
-            $raw = [System.IO.File]::ReadAllText($pidFile).Trim()
-            $parsed = 0
-            if ([int]::TryParse($raw, [ref]$parsed) -and $parsed -ne $lastKilledPid) {
-                $p = Get-Process -Id $parsed -ErrorAction SilentlyContinue
-                if ($p -and $p.ProcessName -like "*$TargetProcess*") {
-                    $targetPid = $parsed
+    foreach ($pidFile in $pidFiles) {
+        if (Test-Path $pidFile) {
+            try {
+                $raw = [System.IO.File]::ReadAllText($pidFile).Trim()
+                $parsed = 0
+                if ([int]::TryParse($raw, [ref]$parsed) -and $parsed -ne $lastKilledPid) {
+                    $p = Get-Process -Id $parsed -ErrorAction SilentlyContinue
+                    if ($p -and $p.ProcessName -like "*$TargetProcess*") {
+                        $targetPid = $parsed
+                        break
+                    }
                 }
-            }
-        } catch {}
+            } catch {}
+        }
     }
 
     # 2. Fallback: query process by executable name

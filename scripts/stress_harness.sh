@@ -6,7 +6,8 @@ TARGET_PROCESS="${1:-process_termination_loop}"
 KILLS="${2:-10000}"
 MIN_SLEEP_SEC="${3:-0.001}"
 
-PID_FILE="target/chaos_worker.pid"
+PID_FILE="target/supervised_worker.pid"
+LEGACY_PID_FILE="target/chaos_worker.pid"
 EXECUTED=0
 LAST_KILLED_PID=0
 
@@ -21,8 +22,15 @@ while [ "$EXECUTED" -lt "$KILLS" ]; do
     TARGET_PID=0
 
     # 1. Fast path: check published worker PID
+    CURRENT_PID_FILE=""
     if [ -f "$PID_FILE" ]; then
-        PARSED=$(cat "$PID_FILE" 2>/dev/null | tr -d '[:space:]')
+        CURRENT_PID_FILE="$PID_FILE"
+    elif [ -f "$LEGACY_PID_FILE" ]; then
+        CURRENT_PID_FILE="$LEGACY_PID_FILE"
+    fi
+
+    if [ -n "$CURRENT_PID_FILE" ]; then
+        PARSED=$(cat "$CURRENT_PID_FILE" 2>/dev/null | tr -d '[:space:]')
         if [ -n "$PARSED" ] && [ "$PARSED" -ne "$LAST_KILLED_PID" ]; then
             if kill -0 "$PARSED" 2>/dev/null; then
                 TARGET_PID="$PARSED"

@@ -240,7 +240,7 @@ fn hang_timeout_fires_on_silence_and_restarts() {
         Err(_) => panic!("wrong refusal"),
         Ok(_) => panic!("stale generation must be rejected"),
     }
-    writer_h.join().expect("frozen worker thaws");
+    writer_h.join().expect("frozen worker unblocks");
 }
 
 /// Supervised erased entry behaves like the canonical worker entry on a
@@ -391,11 +391,13 @@ fn stdin_digest_chain_is_closed_tick0() {
         successor
     };
     if !successor.exists() {
-        // Build examples if not built yet
-        let status = std::process::Command::new("cargo")
-            .args(["build", "--example", "process_state_handoff"])
-            .status()
-            .expect("build example");
+        // Build examples if not built yet, matching the active profile (debug vs release)
+        let mut build_cmd = std::process::Command::new("cargo");
+        build_cmd.args(["build", "--example", "process_state_handoff"]);
+        if !cfg!(debug_assertions) {
+            build_cmd.arg("--release");
+        }
+        let status = build_cmd.status().expect("build example");
         assert!(status.success());
     }
     assert!(successor.exists(), "build examples first: {successor:?}");

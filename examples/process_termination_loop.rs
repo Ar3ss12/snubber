@@ -28,9 +28,9 @@ fn main() {
         .position(|a| a == "--report-path")
         .and_then(|idx| args.get(idx + 1))
         .cloned()
-        .unwrap_or_else(|| "target/chaos_report.json".to_string());
+        .unwrap_or_else(|| "target/termination_report.json".to_string());
 
-    let pid_file = "target/chaos_worker.pid";
+    let pid_file = "target/supervised_worker.pid";
     if let Some(parent) = std::path::Path::new(pid_file).parent() {
         let _ = std::fs::create_dir_all(parent);
     }

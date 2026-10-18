@@ -95,8 +95,8 @@ torture/stress test MUST assert:
 - `rollbacks_fired == aborts + drops` (REAL `fn rollback`, never `|| {}`),
 - `poison_recoveries == 0`.
 
-`tests/cycle_torture.rs` (CAMP 1, reflexes OFF) + `tests/reflex_breaker.rs`
-+ `tests/reflex_bulkhead.rs` (CAMP 2, reflexes ON) are the reference shape.
+`tests/cycle_torture.rs` (TIER 1, reflexes OFF) + `tests/reflex_breaker.rs`
++ `tests/reflex_bulkhead.rs` (TIER 2, reflexes ON) are the reference shape.
 `input_boundary.rs::hotkey_flap` (`admitted == 100` + `stale == 100`) is the
 small-scale shape. Copy them, do not invent quieter ones.
 

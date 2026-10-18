@@ -1,4 +1,4 @@
-//! CAMP 2 — PRIORITY PREEMPTION (Phase 1): senior knocks, junior yields.
+//! SUITE 02 — PRIORITY PREEMPTION (Phase 1): high-priority preemption and cooperative yielding.
 //!
 //! A `Priority::Critical` admission over pure-`Priority::Background`
 //! occupancy files ONE cooperative `Preempted` request (flag + counter,
@@ -126,7 +126,7 @@ fn critical_preempts_pure_background_cooperatively() {
 }
 
 #[test]
-fn checked_transition_moves_by_rib_and_burns_illegal_at_compile() {
+fn checked_transition_moves_by_valid_edge_and_burns_illegal_at_compile() {
     use snubber::{LegalMove, SnubberNode};
     #[derive(Debug, PartialEq)]
     struct Idle;
@@ -140,13 +140,13 @@ fn checked_transition_moves_by_rib_and_burns_illegal_at_compile() {
     let node = SnubberNode::builder("sm/checked").build();
     let (st, ()) = node
         .transition_checked(Idle, || {}, |_old: &mut Idle| Ok::<(), &'static str>(()))
-        .expect("legal rib Idle -> Running");
+        .expect("legal edge Idle -> Running");
     assert_eq!(st, Running);
     let s = node.stats();
     assert_eq!(s.total_started, 1);
     assert_eq!(s.committed, 1);
     assert_eq!(s.poison_recoveries, 0);
-    println!("\n[SM]: rib=Idle->Running illegal=rejected-at-compile poison=0");
+    println!("\n[SM]: edge=Idle->Running illegal=rejected-at-compile poison=0");
 }
 
 #[test]
@@ -196,21 +196,21 @@ fn critical_never_preempts_normal_no_inversion() {
 }
 
 #[test]
-fn critical_never_forces_deaf_background() {
+fn critical_never_forces_uncooperative_worker() {
     static ROLLBACKS: AtomicU64 = AtomicU64::new(0);
     static ABORTS: AtomicU64 = AtomicU64::new(0);
     ROLLBACKS.store(0, Ordering::SeqCst);
     ABORTS.store(0, Ordering::SeqCst);
 
     let node = Arc::new(
-        SnubberNode::builder("iron/deaf-bg")
+        SnubberNode::builder("iron/uncooperative-bg")
             .max_in_flight(1)
             .queue_limit(64)
             .trip_after_failures(0)
             .build(),
     );
 
-    // Deaf worker: arms Background, sleeps 300 ms WITHOUT ever touching
+    // Uncooperative worker: arms Background, sleeps 300 ms WITHOUT ever touching
     // a conduit, then commits. No checkpoint — R5: the node never forces.
     let n_bg = Arc::clone(&node);
     let bg = std::thread::spawn(move || {
@@ -218,7 +218,7 @@ fn critical_never_forces_deaf_background() {
             .enter_with_priority(Priority::Background, 1, 1, || {
                 ROLLBACKS.fetch_add(1, Ordering::SeqCst);
             })
-            .expect("deaf background arms the slot");
+            .expect("uncooperative background arms the slot");
         assert_eq!(guard.priority(), Priority::Background);
         std::thread::sleep(std::time::Duration::from_millis(300));
         guard.commit();
@@ -234,27 +234,30 @@ fn critical_never_forces_deaf_background() {
     assert_eq!(node.lane_in_flight(), [1, 0, 0]);
 
     // Five Critical knocks, fresh epochs (monotonic gate): ALL bounce,
-    // exactly ONE Preempted filed, flag stays UP (victim is deaf).
+    // exactly ONE Preempted filed, flag stays UP (task channel unpolled).
     let mut bulk = 0u64;
     for epoch in 2..=6u64 {
         match node.enter_with_priority(Priority::Critical, epoch, epoch, || {
             ROLLBACKS.fetch_add(1, Ordering::SeqCst);
         }) {
-            Ok(_) => panic!("deaf background must NOT be forced out"),
+            Ok(_) => panic!("uncooperative background must NOT be forced out"),
             Err(EnterError::BulkheadFull) => bulk += 1,
             Err(other) => panic!("unexpected refusal: {other:?}"),
         }
     }
     assert_eq!(bulk, 5, "every knock bounces, none vanish");
-    assert!(node.preempt_requested(), "request waits for deaf worker");
+    assert!(
+        node.preempt_requested(),
+        "request waits for uncooperative worker"
+    );
     let s = node.stats();
     assert_eq!(s.preempted, 1, "one knock wave = one filed request");
     assert_eq!(s.bulkhead_rejections, 5, "every bounce counted");
     assert_eq!(node.lane_in_flight(), [1, 0, 0], "slot still held");
-    assert_eq!(ABORTS.load(Ordering::SeqCst), 0, "nobody aborted deaf");
+    assert_eq!(ABORTS.load(Ordering::SeqCst), 0, "nobody aborted worker");
 
-    // Deaf worker settles ITSELF on its own clock — flag clears, frees.
-    bg.join().expect("deaf worker finishes alone");
+    // Uncooperative worker settles ITSELF on its own clock — flag clears, frees.
+    bg.join().expect("uncooperative worker finishes alone");
     assert!(!node.preempt_requested(), "settle of lane 0 clears flag");
     assert_eq!(node.lane_in_flight(), [0, 0, 0]);
 

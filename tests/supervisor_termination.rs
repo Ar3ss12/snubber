@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 #[test]
 #[ignore = "Spawns background supervisor & killer and executes hundreds/thousands of hard OS kills. Run explicitly: cargo test --test process_kill_stress -- --ignored --nocapture"]
 fn process_kill_stress_test() {
-    let report_file = "target/chaos_report.json";
+    let report_file = "target/termination_report.json";
     if Path::new(report_file).exists() {
         let _ = std::fs::remove_file(report_file);
     }
@@ -27,7 +27,8 @@ fn process_kill_stress_test() {
         "failed to build process_termination_loop example"
     );
 
-    let kills: u32 = std::env::var("CHAOS_KILLS")
+    let kills: u32 = std::env::var("STRESS_TARGET_KILLS")
+        .or_else(|_| std::env::var("CHAOS_KILLS"))
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
@@ -40,43 +41,41 @@ fn process_kill_stress_test() {
 
     #[cfg(windows)]
     {
-        // 1. Spawn Terminal 1: Supervisor Instance
-        let cmd1 = format!(
-            "$host.UI.RawUI.WindowTitle = 'SNUBBER SUPERVISOR (TERMINAL 1)'; cargo run --example process_termination_loop -- --target-kills {} --report-path {}",
-            kills, report_file
-        );
-        let mut term1 = Command::new("powershell")
+        // 1. Spawn Supervisor Instance in background (headless, no popup window)
+        let mut supervisor = Command::new("cargo")
             .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Start-Process powershell -ArgumentList '-NoExit', '-Command', \"{}\"",
-                    cmd1
-                ),
+                "run",
+                "--example",
+                "process_termination_loop",
+                "--",
+                "--target-kills",
+                &kills.to_string(),
+                "--report-path",
+                report_file,
             ])
             .spawn()
-            .expect("spawn terminal 1");
-        let _ = term1.wait();
+            .expect("spawn supervisor");
 
         std::thread::sleep(Duration::from_millis(1500));
 
-        // 2. Spawn Terminal 2: Process Killer Harness
-        let cmd2 = format!(
-            "powershell -ExecutionPolicy Bypass -File .\\scripts\\stress_harness.ps1 -TargetProcess process_termination_loop -Kills {}",
-            kills
-        );
-        let mut term2 = Command::new("powershell")
+        // 2. Spawn Process Killer Harness in background
+        let mut killer = Command::new("powershell")
             .args([
                 "-NoProfile",
-                "-Command",
-                &format!(
-                    "Start-Process powershell -ArgumentList '-NoExit', '-Command', \"{}\"",
-                    cmd2
-                ),
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                ".\\scripts\\stress_harness.ps1",
+                "-TargetProcess",
+                "process_termination_loop",
+                "-Kills",
+                &kills.to_string(),
             ])
             .spawn()
-            .expect("spawn terminal 2");
-        let _ = term2.wait();
+            .expect("spawn killer harness");
+
+        let _ = killer.wait();
+        let _ = supervisor.wait();
     }
 
     #[cfg(not(windows))]
@@ -138,7 +137,7 @@ fn process_kill_stress_test() {
 
     assert!(
         !report_content.is_empty(),
-        "Timeout waiting for chaos test report! Pipe might have deadlocked."
+        "Timeout waiting for process termination report! Pipe might have deadlocked."
     );
 
     println!("[TEST RUNNER] Report received:\n{}", report_content);

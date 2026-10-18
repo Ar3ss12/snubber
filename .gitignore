@@ -8,6 +8,8 @@ target/
 *.tmp
 target/chaos_worker.pid
 target/chaos_report.json
+target/supervised_worker.pid
+target/termination_report.json
 
 # Python & scripts cache
 __pycache__/

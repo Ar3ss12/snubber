@@ -614,7 +614,7 @@ const _: () = {
 /// Frame 2 carries 16 bytes of data + 4 bytes of full-digest CRC + 4 bytes padding + 4 bytes chunk CRC.
 /// Reassembly verifies individual chunk CRCs and validates the full 64-byte payload against the full-digest CRC.
 /// Torn or mismatched frames dropped — replacement process receives the last verified complete
-/// state digest, never a corrupt or Franken-state fragment.
+/// state digest, never a corrupt or fragmented hybrid state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StateDigest {
     /// Opaque state bytes (user-packed, user-read).
