@@ -1,10 +1,18 @@
-//! Pattern 04: Process Supervisor & Pipe Drain
+//! Pattern 06: Process Supervisor & Token Rescue
 //!
 //! Demonstrates Layer 4 multi-process supervision:
 //! Running an untrusted or crash-prone child process (e.g. WebView, plugin, GPU worker)
 //! across a framed IPC boundary. If the child process is abruptly killed by the OS
 //! (SIGKILL, TerminateProcess), the supervisor detects EOF without deadlocking and
 //! releases the external resource on the parent side.
+//!
+//! Note: For automatic supervisor restart policies and state preservation,
+//! see `07_state_handoff.rs` and `09_autopilot_assembly.rs`.
+//!
+//! Run with:
+//! ```powershell
+//! cargo run --example 06_process_supervisor
+//! ```
 
 use snubber::{PipeDrain, ProcessToken};
 use std::io::Write;
@@ -15,7 +23,7 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
-    println!("=== Pattern 04: Multi-Process Isolation & Token Rescue ===");
+    println!("=== Pattern 06: Process Supervisor & Token Rescue ===");
 
     let hardware_token_held = Arc::new(AtomicBool::new(true));
 

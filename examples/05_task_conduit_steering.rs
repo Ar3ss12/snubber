@@ -1,6 +1,6 @@
-//! Task Conduit Steering Protocol: Two-way communication between caller and worker.
+//! Pattern 05: Task Conduit Steering Protocol
 //!
-//! Demonstrates:
+//! Two-way communication protocol between caller and worker:
 //! - Worker (`TaskConduit`) reporting live telemetry state & stage.
 //! - Observer (`TaskHandle`) non-blocking state inspection (`inspect`).
 //! - Observer issuing runtime directives (`Pause`, `Proceed`, `SkipStage`, `Cancel`).
@@ -8,7 +8,7 @@
 //!
 //! Run with:
 //! ```powershell
-//! cargo run --example task_conduit_steering
+//! cargo run --example 05_task_conduit_steering
 //! ```
 
 use snubber::{Directive, TaskConduit};

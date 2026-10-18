@@ -1,4 +1,4 @@
-//! Pipeline supervisor assembly (all phases): gateway + priority + restart + handoff.
+//! Pattern 09: Autopilot Assembly (Steel Thread)
 //!
 //! Run: `cargo run --example 09_autopilot_assembly`
 //!

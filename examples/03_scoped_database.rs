@@ -1,7 +1,7 @@
-//! Pattern 03: Database Bulkhead & Async Backpressure
+//! Pattern 03: Database Concurrency Bulkhead & Backpressure
 //!
-//! Demonstrates protecting downstream resources (databases, network sockets, microservices)
-//! from sudden load surges using an admission bulkhead and backpressure pacing.
+//! Demonstrates protecting downstream database resources from load surges
+//! using an admission bulkhead and backpressure pacing across concurrent worker threads.
 //! When capacity is exceeded, callers receive actionable backpressure metadata (`retry_after_ms`).
 
 use snubber::{EnterError, SnubberNode};

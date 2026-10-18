@@ -1,6 +1,6 @@
-//! Hot standby pool (Phase 5): pattern, NOT framework.
+//! Pattern 08: Hot Standby Failover (Zero-Framework N+1 Pool)
 //!
-//! Run: `cargo run --example hot_standby`
+//! Run: `cargo run --example 08_hot_standby_failover`
 //!
 //! The crate gives primitives (GenerationClock, RestartTracker,
 //! StateDigest, gateway, Priority). THIS file shows how an APP

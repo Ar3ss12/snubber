@@ -1,10 +1,10 @@
-//! Async gateway without a runtime: refuse fast, sleep outside.
+//! Pattern 04: Async Web Gateway (Tokio/Axum Integration)
 //!
-//! Run: `cargo run --example async_gateway`
+//! Run: `cargo run --example 04_async_web_gateway`
 //!
-//! No `tokio` here (zero-dep stays): the wait is recorded, not slept.
-//! The node admits synchronously, refusals map to outcomes via
-//! `classify()` + `retry_after_ms()`. In Tokio replace the record with
+//! Runtime-agnostic async entry without bundling Tokio inside the library:
+//! The node admits synchronously, refusals map to actionable outcomes via
+//! `classify()` + `retry_after_ms()`. In Tokio/Axum, replace the recorded wait with
 //! `tokio::time::sleep(...).await`.
 
 use snubber::{AsyncGate, Refusal, SnubberNode};
