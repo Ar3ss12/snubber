@@ -32,7 +32,7 @@ jobs:
       - name: Clippy Zero-Warnings Gate
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Pure Bare-Metal Floor 1 Check (no-default-features)
+      - name: Pure Bare-Metal Layer 1 Check (no-default-features)
         run: cargo check --no-default-features
 
       - name: Validate Documentation Links (cargo doc)
@@ -62,8 +62,13 @@ jobs:
       - name: Verify Release Build Performance
         run: cargo build --release
 
-      - name: Run Release Cycle Torture (40,000 transactions)
-        run: cargo test --release --test cycle_torture
+      - name: Run Release Concurrency Stress (40,000 transactions)
+        run: cargo test --release --test concurrency_stress
+
+      - name: Run Release Hard Clamp & Bulkhead Capacity
+        run: |
+          cargo test --release --test hard_clamp
+          cargo test --release --test bulkhead_capacity
 
   # 3. MIRI VERIFICATION: Formal memory model verification
   miri:
@@ -104,7 +109,14 @@ jobs:
           cargo miri test --test policy_alert
           cargo miri test --test node_breaker
           cargo miri test --test node_stats
-          cargo miri test --test reflex_breaker
+          cargo miri test --test circuit_breaker
+          cargo miri test --test bulkhead_capacity
+          cargo miri test --test fault_classification
           cargo miri test --test async_gate
-          cargo miri test --test async_metal
+          cargo miri test --test async_primitives
+          cargo miri test --test async_waker_dedup
           cargo miri test --test task_engine
+          cargo miri test --test transition_orphan
+          cargo miri test --test regression_postmortems
+          cargo miri test --test diagnostics_codec
+          cargo miri test --test protect
