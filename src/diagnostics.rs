@@ -91,14 +91,22 @@ pub struct SnapshotV1 {
 }
 
 impl SnapshotV1 {
-    /// Catastrophic fault count (derived, saturating): panic + timeout +
+    /// Catastrophic fault count: panic + timeout +
     /// process-died reports + implicit drops.
     #[must_use]
-    pub fn nuclear_breaches(&self) -> u64 {
+    #[inline]
+    pub fn catastrophic_faults(&self) -> u64 {
         self.reported[1]
             .saturating_add(self.reported[2])
             .saturating_add(self.reported[10])
             .saturating_add(self.implicit_drops)
+    }
+
+    /// Catastrophic fault count (alias for backwards compatibility).
+    #[must_use]
+    #[inline]
+    pub fn nuclear_breaches(&self) -> u64 {
+        self.catastrophic_faults()
     }
 
     /// Capacity shedding: bulkhead + evicted (slow worker, not sick).

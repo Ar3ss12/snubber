@@ -137,7 +137,7 @@ impl FaultKind {
 /// Admission priority lane (Phase 1 preemption).
 ///
 /// Core-only `Copy` data — no logic lives here. The node interprets it:
-/// * `Background(0)` — trash lane: logs, presets, slow UI repaints.
+/// * `Background(0)` — low-priority lane: telemetry, presets, background UI repaints.
 ///   Yields to `Critical` on demand (cooperative `Preempted`).
 /// * `Normal(1)` — ordinary commands. Never preempts, never preempted
 ///   by anyone except `Critical` (and only when the whole node holds
@@ -258,9 +258,7 @@ impl fmt::Display for FaultDetail {
 }
 
 // COMPILE-TIME GATES (zero runtime, zero deps, MSRV 1.70-safe):
-// `panic!` in const context is stable since 1.57, `size_of` const since
-// 1.24 — this block is a build-time guillotine, not a test. Break the
-// catalog and the build dies with the CRITICAL line, not a silent drift.
+// Compile-time assertions verifying enum discriminant layout and catalog count.
 const _: () = {
     assert!(
         FaultKind::COUNT == 12,

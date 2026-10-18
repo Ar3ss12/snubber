@@ -25,7 +25,11 @@ fn commit_releases_resource_intact() {
     assert_eq!(*p.get(), 50);
     let out = p.commit();
     assert_eq!(out, 50, "commit returns inner resource value intact");
-    assert_eq!(ROLLBACKS.load(Ordering::SeqCst), 0, "no rollback triggered on commit");
+    assert_eq!(
+        ROLLBACKS.load(Ordering::SeqCst),
+        0,
+        "no rollback triggered on commit"
+    );
 }
 
 #[test]
@@ -56,7 +60,11 @@ fn error_drops_resource_and_executes_rollback_once() {
     let mut p = Protected::new(res, guard);
     let _ = p.get_mut();
     drop(p); // implicit abort on drop
-    assert_eq!(ROLLBACKS.load(Ordering::SeqCst), 1, "exactly one rollback execution");
+    assert_eq!(
+        ROLLBACKS.load(Ordering::SeqCst),
+        1,
+        "exactly one rollback execution"
+    );
     assert_eq!(
         state_marker.load(Ordering::SeqCst),
         2,
@@ -76,6 +84,10 @@ fn abort_runs_rollback_and_preserves_authentic_header() {
     assert!(ev.is_terminal(), "abort returns terminal event");
     assert_eq!(ev.header().epoch, 3, "preserves authentic epoch");
     assert_eq!(ev.header().task_id, 42, "preserves authentic task_id");
-    assert_eq!(ROLLBACKS.load(Ordering::SeqCst), 1, "rollback triggered on abort");
+    assert_eq!(
+        ROLLBACKS.load(Ordering::SeqCst),
+        1,
+        "rollback triggered on abort"
+    );
     println!("\n[PROTECTED:ABORT] epoch=3 task_id=42 rollbacks=1 outcome=terminal");
 }

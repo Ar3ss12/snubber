@@ -39,14 +39,18 @@ impl<T, F: FnOnce()> Protected<T, F> {
     #[inline]
     #[must_use]
     pub fn get(&self) -> &T {
-        self.resource.as_ref().expect("protected resource invariant")
+        self.resource
+            .as_ref()
+            .expect("protected resource invariant")
     }
 
     /// Access the underlying resource (read-write).
     #[inline]
     #[must_use]
     pub fn get_mut(&mut self) -> &mut T {
-        self.resource.as_mut().expect("protected resource invariant")
+        self.resource
+            .as_mut()
+            .expect("protected resource invariant")
     }
 
     /// Disarms the guard and extracts the inner resource upon clean completion.

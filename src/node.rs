@@ -1,11 +1,11 @@
-//! Bulkhead node: bounded concurrency + circuit breaker + flight recorder.
+//! Bulkhead node: bounded concurrency + circuit breaker + telemetry recorder.
 //!
-//! The `v0.1` core ([`crate::SnubberGuard`], [`crate::EpochGate`]) is a
-//! silent pillow: it absorbs the hit but tells nobody. This module is the second floor —
-//! the aviation black box. Every entry, exit, stale epoch and bulkhead
-//! rejection is counted, the last fault carries its `#[track_caller]`
-//! coordinates, and a tripped breaker fails fast with a fallback instead
-//! of hammering dead hardware.
+//! The `v0.1` core ([`crate::SnubberGuard`], [`crate::EpochGate`]) handles
+//! transaction rollback and generation gating without recording history.
+//! This module provides the telemetry and supervision layer: every entry,
+//! exit, stale epoch, and bulkhead rejection is tracked, faults carry caller
+//! coordinates via `#[track_caller]`, and a tripped circuit breaker fails fast
+//! to protect downstream subsystems during persistent failure states.
 //!
 //! `std`-gated: needs [`std::sync::Mutex`] for the shared recorder and
 //! [`std::sync::Arc`] for guard ownership. The v0.1 core stays `core`-only.
@@ -198,15 +198,23 @@ pub struct SnubberStats {
 impl SnubberStats {
     /// Catastrophic fault count: unrecoverable task deaths.
     ///
-    /// `reported[Panic] + reported[Timeout] + reported[ProcessDied] +
-    /// implicit_drops`. Pure snapshot math (`saturating_add`, no lock).
-    /// Growth here indicates algorithmic defects.
+    /// Sum of panics, timeouts, worker process terminations, and implicit drops.
+    /// Pure snapshot math (`saturating_add`, no lock).
+    /// Non-zero count indicates algorithmic defects.
     #[must_use]
-    pub fn nuclear_breaches(&self) -> u64 {
+    #[inline]
+    pub fn catastrophic_faults(&self) -> u64 {
         self.reported[FaultKind::Panic.index()]
             .saturating_add(self.reported[FaultKind::Timeout.index()])
             .saturating_add(self.reported[FaultKind::ProcessDied.index()])
             .saturating_add(self.implicit_drops)
+    }
+
+    /// Catastrophic fault count (alias for backwards compatibility).
+    #[must_use]
+    #[inline]
+    pub fn nuclear_breaches(&self) -> u64 {
+        self.catastrophic_faults()
     }
 
     /// Capacity shedding: no free bulkhead slot (`BulkheadFull` +
@@ -1009,23 +1017,23 @@ pub trait LegalMove<Next> {
     fn convert(from: Self) -> Next;
 }
 
-/// Spawned guarded worker: thread join + controller leash (debt 1).
+/// Spawned guarded worker: thread join handle and controller task handle.
 /// `JoinHandle` yields `Err(Admission(..))` when the membrane refused
-/// (bulkhead/breaker) — join and see why, zero guessing.
+/// (bulkhead/breaker) — join and inspect the error.
 #[cfg(feature = "alloc")]
 pub type SpawnedGuard<S, D = ()> = (
     std::thread::JoinHandle<Result<(), SnubberError<()>>>,
     crate::TaskHandle<S, D>,
 );
 
-/// Scope seal: a `!Send + !Sync` context token (Weapon 1, opt-in).
+/// Scope seal: an opt-in `!Send + !Sync` context token.
 ///
-/// Zero-size (`PhantomData` only — costs nothing at runtime), but the
-/// `*const ()` inside poisons `Send` and the `&'a ()` poisons `Sync`.
+/// Zero-size (`PhantomData` only — zero runtime cost), where
+/// `*const ()` ensures `!Send` and `&'a ()` ensures `!Sync`.
 /// [`SnubberNode::scoped_sealed`] hands `&ScopeToken` to the work closure;
-/// any attempt to `move` it into `thread::spawn` dies at compile time.
-/// `scoped`/`scoped_checked`/`transition` stay untouched (SemVer peace) —
-/// reach for the sealed sibling only where thread-leakage is the threat.
+/// any attempt to `move` it into `thread::spawn` fails at compile time.
+/// `scoped`/`scoped_checked`/`transition` remain untouched for API compatibility;
+/// use `scoped_sealed` when cross-thread leakage prevention is needed.
 pub struct ScopeToken<'a> {
     _marker: core::marker::PhantomData<(*const (), &'a ())>,
 }
@@ -1042,10 +1050,10 @@ impl<'a> ScopeToken<'a> {
 /// Compile-time seal check: `*const ()` is `!Send + !Sync`, so any
 /// closure that captures `&ScopeToken` (or the token itself) becomes
 /// `!Send` and `thread::spawn` rejects it. Negative auto-trait impls
-/// (`impl !Send`) are unstable — the REAL proof is the `compile_fail`
+/// (`impl !Send`) are unstable — the proof is verified by the `compile_fail`
 /// doctest on [`SnubberNode::scoped_sealed`]: leaking `ctx` into a
 /// detached thread fails with ``*const ()` cannot be sent between
-/// threads safely``. This comment is the map; the doctest is the proof.
+/// threads safely``.
 const _: () = {
     assert!(
         core::mem::size_of::<ScopeToken<'static>>() == 0,
@@ -1053,19 +1061,11 @@ const _: () = {
     );
 };
 
-/// Compile-time capacity proof (Weapon 4, opt-in) — HONEST SCOPE.
+/// Compile-time capacity validation wrapper for bounded concurrency.
 ///
 /// Thin wrapper over the runtime builder: `IN_FLIGHT` slots, `QUEUE`
-/// horizon. COMPARISON against the alternative: stable Rust forbids
-/// arithmetic on generic const params in `where` bounds
-/// (`generic_const_exprs` is nightly-only), so a pure type-level
-/// `StaticNode::<0, _>` rejection is NOT expressible on MSRV 1.70.
-/// What this wrapper DOES guarantee, checked first in `build()` before
-/// any slot is armed: `IN_FLIGHT > 0`, `QUEUE >= IN_FLIGHT` — via
-/// `assert!`, zero cost when sane, panic naming the violated capacity
-/// when insane. The `compile_fail` doctest below pins the DOCUMENTED
-/// contract; the runtime asserts pin the BEHAVIOR. The `max_in_flight(0)`
-/// "always full" backdoor stays available on the raw builder for tests.
+/// horizon. Checked at construction in `build()`:
+/// `IN_FLIGHT > 0` and `QUEUE >= IN_FLIGHT`.
 ///
 /// ```rust
 /// use snubber::StaticNode;
@@ -1086,7 +1086,7 @@ impl<const IN_FLIGHT: usize, const QUEUE: usize> StaticNode<IN_FLIGHT, QUEUE> {
     }
 }
 
-/// Armored node: bulkhead + breaker + black box around v0.1 guards.
+/// Monitored node: bulkhead + breaker + telemetry recorder around v0.1 guards.
 ///
 /// Clone is cheap (`Arc`): all handles share one recorder.
 #[derive(Clone)]
@@ -1803,13 +1803,13 @@ impl SnubberNode {
         Ok(outcome)
     }
 
-    /// Sealed scope: `scoped` + a `!Send + !Sync` context token (Weapon 1).
+    /// Sealed scope: `scoped` + an opt-in `!Send + !Sync` context token.
     ///
-    /// `scoped`/`scoped_checked`/`transition` are frozen (SemVer peace).
-    /// This opt-in sibling binds the work closure to the current stack at
+    /// `scoped`/`scoped_checked`/`transition` remain untouched for API compatibility.
+    /// This opt-in variant binds the work closure to the current stack at
     /// the TYPE level: `work` receives `&ScopeToken`, a zero-size token
-    /// that can never cross a thread boundary. Smuggling it into
-    /// `thread::spawn(move || ...)` is a COMPILE error
+    /// that cannot cross a thread boundary. Attempting to pass it into
+    /// `thread::spawn(move || ...)` is a compile-time error
     /// (``*const ()` cannot be sent between threads safely``).
     ///
     /// Honest limit (documented, not hidden): the token blocks CONTEXT
