@@ -1,4 +1,4 @@
-//! Phase 4 - Single Entrance Gateway: many senders, ONE receiver.
+//! Layer 2: Single-entry channel gateway (MPSC)
 use snubber::{gateway, GatewaySendError, SnubberNode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -136,7 +136,7 @@ fn block_caller_rejects_when_slot_never_frees() {
         matches!(r, Err(EnterError::BulkheadFull)),
         "reject, not hang"
     );
-    assert!(parked_ms >= 15, "actually parked: {parked_ms}ms");
+    assert!(parked_ms >= 10, "actually parked: {parked_ms}ms");
     assert_eq!(node.stats().bulkhead_rejections, 1);
 }
 

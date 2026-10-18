@@ -31,7 +31,7 @@ fn test_node_floor_map_anchors_exist() {
     }
 }
 
-/// Every low-level entry must carry the scare-strip pointing at the
+/// Every low-level entry must carry the Canonical Indirection Warning pointing at the
 /// canonical worker entry. A newcomer hovering over `enter` in an IDE must
 /// see "prefer enter_erased_auto" before invoking low-level primitives.
 #[test]
@@ -39,18 +39,42 @@ fn test_low_level_entries_point_at_canonical() {
     let source =
         std::fs::read_to_string("src/node.rs").expect("Failed to read src/node.rs for entry audit");
 
-    // One scare-strip per low-level method. `enter_erased_auto` is the
-    // canonical target and must NOT carry the strip itself.
-    let strip = "prefer the canonical [`Self::enter_erased_auto`]";
-    let strips = source.matches(strip).count();
-    assert_eq!(
-        strips, 8,
-        "TRIPWIRE FIRED: want exactly 8 scare-strips (enter, \
-         enter_with_priority, enter_with_generation, enter_erased, enter_auto, enter_checked_auto, \
-         enter_checked, enter_supervised_erased), found {strips}.",
+    const LOW_LEVEL_METHODS: &[&str] = &[
+        "pub fn enter<F: FnOnce()>(",
+        "pub fn enter_with_priority<F: FnOnce()>(",
+        "pub fn enter_with_generation<F: FnOnce()>(",
+        "pub fn enter_erased<F: FnOnce() + Send + 'static>(",
+        "pub fn enter_auto<F: FnOnce()>(",
+        "pub fn enter_checked_auto<P, V, F: FnOnce()>(",
+        "pub fn enter_checked<P, V, F: FnOnce()>(",
+        "pub fn enter_supervised_erased<F>(",
+    ];
+
+    let warning = "prefer the canonical [`Self::enter_erased_auto`]";
+
+    for method in LOW_LEVEL_METHODS {
+        let pos = source
+            .find(method)
+            .unwrap_or_else(|| panic!("Method {method} not found in src/node.rs"));
+        let doc_window = &source[pos.saturating_sub(2500)..pos];
+        assert!(
+            doc_window.contains(warning),
+            "Method {method} is missing the Canonical Indirection Warning banner"
+        );
+    }
+
+    // `enter_erased_auto` is the canonical target and must NOT carry the redirection itself.
+    let canonical_pos = source
+        .find("pub fn enter_erased_auto<")
+        .expect("Canonical entry missing");
+    let canonical_doc = &source[canonical_pos.saturating_sub(600)..canonical_pos];
+
+    assert!(
+        !canonical_doc.contains(warning),
+        "Canonical entry must not carry a redirection warning to itself"
     );
 
-    // The canonical entry advertises itself with the green header.
+    // The canonical entry advertises itself with the canonical header.
     assert!(
         source.contains("# 🟢 CANONICAL APPLICATION ENTRY"),
         "TRIPWIRE FIRED: canonical header missing from enter_erased_auto.",

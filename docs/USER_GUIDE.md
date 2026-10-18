@@ -10,9 +10,10 @@
 
 ---
 
-## 0. Universal Ergonomics: Zero-Boilerplate Scoped Execution
+## Quick Start: Zero-Boilerplate Scoped Execution
 
-If you don't want to manually handle `guard.commit()` or track tokens in your head, use the **`scoped`** functional API. It turns transactional safety into a single clean call. Its sealed sibling **`scoped_sealed`** adds a `!Send` `ScopeToken` (thread-leak fails at compile), **`transition_checked`** + `LegalMove` close the state graph (illegal ribs die at compile), **`StaticNode`** validates capacities FIRST in `build()`, and **`Protected`** burns the resource with a failed guard — all opt-in, see the API table:
+If you don't want to manually handle `guard.commit()` or track tokens in your head, use the **`scoped`** functional API. It turns transactional safety into a single clean call. Its sealed sibling **`scoped_sealed`** adds a `!Send` `ScopeToken` (thread-leak fails at compile), **`transition_checked`** + `LegalMove` close the state graph (illegal transitions rejected at compile time), **`StaticNode`** validates capacities FIRST in `build()`, and **`Protected`** releases or rolls back the resource with a guard — all opt-in, see the API table:
+
 
 ```rust
 use snubber::{snub_check, SnubberNode};
@@ -49,7 +50,7 @@ let receipt = node.scoped_checked(
 
 ---
 
-## Layer 1: Core RAII Guard (Stack Rollback & Universal Ergonomics)
+## Layer 1: Core RAII Guard (Stack Rollback)
 
 No nodes, no config. Three lines:
 
@@ -129,34 +130,34 @@ match node.enter_auto(|| release_locks()) {
 
 ### 2.5 Long-Lived Worker Daemon (Autonomous Slot Claiming)
 
-Imagine a turnstile into a room with one strict rule: **only ONE person
-may be inside at a time** (`max_in_flight(1)`). Anyone who tries to enter
-while the room is occupied gets an iron bar to the ribs and an error:
-`BulkheadRejected`.
+Consider a concurrency-limited execution perimeter where **only ONE operation
+may execute concurrently** (`max_in_flight(1)`). Any incoming concurrent admission
+while the slot is held is rejected at the bulkhead boundary with:
+`EnterError::BulkheadFull`.
 
 ### The trap: wrapping `thread::spawn` in `scoped_checked`
 
-A developer thinks: *"I need to start the clicker thread safely — I'll
+A developer thinks: *"I need to start the background worker thread safely — I'll
 wrap the launch in `scoped_checked`!"*
 
 ```rust
-// Main thread (UI or the "Start" command)
+// Caller thread (UI or the "Start" command)
 click_node.scoped_checked(&params, validate, || {}, |_| {
-    // 1. YOU STEPPED INSIDE. Counter in_flight = 1. All slots exhausted.
+    // 1. Caller thread claimed the slot: in_flight = 1. Capacity exhausted.
 
     std::thread::spawn(move || {
-        // 2. The newborn worker thread runs to the SAME turnstile:
-        //    "let me in to click!"
+        // 2. The newborn worker thread attempts admission on the SAME node:
         let _guard = click_node.enter_erased_auto(..)?;
-        // ❌ BANG! The node sees in_flight == 1 and answers: BulkheadRejected!
-        // The worker never started — it turns around and dies.
+        // ❌ REJECTED: The node observes in_flight == 1 and returns BulkheadFull!
+        // The worker never started — it aborts immediately.
     });
 
-    // 3. Only HERE does scoped_checked end and free the slot (in_flight = 0).
+    // 3. Only after exiting this closure is the slot released (in_flight = 0).
 })?;
 ```
 
-Millisecond physics of the disaster:
+Millisecond physics of the race condition:
+
 
 1. **ms 0:** the main thread calls `scoped_checked`. Snubber opens the
    door, leads it in, locks the gate. The only free slot is taken.
@@ -512,12 +513,13 @@ let guard = node.enter_supervised_erased(
 )?;
 ```
 
-### Chaos Monkey Verification (10,000 OS Kills):
+### Out-of-Process Hard Termination Harness (10,000 OS Kills):
 The architecture has been verified against **10,000 real Windows `TerminateProcess` executions** at ~52 kills/sec without a single pipe deadlock or lost token:
 ```powershell
 # Run the automated 10,000 kill stress test:
 cargo test --test supervisor_termination -- --ignored --nocapture
 ```
+
 
 
 ### 4.5 Declarative restart (Phase 2: Declarative process restart tracking)

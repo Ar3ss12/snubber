@@ -49,15 +49,39 @@ fn sync_intercom_live_inspection_and_directives() {
         Ok(())
     });
 
-    // Wait until worker updates progress
-    std::thread::sleep(Duration::from_millis(5));
+    // Wait until worker updates progress (up to 2 seconds timeout)
+    let start = std::time::Instant::now();
+    while handle.inspect().progress == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "timeout waiting for progress"
+        );
+        std::thread::yield_now();
+    }
     let snap = handle.inspect();
     assert!(snap.progress > 0);
     assert_eq!(snap.stage, "Started");
 
     // Pause worker
     handle.send_directive(Directive::Pause);
-    std::thread::sleep(Duration::from_millis(10));
+
+    // Give worker time to reach Pause checkpoint
+    let pause_start = std::time::Instant::now();
+    let mut last_progress = handle.inspect().progress;
+    let mut stable_cycles = 0;
+    while pause_start.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(2));
+        let curr = handle.inspect().progress;
+        if curr == last_progress {
+            stable_cycles += 1;
+            if stable_cycles >= 5 {
+                break;
+            }
+        } else {
+            stable_cycles = 0;
+            last_progress = curr;
+        }
+    }
     let paused_progress = handle.inspect().progress;
 
     // Verify worker didn't move while paused
@@ -68,7 +92,13 @@ fn sync_intercom_live_inspection_and_directives() {
     handle.resume();
 
     // Send skip stage to fast-forward
-    std::thread::sleep(Duration::from_millis(5));
+    let resume_start = std::time::Instant::now();
+    while handle.inspect().progress == paused_progress {
+        if resume_start.elapsed() > Duration::from_secs(2) {
+            break;
+        }
+        std::thread::yield_now();
+    }
     handle.send_directive(Directive::SkipStage);
 
     let _ = worker.join().unwrap();
@@ -90,7 +120,14 @@ fn sync_intercom_cancel_directive_aborts_immediately() {
         }
     });
 
-    std::thread::sleep(Duration::from_millis(5));
+    let start = std::time::Instant::now();
+    while handle.inspect().stage != "Running" {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "timeout waiting for worker running"
+        );
+        std::thread::yield_now();
+    }
     assert_eq!(handle.inspect().stage, "Running");
 
     handle.send_directive(Directive::Cancel("mission_aborted"));
@@ -170,11 +207,12 @@ fn fake_waker() -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
 }
 
-/// Dragon-tooth regression: hand-written `Clone` on the intercom pair must
+/// Zero-Bound Clone Invariant: hand-written `Clone` on the intercom pair must
 /// carry NO bounds. `#[derive(Clone)]` would demand `S: Clone, D: Clone`
 /// even though cloning the inner `Arc` never touches the payload — a
 /// non-`Clone` draft/directive type would then forbid handing control to
 /// another thread. This test pins the zero-bound contract at compile time:
+
 ///
 /// ```text
 /// struct NoClone; // deliberately NOT Clone
