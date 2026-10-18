@@ -13,12 +13,12 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo check --no-default-features
-cargo test --release --test cycle_torture
+cargo test --release --test concurrency_stress
 ```
 
-`cargo test` today = **168 passed** (7 unit + 161 integration in 42 files)
-+ 20 doc-tests = **188 green**. If your change moves a documented number,
-update it in the SAME commit (README + tech.md). Stale numbers send the
+`cargo test` today = **194 passed** (7 unit + 187 integration in 32 files)
++ 20 doc-tests = **214 green**. If your change moves a documented number,
+update it in the SAME commit (README + tech.md + AGENTS.md). Stale numbers send the
 next agent hunting ghosts.
 
 Windows note: `target/` incremental cache wedges with `os error 32`.
@@ -54,14 +54,14 @@ with default policy isolates ITSELF after report #1: `started=1`,
 `breaker=39999`. Fix (already in `record_locked`): policy trip honors
 `trip_after_failures(0) + failure_window(0)` = fully OFF. Torture nodes
 additionally override Panic to `DiscardSilently`; trip behavior is covered
-by `tests/reflex_breaker.rs` + `tests/node_breaker.rs`, not by throughput
+by `tests/circuit_breaker.rs`, not by throughput
 tests. Never assume `0 = OFF` for the whole breaker — check streak AND
 policy AND window.
 
 One armed trigger at a time: `half_open_probe` admits exactly one probe;
 no second probe in parallel, no manual `breaker = HalfOpen` outside
 `record_locked` / `note_outcome` / `reset_breaker`. Tripwire:
-`tests/reflex_breaker.rs` two waves (1 probe → 8 flood).
+`tests/circuit_breaker.rs` two waves (1 probe → 8 flood).
 
 ## 3. EpochGate is single-lane — do not bench it with 8 lanes
 
@@ -78,7 +78,7 @@ without counting it is cardboard. `stale≈200/40k` debug noise is honest;
 `stale=34992` with disjoint lanes was the test being wrong.
 
 F3 CONTRACT (library stays ruthless): the retry loop above lives ONLY in
-the test harness (`tests/cycle_torture.rs`), which imitates a parallel
+the test harness (`tests/concurrency_stress.rs`), which imitates a parallel
 storm. Inside `snubber` itself `StaleEpoch` is a HARD refusal — `enter`
 returns `Err`, the gate does not advance, no hidden re-issue. NEVER move
 the retry inside the library: a hidden in-crate retry turns a fail-fast
@@ -95,8 +95,8 @@ torture/stress test MUST assert:
 - `rollbacks_fired == aborts + drops` (REAL `fn rollback`, never `|| {}`),
 - `poison_recoveries == 0`.
 
-`tests/cycle_torture.rs` (TIER 1, reflexes OFF) + `tests/reflex_breaker.rs`
-+ `tests/reflex_bulkhead.rs` (TIER 2, reflexes ON) are the reference shape.
+`tests/concurrency_stress.rs` (TIER 1, reflexes OFF) + `tests/circuit_breaker.rs`
++ `tests/bulkhead_capacity.rs` (TIER 2, reflexes ON) are the reference shape.
 `input_boundary.rs::hotkey_flap` (`admitted == 100` + `stale == 100`) is the
 small-scale shape. Copy them, do not invent quieter ones.
 
@@ -186,7 +186,7 @@ review-blocking defect (dead setting).
 ## 10. F-catalog: Documented Postmortems (symptom → root cause → mitigation)
 
 - **F1 fake-green (`1 = 1+0+0`).** 40k attempts, `started=1`, test green.
-  Veto: conservation + hard floor + per-kind counters (§4). Ref: `cycle_torture`.
+  Veto: conservation + hard floor + per-kind counters (§4). Ref: `concurrency_stress`.
 - **F2 breaker OFF trap.** `trip_after_failures(0)` kills streak, not
   `Panic→TripBreaker` policy → `breaker=39999`. Veto: OFF-honoring trip +
   explicit Panic override in torture; trips covered by reflex tests.
@@ -238,10 +238,10 @@ review-blocking defect (dead setting).
 ## 11. Diagnostics: where to look
 
 ```powershell
-cargo test --test cycle_torture -- --nocapture | findstr REALITY
-cargo test --test reflex_bulkhead -- --nocapture | findstr WALL
-# Heavy 10,000 OS TerminateProcess Chaos Monkey (~3 min, spawns 2 GUI windows):
-cargo test --test chaos_dual_terminal -- --ignored --nocapture
+cargo test --test concurrency_stress -- --nocapture | findstr REALITY
+cargo test --test bulkhead_capacity -- --nocapture | findstr WALL
+# Heavy 10,000 OS TerminateProcess stress test:
+cargo test --test supervisor_termination -- --ignored --nocapture
 ```
 
 `[REALITY] attempts/started/settled/bulk/stale/breaker/poison`,
@@ -259,13 +259,13 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo check --no-default-features
-cargo test --release --test cycle_torture
+cargo test --release --test concurrency_stress
 ```
 
 Green = all above green in ONE run, same commit updates `README.md` +
 `AGENTS.md` + `tech.md` numbers. Version lives ONLY in `Cargo.toml`
 (`name`/`version`); docs quote it, never redefine it. Current:
-**v0.5.0**, **188 green**, MSRV 1.70.
+**v0.5.0**, **214 green** (194 tests + 20 doc-tests), MSRV 1.70.
 
 Publication honesty (R7): `.gitignore` has been added covering `target/`,
 local scratch logs, python artifacts, and OS temp files. Cargo package exclusions
@@ -302,3 +302,39 @@ Through non-technical, poetic language in the repository, this product failed to
    Do not use metaphors, dramatic descriptions, or informal analogies in code comments, function names, file names, or documentation. Write exclusively as a technical specification: direct facts, numerical metrics, and data types.
 3. **Immediate replacement:**
    Any metaphorical or literary term must be replaced immediately with its direct technical equivalent.
+
+## 15. Examples Showcase Invariants (01_ .. 09_)
+
+The `examples/` directory is the public showroom of the crate, NOT a draft cemetery:
+
+1. **Numbered sequence 01_ .. 09_:**
+   Every canonical recipe must start with its two-digit index (`01_hardware_fuse.rs` .. `09_pipeline_supervisor.rs`). The file name, first doc-comment line (`//! Pattern XX: ...`), console banner, and `cargo run --example XX_...` instruction MUST match exactly.
+2. **Real RAII rollback, never fake `println!`:**
+   An example must NEVER simulate rollback with a bare `println!` while leaving real resource cleanup to a manual `if result.is_err()` in `main()`. The guard's Drop closure MUST perform the actual state reset (e.g. de-energize relay, disarm device). Manual caller cleanup defeats the entire value proposition of RAII unwinding.
+3. **Honest taxonomy:**
+   - Synchronous thread pools must NOT be labeled as "Async".
+   - In-memory state machine models (like `08_hot_standby_failover.rs`) MUST explicitly declare in their doc-header that they are in-memory simulations rather than live OS process spawns.
+   - Use standard industrial High Availability terminology: `SlotState::Standby` (not `Shadow` or fantasy variants).
+
+## 16. Test Harness vs Example Bindings (The Deletion Minefield)
+
+Never delete or rename files in `examples/` without auditing the integration test tree:
+
+1. **Hardcoded example paths:**
+   Tests like `tests/supervisor.rs` build and invoke example binaries directly (e.g. `Command::new("cargo").args(["build", "--example", "07_state_handoff"])`). Renaming an example without updating the test breaks the suite.
+2. **Stress loop harnesses:**
+   `tests/supervisor_termination.rs` and `scripts/stress_harness.*` depend on dedicated multi-process targets (like `examples/process_termination_loop.rs`). Keep stress-loop binaries intact or update harness scripts synchronously.
+3. **Audit gate before deleting:**
+   Always run `git grep -n "<example_name>"` across `tests/`, `scripts/`, `src/`, `docs/`, and `README.md` before removing any example.
+
+## 17. Host Resource Safety & Single-Threaded Cargo Gate
+
+On Windows MSVC with limited physical memory (8 GB / low commit charge):
+
+1. **Always single-threaded build:**
+   `$env:CARGO_BUILD_JOBS="1"; $env:CARGO_INCREMENTAL="0"` must be set before full test runs to prevent `LNK1102: out of memory` and `0xc0000409` compiler stack buffer overruns.
+2. **No thread-storm fuzzers:**
+   Never spawn unbounded OS threads in loops (e.g. 1000+ threads) in tests. Use bounded thread pools, channel drains, or emulated step counters.
+3. **Single test threads on full runs:**
+   Run `cargo test -j 1 -- --test-threads=1` when executing comprehensive suites.
+
