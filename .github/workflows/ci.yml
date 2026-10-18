@@ -67,7 +67,6 @@ jobs:
 
       - name: Run Release Hard Clamp & Bulkhead Capacity
         run: |
-          cargo test --release --test hard_clamp
           cargo test --release --test bulkhead_capacity
 
   # 3. MIRI VERIFICATION: Formal memory model verification
@@ -94,29 +93,28 @@ jobs:
           MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks"
         run: |
           cargo miri test --test guard
-          cargo miri test --test scoped_ergonomics
+          cargo miri test --test scoped_transactions
           cargo miri test --test erased
-          cargo miri test --test closure_policy
-          cargo miri test --test invariant
-          cargo miri test --test watchdog
+          cargo miri test --test invariants
           cargo miri test --test memory_boundary
-          cargo miri test --test presets
-          cargo miri test --test process_died
-          cargo miri test --test guard_lifecycle
-          cargo miri test --test backpressure
-          cargo miri test --test input_boundary
-          cargo miri test --test policy
-          cargo miri test --test policy_alert
-          cargo miri test --test node_breaker
-          cargo miri test --test node_stats
           cargo miri test --test circuit_breaker
           cargo miri test --test bulkhead_capacity
+          cargo miri test --test channel
+          cargo miri test --test conduit
+          cargo miri test --test priority_preemption
+          cargo miri test --test policy
+          cargo miri test --test node_stats
+          cargo miri test --test presets
+          cargo miri test --test watchdog
+          cargo miri test --test input_boundary
+          cargo miri test --test backpressure
           cargo miri test --test fault_classification
           cargo miri test --test async_gate
           cargo miri test --test async_primitives
-          cargo miri test --test async_waker_dedup
+          cargo miri test --test supervisor
+          cargo miri test --test supervisor_restart
+          cargo miri test --test diagnostics
           cargo miri test --test task_engine
           cargo miri test --test transition_orphan
           cargo miri test --test regression_postmortems
-          cargo miri test --test diagnostics_codec
-          cargo miri test --test protect
+

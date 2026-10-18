@@ -292,3 +292,131 @@ fn supervised_erased_entry_recycles_single_flight_slot() {
         "no rollback on clean path"
     );
 }
+
+#[test]
+fn process_died_is_own_kind_not_channel() {
+    use snubber::{FaultAction, FaultKind, LogLevel};
+    assert_eq!(FaultKind::ProcessDied.index(), 10);
+    assert!(matches!(
+        snubber::DEFAULT_POLICIES[FaultKind::ProcessDied.index()].action,
+        FaultAction::RollbackAndAlert
+    ));
+    assert_eq!(
+        snubber::DEFAULT_POLICIES[FaultKind::ProcessDied.index()].log_level,
+        Some(LogLevel::Critical)
+    );
+    assert_eq!(
+        snubber::DEFAULT_POLICIES[FaultKind::ProcessDied.index()].metric_tag,
+        Some("process_deaths_total")
+    );
+    let node = SnubberNode::builder("death/honest").build();
+    node.report(FaultKind::ProcessDied, 1, 1);
+    let s = node.stats();
+    assert_eq!(s.reported[FaultKind::ProcessDied.index()], 1);
+    assert_eq!(s.reported[FaultKind::ChannelDisconnected.index()], 0);
+    assert_eq!(s.last_fault.map(|f| f.kind), Some(FaultKind::ProcessDied));
+    assert!(node.take_alert(), "death must toast, not whisper");
+}
+
+#[test]
+fn spawn_guarded_binds_thread_guard_leash() {
+    use snubber::{Directive, TaskConduit};
+    let node = SnubberNode::builder("debt/spawn")
+        .max_in_flight(1)
+        .trip_after_failures(0)
+        .build();
+    let (join, handle) = node.spawn_guarded(
+        || {},
+        0u64,
+        |conduit: TaskConduit<u64, ()>| {
+            conduit.update_state(|s| *s = 1);
+            loop {
+                match conduit.check_directive() {
+                    Directive::Cancel(_) | Directive::Preempted(_) => break,
+                    Directive::Pause => {
+                        let _ = conduit.wait_for_resume();
+                    }
+                    _ => std::thread::yield_now(),
+                }
+            }
+        },
+    );
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert_eq!(handle.inspect(), 1, "worker published via conduit");
+    handle.send_directive(Directive::Cancel("stop"));
+    let res = join.join().expect("worker joined");
+    assert!(res.is_ok(), "clean commit, got {res:?}");
+    let s = node.stats();
+    assert_eq!(s.total_started, 1);
+    assert_eq!(s.committed, 1);
+    assert_eq!(s.poison_recoveries, 0);
+}
+
+#[test]
+fn spawn_guarded_refusal_surfaces_in_join() {
+    use snubber::{SnubberError, TaskConduit};
+    let node = SnubberNode::builder("debt/refuse")
+        .max_in_flight(1)
+        .trip_after_failures(0)
+        .build();
+    let _held = node.enter(1, 1, || {}).expect("hold");
+    let (join, _handle) = node.spawn_guarded(
+        || {},
+        0u64,
+        |_: TaskConduit<u64, ()>| panic!("work must never run on refusal"),
+    );
+    let res = join.join().expect("joined");
+    match res {
+        Err(SnubberError::Admission(_)) => {}
+        other => panic!("honest admission boundary refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn stdin_digest_chain_is_closed_tick0() {
+    use snubber::{StateDigest, STATE_LEN};
+    let mut bytes = [0u8; STATE_LEN];
+    bytes[0] = 42;
+    let exe = std::env::current_exe().expect("exe");
+    let successor = exe
+        .parent()
+        .expect("deps dir")
+        .parent()
+        .expect("debug dir")
+        .join("examples")
+        .join("process_state_handoff");
+    let successor = if cfg!(windows) {
+        successor.with_extension("exe")
+    } else {
+        successor
+    };
+    if !successor.exists() {
+        // Build examples if not built yet
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--example", "process_state_handoff"])
+            .status()
+            .expect("build example");
+        assert!(status.success());
+    }
+    assert!(successor.exists(), "build examples first: {successor:?}");
+    let digest = StateDigest::new(bytes);
+    let mut cmd = std::process::Command::new(&successor);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+
+    use std::io::Write;
+    let mut child = cmd.spawn().expect("spawn replacement process");
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(&digest.bytes).expect("64 B, no block");
+    }
+    let status = child.wait().expect("reap replacement process");
+    assert_eq!(status.code(), Some(42), "mark 42 survived real spawn");
+
+    let mut sink = std::process::Command::new(&successor);
+    sink.stdout(std::process::Stdio::null());
+    sink.stderr(std::process::Stdio::null());
+    let mut child2 = snubber::Supervisor::spawn_with_digest(sink, &digest).expect("spawn via fn");
+    let st = child2.wait().expect("reap");
+    assert_eq!(st.code(), Some(42), "fn path delivers too");
+}

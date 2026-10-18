@@ -1,13 +1,21 @@
-//! P0 regression: erased guards live in struct fields, details carry values,
-//! BlockCaller parks instead of rejecting.
+//! Layer 1/3 (alloc): Type-erased guards and capturing closure policies.
+//!
+//! Merged test suite covering:
+//! - [`ErasedGuard`] struct-field embedding, context capture, and commit hooks
+//! - [`ClosurePolicy`] capturing self-healing commands and debug representation
+//! - [`FaultDetail`] zero-cost static strings and owned formatting
+//! - `BlockCaller` backpressure behavior
+
+#![cfg(feature = "alloc")]
 
 use snubber::{
-    EnterError, ErasedGuard, FaultAction, FaultDetail, FaultKind, FaultPolicy, LogLevel,
-    SnubberNode,
+    ClosurePolicy, EnterError, ErasedGuard, FaultAction, FaultDetail, FaultKind, FaultPolicy,
+    LogLevel, SnubberNode,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
-// The struct-field shape that was IMPOSSIBLE with TrackedGuard<F>:
+// The struct-field shape that was impossible with TrackedGuard<F>:
 // every closure is a different anonymous type; ErasedGuard erases once.
 struct App {
     hold: Option<ErasedGuard>,
@@ -44,8 +52,7 @@ fn erased_guard_commit_disarms() {
 
 #[test]
 fn erased_guard_captures_context() {
-    // The point of the box: move || with captured state, no registries.
-    let fired = std::sync::Arc::new(AtomicU64::new(0));
+    let fired = Arc::new(AtomicU64::new(0));
     let c = fired.clone();
     let node = SnubberNode::builder("erased/capture").build();
     let g = node
@@ -78,7 +85,6 @@ fn fault_detail_static_is_zero_cost() {
 
 #[test]
 fn fault_detail_owned_carries_live_values() {
-    // The real bug says interval=359999640000, not a literal.
     let d = FaultDetail::from(format!("interval={}", 359_999_640_000u64));
     assert!(!d.is_static());
     assert_eq!(d.detail(), "interval=359999640000");
@@ -86,9 +92,6 @@ fn fault_detail_owned_carries_live_values() {
 
 #[test]
 fn block_caller_parks_then_admits_freed_slot() {
-    // Bulkhead of 1, BlockCaller(50): first guard occupies the slot in a
-    // helper thread and releases after 10ms; the caller parks 50ms and
-    // must be ADMITTED (not rejected).
     let node = SnubberNode::builder("block/admit")
         .max_in_flight(1)
         .policy(
@@ -113,8 +116,6 @@ fn block_caller_parks_then_admits_freed_slot() {
 
 #[test]
 fn block_caller_rejects_when_slot_never_frees() {
-    // Same policy, but nobody releases: the caller parks the full 20ms
-    // and is then REJECTED as BulkheadFull (no silent hang).
     let node = SnubberNode::builder("block/reject")
         .max_in_flight(1)
         .policy(
@@ -166,4 +167,25 @@ fn node_enter_auto_mints_monotonic_sequences() {
     assert!(g2.header().epoch > g1.header().epoch);
     g1.commit();
     g2.commit();
+}
+
+#[test]
+fn closure_captures_context() {
+    let attempts = Arc::new(AtomicU32::new(0));
+    let c = Arc::clone(&attempts);
+    let policy = ClosurePolicy::new(move || {
+        c.fetch_add(1, Ordering::SeqCst);
+    });
+    policy.run();
+    policy.run();
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn closure_debug_does_not_leak_captures() {
+    let x = 42u32;
+    let policy = ClosurePolicy::new(move || {
+        let _ = x;
+    });
+    assert_eq!(format!("{:?}", policy), "ClosurePolicy(..)");
 }

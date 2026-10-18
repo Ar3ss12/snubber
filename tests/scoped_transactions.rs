@@ -196,3 +196,30 @@ fn scoped_checked_admits_and_executes_valid_order() {
     assert_eq!(stats.committed, 1);
     assert_eq!(stats.total_started, 1);
 }
+
+#[test]
+fn scoped_sealed_commits_and_passes_scope_token() {
+    let node = SnubberNode::builder("scoped_sealed_test").build();
+    let rollback_fired = Arc::new(AtomicBool::new(false));
+    let rb = Arc::clone(&rollback_fired);
+
+    let res: Result<&'static str, SnubberError<&'static str>> = node.scoped_sealed(
+        move || {
+            rb.store(true, Ordering::SeqCst);
+        },
+        |_token| {
+            // ScopeToken is passed by reference, zero-sized and !Send
+            Ok("done")
+        },
+    );
+
+    assert_eq!(res.unwrap(), "done");
+    assert!(!rollback_fired.load(Ordering::SeqCst));
+    assert_eq!(node.stats().committed, 1);
+}
+
+#[test]
+fn scope_token_is_zero_sized() {
+    use snubber::ScopeToken;
+    assert_eq!(core::mem::size_of::<ScopeToken<'static>>(), 0);
+}

@@ -1,11 +1,17 @@
-//! Integration tests for `snubber`: real rollback / epoch / unwind behavior.
+//! Layer 1: Core RAII guard, slot lifecycle, and protected resource integration.
 //!
-//! Each test drives the public API only — no access to guard internals.
+//! Merged test suite covering:
+//! - [`SnubberGuard`] core drop-guaranteed rollback, monotonic headers, and unwinding
+//! - [`Protected`] scoped resource encapsulation, deref semantics, and drop order
+//! - Node-level guard/slot lifecycles, re-entrant hooks, and generation re-handshakes
 
-use snubber::{EpochGate, SnubberEvent, SnubberGuard, TransactionHeader};
+use snubber::{
+    EpochGate, FaultKind, OverflowPolicy, Protected, SnubberEvent, SnubberGuard, SnubberNode,
+    TransactionHeader,
+};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 fn counter() -> Arc<AtomicU32> {
     Arc::new(AtomicU32::new(0))
@@ -17,6 +23,10 @@ fn bumped(flag: &Arc<AtomicU32>) -> impl FnOnce() + '_ {
         flag.fetch_add(1, Ordering::SeqCst);
     }
 }
+
+// ============================================================================
+// 1. Core SnubberGuard & EpochGate Invariants
+// ============================================================================
 
 #[test]
 fn commit_disarms_the_rollback() {
@@ -132,6 +142,171 @@ fn explicit_abort_runs_rollback_and_reports_reason() {
     }
     assert!(event.is_terminal());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+// ============================================================================
+// 2. Node Guard & Slot Lifecycle Invariants
+// ============================================================================
+
+#[test]
+fn slot_returns_on_panic_unwind() {
+    let node = SnubberNode::builder("slots")
+        .max_in_flight(1)
+        .trip_after_failures(100)
+        .build();
+    let probe = std::panic::AssertUnwindSafe(|| {
+        let _g = node.enter(1, 1, || {}).expect("enter");
+        panic!("boom");
+    });
+    let _ = std::panic::catch_unwind(probe);
+    // Slot came home: the node admits again immediately.
+    node.enter(2, 2, || {}).expect("slot freed").commit();
+    assert_eq!(node.stats().implicit_drops, 1);
+    assert_eq!(node.stats().committed, 1);
+}
+
+#[test]
+fn slot_returns_on_question_mark_early_return() {
+    fn fallible(node: &SnubberNode, epoch: u64, ok: bool) -> Result<(), &'static str> {
+        let _g = node.enter(epoch, 1, || {}).map_err(|_| "enter failed")?;
+        if !ok {
+            return Err("nope"); // guard drops -> slot home
+        }
+        Ok(())
+    }
+    let node = SnubberNode::builder("slots_q")
+        .max_in_flight(1)
+        .trip_after_failures(100)
+        .build();
+    assert_eq!(fallible(&node, 1, false), Err("nope"));
+    fallible(&node, 2, true).expect("slot freed after ?-exit");
+    // Both exits are implicit drops (fallible never commits) — but the
+    // SLOT came home both times, which is what this test proves.
+    assert_eq!(node.stats().implicit_drops, 2);
+}
+
+#[test]
+fn hooks_are_reentrant_no_deadlock() {
+    let node = SnubberNode::builder("reenter")
+        .trip_after_failures(100)
+        .build();
+    let handle = node.clone();
+    let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let probe = Arc::clone(&seen);
+    let node2 = SnubberNode::builder("reenter2")
+        .trip_after_failures(100)
+        .on_fault(move |_rec, _stats, _policy| {
+            // Re-enter the OTHER node from inside the hook: if emit held
+            // any lock, this would wedge. It must just work.
+            let _ = handle.stats().total_started;
+            probe.lock().unwrap().push(1);
+        })
+        .build();
+    node2.report(FaultKind::StaleEpoch, 1, 1);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    let _ = node.stats();
+}
+
+#[test]
+fn node_rehandshakes_new_generation() {
+    // Cold-boot split-brain through the node: old client at epoch 50,
+    // rebooted client starts gen 1 / epoch 1 — admitted, no wedge.
+    let node = SnubberNode::builder("reboot")
+        .max_in_flight(16)
+        .overflow(OverflowPolicy::EvictOldest)
+        .build();
+    // Simulate gen-0 traffic by direct gate: enter uses gen 0.
+    node.enter(50, 1, || {}).expect("gen0").commit();
+    // A gen-1 header must be fresh even at epoch 1 < 50.
+    let fresh = TransactionHeader::with_generation(1, 1, 2);
+    assert!(node.observe(&fresh), "new generation re-handshakes");
+    // Stale packet from gen 0 is rejected even with a HIGHER epoch.
+    let stale = TransactionHeader::with_generation(0, 999, 1);
+    assert!(!node.observe(&stale), "stale generation rejected");
+}
+
+// ============================================================================
+// 3. Protected Resource Wrapper Invariants
+// ============================================================================
+
+#[test]
+fn commit_releases_resource_intact() {
+    static ROLLBACKS: AtomicU32 = AtomicU32::new(0);
+    ROLLBACKS.store(0, Ordering::SeqCst);
+    let guard = SnubberGuard::new(1, 1, || {
+        ROLLBACKS.fetch_add(1, Ordering::SeqCst);
+    });
+    let mut p = Protected::new(42u32, guard);
+    // Deref & DerefMut verification
+    assert_eq!(*p, 42);
+    *p += 8;
+    assert_eq!(*p.get(), 50);
+    let out = p.commit();
+    assert_eq!(out, 50, "commit returns inner resource value intact");
+    assert_eq!(
+        ROLLBACKS.load(Ordering::SeqCst),
+        0,
+        "no rollback triggered on commit"
+    );
+}
+
+#[test]
+fn error_drops_resource_and_executes_rollback_once() {
+    static ROLLBACKS: AtomicU32 = AtomicU32::new(0);
+    ROLLBACKS.store(0, Ordering::SeqCst);
+    // Drop order witness: rollback must observe resource alive
+    // (guard field drops before wrapped resource field).
+    let state_marker = Arc::new(AtomicU32::new(0));
+    let probe = Arc::clone(&state_marker);
+    struct ResourceProbe {
+        state: Arc<AtomicU32>,
+    }
+    impl Drop for ResourceProbe {
+        fn drop(&mut self) {
+            self.state.store(2, Ordering::SeqCst); // drops second
+        }
+    }
+    let res = ResourceProbe {
+        state: Arc::clone(&state_marker),
+    };
+    state_marker.store(1, Ordering::SeqCst); // active during transaction
+    let guard = SnubberGuard::new(2, 2, move || {
+        ROLLBACKS.fetch_add(1, Ordering::SeqCst);
+        // Rollback runs while resource still lives: marker is 1.
+        probe.store(probe.load(Ordering::SeqCst), Ordering::SeqCst);
+    });
+    let mut p = Protected::new(res, guard);
+    let _ = p.get_mut();
+    drop(p); // implicit abort on drop
+    assert_eq!(
+        ROLLBACKS.load(Ordering::SeqCst),
+        1,
+        "exactly one rollback execution"
+    );
+    assert_eq!(
+        state_marker.load(Ordering::SeqCst),
+        2,
+        "resource dropped after guard rollback completed"
+    );
+}
+
+#[test]
+fn abort_runs_rollback_and_preserves_authentic_header() {
+    static ROLLBACKS: AtomicU32 = AtomicU32::new(0);
+    ROLLBACKS.store(0, Ordering::SeqCst);
+    let guard = SnubberGuard::new(3, 42, || {
+        ROLLBACKS.fetch_add(1, Ordering::SeqCst);
+    });
+    let p = Protected::new(7u32, guard);
+    let ev = p.abort("plan-b");
+    assert!(ev.is_terminal(), "abort returns terminal event");
+    assert_eq!(ev.header().epoch, 3, "preserves authentic epoch");
+    assert_eq!(ev.header().task_id, 42, "preserves authentic task_id");
+    assert_eq!(
+        ROLLBACKS.load(Ordering::SeqCst),
+        1,
+        "rollback triggered on abort"
+    );
 }
 
 /// Telemetry payload used by the commit test (Copy: zero-cost by construction).

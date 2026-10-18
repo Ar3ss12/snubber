@@ -1,14 +1,12 @@
-//! Bulkhead capacity & saturation: capacity limits and rejection accounting.
+//! Layer 2: Bulkhead capacity, saturation, hard slot clamping, and backpressure measurements.
 //!
-//! Companion to `tests/concurrency_stress.rs` (wide concurrency).
-//! Here the bulkhead is tight (`max_in_flight(2)`, 8 threads): excess
-//! attempts are rejected as `BulkheadFull`, and every rejection is
-//! counted on both sides (test atomics == node books). What must hold:
-//! * `attempts == started + bulkhead` — none vanish;
-//! * admitted guards settle exactly once (`started == settled`);
-//! * telemetry readings accompany the error (`retry_after_ms > 0`, depth > 0).
+//! Merged test suite covering:
+//! - Tight bulkhead capacity ceiling (`max_in_flight = 2`) under heavy thread race
+//! - `hard_clamp_slots` ceiling guarantee with `EvictOldest` overbooking policy
+//! - Full rejection accounting (`attempts == started + bulkhead + stale`)
+//! - Backpressure depth and retry-after hints on `BulkheadFull`
 
-use snubber::{EnterError, SnubberNode};
+use snubber::{EnterError, OverflowPolicy, SnubberNode};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -52,8 +50,6 @@ fn bulkhead_pushes_back_and_counts_every_bounce() {
                         BULK.fetch_add(1, Ordering::SeqCst);
                     }
                     Err(EnterError::StaleEpoch) => {
-                        // Global-epoch race: count the race separately,
-                        // retry once fresh.
                         STALE.fetch_add(1, Ordering::SeqCst);
                         let ep2 = e.fetch_add(1, Ordering::SeqCst);
                         ATTEMPTS.fetch_add(1, Ordering::SeqCst);
@@ -93,7 +89,6 @@ fn bulkhead_pushes_back_and_counts_every_bounce() {
         s.bulkhead_rejections,
         s.stale_epochs_rejected
     );
-    // The wall bit: with 2 slots vs 8 hammering threads, most bounced.
     assert!(bulk > started, "tight wall must reject most attempts");
     assert_eq!(started, s.total_started, "test count matches node books");
     assert_eq!(bulk, s.bulkhead_rejections, "every bounce counted");
@@ -108,8 +103,54 @@ fn bulkhead_pushes_back_and_counts_every_bounce() {
         settled, s.committed,
         "wall test commits everything it admits"
     );
-    // Readings ride the refusal (Newton's 3rd law, info layer).
     let err = EnterError::BulkheadFull;
     assert!(err.retry_after_ms() > 0);
     assert!(err.backpressure().map(|b| b.depth).unwrap_or(0) > 0);
+}
+
+#[test]
+fn hard_clamp_slots_guarantees_ceiling_under_evict_oldest_stress() {
+    let node = Arc::new(
+        SnubberNode::builder("test_hard_clamp")
+            .max_in_flight(2)
+            .queue_capacity(8)
+            .shed_policy(OverflowPolicy::EvictOldest)
+            .trip_after_failures(0)
+            .build(),
+    );
+
+    let mut handles = Vec::new();
+    for thread_id in 0..8usize {
+        let n = Arc::clone(&node);
+        handles.push(std::thread::spawn(move || {
+            for i in 0..200u64 {
+                let task_id = thread_id as u64 * 1000 + i;
+                if let Ok(guard) = n.enter(task_id, task_id, || {}) {
+                    std::thread::yield_now();
+                    guard.commit();
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("thread join");
+    }
+
+    assert_eq!(
+        node.lane_in_flight(),
+        [0, 0, 0],
+        "all lanes must return to zero after drain"
+    );
+    assert!(
+        node.bulkhead_has_room(),
+        "node must report available room after drain"
+    );
+
+    let s = node.stats();
+    assert_eq!(
+        s.total_started,
+        s.committed + s.implicit_drops + s.explicit_aborts,
+        "every admitted transaction must settle exactly once"
+    );
 }

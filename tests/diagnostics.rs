@@ -1,13 +1,30 @@
-//! Phase 3+4: snapshot codec round-trip, anomaly verdicts, registry, macro.
+//! Diagnostics verification: snapshot codec round-trip, anomaly verdicts,
+//! flight recorder ring buffer, telemetry sinks, node registry, and health reporting.
 //!
 //! Cold paths only: encode/decode on cached snapshots, pure math scans.
 //! Admission stays ZERO-PANIC; these tests never touch the hot pipeline.
 
 use snubber::{
     assert_no_anomalies, diagnostic_line, find_anomalies, find_anomalies_for_snapshot,
-    write_diagnostic_line, write_health, AnomalyKind, AnomalyPolicy, FaultKind, NodeRegistry,
-    SnapshotV1, SnubberNode, SNAPSHOT_LEN,
+    write_diagnostic_line, write_health, AnomalyKind, AnomalyPolicy, FaultKind, FaultPolicy,
+    FaultRecord, NodeRegistry, SnapshotV1, SnubberNode, SnubberStats, TelemetrySink, SNAPSHOT_LEN,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+struct Counter(Arc<AtomicU64>);
+impl TelemetrySink for Counter {
+    fn on_fault(&self, _r: &FaultRecord, _s: &SnubberStats, _p: &FaultPolicy) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct PanickingSink;
+impl TelemetrySink for PanickingSink {
+    fn on_fault(&self, _r: &FaultRecord, _s: &SnubberStats, _p: &FaultPolicy) {
+        panic!("telemetry plugin simulated failure");
+    }
+}
 
 #[test]
 fn snapshot_codec_round_trips() {
@@ -38,6 +55,29 @@ fn snapshot_rejects_tampering() {
     let mut bad = snap.encode();
     bad[0] = b'X';
     assert!(SnapshotV1::decode(&bad).is_err());
+}
+
+#[test]
+fn snapshot_v1_codec_roundtrip_with_catastrophic_anomalies() {
+    let mut stats = SnubberStats::default();
+    stats.reported[FaultKind::Panic.index()] = 3;
+    stats.stale_epochs_rejected = 1;
+
+    let snap = SnapshotV1::from_stats(&stats, 42);
+    assert_eq!(snap.catastrophic_faults(), 3);
+
+    // Verify binary roundtrip:
+    let bytes = snap.encode();
+    let decoded = SnapshotV1::decode(&bytes).expect("CRC and version must hold");
+    assert_eq!(decoded.catastrophic_faults(), 3);
+    assert_eq!(decoded.generation, 42);
+
+    // Verify diagnostic report generation with standardized terminology:
+    let anomalies = find_anomalies_for_snapshot("worker", &decoded, &AnomalyPolicy::default());
+    assert!(anomalies
+        .iter()
+        .any(|a| a.kind == AnomalyKind::Catastrophic));
+    assert_eq!(AnomalyKind::Catastrophic.code(), "catastrophic_fault");
 }
 
 #[test]
@@ -147,4 +187,60 @@ fn assert_macro_is_green_on_quiet_red_on_faulty() {
         assert_no_anomalies!(&faulty);
     }));
     assert!(caught.is_err(), "macro must fail red on catastrophic fault");
+}
+
+#[test]
+fn ring_holds_last_n_codes() {
+    let node = SnubberNode::builder("flight").flight_depth(16).build();
+    assert_eq!(node.flight_depth(), 16);
+    for i in 1..=20u64 {
+        node.report(FaultKind::StaleEpoch, i, i);
+    }
+    let dump = node.dump_flight();
+    assert_eq!(dump.len(), 16, "cap 16 evicts oldest 4");
+    assert_eq!(dump[0].epoch, 5, "oldest-first after eviction");
+    assert_eq!(dump[15].epoch, 20);
+    assert!(dump.iter().all(|s| s.kind == FaultKind::StaleEpoch));
+    // Implicit drops land in the ring too (guard path).
+    let g = node.enter(100, 100, || {}).expect("admit");
+    drop(g);
+    let dump2 = node.dump_flight();
+    assert_eq!(dump2.len(), 16);
+    assert_eq!(dump2[15].kind, FaultKind::ImplicitDrop);
+    assert_eq!(node.stats().poison_recoveries, 0);
+}
+
+#[test]
+fn flight_depth_clamps() {
+    let tiny = SnubberNode::builder("tiny").flight_depth(0).build();
+    assert_eq!(tiny.flight_depth(), 1);
+    let huge = SnubberNode::builder("huge").flight_depth(9999).build();
+    assert_eq!(huge.flight_depth(), 64);
+}
+
+#[test]
+fn panicking_sink_does_not_break_chain() {
+    let hits = Arc::new(AtomicU64::new(0));
+    let node = SnubberNode::builder("sinks")
+        .telemetry_sink(PanickingSink)
+        .telemetry_sink(Counter(Arc::clone(&hits)))
+        .build();
+    node.report(FaultKind::Panic, 1, 1);
+    node.report(FaultKind::Timeout, 2, 2);
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "good sink still fires");
+    assert_eq!(node.stats().poison_recoveries, 0);
+    // inspect() is the stats() alias.
+    let snap = node.inspect();
+    assert_eq!(snap.catastrophic_faults(), 2);
+    assert_eq!(snap.shed_rate(), 0);
+}
+
+#[test]
+fn stats_hot_smoke_docs_f10_scope() {
+    let node = SnubberNode::builder("hot").build();
+    for i in 1..=160u64 {
+        node.report(FaultKind::StaleEpoch, i, i);
+        let _ = node.stats();
+    }
+    assert_eq!(node.stats().shed_stale(), 160);
 }
