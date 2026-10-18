@@ -15,6 +15,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 /// Future of one async admission (`node.enter_async(...)`).
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct EnterFuture<F: FnOnce()> {
     node: SnubberNode,
     epoch: u64,

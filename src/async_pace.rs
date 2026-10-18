@@ -1,9 +1,9 @@
-//! Async pacing: Newton waits without freezing the executor.
+//! Async pacing: Backpressure delay without blocking executor threads.
 //!
 //! Sync `AdaptiveBlock` parks the OS thread (`std::thread::sleep`) — in an
 //! async runtime that freezes the WHOLE worker. This module injects YOUR
 //! sleep (`tokio::time::sleep`, `async-std`, test fake): snubber computes
-//! the friction wait from the SAME spring, then `.await`s YOUR timer.
+//! the friction wait using configured backpressure friction, then `.await`s YOUR timer.
 //!
 //! Zero deps: `Future` is `core`, the sleeper is a caller-supplied async fn.
 

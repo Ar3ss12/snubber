@@ -68,7 +68,7 @@ impl AsyncGate {
         self.node.enter(epoch, task_id, rollback)
     }
 
-    /// Admit with membrane validation first (poison never takes a slot).
+    /// Admit with input invariant validation first (invalid parameters rejected before admission).
     pub fn admit_checked<P, V, F: FnOnce()>(
         &self,
         epoch: u64,
@@ -89,7 +89,8 @@ impl AsyncGate {
         self.node.enter_auto(rollback)
     }
 
-    /// Admit with membrane validation and automatically minted sequence coordinates.
+    /// Admit with input invariant validation first (invalid parameters rejected before admission)
+    /// and automatically minted sequence coordinates.
     pub fn admit_checked_auto<P, V, F: FnOnce()>(
         &self,
         params: &P,
@@ -116,14 +117,20 @@ pub enum GateError {
 ///
 /// In Tokio:
 /// ```text
-/// async fn sleep_ms(ms: u64) {
-///     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+/// impl AsyncSleeper for TokioSleeper {
+///     type SleepFut = tokio::time::Sleep;
+///     fn sleep_ms(ms: u64) -> Self::SleepFut {
+///         tokio::time::sleep(std::time::Duration::from_millis(ms))
+///     }
 /// }
 /// ```
-/// The trait below only names the shape so all runtimes share one gate.
+/// The trait uses an associated future type to stay fully compatible with MSRV 1.70.
 pub trait AsyncSleeper {
+    /// Future returned by `sleep_ms`.
+    type SleepFut: core::future::Future<Output = ()>;
+
     /// Sleep `ms` without blocking an OS thread.
-    fn sleep_ms(ms: u64) -> impl std::future::Future<Output = ()>;
+    fn sleep_ms(ms: u64) -> Self::SleepFut;
 }
 
 /// Classify a refusal for an HTTP/gRPC mapper (exhaustive, no `_`).
@@ -146,9 +153,9 @@ pub fn classify(err: &EnterError) -> Refusal {
 #[must_use = "a Refusal maps to an HTTP verdict (FailFast/Backoff/Ignore/BadRequest) — handle it, never drop it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Refusal {
-    /// Sick downstream — serve fallback, `200` with degraded body.
+    /// Failing downstream target — serve fallback, `200` with degraded body.
     FailFast,
-    /// Wall pressure — sleep `retry_after_ms` in YOUR runtime, then `429`/`503`.
+    /// Capacity saturated — sleep `retry_after_ms` in YOUR runtime, then `429`/`503`.
     Backoff,
     /// Late packet — `200` ignored, nothing to pace.
     Ignore,
@@ -163,7 +170,7 @@ pub fn retry_after_ms(err: &EnterError) -> u64 {
     err.retry_after_ms()
 }
 
-/// Wall readings if this refusal IS pressure (`None` = wrong door).
+/// Backpressure telemetry for capacity refusals.
 #[inline]
 #[must_use]
 pub fn backpressure_of(err: &EnterError) -> Option<Backpressure> {

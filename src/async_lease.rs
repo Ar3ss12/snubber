@@ -1,11 +1,11 @@
 //! Bounded lease channel: honest `try_send` on `SyncSender`, zero deps.
 //!
 //! `std::sync::mpsc::Sender` (unbounded) has NO `try_send` — only
-//! [`std::sync::mpsc::SyncSender`] (from `sync_channel`) does. An unbounded
-//! queue under a storm eats all RAM; this module caps it (default 1024)
-//! and counts overflows as `BufferOverflow` instead of lying.
+//! [`std::sync::mpsc::SyncSender`] (from `sync_channel`) does. A bounded
+//! queue caps memory consumption during peak load; overflows are recorded
+//! as `BufferOverflow`.
 //!
-//! Used by the async reaper: `Drop` fires `try_send` (never blocks), the
+//! Used by background cleanup tasks: `Drop` fires `try_send` (never blocks), the
 //! background task drains and runs the heavy rollback.
 
 use super::policy::FaultKind;
@@ -67,8 +67,9 @@ impl LeaseChannel {
 /// RAII lease tied to a bounded [`SyncSender<LeaseEvent>`]: on `Drop` without
 /// `commit()`, fires `try_send` carrying the last `stage` reached (`set_stage`).
 ///
-/// Bounded by construction: `SyncSender` has a hard capacity ceiling (no RAM
-/// leaks during storms). `try_send` in `Drop` never blocks the worker thread.
+/// Bounded by construction: `SyncSender` has a hard capacity ceiling (no memory
+/// leaks during load spikes). `try_send` in `Drop` never blocks the worker thread.
+#[must_use = "an uncommitted AsyncLease immediately sends an abort event on drop"]
 #[derive(Debug)]
 pub struct AsyncLease {
     tx: SyncSender<LeaseEvent>,
@@ -79,7 +80,6 @@ pub struct AsyncLease {
 
 impl AsyncLease {
     /// Arm a lease for `task_id` wired to `tx`.
-    #[must_use]
     pub const fn new(tx: SyncSender<LeaseEvent>, task_id: u64) -> Self {
         Self {
             tx,
