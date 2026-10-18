@@ -1,67 +1,83 @@
-//! Single Entrance Gateway (Phase 4): many doors, ONE host.
+//! Single-entry channel gateway: multiple senders, one receiver.
 //!
-//! Law of the single checkpoint: doors never touch worker state.
-//! They `send(cmd)` an intent into a bounded box (~10 ns) and return.
-//! The host (one loop, one thread) `recv()`s intents in order and
-//! mutates state in exactly one place, under the snubber membrane.
+//! Contract: senders enqueue an intent into a bounded channel (~10 ns)
+//! and return immediately. The receiver loop dequeues in order and
+//! mutates state in exactly one place, inside the admission boundary.
+//!
+//! Overflow policy split by design (structural constraint, not a bug):
+//! * `RejectNew` — `GatewaySender::send()` handles it: returns `Full`.
+//! * `EvictOldest` — requires draining from the receiver side; senders
+//!   have no access to the `Receiver`. Use `GatewayHost::send_fresh()`
+//!   when the queue is full and eviction is needed.
 //!
 //! Inside: ONLY `std::sync::mpsc::sync_channel` + `try_send` (F14:
 //! plain `Sender` has NO `try_send`, only `SyncSender` does). Never
-//! blocks the door. Reuses `OverflowPolicy`, no second enum (R1).
+//! blocks the sender. Reuses `OverflowPolicy`, no second enum (R1).
 use super::OverflowPolicy;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+
 /// Plain gateway counters (saturating, mutex-guarded, never panic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct GatewayStats {
-    /// `send` calls that landed in the box.
+    /// `send` calls that landed in the channel.
     pub sent: u64,
-    /// `recv` calls that delivered an intent to the host.
+    /// `recv` calls that delivered an intent to the receiver.
     pub admitted: u64,
-    /// Intents dropped at a full box (newcomer or stalest, counted).
+    /// Intents dropped at a full channel (rejected or evicted, counted).
     pub shed: u64,
 }
-/// Internal books behind one short mutex (node books untouched).
+
+/// Internal counters behind one short mutex (node counters untouched).
 #[derive(Debug, Default)]
 struct GatewayBooks {
     sent: u64,
     admitted: u64,
     shed: u64,
 }
-/// Why a `send` refused.
+
+/// Why a `send` call was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GatewaySendError {
-    /// Box full under `RejectNew`: newcomer dropped, counted as shed.
+    /// Channel capacity exceeded. Under `RejectNew` this is final.
+    /// Under `EvictOldest`, `GatewaySender::send()` cannot evict (no
+    /// access to the receiver side) — call `GatewayHost::send_fresh()`
+    /// instead, which dequeues the oldest entry and retries.
     Full,
-    /// Host hung up (`recv` side dropped): dead house.
+    /// Receiver dropped; channel is broken, intent cannot be delivered.
     Disconnected,
 }
-/// Why a `recv` ended.
+
+/// Why a blocking `recv` returned without a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GatewayRecvError {
-    /// All doors dropped and the box drained: host shift over.
+    /// All senders dropped and the channel queue is empty.
     Disconnected,
 }
-/// `send` side: cheap `Clone` (shares box + books). One per door.
+
+/// Sender endpoint: cheap `Clone` (shares channel + counters). One per producer thread.
 #[derive(Debug)]
 pub struct GatewaySender<T> {
     tx: SyncSender<T>,
     books: Arc<Mutex<GatewayBooks>>,
     overflow: OverflowPolicy,
 }
-/// `recv` side: NOT `Clone` (one host, one house). Host loop owns it.
+
+/// Receiver endpoint: NOT `Clone` — one receiver owns the channel. Runs the consumer loop.
 #[derive(Debug)]
 pub struct GatewayHost<T> {
     rx: Receiver<T>,
     books: Arc<Mutex<GatewayBooks>>,
 }
-/// Build the checkpoint: bounded box + books + `RejectNew` rule.
-/// `capacity == 0` saturates to 1 (rendezvous box, never panics).
+
+/// Build a channel gateway with `RejectNew` overflow policy.
+/// `capacity == 0` saturates to 1 (rendezvous channel, never panics).
 #[must_use]
 pub fn gateway<T>(capacity: usize) -> (GatewaySender<T>, GatewayHost<T>) {
     gateway_with_overflow(capacity, OverflowPolicy::RejectNew)
 }
-/// Build with an explicit overflow rule (UI doors: `EvictOldest`).
+
+/// Build a channel gateway with an explicit overflow policy.
 #[must_use]
 pub fn gateway_with_overflow<T>(
     capacity: usize,
@@ -78,17 +94,24 @@ pub fn gateway_with_overflow<T>(
         GatewayHost { rx, books },
     )
 }
+
 impl<T> GatewaySender<T> {
-    /// Switch the overflow rule live (doors adapt without rebuild).
+    /// Update the overflow policy on this sender.
     pub fn set_overflow(&mut self, overflow: OverflowPolicy) {
         self.overflow = overflow;
     }
-    /// Current overflow rule.
+
+    /// Current overflow policy on this sender.
     #[must_use]
     pub fn overflow(&self) -> OverflowPolicy {
         self.overflow
     }
-    /// Offer one intent. Never blocks, never panics.
+
+    /// Enqueue one intent. Never blocks, never panics.
+    ///
+    /// Returns `Err(Full)` when the channel is at capacity. If the policy
+    /// is `EvictOldest`, the caller must use `GatewayHost::send_fresh()`
+    /// to evict the oldest entry — the sender has no access to the receiver.
     pub fn send(&self, cmd: T) -> Result<(), GatewaySendError> {
         match self.tx.try_send(cmd) {
             Ok(()) => {
@@ -106,7 +129,8 @@ impl<T> GatewaySender<T> {
             Err(TrySendError::Disconnected(_)) => Err(GatewaySendError::Disconnected),
         }
     }
-    /// Snapshot the books (`Copy` out, poison-safe default).
+
+    /// Snapshot the counters (`Copy` out, poison-safe default).
     #[must_use]
     pub fn stats(&self) -> GatewayStats {
         self.books
@@ -118,8 +142,9 @@ impl<T> GatewaySender<T> {
             })
     }
 }
+
 impl<T> Clone for GatewaySender<T> {
-    /// Cheap clone: shares the box + books (one more door).
+    /// Arc refcount bump only — no clone of channel data or counters.
     #[inline]
     fn clone(&self) -> Self {
         Self {
@@ -129,8 +154,9 @@ impl<T> Clone for GatewaySender<T> {
         }
     }
 }
+
 impl<T> GatewayHost<T> {
-    /// Take the next intent (blocks: the host parks here, doors never).
+    /// Blocking dequeue: receiver parks here until an intent arrives or all senders drop.
     pub fn recv(&self) -> Result<T, GatewayRecvError> {
         match self.rx.recv() {
             Ok(cmd) => {
@@ -142,7 +168,8 @@ impl<T> GatewayHost<T> {
             Err(_) => Err(GatewayRecvError::Disconnected),
         }
     }
-    /// Non-blocking take (`None` = box empty right now).
+
+    /// Non-blocking dequeue. Returns `None` if the channel is empty right now.
     #[must_use]
     pub fn try_recv(&self) -> Option<T> {
         match self.rx.try_recv() {
@@ -155,7 +182,12 @@ impl<T> GatewayHost<T> {
             Err(_) => None,
         }
     }
-    /// Land freshest under `EvictOldest` (HOST side owns the dequeue).
+
+    /// Enqueue under `EvictOldest`: dequeues the oldest entry to free a slot, then retries.
+    ///
+    /// Only the receiver can evict because eviction requires `Receiver::try_recv()`.
+    /// `GatewaySender::send()` returns `Err(Full)` when the queue is full under
+    /// `EvictOldest` — that is the signal to call this method instead.
     pub fn send_fresh(&self, tx: &GatewaySender<T>, cmd: T) -> Result<(), GatewaySendError> {
         match tx.tx.try_send(cmd) {
             Ok(()) => {
@@ -189,7 +221,8 @@ impl<T> GatewayHost<T> {
             Err(TrySendError::Disconnected(_)) => Err(GatewaySendError::Disconnected),
         }
     }
-    /// Snapshot the books.
+
+    /// Snapshot the counters.
     #[must_use]
     pub fn stats(&self) -> GatewayStats {
         self.books

@@ -1,6 +1,6 @@
 //! Rollback contract: the four MUSTs every rollback obeys.
 //!
-//! A rollback is voltage discharge, not a money transfer:
+//! A rollback is a compensating state reset, not a forward operation:
 //! * MUST be **idempotent**: `f(f(x)) == f(x)`. Release / zeroize / mute /
 //!   `laser_off` twice is safe; send-money / send-packet twice is NOT.
 //!   Non-idempotent work belongs ONLY in the `commit()` branch.
@@ -9,10 +9,10 @@
 //!   (`docs/FUTURE_TRAPS.md` Trap 2) — no userspace crate preempts kernel.
 //! * MUST be **lock-free vs the node**: never call back into the same
 //!   `SnubberNode` from inside a rollback (open-call rule — re-entrant
-//!   `enter` from a rollback is a deadlock smell).
+//!   `enter` from a rollback is a deadlock hazard).
 //! * MUST **ground its own shared memory**: the node's internal mutex
-//!   synchronizes ONLY node books (counters, breaker, slots). Rollbacks
-//!   run OUTSIDE that lock, and Floor-1 guards own no lock at all.
+//!   synchronizes ONLY node counters (breaker, slots, stats). Rollbacks
+//!   run OUTSIDE that lock, and Layer 1 guards own no lock at all.
 //!   Every guard runs a `SeqCst` fence before the rollback body (free on
 //!   x86/x64) — that narrows the reordering window, but a fence alone
 //!   pairs with NOTHING: a rollback that touches foreign shared state
