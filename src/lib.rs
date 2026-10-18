@@ -375,7 +375,7 @@ impl EpochGate {
     }
 }
 
-// COMPILE-TIME GATES (Floor 1 wire math, always compiled, `core`-only):
+// COMPILE-TIME GATES (Layer 1 wire math, always compiled, `core`-only):
 // header = 3×u64 (24 B), gate = 2×u64 (16 B); `usize` floor keeps the
 // auto-sequence ticket minting off 16-bit microcontrollers.
 // Pointer-width independence is PROVEN (sums of fixed primitives), not
@@ -610,8 +610,8 @@ mod unit_tests {
     #[test]
     #[cfg(feature = "std")]
     fn panicking_rollback_does_not_abort_process() {
-        // The idiot's rollback: panics inside Drop while the worker is
-        // ALREADY unwinding. Without catch_unwind this is instant abort.
+        // Panicking rollback: panics inside Drop while the worker is
+        // already unwinding. Without catch_unwind this is instant abort.
         let probe = std::panic::AssertUnwindSafe(|| {
             let _g = SnubberGuard::new(1, 1, || panic!("rollback idiot"));
             panic!("worker failure");
