@@ -373,6 +373,10 @@ fn spawn_guarded_refusal_surfaces_in_join() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "Miri does not support posix_spawn / OS process spawning"
+)]
 fn stdin_digest_chain_is_closed_tick0() {
     use snubber::{StateDigest, STATE_LEN};
     let mut bytes = [0u8; STATE_LEN];
