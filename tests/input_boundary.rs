@@ -39,7 +39,7 @@ fn hour_99999_cut_before_checked_sub() {
     match node.enter_checked(1, 2, &interval, |p| click_invariant(*p), || {}) {
         Err(EnterError::InvariantBreach(_)) => {}
         Err(other) => panic!("wrong rejection: {other:?}"),
-        Ok(_) => panic!("LEAK: poison reached unwrap"),
+        Ok(_) => panic!("LEAK: invalid input reached unwrap"),
     }
     assert_eq!(node.stats().poisoned_rejected, 1);
 }

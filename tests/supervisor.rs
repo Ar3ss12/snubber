@@ -315,7 +315,7 @@ fn process_died_is_own_kind_not_channel() {
     assert_eq!(s.reported[FaultKind::ProcessDied.index()], 1);
     assert_eq!(s.reported[FaultKind::ChannelDisconnected.index()], 0);
     assert_eq!(s.last_fault.map(|f| f.kind), Some(FaultKind::ProcessDied));
-    assert!(node.take_alert(), "death must toast, not whisper");
+    assert!(node.take_alert(), "death must raise an alert latch");
 }
 
 #[test]

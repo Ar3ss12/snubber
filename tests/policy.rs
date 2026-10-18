@@ -74,7 +74,7 @@ fn custom_command_runs_outside_the_lock() {
     }
     let seen: Arc<Mutex<Vec<Option<&'static str>>>> = Arc::new(Mutex::new(Vec::new()));
     let probe = Arc::clone(&seen);
-    let node = SnubberNode::builder("self_heal")
+    let node = SnubberNode::builder("auto_reset_policy")
         .policy(
             FaultKind::Panic,
             FaultPolicy::arm(
@@ -133,7 +133,7 @@ fn fault_action_variant_names() {
 }
 
 #[test]
-fn rollback_and_alert_sets_toast_flag() {
+fn rollback_and_alert_sets_notification_flag() {
     let node = SnubberNode::builder("alerts")
         .policy(
             FaultKind::Timeout,
@@ -147,8 +147,8 @@ fn rollback_and_alert_sets_toast_flag() {
         .build();
     assert!(!node.take_alert(), "no alert before the fault");
     node.report(FaultKind::Timeout, 9, 9);
-    assert!(node.take_alert(), "policy must raise the UI alert");
-    assert!(!node.take_alert(), "toast-queue semantics: drains once");
+    assert!(node.take_alert(), "policy must raise the alert latch");
+    assert!(!node.take_alert(), "drain-once latch semantics");
 }
 
 #[test]

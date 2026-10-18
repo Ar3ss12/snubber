@@ -916,7 +916,6 @@ impl PipeDrain {
     /// Take the last un-settled token, if any (call AFTER `EOF`/reap).
     #[must_use]
     pub fn take_armed(&self) -> Option<ProcessToken> {
-
         self.state.lock().ok().and_then(|mut st| st.armed.take())
     }
 

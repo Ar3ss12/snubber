@@ -30,12 +30,13 @@ fn release_acquire_pair_carries_rollback_state() {
         // Implicit drop fires the rollback.
         probe.store(true, Ordering::Release);
     });
-    h.join().expect("worker");
-    assert!(done.load(Ordering::Acquire), "worker ran");
     // Observer: Acquire on FLAG, then plain read of DATA is ordered.
-    let mut spins = 0u32;
-    while !FLAG.load(Ordering::Acquire) && spins < 10_000_000 {
-        spins += 1;
+    let start = std::time::Instant::now();
+    while !FLAG.load(Ordering::Acquire) {
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("timed out waiting for worker FLAG");
+        }
+        std::hint::spin_loop();
     }
     assert!(FLAG.load(Ordering::Acquire), "flag arrived");
     assert_eq!(
@@ -43,6 +44,8 @@ fn release_acquire_pair_carries_rollback_state() {
         42,
         "Release→Acquire carries the rollback write"
     );
+    h.join().expect("worker");
+    assert!(done.load(Ordering::Acquire), "worker ran");
 }
 
 #[test]

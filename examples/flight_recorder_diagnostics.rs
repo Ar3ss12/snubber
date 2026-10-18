@@ -66,7 +66,7 @@ fn main() {
                 passed += 1;
             }
             Err(other) => panic!("[scene2] wrong rejection: {other:?}"),
-            Ok(_) => panic!("[scene2] LEAK: poison reached unwrap"),
+            Ok(_) => panic!("[scene2] LEAK: invalid input reached unwrap"),
         }
         assert_eq!(node.stats().poisoned_rejected, 1);
     }

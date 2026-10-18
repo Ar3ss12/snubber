@@ -28,7 +28,7 @@ fn implicit_drop_is_a_bug_report_with_coordinates() {
     use std::sync::{Arc, Mutex};
     let seen: Arc<Mutex<Vec<(FaultKind, String, u32)>>> = Arc::new(Mutex::new(Vec::new()));
     let probe = Arc::clone(&seen);
-    let node = SnubberNode::builder("bug_hunt")
+    let node = SnubberNode::builder("caller_audit")
         .on_fault(move |rec, _stats, _policy| {
             probe
                 .lock()
@@ -46,7 +46,7 @@ fn implicit_drop_is_a_bug_report_with_coordinates() {
     assert_eq!(s.committed, 0);
     let fault = s.last_fault.expect("implicit drop records a fault");
     assert_eq!(fault.kind, FaultKind::ImplicitDrop);
-    assert_eq!(fault.node, "bug_hunt");
+    assert_eq!(fault.node, "caller_audit");
     assert_eq!(fault.header, TransactionHeader::new(1, 99));
     // #[track_caller]: the arming site is THIS file (the `enter` line above).
     assert!(

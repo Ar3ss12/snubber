@@ -34,7 +34,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-/// Universal invariant assertion macro for semantic customs gates.
+/// Universal invariant assertion macro for semantic admission boundary gates.
 ///
 /// Evaluates a boolean expression; if false, returns early with `Err(reason)`.
 ///

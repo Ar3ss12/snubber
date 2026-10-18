@@ -1,7 +1,7 @@
 //! Layer 1: Invariant gates, formal verification harness, and compile-time Send/Sync gates.
 //!
 //! Merged test suite covering:
-//! - Semantic customs gates (`enter_checked`) with pre-admission invariant validation
+//! - Semantic admission boundary gates (`enter_checked`) with pre-admission invariant validation
 //! - Mathematical formal invariants under multithreaded contention (zero leaks, single-shot rollback)
 //! - Compile-time assertions verifying `Send + Sync` bounds on critical types
 
@@ -32,7 +32,7 @@ const _: () = {
 };
 
 // ============================================================================
-// 2. Customs Gate: Invariant Validation (`enter_checked`)
+// 2. Admission Boundary: Invariant Validation (`enter_checked`)
 // ============================================================================
 
 struct ClickParams {
@@ -52,7 +52,7 @@ fn physics(p: &ClickParams) -> Result<(), &'static str> {
 
 #[test]
 fn valid_params_arm_normally() {
-    let node = SnubberNode::builder("customs").build();
+    let node = SnubberNode::builder("invariant_gate").build();
     let p = ClickParams {
         cps: 120,
         jitter_percent: 20,
@@ -68,7 +68,7 @@ fn valid_params_arm_normally() {
 
 #[test]
 fn zero_cps_rejected_at_the_admission_boundary() {
-    let node = SnubberNode::builder("customs_zero").build();
+    let node = SnubberNode::builder("admission_boundary_zero").build();
     let p = ClickParams {
         cps: 0,
         jitter_percent: 20,
@@ -107,7 +107,7 @@ fn breach_fires_poison_policy_with_custom_command() {
     fn reset() {
         RESETS.fetch_add(1, Ordering::SeqCst);
     }
-    let node = SnubberNode::builder("customs_cmd")
+    let node = SnubberNode::builder("admission_boundary_cmd")
         .policy(
             FaultKind::PoisonedPayload,
             FaultPolicy::arm(
@@ -129,7 +129,7 @@ fn breach_fires_poison_policy_with_custom_command() {
 
 #[test]
 fn breach_coordinates_point_at_the_call_site() {
-    let node = SnubberNode::builder("customs_site").build();
+    let node = SnubberNode::builder("admission_boundary_site").build();
     let p = ClickParams {
         cps: 50,
         jitter_percent: 150,
@@ -163,11 +163,13 @@ fn verify_slot_containment_and_single_shot_rollback() {
     );
 
     let rollback_counter = Arc::new(AtomicU64::new(0));
+    let abort_counter = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::new();
 
     for _ in 0..THREADS {
         let n = Arc::clone(&node);
         let rb = Arc::clone(&rollback_counter);
+        let ab = Arc::clone(&abort_counter);
 
         handles.push(thread::spawn(move || {
             for i in 0..ATTEMPTS_PER_THREAD {
@@ -186,6 +188,7 @@ fn verify_slot_containment_and_single_shot_rollback() {
                 if i % 2 == 0 {
                     guard.commit();
                 } else {
+                    ab.fetch_add(1, Ordering::SeqCst);
                     guard.abort("simulated_failure");
                 }
             }
@@ -205,8 +208,13 @@ fn verify_slot_containment_and_single_shot_rollback() {
 
     // Invariant 3: Rollbacks must match abort count (no duplicate executions)
     let rollbacks = rollback_counter.load(Ordering::SeqCst);
+    let aborts = abort_counter.load(Ordering::SeqCst);
     assert!(
-        rollbacks > 0,
-        "Invariant 3: Rollback handler must have executed for aborted admissions"
+        aborts > 0,
+        "Stress test must exercise at least one aborted admission"
+    );
+    assert_eq!(
+        rollbacks, aborts,
+        "Invariant 3 Broken: Every aborted admission must trigger its rollback exactly once"
     );
 }

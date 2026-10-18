@@ -837,7 +837,7 @@ struct NodeInner {
     breaker: BreakerState,
     half_open_probe: bool,
     console_used: usize,
-    /// Set by `RollbackAndAlert`: the UI layer polls it and shows a toast.
+    /// Set by `RollbackAndAlert`: notification latch polled by the UI layer.
     alert_pending: bool,
     timeouts_fired: u64,
     rate_rejected: u64,
@@ -1324,7 +1324,7 @@ impl SnubberNode {
         crate::SnapshotV1::from_stats(&stats, generation)
     }
 
-    /// Plan-B value for an isolated module (`None` = no fallback armed).
+    /// Fallback strategy value for an isolated module (`None` = no fallback armed).
     /// When the breaker is OPEN, the UI calls this instead of staring at
     /// `Err(BreakerOpen)`: last-known-good value keeps painting.
     ///
@@ -1499,7 +1499,7 @@ impl SnubberNode {
     }
 
     /// Drain the UI-alert flag set by `RollbackAndAlert` policies.
-    /// Returns `true` once per pending alert (toast-queue semantics).
+    /// Returns `true` once per pending alert (drain-once latch semantics).
     pub fn take_alert(&self) -> bool {
         let mut inner = self.lock();
         core::mem::replace(&mut inner.alert_pending, false)
@@ -2113,7 +2113,7 @@ impl SnubberNode {
     /// ⚠️ *Low-level primitive.* If you are building a background worker or
     /// daemon, prefer the canonical [`Self::enter_erased_auto`].
     ///
-    /// Arm a tracked guard behind a semantic customs gate.
+    /// Arm a tracked guard behind an admission boundary invariant gate.
     ///
     /// Rust types are not enough: `cps: u32` accepts `0` (division by
     /// zero) and `999999` (saturated dispatcher) with a straight face. The
