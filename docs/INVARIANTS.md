@@ -11,7 +11,7 @@ The state machine of `snubber` guarantees that the following four properties hol
 ### Invariant 1: Conservation of Admissions
 At any point in time, the sum of all terminal and active states equals the total number of attempted admissions:
 
-$$\text{Attempts} = \text{Admitted} + \text{BulkheadFull} + \text{BreakerTripped} + \text{StaleEpoch} + \text{RateLimited}$$
+$$\text{Attempts} = \text{Admitted} + \text{BulkheadFull} + \text{BreakerOpen} + \text{StaleEpoch} + \text{RateLimited}$$
 
 No request is silently dropped, double-counted, or lost during state transitions, even under high-concurrency races.
 
@@ -34,7 +34,7 @@ For any acquired guard or lease:
 - Double-drop, nested unwinding, or re-entrant drops are mathematically unreachable.
 
 ### Invariant 4: Bounded Pipe Drain under Process Termination
-In the multi-process supervisor (Floor 5), when a monitored child process terminates abnormally via `SIGKILL` or `TerminateProcess`:
+In the multi-process supervisor (Layer 4), when a monitored child process terminates abnormally via `SIGKILL` or `TerminateProcess`:
 - The supervisor guarantees reader termination within a strictly bounded window ($t \le 100\text{ ms}$).
 - Pipe handles are closed without kernel deadlocks or thread starvation.
 - The external reservation held on behalf of the child is released unconditionally.

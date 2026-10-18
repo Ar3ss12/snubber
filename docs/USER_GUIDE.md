@@ -70,8 +70,8 @@ How it works: the guard owns your rollback closure. `commit()` disarms it (succe
 1. **Safe to run twice:** Releasing a button twice is fine; sending money twice is not — put terminal forward actions in `commit()`.
 2. **Fast and non-blocking:** Atomic stores, event flags, non-blocking sends.
 3. **No node re-entrancy:** Never call back into the same node's admission method under the rollback (that deadlocks).
-4. **Memory ordering:** The node's mutex protects node books only. Every guard runs a `SeqCst` fence before the rollback body (free on x86/x64) — but a fence pairs with NOTHING. If your rollback publishes to shared state that another thread reads, pair it yourself: store with `Release`, load with `Acquire` (or guard the state with your own lock). `Relaxed`×2 reads rot (F13).
-5. **Bind resource to guard:** Wrap the handle in `Protected::new(res, guard)` — `commit()` walks it out alive, any other exit burns it. Post-crash access becomes a compile error, not a forgotten `if`.
+4. **Memory ordering:** The node's mutex protects node books only. Every guard runs a `SeqCst` fence before the rollback body (free on x86/x64) — but a fence pairs with NOTHING. If your rollback publishes to shared state that another thread reads, pair it yourself: store with `Release`, load with `Acquire` (or guard the state with your own lock). `Relaxed`×2 reads stale data (F13).
+5. **Bind resource to guard:** Wrap the handle in `Protected::new(res, guard)` — `commit()` disarms the guard and returns the resource; any other exit executes rollback and drops the resource. Post-crash access becomes a compile error, not a forgotten `if`.
 6. **Seal the scope:** Prefer `node.scoped_sealed(rb, work)` where thread-leakage is the threat — the `!Send` `ScopeToken` makes `spawn` with context a compile error (E0277).
 
 ---
@@ -319,7 +319,7 @@ use snubber::{Priority, SnubberNode};
 
 let node = SnubberNode::builder("clicker").max_in_flight(1).build();
 
-// Slow repaint holds the single slot on the trash lane:
+// Low-priority task holds the single slot on the Background lane:
 let bg = node.enter_with_priority(Priority::Background, 1, 1, || release_all())?;
 
 // Emergency stop knocks on the senior lane. Over pure-Background
@@ -519,7 +519,7 @@ The architecture has been verified against **10,000 real Windows `TerminateProce
 cargo test --test chaos_dual_terminal -- --ignored --nocapture
 ```
 
-### 4.5 Declarative restart (Phase 2: dumb-spine reanimation)
+### 4.5 Declarative restart (Phase 2: Declarative process restart tracking)
 The supervisor does not guess — it counts. Declare the policy once,
 the caller loop owns spawn/sleep:
 ```rust
@@ -566,21 +566,21 @@ fn pack_state(x: i32, y: i32, flags: u32, clicks: u64) -> StateDigest {
 ```
 ```rust
 use snubber::StateDigest;
-// Satellite: pack flat (or a wardrobe ticket for 100 MB on disk)…
+// Satellite: pack flat (or a storage ticket for 100 MB on disk)…
 let digest = StateDigest::new(packed_64_bytes);
 digest.emit_if_supervised(); // no-op when unsupervised
-// …death… supervisor hands it to the heir's stdin tick 0:
+// …death… supervisor hands it to the replacement process stdin tick 0:
 ```
 Chain closed 100% in-crate (debt 2): the parent side pipes stdin,
 writes 64 B (fits any 4 KB kernel buffer — never blocks), drops for
-EOF; the heir reads on its first line:
+EOF; the replacement process reads on its first line:
 ```rust
 use snubber::{StateDigest, Supervisor};
 // Parent: caller builds Command (exe+args+env), crate pipes + writes:
 let mut child = Supervisor::spawn_with_digest(cmd, &digest)?;
-// Heir, first line of main (ONCE — second call sees EOF):
+// Replacement process, first line of main (ONCE — second call sees EOF):
 if let Some(digest) = snubber::take_stdin_digest() {
-    restore_from_bytes(digest.bytes); // 42 is back, amnesia cured
+    restore_from_bytes(digest.bytes); // 42 is back, state restored
 }
 ```
 
@@ -674,7 +674,7 @@ profiler at 160 CPS).
 
 ## API & Cost Quick Reference
 
-| Operation | Floor | Latency / Footprint | When to Use |
+| Operation | Layer | Latency / Footprint | When to Use |
 |---|---|---|---|
 | `snub_check!(cond, reason)` | 1 / core | ~0 ns (single branch) | Universal invariant check, returns `Err` |
 | `SnubberGuard::new` | 1 / core | **~1.5 ns** (stack move) | Single function synchronous rollback |
