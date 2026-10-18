@@ -292,24 +292,13 @@ Radius: snubber guards a SYNCHRONOUS perimeter with unwinding
   external daemon + shared-memory heartbeat that releases iron from
   outside. Do not sell the knife as a spaceship.
 
-## 14. BANNED: Poetic & Theatrical Language (Commercial Rule)
+## 14. BANNED: Metaphors & Non-Technical Language
 
-Metaphors in this repo's source, comments, and docs cost a real sales
-conversation. Absolute prohibition, no exceptions, no "just this once":
+Through non-technical, poetic language in the repository, this product failed to pass commercial evaluation.
 
-1. **User metaphors stay in chat.** When the user writes "weapon 3",
-   "held hostage", "aorta", or "burning cage" — that is chat shorthand
-   for understanding, not repository text. Translate it immediately to
-   the plainest technical term that fits: not "hostage" → `owned`, not
-   "postman" → `pipe reader`, not "genetic passport" → `state bytes`.
-   Copying user wording into code or docs verbatim is a disqualifying defect.
-
-2. **Zero poetry in code and docs.** No dramatic names, no literary
-   images, no "cool" branding in function names, comments, filenames,
-   or documentation. Write at the level of a hardware datasheet: precise,
-   short, no adjectives that carry emotion. If a sentence can be cut in
-   half without losing meaning, cut it to a third.
-
-3. **Immediate purge.** Any poetic name found during review is renamed
-   on the spot — no planning documents, no five-page proposals. One
-   commit, smallest possible diff, gates green.
+1. **Do not copy user metaphors into the repository:**
+   If the user uses analogies, comparisons, or informal language in conversation, translate them into standard technical terms (types, functions, syscalls, parameters).
+2. **Zero metaphors in code and documentation:**
+   Do not use metaphors, dramatic descriptions, or informal analogies in code comments, function names, file names, or documentation. Write exclusively as a technical specification: direct facts, numerical metrics, and data types.
+3. **Immediate replacement:**
+   Any metaphorical or literary term must be replaced immediately with its direct technical equivalent.
