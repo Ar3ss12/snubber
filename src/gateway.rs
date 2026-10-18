@@ -4,16 +4,12 @@
 //! and return immediately. The receiver loop dequeues in order and
 //! mutates state in exactly one place, inside the admission boundary.
 //!
-//! Overflow policy split by design (structural constraint, not a bug):
-//! * `RejectNew` — `GatewaySender::send()` handles it: returns `Full`.
-//! * `EvictOldest` — requires draining from the receiver side; senders
-//!   have no access to the `Receiver`. Use `GatewayHost::send_fresh()`
-//!   when the queue is full and eviction is needed.
+//! Rejection is synchronous and non-blocking: if the channel is full,
+//! `GatewaySender::send()` immediately returns `Err(GatewaySendError::Full)`.
 //!
 //! Inside: ONLY `std::sync::mpsc::sync_channel` + `try_send` (F14:
 //! plain `Sender` has NO `try_send`, only `SyncSender` does). Never
-//! blocks the sender. Reuses `OverflowPolicy`, no second enum (R1).
-use super::OverflowPolicy;
+//! blocks the sender.
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +20,7 @@ pub struct GatewayStats {
     pub sent: u64,
     /// `recv` calls that delivered an intent to the receiver.
     pub admitted: u64,
-    /// Intents dropped at a full channel (rejected or evicted, counted).
+    /// Intents dropped due to a full channel (counted).
     pub shed: u64,
 }
 
@@ -39,10 +35,7 @@ struct GatewayBooks {
 /// Why a `send` call was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GatewaySendError {
-    /// Channel capacity exceeded. Under `RejectNew` this is final.
-    /// Under `EvictOldest`, `GatewaySender::send()` cannot evict (no
-    /// access to the receiver side) — call `GatewayHost::send_fresh()`
-    /// instead, which dequeues the oldest entry and retries.
+    /// Channel capacity exceeded. Non-blocking drop.
     Full,
     /// Receiver dropped; channel is broken, intent cannot be delivered.
     Disconnected,
@@ -60,7 +53,6 @@ pub enum GatewayRecvError {
 pub struct GatewaySender<T> {
     tx: SyncSender<T>,
     books: Arc<Mutex<GatewayBooks>>,
-    overflow: OverflowPolicy,
 }
 
 /// Receiver endpoint: NOT `Clone` — one receiver owns the channel. Runs the consumer loop.
@@ -70,48 +62,25 @@ pub struct GatewayHost<T> {
     books: Arc<Mutex<GatewayBooks>>,
 }
 
-/// Build a channel gateway with `RejectNew` overflow policy.
+/// Build a channel gateway.
 /// `capacity == 0` saturates to 1 (rendezvous channel, never panics).
 #[must_use]
 pub fn gateway<T>(capacity: usize) -> (GatewaySender<T>, GatewayHost<T>) {
-    gateway_with_overflow(capacity, OverflowPolicy::RejectNew)
-}
-
-/// Build a channel gateway with an explicit overflow policy.
-#[must_use]
-pub fn gateway_with_overflow<T>(
-    capacity: usize,
-    overflow: OverflowPolicy,
-) -> (GatewaySender<T>, GatewayHost<T>) {
     let (tx, rx) = sync_channel(capacity.max(1));
     let books = Arc::new(Mutex::new(GatewayBooks::default()));
     (
         GatewaySender {
             tx,
             books: Arc::clone(&books),
-            overflow,
         },
         GatewayHost { rx, books },
     )
 }
 
 impl<T> GatewaySender<T> {
-    /// Update the overflow policy on this sender.
-    pub fn set_overflow(&mut self, overflow: OverflowPolicy) {
-        self.overflow = overflow;
-    }
-
-    /// Current overflow policy on this sender.
-    #[must_use]
-    pub fn overflow(&self) -> OverflowPolicy {
-        self.overflow
-    }
-
     /// Enqueue one intent. Never blocks, never panics.
     ///
-    /// Returns `Err(Full)` when the channel is at capacity. If the policy
-    /// is `EvictOldest`, the caller must use `GatewayHost::send_fresh()`
-    /// to evict the oldest entry — the sender has no access to the receiver.
+    /// Returns `Err(GatewaySendError::Full)` when the channel capacity is saturated.
     pub fn send(&self, cmd: T) -> Result<(), GatewaySendError> {
         match self.tx.try_send(cmd) {
             Ok(()) => {
@@ -150,7 +119,6 @@ impl<T> Clone for GatewaySender<T> {
         Self {
             tx: self.tx.clone(),
             books: Arc::clone(&self.books),
-            overflow: self.overflow,
         }
     }
 }
@@ -180,45 +148,6 @@ impl<T> GatewayHost<T> {
                 Some(cmd)
             }
             Err(_) => None,
-        }
-    }
-
-    /// Enqueue under `EvictOldest`: dequeues the oldest entry to free a slot, then retries.
-    ///
-    /// Only the receiver can evict because eviction requires `Receiver::try_recv()`.
-    /// `GatewaySender::send()` returns `Err(Full)` when the queue is full under
-    /// `EvictOldest` — that is the signal to call this method instead.
-    pub fn send_fresh(&self, tx: &GatewaySender<T>, cmd: T) -> Result<(), GatewaySendError> {
-        match tx.tx.try_send(cmd) {
-            Ok(()) => {
-                if let Ok(mut b) = self.books.lock() {
-                    b.sent = b.sent.saturating_add(1);
-                }
-                Ok(())
-            }
-            Err(TrySendError::Full(cmd)) => {
-                if self.rx.try_recv().is_ok() {
-                    if let Ok(mut b) = self.books.lock() {
-                        b.shed = b.shed.saturating_add(1);
-                    }
-                }
-                match tx.tx.try_send(cmd) {
-                    Ok(()) => {
-                        if let Ok(mut b) = self.books.lock() {
-                            b.sent = b.sent.saturating_add(1);
-                        }
-                        Ok(())
-                    }
-                    Err(TrySendError::Full(_)) => {
-                        if let Ok(mut b) = self.books.lock() {
-                            b.shed = b.shed.saturating_add(1);
-                        }
-                        Err(GatewaySendError::Full)
-                    }
-                    Err(TrySendError::Disconnected(_)) => Err(GatewaySendError::Disconnected),
-                }
-            }
-            Err(TrySendError::Disconnected(_)) => Err(GatewaySendError::Disconnected),
         }
     }
 

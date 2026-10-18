@@ -162,8 +162,7 @@ pub use intercom::{Directive, ResumeFuture, TaskConduit, TaskHandle};
 
 #[cfg(feature = "std")]
 pub use gateway::{
-    gateway, gateway_with_overflow, GatewayHost, GatewayRecvError, GatewaySendError, GatewaySender,
-    GatewayStats,
+    gateway, GatewayHost, GatewayRecvError, GatewaySendError, GatewaySender, GatewayStats,
 };
 
 use core::fmt;
