@@ -636,7 +636,7 @@ print_health("click_worker", &snap, &policy);
 // CRITICAL: 0 breaches
 //   bulk_path  | calls: 124000 | shed_bulk: 0 (0%)   | OK
 //   spam_path  | calls: 124000 | shed_rate: 142 (0%) | OK
-//   ghost_path | calls: 124000 | shed_stale: 0       | OK
+//   stale_path | calls: 124000 | shed_stale: 0       | OK
 ```
 
 ### Filter 3 — production (`app.snub` + one-line diagnosis)

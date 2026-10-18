@@ -57,7 +57,7 @@ pub struct SnapshotV1 {
     pub explicit_aborts: u64,
     /// Implicit drops (catastrophic: bug/panic path).
     pub implicit_drops: u64,
-    /// Membrane poison cuts.
+    /// Input validation rejections (PoisonedPayload).
     pub poisoned_rejected: u64,
     /// Stale-epoch cuts.
     pub stale_epochs_rejected: u64,
@@ -102,14 +102,7 @@ impl SnapshotV1 {
             .saturating_add(self.implicit_drops)
     }
 
-    /// Catastrophic fault count (alias for backwards compatibility).
-    #[must_use]
-    #[inline]
-    pub fn nuclear_breaches(&self) -> u64 {
-        self.catastrophic_faults()
-    }
-
-    /// Capacity shedding: bulkhead + evicted (slow worker, not sick).
+    /// Capacity shedding: bulkhead + evicted (worker capacity saturated).
     #[must_use]
     pub fn shed_bulkhead(&self) -> u64 {
         self.bulkhead_rejections.saturating_add(self.evicted)
@@ -342,7 +335,7 @@ pub fn diagnostic_hash(node: &str, snap: &SnapshotV1) -> u32 {
         mix(b);
     }
     for &w in &[
-        snap.nuclear_breaches(),
+        snap.catastrophic_faults(),
         snap.shed_bulkhead(),
         snap.shed_rate(),
         snap.shed_stale(),
@@ -364,10 +357,10 @@ pub enum AnomalyKind {
     Bottleneck,
     /// `shed_rate / total > flood_pct`: external spam / key chatter.
     Flood,
-    /// `shed_stale > 0`: ghost task on a dead epoch/generation.
+    /// `shed_stale > 0`: stale packet from superseded generation.
     Desync,
-    /// `nuclear_breaches > 0`: catastrophic failure — algorithmic defect.
-    Nuclear,
+    /// `catastrophic_faults > 0`: catastrophic failure — algorithmic defect.
+    Catastrophic,
     /// `shed_preempted / total > flood_pct`: seniors constantly evict
     /// juniors — either the Background lane is starved by design or
     /// priorities are inverted upstream. Operational shedding, never catastrophic.
@@ -382,7 +375,7 @@ impl AnomalyKind {
             Self::Bottleneck => "bulkhead_starvation",
             Self::Flood => "rate_flood",
             Self::Desync => "epoch_desync",
-            Self::Nuclear => "nuclear_breach",
+            Self::Catastrophic => "catastrophic_fault",
             Self::PreemptStorm => "preempt_storm",
         }
     }
@@ -395,7 +388,7 @@ pub struct Anomaly {
     pub kind: AnomalyKind,
     /// Node that fired.
     pub node: &'static str,
-    /// Guilty share in percent (nuclear/desync carry 100/1 as markers).
+    /// Guilty share in percent (catastrophic/desync carry 100/1 as markers).
     pub pct: u8,
     /// Raw guilty counter.
     pub count: u64,
@@ -477,13 +470,13 @@ pub fn find_anomalies_for_snapshot(
     policy: &AnomalyPolicy,
 ) -> Vec<Anomaly> {
     let mut out = Vec::new();
-    let nuclear = snap.nuclear_breaches();
-    if nuclear > 0 {
+    let catastrophic = snap.catastrophic_faults();
+    if catastrophic > 0 {
         out.push(Anomaly {
-            kind: AnomalyKind::Nuclear,
+            kind: AnomalyKind::Catastrophic,
             node,
             pct: 100,
-            count: nuclear,
+            count: catastrophic,
         });
     }
     if snap.shed_stale() > 0 {
@@ -566,7 +559,7 @@ pub fn write_health<W: fmt::Write>(
         }
     };
     writeln!(w, "[SNUBBER PULSE] node=\"{node}\"")?;
-    writeln!(w, "CRITICAL: {} breaches", snap.nuclear_breaches())?;
+    writeln!(w, "CRITICAL: {} breaches", snap.catastrophic_faults())?;
     writeln!(
         w,
         "  bulk_path  | calls: {} | shed_bulk: {} ({}%) | {}",
@@ -585,7 +578,7 @@ pub fn write_health<W: fmt::Write>(
     )?;
     writeln!(
         w,
-        "  ghost_path | calls: {} | shed_stale: {} | {}",
+        "  stale_path | calls: {} | shed_stale: {} | {}",
         total,
         snap.shed_stale(),
         if snap.shed_stale() > 0 { "WARN" } else { "OK" }

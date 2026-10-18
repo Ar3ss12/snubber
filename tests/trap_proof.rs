@@ -1,6 +1,6 @@
 //! Surgical trap proofs: one verdict per trap from the review, two tests each.
 //!
-//! * Trap 1 — no double-count of `ImplicitDrop` in `nuclear_breaches()`.
+//! * Trap 1 — no double-count of `ImplicitDrop` in `catastrophic_faults()`.
 //! * Trap 2 — `#[track_caller]` coordinates land in record + ring slot.
 //! * Trap 3 — `flight_depth(0)` clamps to 1, huge clamps to 64.
 //! * Trap 4 — ring never grows past cap under flood / mixed paths.
@@ -10,17 +10,17 @@ use snubber::{FaultKind, SnubberNode};
 #[test]
 fn trap1_no_double_count_implicit_drop_vs_reported() {
     // Guard path (`settle_implicit`): ONE implicit drop bumps
-    // `implicit_drops` exactly once. `nuclear_breaches()` sums
+    // `implicit_drops` exactly once. `catastrophic_faults()` sums
     // Panic/Timeout/ProcessDied reports + `implicit_drops` — the guard
     // path never touches `reported[ImplicitDrop]`, so one drop = one
-    // breach, never two.
+    // fault, never two.
     let node = SnubberNode::builder("trap1_guard").build();
     let g = node.enter(1, 1, || {}).expect("admit");
     drop(g);
     let s = node.stats();
     assert_eq!(s.implicit_drops, 1);
     assert_eq!(s.reported[FaultKind::ImplicitDrop.index()], 0);
-    assert_eq!(s.nuclear_breaches(), 1, "one drop = one breach, not two");
+    assert_eq!(s.catastrophic_faults(), 1, "one drop = one fault, not two");
 }
 
 #[test]
@@ -37,7 +37,7 @@ fn trap1_report_implicit_drop_does_not_feed_streak_twice() {
     let s = node.stats();
     assert_eq!(s.reported[FaultKind::ImplicitDrop.index()], 2);
     assert_eq!(s.implicit_drops, 2, "one bump per call, never twice");
-    assert_eq!(s.nuclear_breaches(), 2, "one incident = one breach");
+    assert_eq!(s.catastrophic_faults(), 2, "one incident = one fault");
     assert_eq!(
         s.breaker_state,
         snubber::BreakerState::Closed,

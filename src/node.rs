@@ -11,7 +11,7 @@
 //! [`std::sync::Arc`] for guard ownership. The v0.1 core stays `core`-only.
 //!
 //! =========================================================================
-//! FLOOR MAP (Quick Jump via Search)
+//! SECTION INDEX (Quick Jump via Search)
 //! =========================================================================
 //! Records & Types   -> search: // [ANCHOR: RECORDS]
 //! Node Builder      -> search: // [ANCHOR: BUILDER]
@@ -210,13 +210,6 @@ impl SnubberStats {
             .saturating_add(self.implicit_drops)
     }
 
-    /// Catastrophic fault count (alias for backwards compatibility).
-    #[must_use]
-    #[inline]
-    pub fn nuclear_breaches(&self) -> u64 {
-        self.catastrophic_faults()
-    }
-
     /// Capacity shedding: no free bulkhead slot (`BulkheadFull` +
     /// `BufferOverflow` mirror). Upstream throughput exceeds worker capacity.
     #[must_use]
@@ -352,7 +345,7 @@ pub const DEFAULT_POLICIES: [FaultPolicy; FaultKind::COUNT] = [
         FaultAction::DiscardSilently,
         LogLevel::Warn,
         "buffer capacity limit reached, backpressure applied",
-        "buffer_choke_total",
+        "buffer_overflow_total",
     ),
     // StaleEpoch — routine UI lag / reorder: debug only.
     FaultPolicy::arm(
@@ -2146,8 +2139,7 @@ impl SnubberNode {
     /// returns to the caller, and the hardware is untouched
     /// (`total_started` does not move, the gate does not advance).
     /// Coordinates are the `enter_checked` call site (`#[track_caller]`),
-    /// so cause and effect collapse into one line: the Heisenbug
-    /// materializes the same nanosecond it is born.
+    /// capturing the precise boundary assertion site without runtime overhead.
     ///
     /// The predicate must be pure and fast (no I/O, no locks) — it runs
     /// while holding no node lock, before any admission check.

@@ -63,7 +63,7 @@ fn panicking_sink_does_not_break_chain() {
     assert_eq!(node.stats().poison_recoveries, 0);
     // inspect() is the stats() alias.
     let snap = node.inspect();
-    assert_eq!(snap.nuclear_breaches(), 2);
+    assert_eq!(snap.catastrophic_faults(), 2);
     assert_eq!(snap.shed_rate(), 0);
 }
 

@@ -57,12 +57,12 @@ fn per_kind_override_replaces_one_cell_only() {
     // Closure configurator starts from the table default.
     let node2 = SnubberNode::builder("matrix2")
         .policy_fn(FaultKind::BufferOverflow, |p| {
-            p.log(LogLevel::Warn, "bus choked, backpressure applied")
-                .metric("buffer_choke_total")
+            p.log(LogLevel::Warn, "buffer full, backpressure applied")
+                .metric("buffer_overflow_total")
         })
         .build();
     let buf = node2.policy_of(FaultKind::BufferOverflow);
-    assert_eq!(buf.metric_tag, Some("buffer_choke_total"));
+    assert_eq!(buf.metric_tag, Some("buffer_overflow_total"));
     assert_eq!(buf.log_level, Some(LogLevel::Warn));
 }
 

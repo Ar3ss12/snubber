@@ -66,7 +66,7 @@ fn shed_never_trips_breaker() {
         "shed must not isolate"
     );
     assert_eq!(s.breaker_trips, 0);
-    assert_eq!(s.nuclear_breaches(), 0, "no catastrophic fault recorded");
+    assert_eq!(s.catastrophic_faults(), 0, "no catastrophic fault recorded");
     assert!(s.shed_bulkhead() >= bulk);
     assert_eq!(s.shed_rate(), s.rate_rejected);
     assert!(s.shed_stale() >= stale);
@@ -83,7 +83,7 @@ fn catastrophic_faults_trip_breaker() {
     node.report(FaultKind::Timeout, 2, 2);
     node.report(FaultKind::ProcessDied, 3, 3);
     let s = node.stats();
-    assert_eq!(s.nuclear_breaches(), 3);
+    assert_eq!(s.catastrophic_faults(), 3);
     assert_ne!(
         s.breaker_state,
         BreakerState::Closed,
@@ -102,7 +102,7 @@ fn catastrophic_faults_trip_breaker() {
     }
     let s2 = node2.stats();
     assert_eq!(s2.implicit_drops, 3);
-    assert_eq!(s2.nuclear_breaches(), 3);
+    assert_eq!(s2.catastrophic_faults(), 3);
     assert_ne!(s2.breaker_state, BreakerState::Closed);
 }
 
@@ -117,7 +117,7 @@ fn channel_disconnect_is_operational_shedding() {
     let s = node.stats();
     assert_eq!(s.breaker_state, BreakerState::Closed);
     assert_eq!(s.breaker_trips, 0);
-    assert_eq!(s.nuclear_breaches(), 0, "drain is not a breach");
+    assert_eq!(s.catastrophic_faults(), 0, "drain is not a breach");
     assert_eq!(s.reported[FaultKind::ChannelDisconnected.index()], 10);
     assert_eq!(s.poison_recoveries, 0);
 }

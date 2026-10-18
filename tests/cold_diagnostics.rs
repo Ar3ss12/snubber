@@ -70,17 +70,17 @@ fn anomalies_pin_each_verdict() {
         "expected flood, got {hits:?}"
     );
 
-    // Desync: stale epoch ghost.
-    let ghost = SnubberNode::builder("ghost").build();
-    ghost.report(FaultKind::StaleEpoch, 1, 1);
-    let hits = find_anomalies("ghost", &ghost.stats(), &policy);
+    // Desync: stale epoch packet.
+    let stale = SnubberNode::builder("stale").build();
+    stale.report(FaultKind::StaleEpoch, 1, 1);
+    let hits = find_anomalies("stale", &stale.stats(), &policy);
     assert!(hits.iter().any(|h| h.kind == AnomalyKind::Desync));
 
-    // Nuclear: panic breach.
-    let nuke = SnubberNode::builder("nuke").build();
-    nuke.report(FaultKind::Panic, 1, 1);
-    let hits = find_anomalies("nuke", &nuke.stats(), &policy);
-    assert!(hits.iter().any(|h| h.kind == AnomalyKind::Nuclear));
+    // Catastrophic: panic fault.
+    let cat_node = SnubberNode::builder("cat_node").build();
+    cat_node.report(FaultKind::Panic, 1, 1);
+    let hits = find_anomalies("cat_node", &cat_node.stats(), &policy);
+    assert!(hits.iter().any(|h| h.kind == AnomalyKind::Catastrophic));
 
     // Silence: no verdicts on a quiet node.
     let quiet = SnubberNode::builder("quiet").build();
@@ -96,13 +96,13 @@ fn diagnostic_line_and_health_render() {
     let snap = node.snapshot_v1();
     let policy = AnomalyPolicy::default();
     let hits = find_anomalies_for_snapshot("click_worker", &snap, &policy);
-    let nuke = hits
+    let cat = hits
         .iter()
-        .find(|h| h.kind == AnomalyKind::Nuclear)
-        .expect("nuclear");
-    let line = diagnostic_line("click_worker", nuke, &snap);
+        .find(|h| h.kind == AnomalyKind::Catastrophic)
+        .expect("catastrophic");
+    let line = diagnostic_line("click_worker", cat, &snap);
     assert!(line.starts_with("[DIAG 0x"), "got {line}");
-    assert!(line.contains("nuclear_breach"));
+    assert!(line.contains("catastrophic_fault"));
 
     let mut buf = String::new();
     write_health(&mut buf, "click_worker", &snap, &policy).expect("render");
@@ -110,7 +110,7 @@ fn diagnostic_line_and_health_render() {
     assert!(buf.contains("CRITICAL: 1 breaches"));
 
     let mut diag = String::new();
-    write_diagnostic_line(&mut diag, "click_worker", nuke, &snap).expect("diag");
+    write_diagnostic_line(&mut diag, "click_worker", cat, &snap).expect("diag");
     assert_eq!(diag, line);
 }
 
@@ -146,5 +146,5 @@ fn assert_macro_is_green_on_quiet_red_on_sick() {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assert_no_anomalies!(&sick);
     }));
-    assert!(caught.is_err(), "macro must fail red on nuclear");
+    assert!(caught.is_err(), "macro must fail red on catastrophic fault");
 }
