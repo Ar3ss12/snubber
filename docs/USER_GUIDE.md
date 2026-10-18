@@ -516,8 +516,9 @@ let guard = node.enter_supervised_erased(
 The architecture has been verified against **10,000 real Windows `TerminateProcess` executions** at ~52 kills/sec without a single pipe deadlock or lost token:
 ```powershell
 # Run the automated 10,000 kill stress test:
-cargo test --test process_kill_stress -- --ignored --nocapture
+cargo test --test supervisor_termination -- --ignored --nocapture
 ```
+
 
 ### 4.5 Declarative restart (Phase 2: Declarative process restart tracking)
 The supervisor does not guess — it counts. Declare the policy once,

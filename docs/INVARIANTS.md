@@ -51,9 +51,9 @@ cargo test --test concurrency_stress
 
 # Verify process death handling and supervisor pipe recovery
 cargo test --test supervisor
-cargo test --test process_died
 
 # Verify bulkhead pushback and rate limits
+
 cargo test --test bulkhead_capacity
 cargo test --test circuit_breaker
 ```

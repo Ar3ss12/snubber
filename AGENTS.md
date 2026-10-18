@@ -146,10 +146,10 @@ incremental cache (`os error 32` here, `os error 1455` there):
 | unit+integration | `cargo test` | 168 + 20 doc = 188 green |
 | features | `cargo check --no-default-features` | ok |
 | miri (lib UB check) | `cargo +nightly miri test --lib` | 6 unit tests ok (0 UB) |
-| miri (integration suite) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test guard --test scoped_ergonomics --test erased --test closure_policy --test invariant --test watchdog --test memory_boundary --test presets --test process_died` | 36 integration tests ok (0 UB) |
-| miri (new cold suites) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test trap_proof --test cold_diagnostics --test catastrophic_vs_shedding --test flight_diagnostics` | 22 tests ok (0 UB; trap 8/8 in ~50s) |
-| torture release | `cargo test --release --test cycle_torture` | ok |
+| miri (integration suite) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test guard --test scoped_transactions --test erased --test invariants --test watchdog --test memory_boundary --test presets --test supervisor` | integration tests ok (0 UB) |
+| miri (new cold suites) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test diagnostics --test fault_classification` | tests ok (0 UB) |
 | clean rebuild | `rmdir /s /q target` then the gates above | — |
+
 
 After ANY clean: `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test`.
 That is the environment, not the code. Never "fix" it by editing Rust.
