@@ -2,73 +2,55 @@
 //!
 //! Core-only (`core` + `Copy` only, no `std`, no `alloc`): the catalog of
 //! failures and the declarative policy types live here so even `no_std`
-//! firmware can name its faults. The *execution* of policies (running a
-//! custom command, printing, tagging metrics) lives in
-//! [`crate::SnubberNode`], which owns the lock + hooks + console.
+//! firmware can classify faults. Policy execution (running custom actions,
+//! emitting telemetry, incrementing metrics) is handled by [`crate::SnubberNode`].
 //!
-//! Closure-capturing commands (`move || …`) live behind the `alloc`
-//! feature (`crate::ClosurePolicy`, in `default` since v0.3): boxed,
-//! executed outside the node lock like every hook.
+//! Capturing commands (`move || …`) require heap allocation and reside in
+//! [`crate::ClosurePolicy`] under the `alloc` feature.
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
 use core::fmt;
 
-/// What went wrong, in one cheap `Copy` enum.
+/// Categorized failure classification for transactional and runtime faults.
 ///
-/// Core-only so firmware, dashboards and [`Backpressure`] can name faults
-/// without pulling the `std` node. Sized as a dense catalog (see
-/// [`FaultKind::COUNT`]) so the node keeps a per-kind policy table +
-/// per-kind metric counters with zero hashing.
+/// Dense, zero-allocation `Copy` enum sized by [`FaultKind::COUNT`].
+/// Enables indexed table lookups and metrics tracking without hashing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FaultKind {
-    /// Guard dropped without `commit`/`abort` — unchecked `?`, early
-    /// return, dead channel. **This is the bug detector.**
+    /// Guard dropped without explicit `commit`/`abort` (early return, `?`, unhandled drop).
     ImplicitDrop,
-    /// A thread died inside the transaction (`panic!` / failed `unwrap`).
-    /// Reported explicitly via `SnubberNode::report` from a
-    /// `catch_unwind` boundary — the guard alone cannot tell *panic*
-    /// from *plain early return*, so the supervisor names it.
+    /// Thread panic intercepted within a protected transaction boundary.
     Panic,
-    /// Task hung past its heartbeat deadline (watchdog fires `report`).
+    /// Execution exceeded configured lease or heartbeat deadline.
     Timeout,
-    /// Channel broke mid-action (dead WebView / pulled cable).
-    /// Reported via `report`; the guard's implicit drop is the same
-    /// incident seen from the hardware side.
+    /// Underlying channel disconnected during operation.
     ChannelDisconnected,
-    /// Bounded buffer filled (backpressure horizon hit).
+    /// Bounded queue or buffer capacity exhausted under backpressure.
     BufferOverflow,
-    /// Packet arrived with `epoch <= last_seen` — UI lag / reorder.
+    /// Packet arrived with a stale sequence or generation (`epoch <= last_seen`).
     StaleEpoch,
-    /// `max_in_flight` slots busy, `RejectNew` policy — node drowning.
+    /// Bulkhead saturated under `RejectNew` policy; admission denied.
     BulkheadFull,
-    /// `queue_limit` hit, oldest event evicted to keep the freshest.
+    /// Waiter queue capacity exceeded; oldest item evicted under `EvictOldest`.
     EvictedOldest,
-    /// Breaker OPEN: call rejected without touching the sick function.
+    /// Circuit breaker is in OPEN state; call rejected without invoking target.
     BreakerOpen,
-    /// Input failed invariant validation (`cps == 0`, negative sleep…).
-    /// Reported via `report` from the membrane BEFORE hardware is touched.
+    /// Input failed invariant boundary checks prior to resource engagement.
     PoisonedPayload,
-    /// Supervised worker process terminated or hung past its lease
-    /// (`abort()`, SIGKILL, `HangTimeout`). Reported by the supervisor
-    /// via `report` — NEVER masked as `ChannelDisconnected` (v0.4:
-    /// death is infrastructure catastrophe, not a flaky wire).
+    /// Supervised child process terminated anomalously or timed out past lease.
     ProcessDied,
-    /// Live slot evicted by a higher-priority admission (Phase 1
-    /// preemption): a `Priority::Critical` entry asked for a slot held
-    /// only by `Priority::Background` work. The victim observes
-    /// `Directive::Preempted` on its `TaskConduit` and settles itself
-    /// (abort/drop); the newcomer is counted here. Capacity shedding,
-    /// never catastrophic — the node is healthy, the junior yielded.
+    /// Work slot relinquished to satisfy a higher-priority `Priority::Critical` admission.
+    /// Classified as operational load shedding; does not indicate system failure.
     Preempted,
 }
 
 impl FaultKind {
-    /// Number of variants — sizes the policy table and metric counters.
+    /// Total number of variants — matches lookup table dimensions.
     pub const COUNT: usize = 12;
 
-    /// Dense index for table lookup (matches declaration order).
+    /// Dense array index corresponding to declaration order.
     #[must_use]
     pub const fn index(self) -> usize {
         match self {
@@ -87,7 +69,7 @@ impl FaultKind {
         }
     }
 
-    /// All variants in index order (for dashboard rendering).
+    /// All variants arranged in index order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::ImplicitDrop,
         Self::Panic,
@@ -103,21 +85,13 @@ impl FaultKind {
         Self::Preempted,
     ];
 
-    /// Catastrophic fault vs capacity-shedding contour.
+    /// Discriminates unrecoverable failures from operational backpressure shedding.
     ///
-    /// * `true` — catastrophic: the task died anomalously
-    ///   (`Panic`, `Timeout`, `ProcessDied`) or the transaction was
-    ///   abandoned without settle (`ImplicitDrop` — silent panic / `?` /
-    ///   forgotten `commit`). Feeds the breaker streak, may isolate.
-    /// * `false` — operational shedding / entry hygiene: the node is healthy
-    ///   and holding the perimeter (`BulkheadFull`, `BufferOverflow`,
-    ///   `EvictedOldest`, `StaleEpoch`, `BreakerOpen`, `RateLimited`
-    ///   mapped onto bulkhead counters), or the input/wire was at fault
-    ///   (`ChannelDisconnected` graceful drain, `PoisonedPayload` membrane
-    ///   cut, queue TTL / payload budget). Counted, never trips the streak.
-    ///
-    /// Single source of truth for [`crate::SnubberNode::report`]: the old
-    /// hardcoded `feeds_streak` match is this method. `const`, core-only.
+    /// * `true` — Catastrophic: anomalous termination (`Panic`, `Timeout`, `ProcessDied`)
+    ///   or uncommitted drops (`ImplicitDrop`). Feeds circuit breaker consecutive failure streaks.
+    /// * `false` — Operational Shedding: defensive backpressure limits (`BulkheadFull`,
+    ///   `BufferOverflow`, `EvictedOldest`, `StaleEpoch`, `BreakerOpen`, `PoisonedPayload`, `Preempted`).
+    ///   Tracked in telemetry; does not increment breaker failure streaks.
     #[must_use]
     pub const fn is_catastrophic(self) -> bool {
         match self {
@@ -134,33 +108,20 @@ impl FaultKind {
     }
 }
 
-/// Admission priority lane (Phase 1 preemption).
-///
-/// Core-only `Copy` data — no logic lives here. The node interprets it:
-/// * `Background(0)` — low-priority lane: telemetry, presets, background UI repaints.
-///   Yields to `Critical` on demand (cooperative `Preempted`).
-/// * `Normal(1)` — ordinary commands. Never preempts, never preempted
-///   by anyone except `Critical` (and only when the whole node holds
-///   nothing but `Background` — strict condition, no inversion).
-/// * `Critical(2)` — emergency stop, panic recovery, operator kill.
-///   When the bulkhead is full of pure `Background`, requests one
-///   cooperative yield instead of bouncing as `BulkheadFull`.
-///
-/// Ordering is the discriminant: higher outranks lower. Default is
-/// `Normal` — every existing `enter*` call keeps its meaning.
+/// Admission priority classification for concurrency arbitration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub enum Priority {
-    /// Slow background work, first to yield.
+    /// Non-latency-critical background operations; first to yield under load.
     Background = 0,
-    /// Ordinary commands (default).
+    /// Default lane for standard application traffic.
     #[default]
     Normal = 1,
-    /// Emergency lane: stop / recovery / operator override.
+    /// Critical lane: emergency procedures, resets, and high-priority commands.
     Critical = 2,
 }
 
 impl Priority {
-    /// Discriminant as a `u8` code (for lock-held handoffs — `Copy` only).
+    /// Numerical representation of priority ranking.
     #[inline]
     #[must_use]
     pub const fn code(self) -> u8 {
@@ -171,7 +132,7 @@ impl Priority {
         }
     }
 
-    /// Rebuild from a code (`>= 2` saturates to `Critical` — never panics).
+    /// Decodes a numerical rank, saturating unknown values to `Critical`.
     #[inline]
     #[must_use]
     pub const fn from_code(code: u8) -> Self {
@@ -182,9 +143,7 @@ impl Priority {
         }
     }
 
-    /// Strict preemption rule: ONLY `Critical` over pure `Background`
-    /// may ask for a yield. `Critical` vs `Normal` does NOT preempt
-    /// (no inversion), `Normal` never preempts anyone.
+    /// Determines if this priority tier is authorized to request preemption.
     #[inline]
     #[must_use]
     pub const fn may_preempt(self) -> bool {
@@ -192,23 +151,18 @@ impl Priority {
     }
 }
 
-/// Static-or-owned fault detail: `no_std` firmware passes `&'static str`
-/// with zero cost; `alloc` binaries format live values
-/// (`interval=359999640000`) without losing the static fast path.
-///
-/// `FaultDetail::detail()` borrows the text either way — dashboards and
-/// hooks never care which variant they hold.
+/// Dynamic or static error context accompanying fault events.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FaultDetail {
-    /// Zero-cost static reason (`"cps == 0"`).
+    /// Zero-allocation static descriptor.
     Static(&'static str),
-    /// Owned dynamic reason (`format!("interval={v}")`).
+    /// Formatted heap string for dynamic diagnostics.
     #[cfg(feature = "alloc")]
     Owned(alloc::string::String),
 }
 
 impl FaultDetail {
-    /// Borrow the text behind either variant.
+    /// Borrows the underlying diagnostic string.
     #[inline]
     #[must_use]
     pub fn detail(&self) -> &str {
@@ -219,7 +173,7 @@ impl FaultDetail {
         }
     }
 
-    /// `true` for the zero-cost static variant.
+    /// Returns `true` if backed by a static reference.
     #[inline]
     #[must_use]
     pub fn is_static(&self) -> bool {
@@ -257,8 +211,8 @@ impl fmt::Display for FaultDetail {
     }
 }
 
-// COMPILE-TIME GATES (zero runtime, zero deps, MSRV 1.70-safe):
-// Compile-time assertions verifying enum discriminant layout and catalog count.
+// COMPILE-TIME INVARIANTS:
+// Enforces table bounds and alignment guarantees at build time.
 const _: () = {
     assert!(
         FaultKind::COUNT == 12,
@@ -286,117 +240,87 @@ const _: () = {
     );
 };
 
-/// Metric sample for one fault firing: static tag + static node name.
-/// Exporters (Prometheus/OpenMetrics/ETW) poll [`crate::SnubberNode::stats`]
-/// and [`crate::SnubberNode::reported`]; this struct is the single-row
-/// unit they iterate: `(tag, node, kind_index, count)`.
-/// `kind: usize` is deliberate: samples NEVER go on the wire as bytes
-/// (in-memory exporter rows only). Wire structs are `u32/u64/u8` only.
+/// Telemetry metric sample capturing fault occurrences per node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MetricSample {
-    /// Static metric tag from the policy (`"stale_packets_dropped"`).
+    /// Metric identifier tag.
     pub tag: &'static str,
-    /// Node that fired.
+    /// Originating node label.
     pub node: &'static str,
-    /// Dense kind index (`FaultKind::index`, node module).
+    /// Index corresponding to [`FaultKind::index`].
     pub kind: usize,
-    /// How many times this (tag, kind) fired on this node.
+    /// Aggregated incident count.
     pub count: u64,
 }
 
-/// Severity of a fault report. The policy decides the noise level —
-/// stale UI packets stay `Debug`, a dead driver goes `Critical`.
+/// Operational severity levels for diagnostic reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub enum LogLevel {
-    /// Routine telemetry (stale packets, evictions).
+    /// Telemetry and low-priority operational notices.
     Debug,
-    /// Something happened, worth a glance.
+    /// Routine lifecycle events.
     #[default]
     Info,
-    /// Backpressure applied, operator should notice.
+    /// Non-fatal backpressure warnings.
     Warn,
-    /// Hardware rollback fired, immediate attention.
+    /// Actionable failures triggering rollbacks.
     Error,
-    /// Thread crash / breaker trip, wake somebody up.
+    /// Breaker trips and thread termination events.
     Critical,
 }
 
-/// Command the node executes when a fault of a given kind fires.
-///
-/// Evaluated OUTSIDE the node lock (same guarantee as hooks).
-///
-/// Honest matrix (0.3 audit — spec vs code):
-/// * `DiscardSilently / BreakerOpen / RollbackAndAlert / TripBreaker /
-///   Custom(fn())` — core-only, `Copy`, heap-free. `Custom` is a plain
-///   `fn` precisely so policies stay `const`-constructible firmware data.
-/// * `BlockCaller(ms)` — core-only DECLARATION, `std` execution: parks the
-///   CALLER thread up to `ms` milliseconds (backpressure you can feel),
-///   then admits-or-rejects. Implemented in `enter_inner`, not in hooks.
-/// * Capturing `move ||` commands — NOT here (a `Box` cannot be `Copy`).
-///   They live behind `alloc` as [`ClosurePolicy`](crate::ClosurePolicy)
-///   and run through the same outside-the-lock path.
-#[derive(Clone, Copy)]
+/// Action executed by the node upon encountering a classified fault.
+#[derive(Debug, Clone, Copy)]
 pub enum FaultAction {
-    /// Do nothing to the system (counters + hooks still fire).
-    /// Ideal for stale UI packets.
+    /// Suppress action; increment internal telemetry counters only.
     DiscardSilently,
-    /// Fail fast as if the breaker were open for this one call.
+    /// Immediately reject caller as if the circuit breaker were OPEN.
     BreakerOpen,
-    /// Run the hardware rollback NOW and set the UI-alert flag.
-    /// (For entry-time faults no guard is armed yet — the alert flag is
-    /// set immediately and the rollback runs at the next implicit drop.)
+    /// Execute rollback routine immediately and signal diagnostic alert.
     RollbackAndAlert,
-    /// Trip the breaker OPEN immediately (isolate the sick module),
-    /// regardless of the consecutive-failure streak.
+    /// Force circuit breaker into OPEN state immediately.
     TripBreaker,
-    /// Developer self-healing: restart driver, resubscribe Win32 hooks, …
-    /// Must be fast, non-panicking, lock-free — same contract as any
-    /// hot-path destructor. Plain `fn` keeps the policy `Copy` and the
-    /// node `alloc`-minimal. Need captures? Use `ClosurePolicy` (`alloc`).
+    /// Invokes a custom function pointer outside the node lock.
     Custom(fn()),
-    /// Backpressure with teeth: park the CALLER up to `ms` milliseconds
-    /// waiting for a bulkhead slot, then admit — or reject if the slot
-    /// never frees. `0` = try once, never sleep. Only meaningful on
-    /// `BulkheadFull` / `BufferOverflow` kinds; elsewhere behaves as
-    /// `DiscardSilently`. `std`-only execution (uses thread parking).
+    /// Synchronously parks caller thread up to `ms` waiting for capacity.
     ///
-    /// ASYNC-FORBIDDEN: parks the OS thread via `std::thread::sleep`.
-    /// Under Tokio this freezes the whole worker thread — in async code
-    /// use `AdviseOnly` + `tokio::time::sleep(err.retry_after_ms()).await`.
+    /// # Safety & Runtime Warnings
+    /// Invokes `std::thread::sleep`. Forbidden in async contexts under Tokio
+    /// to avoid worker pool starvation. Use async gate pacing instead.
     BlockCaller(u64),
 }
 
-impl fmt::Debug for FaultAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DiscardSilently => write!(f, "DiscardSilently"),
-            Self::BreakerOpen => write!(f, "BreakerOpen"),
-            Self::RollbackAndAlert => write!(f, "RollbackAndAlert"),
-            Self::TripBreaker => write!(f, "TripBreaker"),
-            Self::Custom(_) => write!(f, "Custom(..)"),
-            Self::BlockCaller(ms) => write!(f, "BlockCaller({ms}ms)"),
+impl PartialEq for FaultAction {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::DiscardSilently, Self::DiscardSilently) => true,
+            (Self::BreakerOpen, Self::BreakerOpen) => true,
+            (Self::RollbackAndAlert, Self::RollbackAndAlert) => true,
+            (Self::TripBreaker, Self::TripBreaker) => true,
+            (Self::BlockCaller(a), Self::BlockCaller(b)) => a == b,
+            (Self::Custom(a), Self::Custom(b)) => (*a as usize) == (*b as usize),
+            _ => false,
         }
     }
 }
 
-/// Per-fault-kind triad: COMMAND + LOG + METRIC.
-///
-/// Declarative: `FaultPolicy::new(action).log(level, msg).metric(tag)`.
-/// `const`-constructible, so default tables are compile-time data.
+impl Eq for FaultAction {}
+
+/// Configured policy triad mapping fault kinds to actions, logs, and metrics.
 #[derive(Debug, Clone, Copy)]
 pub struct FaultPolicy {
-    /// What to physically do.
+    /// Action to execute.
     pub action: FaultAction,
-    /// Report severity (`None` = fully silent, counters still move).
+    /// Logging severity threshold.
     pub log_level: Option<LogLevel>,
-    /// Static log line attached to the report.
+    /// Optional static log message.
     pub log_msg: Option<&'static str>,
-    /// Metric tag incremented on the dashboard.
+    /// Dashboard metric label.
     pub metric_tag: Option<&'static str>,
 }
 
 impl FaultPolicy {
-    /// Start a policy with a command; log defaults to `Info`, no metric.
+    /// Initializes a policy with a target action; defaults to `LogLevel::Info`.
     #[must_use]
     pub const fn new(action: FaultAction) -> Self {
         Self {
@@ -407,7 +331,7 @@ impl FaultPolicy {
         }
     }
 
-    /// Set severity + static message.
+    /// Configures logging severity and associated message.
     #[must_use]
     pub const fn log(mut self, level: LogLevel, msg: &'static str) -> Self {
         self.log_level = Some(level);
@@ -415,7 +339,7 @@ impl FaultPolicy {
         self
     }
 
-    /// Silence all reporting for this kind (counters still move).
+    /// Disables console output for this fault (metrics remain active).
     #[must_use]
     pub const fn silent(mut self) -> Self {
         self.log_level = None;
@@ -423,14 +347,14 @@ impl FaultPolicy {
         self
     }
 
-    /// Attach a metric tag incremented on every fault of this kind.
+    /// Configures an associated telemetry metric tag.
     #[must_use]
     pub const fn metric(mut self, tag: &'static str) -> Self {
         self.metric_tag = Some(tag);
         self
     }
 
-    /// Shorthand: command + level + message + metric in one `const` expr.
+    /// Shorthand constructor configuring action, log level, message, and metric.
     #[must_use]
     pub const fn arm(
         action: FaultAction,
@@ -453,26 +377,22 @@ impl Default for FaultPolicy {
     }
 }
 
-/// Dry instrument readings of wall resistance (Newton's 3rd law, info layer).
-///
-/// Returned BY the wall, never imposing: the caller decides whether to
-/// sleep, shed, requeue or retry. `Copy`, `core`-only — realtime-safe to
-/// read even where sleeping is forbidden (audio, games).
+/// Backpressure telemetry readings returned during admission rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Backpressure {
-    /// Advised wait before the next attempt, ms.
+    /// Advised wait period before subsequent retry, in milliseconds.
     pub retry_after_ms: u64,
-    /// How deep the node is under water: 0 (free) ..= 255 (wall).
+    /// Concurrency saturation depth: 0 (unloaded) to 255 (fully saturated).
     pub depth: u8,
-    /// Which fault kind presses (BulkheadFull / RateLimited / BreakerOpen).
-    pub kind: super::FaultKind,
+    /// Triggering fault condition.
+    pub kind: FaultKind,
 }
 
 impl Backpressure {
-    /// Build from parts (used by the node + custom friction authors).
+    /// Constructs a telemetry record.
     #[inline]
     #[must_use]
-    pub const fn new(retry_after_ms: u64, depth: u8, kind: super::FaultKind) -> Self {
+    pub const fn new(retry_after_ms: u64, depth: u8, kind: FaultKind) -> Self {
         Self {
             retry_after_ms,
             depth,
@@ -481,46 +401,26 @@ impl Backpressure {
     }
 }
 
-/// Custom friction math: `(in_flight, max_in_flight) -> wait_ms`.
-///
-/// Plain `fn` so it stays `Copy` and `const`-friendly. Default is the soft
-/// linear spring (`1 + depth * max_wait / 255`); hard systems plug a
-/// quadratic/exponential curve or a fixed hardware cycle.
+/// Custom friction calculation: `(in_flight, max_in_flight) -> wait_ms`.
 pub type FrictionFn = fn(u32, u32) -> u64;
 
-/// Custom pressure reaction: what to do when the wall pushes back.
-///
-/// Runs OUTSIDE the node lock (same guarantee as hooks): may log, export
-/// metrics, reprioritize — must not call back into `enter` synchronously
-/// on realtime paths (read `depth`, decide, return).
+/// Callback invoked outside node locks during backpressure shedding.
 pub type PressureFn = fn(Backpressure);
 
-/// Who owns the wait when the wall pushes back (node-level policy).
-///
-/// Orthogonal to per-kind `FaultAction`: the action says WHAT happens on a
-/// firing, this says WHO SLEEPS when admission is denied. Default is
-/// `AdviseOnly` — the node never touches the caller thread.
-///
-/// NOTE: no `PartialEq` by design — function pointers have no meaningful
-/// identity (`Custom(f) == Custom(f)` would lie). Compare discriminants
-/// via [`BackpressurePolicy::kind_name`] in tests.
+/// Node-level policy defining caller pacing under saturation.
 #[derive(Clone, Copy, Debug)]
 pub enum BackpressurePolicy {
-    /// Passive (default): never park the caller. The `Err` carries the
-    /// readings, the caller paces itself. For audio, games, realtime.
+    /// Non-blocking mode: returns backpressure readings immediately to caller.
     AdviseOnly,
-    /// Park the caller up to `max_wait_ms` on the friction-computed wait,
-    /// then admit-or-reject once. For daemons, workers, scripts.
-    /// `shed_deeper_than`: when `Some(d)`, skip the sleep and reject
-    /// immediately once `depth > d` (load shedding fused into the block).
+    /// Synchronously blocks caller up to `max_wait_ms` under saturation.
+    /// Rejects immediately without waiting if `depth` exceeds `shed_deeper_than`.
     AdaptiveBlock {
-        /// Hard cap on one park, ms.
+        /// Maximum duration to block caller thread, in milliseconds.
         max_wait_ms: u64,
-        /// Reject immediately past this depth (`None` = always park).
+        /// Saturation depth cutoff for immediate rejection.
         shed_deeper_than: Option<u8>,
     },
-    /// Call `PressureFn` with the readings (outside the lock), then reject.
-    /// For telemetry reporters, priority droppers, custom shedders.
+    /// Executes custom handler with telemetry data, then rejects caller.
     Custom(PressureFn),
 }
 
@@ -532,7 +432,7 @@ impl Default for BackpressurePolicy {
 }
 
 impl BackpressurePolicy {
-    /// Discriminant name for tests/dashboards (no `PartialEq` on fn ptrs).
+    /// Textual identifier for diagnostic export.
     #[inline]
     #[must_use]
     pub const fn kind_name(&self) -> &'static str {

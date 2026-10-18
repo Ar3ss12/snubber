@@ -19,10 +19,10 @@ fn default_table_covers_every_kind() {
         DEFAULT_POLICIES[FaultKind::Panic.index()].log_level,
         Some(LogLevel::Critical)
     );
-    assert!(matches!(
+    assert_eq!(
         DEFAULT_POLICIES[FaultKind::Panic.index()].action,
         FaultAction::TripBreaker
-    ));
+    );
     // Phase 1 preemption: operational shedding, debug-quiet, own metric column.
     assert_eq!(
         DEFAULT_POLICIES[FaultKind::Preempted.index()].log_level,
@@ -116,4 +116,20 @@ fn trip_breaker_policy_isolates_immediately() {
     node.report(FaultKind::PoisonedPayload, 1, 1);
     assert_eq!(node.stats().breaker_state, snubber::BreakerState::Open);
     assert_eq!(node.stats().breaker_trips, 1);
+}
+
+#[test]
+fn fault_action_equality_and_comparison() {
+    assert_eq!(FaultAction::DiscardSilently, FaultAction::DiscardSilently);
+    assert_eq!(FaultAction::BreakerOpen, FaultAction::BreakerOpen);
+    assert_eq!(FaultAction::RollbackAndAlert, FaultAction::RollbackAndAlert);
+    assert_eq!(FaultAction::TripBreaker, FaultAction::TripBreaker);
+    assert_eq!(FaultAction::BlockCaller(50), FaultAction::BlockCaller(50));
+    assert_ne!(FaultAction::BlockCaller(50), FaultAction::BlockCaller(100));
+    assert_ne!(FaultAction::TripBreaker, FaultAction::BreakerOpen);
+
+    fn dummy_a() {}
+    fn dummy_b() {}
+    assert_eq!(FaultAction::Custom(dummy_a), FaultAction::Custom(dummy_a));
+    assert_ne!(FaultAction::Custom(dummy_a), FaultAction::Custom(dummy_b));
 }

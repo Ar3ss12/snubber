@@ -341,7 +341,6 @@ impl Default for RestartTracker {
 }
 
 impl RestartTracker {
-
     /// Report one death at `now_ms` (caller clock, monotonic).
     /// `exit_code: None` = killed/hung from outside (always a crash).
     /// Returns the decision; the CALLER sleeps/spawns/reports.
