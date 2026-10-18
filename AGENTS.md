@@ -111,8 +111,8 @@ way; `+=` on a counter is a review-blocking defect.
 
 Hooks / custom / fallback / `friction_fn` / console run OUTSIDE the lock
 (`emit`, PHASE B). A hook may call `stats()` re-entrantly. `isolate_once`
-gives each foreign call its own panic boundary — one rotten observer never
-beheads the chain. A panic in PHASE B unwinds with books settled; the
+gives each foreign call its own panic boundary — one failing observer never
+interrupts the chain. A panic in PHASE B unwinds with books settled; the
 caller's `Drop` (outer meta-guard) fires during unwinding — hardware is
 released. Direction one-way only: dumb guards smart, never node-in-node.
 
@@ -246,7 +246,7 @@ cargo test --test chaos_dual_terminal -- --ignored --nocapture
 
 `[REALITY] attempts/started/settled/bulk/stale/breaker/poison`,
 `[WALL] attempts/started/settled/bulk(node)/stale(node)`.
-Panic noise `telemetry plugin died` on stderr is EXPECTED (rotten-hook
+Panic noise `telemetry plugin died` on stderr is EXPECTED (faulty-hook
 isolation working, caught by `isolate_once`).
 
 Proof, not prose (R4): a bug report without a `[REALITY]` / `[WALL]`
@@ -292,37 +292,24 @@ Radius: snubber guards a SYNCHRONOUS perimeter with unwinding
   external daemon + shared-memory heartbeat that releases iron from
   outside. Do not sell the knife as a spaceship.
 
-## 14. 🚫 Anti-Pattern & Tone Contract: Zero-Theatrics Policy
+## 14. BANNED: Poetic & Theatrical Language (Commercial Rule)
 
-### 1. Заборона на підлітковий "Grimdark" та кітч (No Edge-Lord Naming)
-- **СУВОРО ЗАБОРОНЕНО** використовувати анатомічні, криваві або хоррор-метафори в назвах файлів, функцій, прикладів, коммітів та документації (`aorta`, `blood`, `autopsy`, `corpse`, `flesh`, `meat`, `deathmatch`).
-- **СУВОРО ЗАБОРОНЕНО** іменувати стрес-тести або верифікаційні стенди як гладіаторські бої (`Gauntlet`, `Thunderdome`, `Arena`, `Gladiator`).
-- **Стандарт:** Мова документації та прикладів має відповідати стандартам авіоніки, баз даних та ядра Linux/SQLite:
-  - Замість `torture_ruptured_aorta` → `heavy_pipeline_stress`
-  - Замість `field_rusty_autopsy` → `flight_recorder_diagnostics`
-  - Замість `Gauntlet` → `Formal Invariant Verification` / `INVARIANTS.md`
+Metaphors in this repo's source, comments, and docs cost a real sales
+conversation. Absolute prohibition, no exceptions, no "just this once":
 
-### 2. Заборона на фальшиві фічі та привласнення std (No Bogus Patterns)
-- **СУВОРО ЗАБОРОНЕНО** видавати можливості стандартної бібліотеки Rust (`std::sync::Mutex`, `PoisonError::into_inner()`, `std::panic::catch_unwind`) за унікальні винаходи чи фічі `snubber` (як-от псевдо-патерни "Snubber SafeLock").
-- Кожен приклад в `examples/` зобов'язаний вирішувати реальну практичну проблему суто через публічні примітиви `snubber` (`SnubberGuard`, `SnubberNode`, `scoped`, `TaskConduit`, `Supervisor`).
+1. **User metaphors stay in chat.** When the user writes "weapon 3",
+   "held hostage", "aorta", or "burning cage" — that is chat shorthand
+   for understanding, not repository text. Translate it immediately to
+   the plainest technical term that fits: not "hostage" → `owned`, not
+   "postman" → `pipe reader`, not "genetic passport" → `state bytes`.
+   Copying user wording into code or docs verbatim is a disqualifying defect.
 
-### 3. Тон комунікації: Інженерна Тверезість (Quiet Power)
-- `snubber` — це критичний інфраструктурний запобіжник. Сила бібліотеки доводиться 188+ зеленими тестами, детермінованим фаззером на 1 МБ шуму та апаратними бар'єрами, а не знаками оклику чи зухвалими заявами «Зламай нас, якщо зможеш».
-- Тон документації — стриманий, точний, важкий, практичний.
+2. **Zero poetry in code and docs.** No dramatic names, no literary
+   images, no "cool" branding in function names, comments, filenames,
+   or documentation. Write at the level of a hardware datasheet: precise,
+   short, no adjectives that carry emotion. If a sentence can be cut in
+   half without losing meaning, cut it to a third.
 
-### 4. Термінологічний канон (Terminology Canon)
-- **Заборонено змішувати «Floors» і «Levels»:** використовується виключно єдина драбина архітектурних шарів:
-  - **Layer 1: Core RAII Guard** (`core`-only, stack guard, `EpochGate`, ~1.5 ns)
-  - **Layer 2: Concurrency Bulkhead** (`std`, `SnubberNode`, circuit breaker, priority lanes)
-  - **Layer 3: Async Waker Queue** (0% CPU, runtime-agnostic)
-  - **Layer 4: Process Supervisor** (IPC pipe, EOF drain, token rescue)
-  - **Layer 5: Diagnostics & Health** (Telemetry, `SnapshotV1`, CI gates)
-- **Заборонено косплей підводних човнів і кінотрейлерів:**
-  - Замість «Nuclear vs Hydraulic» / «Hull-breach» → **`Fatal Errors vs Operational Backpressure`** (або `Catastrophic Faults vs Capacity Shedding`)
-  - Замість «Pure Iron Latency» → **`Zero-Allocation Latency (~1.5 ns)`**
-  - Замість «Newton's 3rd Law» → **`Adaptive Backpressure & Pacing`**
-  - Замість «Cockpit Protocol» → **`Bi-directional Task Steering`** (або `Task Conduit`)
-  - Замість «boundary shim» у дескрипшені → **`failure-recovery engine`**
-  - Замість `chaos_sniper` → **`stress_harness`**
-
-
+3. **Immediate purge.** Any poetic name found during review is renamed
+   on the spot — no planning documents, no five-page proposals. One
+   commit, smallest possible diff, gates green.
