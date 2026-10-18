@@ -1,13 +1,13 @@
-//! `snubber` — ultra-light transactional damper and RAII boundary shim.
+//! `snubber` — transactional RAII guard with bulkhead node and failure-recovery engine.
 //!
-//! Three floors, zero bloat:
+//! Three layers:
 //!
-//! * **Floor 1 (core-only, v0.1):** [`SnubberGuard`] (Drop-guaranteed
+//! * **Layer 1 (core-only, v0.1):** [`SnubberGuard`] (Drop-guaranteed
 //!   rollback) + [`EpochGate`] (monotonic late-packet filter).
-//! * **Floor 2 (`std`, v0.2):** [`SnubberNode`] — bounded bulkhead,
+//! * **Layer 2 (`std`, v0.2):** [`SnubberNode`] — bounded bulkhead,
 //!   circuit breaker, flight-recorder stats, `#[track_caller]` fault
 //!   coordinates and a capped console reporter.
-//! * **Floor 3 (`alloc`, in `default` since v0.3):**
+//! * **Layer 3 (`alloc`, in `default` since v0.3):**
 //!   [`crate::ErasedGuard`] (nameable struct-field guard),
 //!   [`crate::ClosurePolicy`] (capturing self-healing commands) and
 //!   [`crate::FaultDetail`] (static-or-owned breach reasons —
@@ -428,13 +428,13 @@ const _: () = {
 ///      `enter` from inside a rollback is a deadlock smell).
 ///
 ///   5. Ground your own shared memory: the node's lock guards ONLY node
-///      books. A rollback runs outside it (Floor-1 guards own no lock at
+///      books. A rollback runs outside it (Layer-1 guards own no lock at
 ///      all). Every guard runs a `SeqCst` fence before the rollback body
 ///      (and before the `commit` disarm) — that narrows the reordering
 ///      window for free on x86/x64, but a fence alone pairs with NOTHING:
 ///      publishing to foreign state still needs `Release` and observing
 ///      it needs `Acquire` — or your own lock. `Relaxed` on both ends may
-///      read rot on another core (F13).
+///      expose a stale value on another core (F13).
 ///
 /// The guard itself is `core`-only and `unsafe`-free; the `Drop` runs on
 /// the language stack, independent of any node bookkeeping.
@@ -529,7 +529,7 @@ impl<F: FnOnce()> Drop for SnubberGuard<F> {
             // reordering window (free on x86/x64); cross-thread sharing
             // still needs a real `Release`/`Acquire` pair or a lock (F13).
             // Bullet 1 — double-panic abort: if the worker is already
-            // unwinding AND the idiot's rollback panics too, Rust aborts
+            // unwinding AND the rollback itself panics, Rust aborts
             // the whole process. Under `std` we swallow the second panic;
             // without `std` there is no catcher — documented, not hidden.
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);

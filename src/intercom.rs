@@ -61,7 +61,7 @@ pub struct TaskConduit<S, D = ()> {
     inner: Arc<IntercomInner<S, D>>,
 }
 
-/// The caller/observer's control console for inspecting and steering the task.
+/// The caller/observer's control handle for inspecting and steering the task.
 ///
 /// Same zero-bound contract as the conduit above.
 pub struct TaskHandle<S, D = ()> {
@@ -269,23 +269,52 @@ impl<S, D> Future for ResumeFuture<S, D> {
     type Output = Result<(), &'static str>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // P0 fix: read the directive WHILE holding the wakers lock.
+        //
+        // wake_async() also acquires the wakers lock before draining.
+        // This makes "write directive → drain wakers" and
+        // "read directive → push waker" mutually exclusive:
+        //
+        //   Case A — controller wins the lock first:
+        //     writes PROCEED → drains (empty list) → releases lock.
+        //     poller takes lock → sees PROCEED → Ready(Ok(())), no waker pushed.
+        //
+        //   Case B — poller wins the lock first:
+        //     reads PAUSE → pushes waker → returns Pending → releases lock.
+        //     controller takes lock → drains → wakes the task.
+        //
+        // The previous "register-then-read" approach had a gap between
+        // release of wakers lock and the directive load, leaving Case A
+        // open: controller could drain (empty list) before poller pushed,
+        // and poller would park forever.
+        let mut wakers = match self.inner.wakers.lock() {
+            Ok(w) => w,
+            Err(_) => return Poll::Ready(Err("wakers lock poisoned")),
+        };
         let dir = self.inner.directive.load(Ordering::Acquire);
-        if dir == DIR_PAUSE {
-            if let Ok(mut wakers) = self.inner.wakers.lock() {
-                wakers.push(cx.waker().clone());
+        match dir {
+            DIR_PAUSE => {
+                // P1 fix: deduplicate via will_wake — repeated polls from
+                // the same task do not accumulate stale waker copies.
+                let current = cx.waker();
+                if let Some(slot) = wakers.iter_mut().find(|w| w.will_wake(current)) {
+                    *slot = current.clone();
+                } else {
+                    wakers.push(current.clone());
+                }
+                Poll::Pending
             }
-            Poll::Pending
-        } else if dir == DIR_CANCEL || dir == DIR_PREEMPTED {
-            let reason = self
-                .inner
-                .cancel_reason
-                .lock()
-                .ok()
-                .and_then(|r| *r)
-                .unwrap_or("cancelled");
-            Poll::Ready(Err(reason))
-        } else {
-            Poll::Ready(Ok(()))
+            DIR_CANCEL | DIR_PREEMPTED => {
+                let reason = self
+                    .inner
+                    .cancel_reason
+                    .lock()
+                    .ok()
+                    .and_then(|r| *r)
+                    .unwrap_or("cancelled");
+                Poll::Ready(Err(reason))
+            }
+            _ => Poll::Ready(Ok(())),
         }
     }
 }
