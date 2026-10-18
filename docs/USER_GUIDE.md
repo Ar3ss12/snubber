@@ -30,7 +30,7 @@ let tx_id = node.scoped(
     }
 )?;
 
-// 2. Customs gate + Scoped work: validates invariants BEFORE arming hardware
+// 2. Admission boundary gate + Scoped work: validates invariants BEFORE arming hardware
 let receipt = node.scoped_checked(
     &payment_request,
     |req| {
@@ -683,7 +683,7 @@ profiler at 160 CPS).
 | `SnubberGuard::new` | 1 / core | **~1.5 ns** (stack move) | Single function synchronous rollback |
 | `EpochGate::observe` | 1 / core | **~2.6 ns** | Monotonic ordering & reboot re-handshake |
 | `node.transition(&mut s, next, rb, work)` | 2 / std | **~86.5 ns** | ONE enum state machine, no flag drift |
-| `node.transition_checked(s, rb, work)` + `LegalMove` | 2 / std | same + 0 ns | Closed graphs: illegal ribs rejected at compile (E0277) |
+| `node.transition_checked(s, rb, work)` + `LegalMove` | 2 / std | same + 0 ns | Closed graphs: illegal edges rejected at compile (E0277) |
 | `node.enter_with_priority(prio)` | 2 / std | **~73.6 ns** | Critical over Background yields cooperatively |
 | `Protected::new(res, guard)` + `commit()` | 1 / core | 0 ns (generics) | Resource burns with guard unless committed |
 | `node.scoped_sealed(rb, work)` + `ScopeToken` | 2 / std | same as `scoped` | `!Send` seal: thread-leak fails at compile |
