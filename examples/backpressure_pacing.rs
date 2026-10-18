@@ -1,6 +1,6 @@
-//! Backpressure pacing (Newton's 3rd law): 100 tasks/s vs bulkhead of 1.
-//! Without pacing half die in BulkheadFull; with `retry_after_ms` pacing
-//! every task lands. AdviseOnly — the caller owns the wait.
+//! Backpressure pacing: 100 tasks/s on a single-slot bulkhead.
+//! Without pacing, excess tasks bounce with BulkheadFull; with `retry_after_ms` pacing
+//! every task lands. AdviseOnly mode — the caller owns the wait.
 //!
 //! Run: `cargo run --example backpressure_pacing`
 

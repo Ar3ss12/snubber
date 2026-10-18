@@ -1,9 +1,9 @@
-//! Catastrophic vs capacity shedding: shed never trips the breaker, catastrophic faults do.
+//! Fault classification: operational shedding vs catastrophic failure handling.
 //!
-//! Pins the approved contour: `FaultKind::is_catastrophic` is the single
+//! Pins the classification contour: `FaultKind::is_catastrophic` is the single
 //! source of truth for `report()` streak feeding. `ImplicitDrop` is
 //! catastrophic but owned by `settle_implicit` (no double-feed via `report`).
-//! `ChannelDisconnected` is operational shedding (graceful drain, not unrecoverable failure).
+//! Operational shedding (e.g. `BulkheadFull`, `RateLimited`, `StaleEpoch`) never trips the breaker.
 
 use snubber::{BreakerState, FaultKind, SnubberNode, TransactionHeader};
 

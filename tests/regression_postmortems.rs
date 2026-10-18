@@ -8,7 +8,7 @@
 use snubber::{FaultKind, SnubberNode};
 
 #[test]
-fn trap1_no_double_count_implicit_drop_vs_reported() {
+fn trap1_no_double_count_implicit_drop_with_reported() {
     // Guard path (`settle_implicit`): ONE implicit drop bumps
     // `implicit_drops` exactly once. `catastrophic_faults()` sums
     // Panic/Timeout/ProcessDied reports + `implicit_drops` — the guard
