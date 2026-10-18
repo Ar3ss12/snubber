@@ -1,6 +1,6 @@
-//! Supervised satellite: dumb supervisor + disposable worker, `std` only.
+//! Supervised child worker: supervisor + disposable worker process, `std` only.
 //!
-//! Run: `cargo run --example supervised_satellite`
+//! Run: `cargo run --example supervisor_child_process`
 //!
 //! Path-1 + Path-2 in one scene, no `unsafe`, no deps:
 //! * supervisor spawns the worker with `SNUBBER_GEN` + a piped stdout;

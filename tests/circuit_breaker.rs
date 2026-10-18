@@ -1,9 +1,8 @@
-//! CAMP 2 — REFLEXES (breaker ON): the brakes must SLAM, not swallow.
+//! Circuit breaker state machine: Closed, Open, HalfOpen transitions.
 //!
-//! Companion to `tests/cycle_torture.rs` (CAMP 1, reflexes OFF).
-//! Here every guard is armed: default `Panic -> TripBreaker` policy,
-//! `trip_after_failures(2)`, single-flight bulkhead. We hammer failures
-//! and demand the node ISOLATE itself fast, LOUD, and with exact books:
+//! Companion to `tests/concurrency_stress.rs`.
+//! Tests policy trips, fast-fail during Open state, single probe admission in
+//! HalfOpen state, and exact refusal accounting:
 //! * first Panic report trips OPEN immediately (policy, not streak);
 //! * admissions during OPEN fail fast as `BreakerOpen` — rollback never
 //!   armed, hardware untouched;

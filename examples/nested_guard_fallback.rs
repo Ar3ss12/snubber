@@ -5,7 +5,7 @@
 //! outer guard still drops the hardware. Direction is ONE-WAY ONLY:
 //! dumb guards smart, never smart guards dumb (no node-in-node).
 //!
-//! Run: `cargo run --example meta_guard`
+//! Run: `cargo run --example nested_guard_fallback`
 
 use snubber::{SnubberGuard, SnubberNode};
 use std::sync::atomic::{AtomicU64, Ordering};

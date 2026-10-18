@@ -55,7 +55,7 @@ fn spawn_guarded_refusal_surfaces_in_join() {
 #[test]
 fn stdin_digest_chain_is_closed_tick0() {
     use snubber::{StateDigest, STATE_LEN};
-    // Replacement binary: examples/digest_heir.rs reads stdin tick 0 via
+    // Replacement binary: examples/process_state_handoff.rs reads stdin tick 0 via
     // take_stdin_digest() and exits with bytes[0] as its code.
     // Parent half: build the example, spawn it with piped stdin,
     // write 64 B + EOF exactly like spawn_with_digest does.
@@ -68,7 +68,7 @@ fn stdin_digest_chain_is_closed_tick0() {
         .parent()
         .expect("debug dir")
         .join("examples")
-        .join("digest_heir");
+        .join("process_state_handoff");
     let successor = if cfg!(windows) {
         successor.with_extension("exe")
     } else {

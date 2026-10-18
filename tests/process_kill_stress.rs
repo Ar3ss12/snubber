@@ -10,8 +10,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[test]
-#[ignore = "Spawns background supervisor & killer and executes hundreds/thousands of hard OS kills. Run explicitly: cargo test --test chaos_dual_terminal -- --ignored --nocapture"]
-fn chaos_dual_terminal_system_kill_test() {
+#[ignore = "Spawns background supervisor & killer and executes hundreds/thousands of hard OS kills. Run explicitly: cargo test --test process_kill_stress -- --ignored --nocapture"]
+fn process_kill_stress_test() {
     let report_file = "target/chaos_report.json";
     if Path::new(report_file).exists() {
         let _ = std::fs::remove_file(report_file);

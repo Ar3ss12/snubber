@@ -53,14 +53,14 @@ fn trap2_report_carries_caller_coordinates() {
     node.report(FaultKind::Panic, 7, 7);
     let fault = node.stats().last_fault.expect("recorded");
     assert!(
-        fault.file.ends_with("trap_proof.rs"),
+        fault.file.ends_with("regression_postmortems.rs"),
         "caller coords, got {}:{}",
         fault.file,
         fault.line
     );
     assert!(fault.line > 0);
     let slot = node.dump_flight().pop().expect("ring slot");
-    assert!(slot.file.ends_with("trap_proof.rs"));
+    assert!(slot.file.ends_with("regression_postmortems.rs"));
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn trap2_guard_drop_carries_arming_coordinates() {
     drop(g);
     let fault = node.stats().last_fault.expect("recorded");
     assert!(
-        fault.file.ends_with("trap_proof.rs"),
+        fault.file.ends_with("regression_postmortems.rs"),
         "arming coords, got {}:{}",
         fault.file,
         fault.line

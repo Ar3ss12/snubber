@@ -515,8 +515,8 @@ let guard = node.enter_supervised_erased(
 ### Chaos Monkey Verification (10,000 OS Kills):
 The architecture has been verified against **10,000 real Windows `TerminateProcess` executions** at ~52 kills/sec without a single pipe deadlock or lost token:
 ```powershell
-# Run the automated 10,000 kill chaos stand:
-cargo test --test chaos_dual_terminal -- --ignored --nocapture
+# Run the automated 10,000 kill stress test:
+cargo test --test process_kill_stress -- --ignored --nocapture
 ```
 
 ### 4.5 Declarative restart (Phase 2: Declarative process restart tracking)

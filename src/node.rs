@@ -2298,7 +2298,7 @@ impl SnubberNode {
 
         // 2. Epoch: stale packets never touch hardware.
         // F3 CONTRACT: HARD refusal, no hidden retry in-crate. The bounded
-        // stale-retry loop lives ONLY in `tests/cycle_torture.rs` (storm
+        // stale-retry loop lives ONLY in `tests/concurrency_stress.rs` (storm
         // imitation). Smuggling a retry here turns fail-fast into a lot.
         if !inner.gate.observe(&header) {
             if inner.breaker == BreakerState::HalfOpen {

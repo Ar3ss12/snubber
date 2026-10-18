@@ -47,15 +47,15 @@ The continuous integration suite validates these invariants under sustained chao
 
 ```bash
 # Verify admission conservation under heavy concurrency (8 threads x 5,000 cycles)
-cargo test --test cycle_torture
+cargo test --test concurrency_stress
 
 # Verify process death handling and supervisor pipe recovery
 cargo test --test supervisor
 cargo test --test process_died
 
 # Verify bulkhead pushback and rate limits
-cargo test --test reflex_bulkhead
-cargo test --test reflex_breaker
+cargo test --test bulkhead_capacity
+cargo test --test circuit_breaker
 ```
 
 ---

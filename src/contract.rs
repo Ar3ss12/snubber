@@ -21,7 +21,7 @@
 //!   `Relaxed` on both ends reads stale or torn data.
 //!
 //! Violate any MUST and the watchdog (meta-guard) will still fire your
-//! rollback twice — deterministically and with telemetry (see `examples/meta_guard.rs`).
+//! rollback twice — deterministically and with telemetry (see `examples/nested_guard_fallback.rs`).
 
 /// Assert idempotency in tests: run `f` twice, check the witness.
 ///

@@ -1,12 +1,12 @@
-//! CAMP 2 — REFLEXES (bulkhead ON): the wall must PUSH BACK, not vanish.
+//! Bulkhead capacity & saturation: capacity limits and rejection accounting.
 //!
-//! Companion to `tests/cycle_torture.rs` (CAMP 1, wide gates).
-//! Here the bulkhead is TIGHT (`max_in_flight(2)`, 8 threads): most
-//! attempts MUST bounce off as `BulkheadFull`, and every bounce must be
+//! Companion to `tests/concurrency_stress.rs` (wide concurrency).
+//! Here the bulkhead is tight (`max_in_flight(2)`, 8 threads): excess
+//! attempts are rejected as `BulkheadFull`, and every rejection is
 //! counted on both sides (test atomics == node books). What must hold:
 //! * `attempts == started + bulkhead` — none vanish;
 //! * admitted guards settle exactly once (`started == settled`);
-//! * wall readings ride the error (`retry_after_ms > 0`, depth > 0).
+//! * telemetry readings accompany the error (`retry_after_ms > 0`, depth > 0).
 
 use snubber::{EnterError, SnubberNode};
 use std::sync::atomic::{AtomicU64, Ordering};

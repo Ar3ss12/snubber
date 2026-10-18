@@ -1,11 +1,10 @@
-//! Cycle torture: 8 threads x 5k enter/commit/drop/report.
+//! Concurrency stress: 8 threads x 5k enter/commit/drop/report.
 //!
-//! CAMP 1 — CONSERVATION (this file): all reflexes OFF on purpose.
-//! Proves the iron lets go: every admission settles exactly once,
-//! no slot leaks, no poison, no deadlock. Wide bulkhead, breaker OFF,
-//! Panic policy disarmed (trip behavior lives in CAMP 2).
-//! See `tests/reflex_breaker.rs` + `tests/reflex_bulkhead.rs` for CAMP 2
-//! (reflexes ON: the brakes must slam, not swallow).
+//! CONSERVATION (this file): circuit breaker and bulkhead limits disarmed.
+//! Proves slot conservation: every admission settles exactly once,
+//! no slot leaks, no deadlock under heavy thread contention.
+//! See `tests/circuit_breaker.rs` + `tests/bulkhead_capacity.rs` for
+//! breaker state machine and bulkhead capacity tests.
 //!
 //! F3 CONTRACT: the bounded stale-retry loop BELOW lives ONLY here (storm
 //! imitation for 8 racing threads). In-crate `StaleEpoch` stays a HARD
