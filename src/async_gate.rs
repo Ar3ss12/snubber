@@ -7,8 +7,6 @@
 //! * [`AsyncGate`] — thin wrapper over [`SnubberNode`](crate::SnubberNode):
 //!   admission only, always [`BackpressurePolicy::AdviseOnly`], never
 //!   parks a thread. Every refusal carries `retry_after_ms` + `depth`.
-//! * [`AsyncSleeper`] — YOUR sleep: `tokio::time::sleep`, `async-std`,
-//!   test fake. The crate never names a runtime (zero-dep stays).
 //! * Rule: `BlockCaller` / `AdaptiveBlock` are FORBIDDEN behind this gate
 //!   (they `std::thread::sleep` the worker — see F14). Cancellation is
 //!   NOT a rollback: `select!` closes the slot honestly, half-written
@@ -111,26 +109,6 @@ pub enum GateError {
     /// Node would park a thread (`BlockCaller`/`AdaptiveBlock` armed).
     /// Rebuild with `BackpressurePolicy::AdviseOnly`.
     WouldBlock,
-}
-
-/// YOUR sleep: implemented by the runtime you run.
-///
-/// In Tokio:
-/// ```text
-/// impl AsyncSleeper for TokioSleeper {
-///     type SleepFut = tokio::time::Sleep;
-///     fn sleep_ms(ms: u64) -> Self::SleepFut {
-///         tokio::time::sleep(std::time::Duration::from_millis(ms))
-///     }
-/// }
-/// ```
-/// The trait uses an associated future type to stay fully compatible with MSRV 1.70.
-pub trait AsyncSleeper {
-    /// Future returned by `sleep_ms`.
-    type SleepFut: core::future::Future<Output = ()>;
-
-    /// Sleep `ms` without blocking an OS thread.
-    fn sleep_ms(ms: u64) -> Self::SleepFut;
 }
 
 /// Classify a refusal for an HTTP/gRPC mapper (exhaustive, no `_`).

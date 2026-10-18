@@ -2,8 +2,7 @@
 //!
 //! [`AsyncGate`] wraps [`SnubberNode`](crate::SnubberNode) and asserts
 //! `AdviseOnly` at construction — a node that would park a thread is
-//! rejected, not adapted. Refusals map to HTTP outcomes via [`classify`];
-//! the sleep lives in YOUR runtime ([`AsyncSleeper`]).
+//! rejected, not adapted. Refusals map to HTTP outcomes via [`classify`].
 
 use snubber::{
     AsyncGate, BackpressurePolicy, EnterError, FaultAction, FaultKind, FaultPolicy, GateError,

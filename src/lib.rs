@@ -153,9 +153,7 @@ pub use async_pace::enter_paced_async;
 pub use async_settle::settle_async;
 
 #[cfg(feature = "std")]
-pub use async_gate::{
-    backpressure_of, classify, retry_after_ms, AsyncGate, AsyncSleeper, GateError, Refusal,
-};
+pub use async_gate::{backpressure_of, classify, retry_after_ms, AsyncGate, GateError, Refusal};
 
 #[cfg(feature = "std")]
 pub use intercom::{Directive, ResumeFuture, TaskConduit, TaskHandle};
