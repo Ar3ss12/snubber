@@ -55,18 +55,21 @@ fn queue_capacity_reject_new_blocks_excess_waiters() {
 
     let _g = node.enter(1, 1, || {}).expect("slot 1");
 
-    let waker = futures_lite_fake_waker();
-    let mut cx = core::task::Context::from_waker(&waker);
-
+    let w1 = futures_lite_fake_waker_id(1);
+    let mut cx1 = core::task::Context::from_waker(&w1);
     let mut f1 = Box::pin(node.enter_async(2, 2, || {}));
-    assert!(f1.as_mut().poll(&mut cx).is_pending());
+    assert!(f1.as_mut().poll(&mut cx1).is_pending());
 
+    let w2 = futures_lite_fake_waker_id(2);
+    let mut cx2 = core::task::Context::from_waker(&w2);
     let mut f2 = Box::pin(node.enter_async(3, 3, || {}));
-    assert!(f2.as_mut().poll(&mut cx).is_pending());
+    assert!(f2.as_mut().poll(&mut cx2).is_pending());
 
     // Queue is now full (2 waiters in queue). 3rd should be rejected with QueueFull!
+    let w3 = futures_lite_fake_waker_id(3);
+    let mut cx3 = core::task::Context::from_waker(&w3);
     let mut f3 = Box::pin(node.enter_async(4, 4, || {}));
-    match f3.as_mut().poll(&mut cx) {
+    match f3.as_mut().poll(&mut cx3) {
         core::task::Poll::Ready(Err(EnterError::QueueFull)) => {}
         _ => panic!("expected QueueFull"),
     }
@@ -84,18 +87,21 @@ fn queue_capacity_evict_oldest_discards_stale_waiter() {
 
     let g = node.enter(1, 1, || {}).expect("slot 1");
 
-    let waker = futures_lite_fake_waker();
-    let mut cx = core::task::Context::from_waker(&waker);
-
+    let w1 = futures_lite_fake_waker_id(1);
+    let mut cx1 = core::task::Context::from_waker(&w1);
     let mut f1 = Box::pin(node.enter_async(2, 2, || {}));
-    assert!(f1.as_mut().poll(&mut cx).is_pending());
+    assert!(f1.as_mut().poll(&mut cx1).is_pending());
 
+    let w2 = futures_lite_fake_waker_id(2);
+    let mut cx2 = core::task::Context::from_waker(&w2);
     let mut f2 = Box::pin(node.enter_async(3, 3, || {}));
-    assert!(f2.as_mut().poll(&mut cx).is_pending());
+    assert!(f2.as_mut().poll(&mut cx2).is_pending());
 
     // 3rd waiter evicts f1
+    let w3 = futures_lite_fake_waker_id(3);
+    let mut cx3 = core::task::Context::from_waker(&w3);
     let mut f3 = Box::pin(node.enter_async(4, 4, || {}));
-    assert!(f3.as_mut().poll(&mut cx).is_pending());
+    assert!(f3.as_mut().poll(&mut cx3).is_pending());
 
     assert_eq!(node.waiter_len(), 2);
     let stats = node.stats();
@@ -248,13 +254,17 @@ fn enter_async_auto_and_is_expired_test() {
 }
 
 fn futures_lite_fake_waker() -> core::task::Waker {
+    futures_lite_fake_waker_id(0)
+}
+
+fn futures_lite_fake_waker_id(id: usize) -> core::task::Waker {
     use core::task::{RawWaker, RawWakerVTable};
-    unsafe fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(core::ptr::null(), &VTABLE)
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        RawWaker::new(data, &VTABLE)
     }
     unsafe fn wake(_: *const ()) {}
     unsafe fn wake_by_ref(_: *const ()) {}
     unsafe fn drop(_: *const ()) {}
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-    unsafe { core::task::Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+    unsafe { core::task::Waker::from_raw(RawWaker::new(id as *const (), &VTABLE)) }
 }

@@ -578,7 +578,7 @@ impl SnubberNodeBuilder {
         self
     }
 
-    /// Plan B fallback value: when the breaker is OPEN, `enter`
+    /// Graceful degradation fallback value: when the breaker is OPEN, `enter`
     /// rejects admission — but [`SnubberNode::fallback_value`] returns this
     /// closure's value to support graceful degradation.
     #[must_use]
@@ -2740,6 +2740,14 @@ impl SnubberNode {
             if inner.breaker == BreakerState::HalfOpen {
                 inner.half_open_probe = false;
             }
+
+            // If the same task polls again, update its registered waker in-place
+            // without inflating the queue length.
+            if let Some(slot) = inner.waiters.iter_mut().find(|w| w.will_wake(waker)) {
+                *slot = waker.clone();
+                return core::task::Poll::Pending;
+            }
+
             let q_cap = inner.queue_limit.max(1);
             if inner.waiters.len() >= q_cap {
                 match inner.overflow {

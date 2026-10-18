@@ -96,9 +96,9 @@ impl SnapshotV1 {
     #[must_use]
     #[inline]
     pub fn catastrophic_faults(&self) -> u64 {
-        self.reported[1]
-            .saturating_add(self.reported[2])
-            .saturating_add(self.reported[10])
+        self.reported[super::FaultKind::Panic.index()]
+            .saturating_add(self.reported[super::FaultKind::Timeout.index()])
+            .saturating_add(self.reported[super::FaultKind::ProcessDied.index()])
             .saturating_add(self.implicit_drops)
     }
 
