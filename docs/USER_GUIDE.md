@@ -44,7 +44,7 @@ let receipt = node.scoped_checked(
 
 ### Error Model: `SnubberError<E>`
 `scoped` returns `Result<T, SnubberError<E>>`, cleanly separating:
-* `SnubberError::Admission(EnterError)` — The node rejected the call at the outer membrane (circuit breaker open, bulkhead full, rate limited, invariant breach). **Protected resources were never touched; no rollback executed.**
+* `SnubberError::Admission(EnterError)` — The node rejected the call at the admission perimeter (circuit breaker open, bulkhead full, rate limited, invariant breach). **Protected resources were never touched; no rollback executed.**
 * `SnubberError::Work(E)` — The protected work unit returned an error `Err(E)`. **Emergency rollback was automatically executed via RAII before returning.**
 
 ---
@@ -106,7 +106,7 @@ match node.enter_auto(|| release_locks()) {
         // Over the per-second rate budget — slow down.
     }
     Err(EnterError::InvariantBreach(reason)) => {
-        // Bad input rejected at membrane before touching hardware — fix the caller.
+        // Bad input rejected during parameter validation before touching hardware — fix the caller.
     }
     Err(EnterError::QueueTtlExpired) => {
         // Task waited in queue longer than task_ttl lease — fail fast.
@@ -543,18 +543,15 @@ loop {
 }
 ```
 
-### 4.6 Hot state handoff (Phase 3: amnesia cured)
-64 B genetic passport (`StateDigest`, one cache line, opaque bytes):
-satellite publishes via `OP_STATE` frames, drain keeps the last WHOLE,
-heir reads it on tick 0 — window wakes where it died, not default.
+### 4.6 Hot state handoff (Phase 3)
+64 B state snapshot (`StateDigest`, one cache line, opaque bytes):
+satellite publishes via `OP_STATE` frames, drain keeps the last complete frame,
+replacement process reads it on tick 0 — process restores where it died, not default.
 
-> **No-padding packing (Weapon 5, recipe not mechanism):** a generic
-> "sum of fields vs `size_of`" detector does not scale in const context
-> without `unsafe` (and this crate is `forbid(unsafe_code)`), so pack
-> field-by-field with `to_le_bytes` into the 64 B array — never
-> `transmute`, never raw-pointer casts. Padding bytes carry uninitialized
-> memory (old keys, noise) into the heir's pipe; explicit packing leaves
-> no holes by construction:
+> **Explicit packing (deterministic serialization):** pack field-by-field
+> with `to_le_bytes` into the 64 B array — never `transmute`, never raw-pointer
+> casts. Padding bytes carry uninitialized memory into the pipe; explicit
+> packing leaves no gaps by construction:
 ```rust
 use snubber::StateDigest;
 fn pack_state(x: i32, y: i32, flags: u32, clicks: u64) -> StateDigest {
@@ -610,7 +607,7 @@ to see operational backpressure **before** it becomes an unrecoverable failure.
 | **Capacity Shedding** (Operational Backpressure) | The healthy node holds the perimeter — tune capacity | `BulkheadFull`, `BufferOverflow`, `EvictedOldest`, `StaleEpoch`, `BreakerOpen`, `RateLimited`, `ChannelDisconnected`, `PoisonedPayload` | Counted, never trips breaker |
 
 Single source of truth: `FaultKind::is_catastrophic()`. Diagnostic counters on
-every snapshot: `stats().nuclear_breaches()`, `shed_bulkhead()`,
+every snapshot: `stats().catastrophic_faults()`, `shed_bulkhead()`,
 `shed_rate()` (own column forever — slow worker vs outer spam),
 `shed_stale()`, `admission_total()`.
 
@@ -688,8 +685,8 @@ profiler at 160 CPS).
 | `Protected::new(res, guard)` + `commit()` | 1 / core | 0 ns (generics) | Resource burns with guard unless committed |
 | `node.scoped_sealed(rb, work)` + `ScopeToken` | 2 / std | same as `scoped` | `!Send` seal: thread-leak fails at compile |
 | `StaticNode::<I, Q>::build(name)` | 2 / std | same as builder | Capacities validated FIRST in `build()` |
-| `gateway::<T>(cap)` + `host.recv()` | 2 / std | ~10 ns door | Many doors, ONE host checkpoint |
-| `RestartTracker::note_death(code, now)` | 2 / std | pure math | Dumb-spine reanimation, caller sleeps |
+| `gateway::<T>(cap)` + `host.recv()` | 2 / std | ~10 ns | Multiple senders, one receiver channel |
+| `RestartTracker::note_death(code, now)` | 2 / std | pure math | Process respawn backoff tracker, caller sleeps |
 | `StateDigest` + `take_state()` | 2 / std | 64 B, ~1 ns | Hot handoff: memory survives death |
 | `NoOrphanGuard` / `OrphanGuard` | 2 / std | trait only | Parent death = satellites reaped (app impl) |
 | `node.enter_auto` | 2 / std | **~86.5 ns** | Monotonic auto sequence ticket minting |
