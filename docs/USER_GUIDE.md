@@ -548,7 +548,7 @@ loop {
 
 ### 4.6 Hot state handoff (Phase 3)
 64 B state snapshot (`StateDigest`, one cache line, opaque bytes):
-satellite publishes via `OP_STATE` frames, drain keeps the last complete frame,
+child process publishes via `OP_STATE` frames, drain keeps the last complete frame,
 replacement process reads it on tick 0 — process restores where it died, not default.
 
 > **Explicit packing (deterministic serialization):** pack field-by-field
@@ -569,7 +569,7 @@ fn pack_state(x: i32, y: i32, flags: u32, clicks: u64) -> StateDigest {
 ```
 ```rust
 use snubber::StateDigest;
-// Satellite: pack flat (or a storage ticket for 100 MB on disk)…
+// Child process: pack flat (or a storage ticket for 100 MB on disk)…
 let digest = StateDigest::new(packed_64_bytes);
 digest.emit_if_supervised(); // no-op when unsupervised
 // …death… supervisor hands it to the replacement process stdin tick 0:
@@ -690,7 +690,7 @@ profiler at 160 CPS).
 | `gateway::<T>(cap)` + `host.recv()` | 2 / std | ~10 ns | Multiple senders, one receiver channel |
 | `RestartTracker::note_death(code, now)` | 2 / std | pure math | Process respawn backoff tracker, caller sleeps |
 | `StateDigest` + `take_state()` | 2 / std | 64 B, ~1 ns | Hot handoff: memory survives death |
-| `NoOrphanGuard` / `OrphanGuard` | 2 / std | trait only | Parent death = satellites reaped (app impl) |
+| `NoOrphanGuard` / `OrphanGuard` | 2 / std | trait only | Parent death = child processes reaped (app impl) |
 | `node.enter_auto` | 2 / std | **~86.5 ns** | Monotonic auto sequence ticket minting |
 | `node.enter_async_auto` | 2 / std | 0% CPU waker park | Async admission under bounded concurrency |
 | `guard.settle_async(fut)` | 2 / std | zero lock during await | Commit across `.await` points |

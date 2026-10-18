@@ -282,9 +282,9 @@ Radius: snubber guards a SYNCHRONOUS perimeter with unwinding
 - **Hung Win32 / kernel zombie.** A thread frozen in the driver holds no
   Rust lock the crate can release. Rescue = external supervisor:
   `stats()` + `last_fault` → heartbeat lost → `TerminateProcess` on the
-  satellite. NEVER `TerminateThread` in-process (heap/loader lock stays
-  wedged — see `docs/FUTURE_TRAPS.md` Trap 2). Satellite pattern
-  (Chrome/DAW): the worker is disposable; the parent releases iron
+  child process. NEVER `TerminateThread` in-process (heap/loader lock stays
+  wedged — see `docs/FUTURE_TRAPS.md` Trap 2). Isolated process pattern
+  (Chrome/DAW): the worker is disposable; the parent releases physical hardware
   itself and reaps the terminated process from outside.
 - **Dead wall: `panic = "abort"` / SIGKILL / D-state (R6).** No tables,
   no `Drop`, no guard moves a micron — the process is gone in one tick.

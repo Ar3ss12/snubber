@@ -48,7 +48,7 @@ fn main() {
     while total_reaped < target_kills {
         let gen = clock.generation();
 
-        // Spawn disposable satellite child
+        // Spawn disposable child worker process
         let mut child = Command::new(&current_exe)
             .arg("--worker")
             .env("SNUBBER_SUPERVISED", "1")
@@ -160,7 +160,7 @@ fn main() {
     f.write_all(report_json.as_bytes()).expect("write report");
 }
 
-/// Satellite worker: arms hardware tokens and commits rapidly in a tight loop.
+/// Supervised child worker: arms hardware tokens and commits rapidly in a tight loop.
 fn worker_main() {
     use std::io::Write;
     let stdout = std::io::stdout();

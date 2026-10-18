@@ -20,7 +20,7 @@ fn storm_guard_trips_after_three_fast_crashes() {
         Backoff::exponential(50, 1000),
         RestartWindow::new(3, 10),
     );
-    // Fake satellite: exits(1) instantly, five times in a row.
+    // Simulated child process: exits(1) instantly, five times in a row.
     // Fake clock: all deaths land inside one 10 s window.
     let mut now_ms = 1_000u64;
     let mut delays = Vec::new();

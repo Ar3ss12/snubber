@@ -692,7 +692,7 @@ impl StateDigest {
         frames
     }
 
-    /// Publish to stdout under a supervisor (satellite side).
+    /// Publish to stdout under a supervisor (child process side).
     /// No-op when unsupervised. Flushes — drain reads in real time.
     pub fn emit_if_supervised(&self) {
         if ProcessToken::is_supervised() {
@@ -968,7 +968,7 @@ impl PipeDrain {
 /// SUPERVISOR, fast + idempotent + lock-free (same as any rollback).
 pub type TokenRollback = fn(u32, [u8; 28]);
 
-/// Turnkey process supervisor managing satellite lifecycle and dead-token emergency rescue.
+/// Turnkey process supervisor managing child process lifecycle and dead-token emergency rescue.
 ///
 /// Phase 6 orphan contract lives below ([`OrphanGuard`]).
 pub struct Supervisor;
@@ -995,15 +995,15 @@ impl Supervisor {
         Ok(child)
     }
 
-    /// Inspect command line args and run the satellite supervisor loop if `--supervisor` is present.
+    /// Inspect command line args and run the child process supervisor loop if `--supervisor` is present.
     ///
     /// Flow:
-    /// - If `args` contains `worker_flag` (e.g. `--worker`): returns `false` (this is the satellite worker).
+    /// - If `args` contains `worker_flag` (e.g. `--worker`): returns `false` (this is the child worker process).
     /// - If `args` does NOT contain `--supervisor`: returns `false` (normal un-supervised execution).
     /// - If `args` contains `--supervisor` and not `worker_flag`:
     ///   Spawns child with `worker_flag`, drains anonymous pipe, waits for death,
     ///   executes `on_dead_token` if worker died leaving an armed token, and returns `true` (exit main).
-    pub fn run_satellite_guard<F>(worker_flag: &'static str, on_dead_token: F) -> bool
+    pub fn run_supervised_guard<F>(worker_flag: &'static str, on_dead_token: F) -> bool
     where
         F: Fn(ProcessToken),
     {
@@ -1079,9 +1079,18 @@ impl Supervisor {
         println!("[SUPERVISOR:RESTART] lineage_bump_gen={next_gen}");
         true
     }
+
+    /// Backward-compatible alias for [`Supervisor::run_supervised_guard`].
+    #[deprecated(since = "0.5.0", note = "use `run_supervised_guard` instead")]
+    pub fn run_satellite_guard<F>(worker_flag: &'static str, on_dead_token: F) -> bool
+    where
+        F: Fn(ProcessToken),
+    {
+        Self::run_supervised_guard(worker_flag, on_dead_token)
+    }
 }
 
-/// Orphan contract (Phase 6): parent death = satellites reaped.
+/// Orphan contract (Phase 6): parent death = child processes reaped.
 ///
 /// The crate NAMES the guarantee; the APP implements it. Win32 needs
 /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`unsafe` + `windows-sys`) —
@@ -1090,7 +1099,7 @@ impl Supervisor {
 /// the trait + a portable no-op; the real impl is an application-level pattern.
 ///
 /// Owner (R1): the APP's supervisor setup. The crate never calls it —
-/// it only types the promise so every satellite binary shares one.
+/// it only types the promise so every child process binary shares one.
 pub trait OrphanGuard: Send + Sync {
     /// Arm: from now on, if THIS process dies, the OS reaps `pid`.
     /// Returns `false` when the platform cannot promise (caller logs).
@@ -1100,7 +1109,7 @@ pub trait OrphanGuard: Send + Sync {
 }
 
 /// Portable no-op guard: promises nothing, says so honestly.
-/// Parent death orphans satellites — same as raw `Command::spawn`.
+/// Parent death orphans child processes — same as raw `Command::spawn`.
 /// Use when the deployment owns reaping (systemd, k8s, outer daemon).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct NoOrphanGuard;
@@ -1147,7 +1156,7 @@ mod wire_tests {
             0x0102030405060708u64.to_le_bytes(),
             [8, 7, 6, 5, 4, 3, 2, 1]
         );
-        // Round-trip: the drain decodes exactly what the satellite encoded.
+        // Round-trip: the drain decodes exactly what the child process encoded.
         let token = ProcessToken::new(0x0102030405060708, 0x12345678, [0xAB; 28]);
         let wire = token.to_bytes();
         assert_eq!(&wire[0..4], b"SNUB");
