@@ -62,7 +62,7 @@ fn main() {
     pool[1].digest = kept;
     assert_eq!(pool[1].digest.bytes[0], 42);
     println!("POOL: shadow 1 -> active, mark=42, downtime=0ms");
-    // Tracker authorizes the replacement in background (dumb spine).
+    // Tracker authorizes replacement process spawn in background.
     let mut tracker = RestartTracker::new(
         RestartPolicy::OnCrash,
         Backoff::exponential(50, 1000),

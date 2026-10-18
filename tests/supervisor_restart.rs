@@ -1,4 +1,4 @@
-//! Phase 2 — RestartPolicy Engine: dumb-spine reanimation math.
+//! Process RestartPolicy Engine: decision logic and backoff tracking.
 //!
 //! The tracker owns ONLY the decision (`RestartPolicy` + `Backoff` +
 //! storm window). The caller owns spawn/wait/sleep — so this test uses
@@ -33,10 +33,10 @@ fn storm_guard_trips_after_three_fast_crashes() {
         }
         now_ms += 100; // 100 ms apart — all inside the 10 s window.
     }
-    // Iron facts: 3 reanimations, then the guard trips on EVERY
-    // further death inside the window (4th AND 5th — honest math).
+    // Verifications: 3 restarts, then the guard trips on EVERY
+    // further death inside the window (4th AND 5th).
     assert_eq!(tracker.attempts(), 5, "every death reported");
-    assert_eq!(tracker.restarts(), 3, "exactly three reanimations");
+    assert_eq!(tracker.restarts(), 3, "exactly three restarts");
     assert_eq!(tracker.giveups(), 2, "guard trips on 4th and 5th");
     assert_eq!(stops, 2, "4th + 5th deaths are GiveUps");
     // Backoff deltas double honestly — recorded, never slept.
@@ -72,7 +72,7 @@ fn policy_matrix_never_oncrash_always() {
     assert_eq!(never.giveups(), 0);
 
     // OnCrash: clean exit(0) is a graceful shutdown.
-    let mut oncrash = RestartTracker::default_spine();
+    let mut oncrash = RestartTracker::default_tracker();
     assert_eq!(
         oncrash.note_death(Some(0), 1000),
         RestartDecision::Stop,

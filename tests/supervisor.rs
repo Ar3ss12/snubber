@@ -1,4 +1,4 @@
-//! Path-1 spine + Path-2 token recovery: generation bump drops stale packets,
+//! Process lifecycle supervision and token recovery: generation bump drops stale packets,
 //! pipe EOF fires the last-armed token. Deterministic supervisor, honest counters.
 
 use snubber::{

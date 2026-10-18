@@ -316,15 +316,31 @@ impl RestartTracker {
         }
     }
 
-    /// Default spine: `OnCrash`, `50ms→1s` cooling, `3 per 10s` guard.
+    /// Default restart tracker configuration: `OnCrash`, `50ms→1s` backoff, `3 per 10s` storm guard.
     #[must_use]
-    pub fn default_spine() -> Self {
+    pub fn default_tracker() -> Self {
         Self::new(
             RestartPolicy::OnCrash,
             Backoff::default(),
             RestartWindow::default(),
         )
     }
+
+    /// Backwards-compatible alias for [`Self::default_tracker`].
+    #[must_use]
+    #[inline]
+    pub fn default_spine() -> Self {
+        Self::default_tracker()
+    }
+}
+
+impl Default for RestartTracker {
+    fn default() -> Self {
+        Self::default_tracker()
+    }
+}
+
+impl RestartTracker {
 
     /// Report one death at `now_ms` (caller clock, monotonic).
     /// `exit_code: None` = killed/hung from outside (always a crash).

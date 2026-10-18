@@ -1,10 +1,9 @@
 //! Compile-time gates: thread-safety the compiler enforces, not tests.
 //!
-//! Zero `#[test]` functions here on purpose — this file contributes ZERO
-//! to the test count. Every block below is a `const` guillotine: break the
-//! invariant and the BUILD dies with the CRITICAL line, long before any
-//! runtime could observe the rot. (Pattern: Alex Crichton's
-//! `futures-cpupool` send/sync probes, dependency-free.)
+//! Zero `#[test]` functions here on purpose — this file contributes zero
+//! to runtime test count. Every block below is a compile-time assertion:
+//! breaking an invariant fails the build during compilation. (Pattern:
+//! Alex Crichton's `futures-cpupool` send/sync probes, dependency-free.)
 //!
 //! Gated coverage:
 //! * always: `SnapshotV1` (lives in `diagnostics`, compiled on every
