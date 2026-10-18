@@ -144,7 +144,7 @@ pub trait TelemetrySink: Send + Sync {
     fn on_fault(&self, record: &FaultRecord, stats: &SnubberStats, policy: &FaultPolicy);
 }
 
-/// Live black-box counters. `Copy`-snapshot via [`SnubberNode::stats`].
+/// Live telemetry counters. `Copy`-snapshot via [`SnubberNode::stats`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SnubberStats {
     /// Guards armed via `enter`.
@@ -153,7 +153,7 @@ pub struct SnubberStats {
     pub committed: u64,
     /// Explicit `abort()` paths (planned cancellations).
     pub explicit_aborts: u64,
-    /// Invariant-gate rejections (poison cut at the membrane).
+    /// Invariant-gate rejections prior to resource acquisition.
     pub poisoned_rejected: u64,
     /// Implicit `Drop` paths — **pure bugs and panics**.
     pub implicit_drops: u64,
@@ -218,7 +218,7 @@ impl SnubberStats {
     }
 
     /// Capacity shedding: no free bulkhead slot (`BulkheadFull` +
-    /// `BufferOverflow` mirror). The worker is slow, not sick.
+    /// `BufferOverflow` mirror). Upstream throughput exceeds worker capacity.
     #[must_use]
     pub fn shed_bulkhead(&self) -> u64 {
         self.bulkhead_rejections
@@ -237,7 +237,7 @@ impl SnubberStats {
         self.stale_epochs_rejected
     }
 
-    /// Total admission attempts observed (started + all membrane refusals).
+    /// Total admission attempts observed (started + all admission refusals).
     /// NOTE: `preempted` is NOT an attempt — it is a side-event of one
     /// `BulkheadFull` knock (Critical over pure-Background). Adding it
     /// here would double-count; it lives in its own column.
@@ -313,80 +313,80 @@ pub type FaultHook = Arc<dyn Fn(&FaultRecord, &SnubberStats, &FaultPolicy) + Sen
 
 /// Default policy table, indexed by [`FaultKind::index`].
 ///
-/// Philosophy: routine lag is Debug-quiet, drowning is Warn, anything
-/// that fires a hardware rollback is Error, a dead thread is Critical.
+/// Philosophy: routine lag is Debug-quiet, capacity saturation is Warn,
+/// any actionable failure triggering rollback is Error, a dead thread is Critical.
 /// Developers override per kind with
 /// [`SnubberNodeBuilder::policy`].
 pub const DEFAULT_POLICIES: [FaultPolicy; FaultKind::COUNT] = [
-    // ImplicitDrop — the bug detector: rollback + loud alert.
+    // ImplicitDrop — the bug detector: rollback + alert.
     FaultPolicy::arm(
         FaultAction::RollbackAndAlert,
         LogLevel::Error,
         "implicit drop: ?/return/panic path without commit",
         "implicit_drops_total",
     ),
-    // Panic — self-heal by default? No: isolate first, let the
-    // supervisor decide. TripBreaker stops fault propagation immediately.
+    // Panic — isolate first, let the supervisor handle restarts.
+    // TripBreaker stops fault propagation immediately.
     FaultPolicy::arm(
         FaultAction::TripBreaker,
         LogLevel::Critical,
         "thread panic inside transaction",
         "critical_panics_total",
     ),
-    // Timeout — watchdog: rollback the hung task, alert the UI.
+    // Timeout — watchdog: rollback hung task, record telemetry.
     FaultPolicy::arm(
         FaultAction::RollbackAndAlert,
         LogLevel::Error,
         "watchdog timeout: task hung past heartbeat",
         "watchdog_timeouts_total",
     ),
-    // ChannelDisconnected — the other end died: roll back, warn once.
+    // ChannelDisconnected — remote endpoint disconnected: roll back, warn.
     FaultPolicy::arm(
         FaultAction::RollbackAndAlert,
         LogLevel::Warn,
         "channel broke mid-action",
         "channel_breaks_total",
     ),
-    // BufferOverflow — backpressure horizon: discard newest, count it.
+    // BufferOverflow — backpressure horizon: discard newest, record metric.
     FaultPolicy::arm(
         FaultAction::DiscardSilently,
         LogLevel::Warn,
-        "bus choked, backpressure applied",
+        "buffer capacity limit reached, backpressure applied",
         "buffer_choke_total",
     ),
-    // StaleEpoch — routine UI lag: debug only, never an error.
+    // StaleEpoch — routine UI lag / reorder: debug only.
     FaultPolicy::arm(
         FaultAction::DiscardSilently,
         LogLevel::Debug,
         "UI lags, packet ignored",
         "stale_packets_dropped",
     ),
-    // BulkheadFull — node drowning under RejectNew: warn + count.
+    // BulkheadFull — capacity saturated under RejectNew: warn + count.
     FaultPolicy::arm(
         FaultAction::BreakerOpen,
         LogLevel::Warn,
         "bulkhead full, newcomer rejected",
         "bulkhead_rejections_total",
     ),
-    // EvictedOldest — kept the freshest: debug, count.
+    // EvictedOldest — retained freshest: debug, count.
     FaultPolicy::arm(
         FaultAction::DiscardSilently,
         LogLevel::Debug,
         "evicted oldest, kept freshest",
         "evicted_oldest_total",
     ),
-    // BreakerOpen — fast rejection while isolated: debug, count.
+    // BreakerOpen — fast rejection while circuit is open: debug, count.
     FaultPolicy::arm(
         FaultAction::DiscardSilently,
         LogLevel::Debug,
         "breaker open, fail fast",
         "breaker_fast_rejections_total",
     ),
-    // PoisonedPayload — membrane cut the poison: loudly, with a tag.
+    // PoisonedPayload — parameter validation failed at boundary: error + count.
     FaultPolicy::arm(
         FaultAction::DiscardSilently,
         LogLevel::Error,
-        "invalid parameters rejected at membrane",
+        "invalid parameters rejected at boundary",
         "poisoned_payloads_total",
     ),
     // ProcessDied — supervised worker terminated or hung (v0.4 honest kind).
@@ -399,8 +399,8 @@ pub const DEFAULT_POLICIES: [FaultPolicy; FaultKind::COUNT] = [
         "process_deaths_total",
     ),
     // Preempted — cooperative yield to a Critical admission (Phase 1).
-    // Capacity shedding, never catastrophic: the node is healthy, the junior yielded.
-    // Debug-quiet, counted in its own column, never trips the breaker.
+    // Capacity shedding, never catastrophic: background task yielded cooperatively.
+    // Counted in its own metric column, does not trip the circuit breaker.
     FaultPolicy::arm(
         FaultAction::DiscardSilently,
         LogLevel::Debug,
@@ -551,7 +551,7 @@ impl SnubberNodeBuilder {
     /// `window` settled outcomes failed (implicit drops + supervisor
     /// failures). `window = 0` disables (default — streak mode governs).
     /// Cloud-grade: `failure_rate(100, 50)` trips at "50 of last 100 died",
-    /// catching the sick-but-intermittent node the streak mode misses
+    /// catching the intermittently failing node that streak mode misses
     /// (fail-ok-fail-ok-… never trips a consecutive counter).
     #[must_use]
     pub fn failure_rate(mut self, window: u32, percent: u8) -> Self {
@@ -585,11 +585,9 @@ impl SnubberNodeBuilder {
         self
     }
 
-    /// Plan B for an isolated module: when the breaker is OPEN, `enter`
-    /// still fails — but [`SnubberNode::fallback_value`] returns this
-    /// closure's value (last-known-good CPS, default config, …) so the
-    /// UI keeps painting instead of showing a black error screen.
-    /// Netflix rule: subtitles died → empty string, movie keeps playing.
+    /// Plan B fallback value: when the breaker is OPEN, `enter`
+    /// rejects admission — but [`SnubberNode::fallback_value`] returns this
+    /// closure's value to support graceful degradation.
     #[must_use]
     pub fn fallback<F>(mut self, f: F) -> Self
     where
@@ -700,7 +698,7 @@ impl SnubberNodeBuilder {
         self
     }
 
-    /// Who owns the wait when the wall pushes back (Newton's 3rd law).
+    /// Node-level policy for caller pacing under admission saturation.
     ///
     /// * `AdviseOnly` (default) — never park the caller; the `Err`
     ///   carries `Backpressure` readings, the caller paces itself.
@@ -889,7 +887,7 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 /// Entry rejection reason (returned by `enter` without arming a guard).
-#[must_use = "an EnterError names the membrane verdict (BreakerOpen/BulkheadFull/StaleEpoch/...) — match or map it, never drop it"]
+#[must_use = "an EnterError indicates why admission was rejected (BreakerOpen/BulkheadFull/StaleEpoch/...) — match or map it, never drop it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnterError {
     /// Breaker OPEN and this call is not the half-open probe.
@@ -908,23 +906,14 @@ pub enum EnterError {
     /// Wait queue at capacity under `RejectNew`.
     QueueFull,
     /// Inbound payload exceeds the configured payload budget.
-    /// `usize` is deliberate: this verdict NEVER goes on the wire as
-    /// bytes (in-memory membrane refusal only — see the `Portability`
-    /// contract on wire structs). Wire types are `u32/u64/u8` only.
     PayloadBudgetExceeded(usize),
 }
 
 impl EnterError {
-    /// Wall-resistance readings, if this refusal IS pressure.
+    /// Backpressure readings associated with this admission rejection.
     ///
-    /// `Some` for `BulkheadFull / RateLimited / BreakerOpen` (the wall
-    /// pushes back — pace yourself); `None` for `StaleEpoch /
-    /// InvariantBreach` ("you knocked on the wrong door" — nothing to
-    /// pace, fix the caller).
-    ///
-    /// NOTE: these are HINTS computed from already-held counters, not
-    /// atomic deadlines. `retry_after_ms` is advice, not a reservation.
-    /// Variants are untouched (`Copy` intact) — only methods added.
+    /// `Some` for `BulkheadFull / RateLimited / BreakerOpen` (capacity saturation);
+    /// `None` for `StaleEpoch / InvariantBreach / QueueTtlExpired / PayloadBudgetExceeded`.
     #[must_use]
     pub fn backpressure(&self) -> Option<Backpressure> {
         match *self {
@@ -944,8 +933,7 @@ impl EnterError {
         }
     }
 
-    /// Advised wait before retry, ms. `0` = no pressure, retry now
-    /// (or: nothing to pace — fix the input).
+    /// Advised wait before retry, ms. `0` = no pressure, retry immediately.
     #[inline]
     #[must_use]
     pub fn retry_after_ms(&self) -> u64 {
@@ -955,17 +943,17 @@ impl EnterError {
 
 /// Unified error type for scoped transactions under a [`SnubberNode`].
 ///
-/// Distinguishes between admission rejections at the outer membrane (where protected
-/// hardware is never touched and no rollback is needed) and domain failures inside the
+/// Distinguishes between admission rejections at the perimeter boundary (where protected
+/// resources are never touched and no rollback is needed) and domain failures inside the
 /// protected work unit (where RAII rollback has already been executed).
-#[must_use = "a SnubberError names the failure origin (Admission = membrane refused, Work = rollback already ran) — match it, never drop it"]
+#[must_use = "a SnubberError names the failure origin (Admission = admission rejected, Work = rollback already ran) — match it, never drop it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnubberError<E> {
-    /// Node rejected admission at the membrane (breaker open, bulkhead full, rate limit, invariant breach).
-    /// Protected hardware/resource was never touched; no rollback executed.
+    /// Node rejected admission at the perimeter gate (breaker open, bulkhead full, rate limit, invariant breach).
+    /// Protected resource was never touched; no rollback executed.
     Admission(EnterError),
     /// Protected work unit returned an error `Err(E)`.
-    /// Hardware rollback was executed via RAII before returning.
+    /// Rollback was executed via RAII before returning.
     Work(E),
 }
 
@@ -1018,7 +1006,7 @@ pub trait LegalMove<Next> {
 }
 
 /// Spawned guarded worker: thread join handle and controller task handle.
-/// `JoinHandle` yields `Err(Admission(..))` when the membrane refused
+/// `JoinHandle` yields `Err(Admission(..))` when the admission layer rejected the call
 /// (bulkhead/breaker) — join and inspect the error.
 #[cfg(feature = "alloc")]
 pub type SpawnedGuard<S, D = ()> = (
@@ -1290,7 +1278,7 @@ impl SnubberNode {
         crate::async_pace::enter_paced_async(self, epoch, task_id, rollback, sleep_fn).await
     }
 
-    /// Copy-snapshot of the black-box counters.
+    /// Copy-snapshot of the live telemetry counters.
     ///
     /// Touch point: also reaps expired watchdog deadlines (see
     /// [`SnubberNodeBuilder::timeout_ms`]) — a hung guard is declared
@@ -1458,7 +1446,7 @@ impl SnubberNode {
     ///
     /// The guard sees *a drop*; only the supervisor knows *why*:
     /// `catch_unwind` names [`FaultKind::Panic`], the watchdog names
-    /// [`FaultKind::Timeout`], the membrane names
+    /// [`FaultKind::Timeout`], parameter validation names
     /// [`FaultKind::PoisonedPayload`], the bus names
     /// [`FaultKind::ChannelDisconnected`]. The per-kind policy fires
     /// exactly as if the node had observed the fault itself —
@@ -1903,7 +1891,7 @@ impl SnubberNode {
     ///
     /// The spaghetti cure: instead of `is_active + current_state + flag`
     /// drifting apart, the caller owns ONE `state: S` and moves it in
-    /// exactly one place. `work` runs under the membrane; on `Ok` the
+    /// exactly one place. `work` executes inside the admission boundary; on `Ok` the
     /// new state sticks + guard commits; on `Err`/panic the OLD state
     /// is restored (caller passes `&mut`, we write back only success)
     /// and the guard rolls back. No half-moved enums, ever.
@@ -1952,7 +1940,7 @@ impl SnubberNode {
     ///
     /// Declare one rib per allowed move in YOUR automaton — and nothing
     /// else compiles. The rib carries the conversion, so the work closure
-    /// operates on the OLD state and the membrane swaps in the NEW one
+    /// operates on the OLD state and the transition logic swaps in the NEW one
     /// only on success:
     ///
     /// ```rust
@@ -2135,8 +2123,8 @@ impl SnubberNode {
     /// Arm a tracked guard behind a semantic customs gate.
     ///
     /// Rust types are not enough: `cps: u32` accepts `0` (division by
-    /// zero) and `999999` (burnt dispatcher) with a straight face. The
-    /// `invariant` predicate is the law of physics for this node —
+    /// zero) and `999999` (saturated dispatcher) with a straight face. The
+    /// `invariant` predicate enforces domain constraints for this node —
     /// it runs BEFORE the epoch gate and the bulkhead, so poison never
     /// advances a generation counter and never occupies a slot:
     ///
@@ -3230,7 +3218,7 @@ fn level_from_u32(v: u32) -> LogLevel {
         _ => LogLevel::Error,
     }
 }
-/// Guard armed through a [`SnubberNode`]: settles the black box on exit.
+/// Guard armed through a [`SnubberNode`]: records telemetry on settlement.
 ///
 /// * `commit()` → `committed += 1`, breaker failure streak reset
 ///   (a probe success closes the breaker).
@@ -3577,8 +3565,8 @@ impl<F: FnOnce()> TrackedGuard<F> {
             release_slot_inner(&mut inner, lane);
             inner.stats.explicit_aborts = inner.stats.explicit_aborts.saturating_add(1);
             // Planned aborts do NOT feed the breaker streak — but a
-            // failed probe still re-opens: a probe that aborts proved
-            // the downstream is still sick.
+            // failed probe still re-opens: a probe that aborts confirmed
+            // the downstream is still degraded.
             if is_probe {
                 inner.breaker = BreakerState::Open;
                 inner.half_open_probe = false;
@@ -3643,7 +3631,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
                 inner.stats.breaker_state = BreakerState::HalfOpen;
             }
         }
-        // Probe that died implicitly: downstream still sick → back to Open.
+        // Probe that settled implicitly: downstream still degraded → back to Open.
         if self.is_probe {
             inner.breaker = BreakerState::Open;
             inner.half_open_probe = false;
