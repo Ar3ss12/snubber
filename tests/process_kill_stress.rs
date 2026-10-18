@@ -62,7 +62,7 @@ fn process_kill_stress_test() {
 
         // 2. Spawn Terminal 2: Process Killer Harness
         let cmd2 = format!(
-            "powershell -ExecutionPolicy Bypass -File .\\stress_harness.ps1 -TargetProcess process_termination_loop -Kills {}",
+            "powershell -ExecutionPolicy Bypass -File .\\scripts\\stress_harness.ps1 -TargetProcess process_termination_loop -Kills {}",
             kills
         );
         let mut term2 = Command::new("powershell")
@@ -101,7 +101,7 @@ fn process_kill_stress_test() {
         // 2. Run stress harness in background
         let mut killer = Command::new("bash")
             .args([
-                "stress_harness.sh",
+                "scripts/stress_harness.sh",
                 "process_termination_loop",
                 &kills.to_string(),
                 "0.001",

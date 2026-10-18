@@ -11,8 +11,7 @@ documentation = "https://docs.rs/snubber"
 keywords = ["transactions", "guard", "raii", "epoch", "bulkhead"]
 categories = ["concurrency", "no-std", "data-structures"]
 exclude = [
-    "stress_harness.ps1",
-    "stress_harness.sh",
+    "scripts/",
     "AGENTS.md",
     "tech.md",
     "docs/DECISION_MATRIX.md",
