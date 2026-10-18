@@ -1,6 +1,6 @@
-//! Pattern 09: Autopilot Assembly (Steel Thread)
+//! Pattern 09: Pipeline Supervisor (End-to-End Steel Thread)
 //!
-//! Run: `cargo run --example 09_autopilot_assembly`
+//! Run: `cargo run --example 09_pipeline_supervisor`
 //!
 //! Demonstrates every primitive wired together: doors send intents
 //! through the gateway, the host mutates ONE enum via transition,
