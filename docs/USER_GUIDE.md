@@ -590,8 +590,8 @@ if let Some(digest) = snubber::take_stdin_digest() {
 ### 4.7 Orphan contract (Phase 6: no zombies)
 ```rust
 use snubber::{NoOrphanGuard, OrphanGuard};
-let guard = NoOrphanGuard; // honest no-op; real Win32 Job Objects
-assert!(!guard.arm(child_pid)); // live in examples/orphan_guard.rs
+let guard = NoOrphanGuard; // honest no-op; real Win32 Job Objects implemented in app
+assert!(!guard.arm(child_pid));
 ```
 
 ---
@@ -645,9 +645,8 @@ print_health("click_worker", &snap, &policy);
 ### Filter 3 — production (`app.snub` + one-line diagnosis)
 
 The crate never touches the filesystem — your app owns the flusher
-thread (see `examples/persist_snapshot.rs`: `snapshot_v1_in(gen)` →
-`encode()` → tmp + rename every 10 s → `decode()` + `find_anomalies()`
-on boot). When a user reports *"it lags"*, ask for one line:
+thread (e.g. `snapshot_v1_in(gen)` → `encode()` → tmp + rename every 10 s →
+`decode()` + `find_anomalies()` on boot). When a user reports *"it lags"*, ask for one line:
 
 ```text
 [DIAG 0x8FA3 click_worker bulkhead_starvation 92%]

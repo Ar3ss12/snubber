@@ -92,10 +92,15 @@ Measured on AMD Ryzen 5 4600H release build
 
 ## 🧪 Production Patterns
 
-* **[Hardware Fuse (`examples/pattern_hardware_fuse.rs`)](examples/pattern_hardware_fuse.rs):** Zero-allocation physical interlock safety.
-* **[Worker Daemon (`examples/pattern_worker_daemon.rs`)](examples/pattern_worker_daemon.rs):** Autonomous slot claiming for background workers.
-* **[Database Bulkhead (`examples/pattern_database_bulkhead.rs`)](examples/pattern_database_bulkhead.rs):** Concurrency limits and adaptive backpressure.
-* **[Process Supervisor (`examples/pattern_process_supervisor.rs`)](examples/pattern_process_supervisor.rs):** Surviving abnormal child process termination (`kill -9`).
+* **[01 Hardware Fuse (`examples/01_hardware_fuse.rs`)](examples/01_hardware_fuse.rs):** Zero-allocation physical interlock safety.
+* **[02 Worker Daemon (`examples/02_worker_daemon.rs`)](examples/02_worker_daemon.rs):** Autonomous slot claiming for background workers.
+* **[03 Scoped Database (`examples/03_scoped_database.rs`)](examples/03_scoped_database.rs):** Concurrency limits and adaptive backpressure.
+* **[04 Async Web Gateway (`examples/04_async_web_gateway.rs`)](examples/04_async_web_gateway.rs):** Runtime-agnostic async entry with pacing metadata.
+* **[05 Task Conduit Steering (`examples/05_task_conduit_steering.rs`)](examples/05_task_conduit_steering.rs):** Bi-directional task control and live telemetry.
+* **[06 Process Supervisor (`examples/06_process_supervisor.rs`)](examples/06_process_supervisor.rs):** Surviving abnormal child process termination (`kill -9`).
+* **[07 State Handoff (`examples/07_state_handoff.rs`)](examples/07_state_handoff.rs):** Crash-resilient successor state digest passing.
+* **[08 Hot Standby Failover (`examples/08_hot_standby_failover.rs`)](examples/08_hot_standby_failover.rs):** Zero-framework N+1 shadow slot failover.
+* **[09 Autopilot Assembly (`examples/09_autopilot_assembly.rs`)](examples/09_autopilot_assembly.rs):** Full end-to-end integration of all resilience layers.
 
 ---
 

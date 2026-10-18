@@ -13,7 +13,7 @@
 //!   network state needs idempotency keys, not a destructor.
 //!
 //! No `tokio` in `[dependencies]`, ever. Runtimes live in YOUR binary
-//! and in `examples/async_gateway.rs` (which is `no_run` without them).
+//! and in `examples/04_async_web_gateway.rs` (which is `no_run` without them).
 
 use crate::node::{EnterError, SnubberNode, TrackedGuard};
 use crate::policy::Backpressure;

@@ -10,8 +10,7 @@
 //!   [`print_health`], [`diagnostic_line`], [`assert_no_anomalies`].
 //!
 //! The crate gives bytes and math; the APP gives threads, paths and
-//! network. `SnapshotV1::encode` + your own 10-second flusher (see
-//! `examples/persist_snapshot.rs`) is the whole "cold layer".
+//! network. `SnapshotV1::encode` + your own 10-second flusher is the whole "cold layer".
 
 use core::fmt;
 

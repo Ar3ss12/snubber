@@ -384,7 +384,7 @@ fn stdin_digest_chain_is_closed_tick0() {
         .parent()
         .expect("debug dir")
         .join("examples")
-        .join("process_state_handoff");
+        .join("07_state_handoff");
     let successor = if cfg!(windows) {
         successor.with_extension("exe")
     } else {
@@ -393,7 +393,7 @@ fn stdin_digest_chain_is_closed_tick0() {
     if !successor.exists() {
         // Build examples if not built yet, matching the active profile (debug vs release)
         let mut build_cmd = std::process::Command::new("cargo");
-        build_cmd.args(["build", "--example", "process_state_handoff"]);
+        build_cmd.args(["build", "--example", "07_state_handoff"]);
         if !cfg!(debug_assertions) {
             build_cmd.arg("--release");
         }

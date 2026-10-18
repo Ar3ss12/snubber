@@ -17,8 +17,7 @@
 //! decision math via [`RestartPolicy`], [`Backoff`], and [`RestartTracker`].
 //!
 //! ORPHAN CONTRACT: Defines the guarantee that child processes terminate with the parent.
-//! Portable no-op included ([`NoOrphanGuard`]); OS-level implementation documented in
-//! `examples/orphan_guard.rs`.
+//! Portable no-op included ([`NoOrphanGuard`]); OS-level implementation is application-owned.
 
 use super::{SnubberEvent, TransactionHeader};
 use std::collections::VecDeque;
@@ -1088,8 +1087,7 @@ impl Supervisor {
 /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`unsafe` + `windows-sys`) —
 /// forbidden here by `forbid(unsafe_code)` + zero-dep. Unix needs
 /// `prctl(PR_SET_PDEATHSIG)` (`libc`) — same veto. So the crate ships
-/// the trait + a portable no-op; the real impl is a documented pattern
-/// in `examples/orphan_guard.rs` (osmotic docs, not dead code).
+/// the trait + a portable no-op; the real impl is an application-level pattern.
 ///
 /// Owner (R1): the APP's supervisor setup. The crate never calls it —
 /// it only types the promise so every satellite binary shares one.

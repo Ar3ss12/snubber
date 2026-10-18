@@ -1,6 +1,6 @@
 //! Pipeline supervisor assembly (all phases): gateway + priority + restart + handoff.
 //!
-//! Run: `cargo run --example pipeline_supervisor`
+//! Run: `cargo run --example 09_autopilot_assembly`
 //!
 //! Demonstrates every primitive wired together: doors send intents
 //! through the gateway, the host mutates ONE enum via transition,
