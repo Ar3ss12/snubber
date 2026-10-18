@@ -71,7 +71,7 @@ fn token_bucket_caps_admissions_per_second() {
 fn sliding_window_catches_intermittent_sickness() {
     // fail-ok-fail-ok never trips a streak counter — window must catch it.
     // Window = 4 outcomes: [fail, ok, fail, ok] = 2/4 = 50% -> trip at 4.
-    let node = SnubberNode::builder("sick")
+    let node = SnubberNode::builder("intermittent_failure")
         .trip_after_failures(1000)
         .failure_rate(4, 50)
         .build();

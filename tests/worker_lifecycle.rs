@@ -87,9 +87,9 @@ fn worker_panic_rolls_back_and_frees_the_slot() {
 
 #[test]
 fn validate_before_arming_burns_no_slot() {
-    // The Level 2.5 membrane rule: a poisoned start reports WITHOUT
+    // The Layer 2.5 admission boundary rule: a poisoned start reports WITHOUT
     // arming — `total_started` untouched, slot free for the next run.
-    let node = SnubberNode::builder("worker_membrane")
+    let node = SnubberNode::builder("worker_boundary")
         .max_in_flight(1)
         .trip_after_failures(100)
         .build();
@@ -100,7 +100,7 @@ fn validate_before_arming_burns_no_slot() {
         let _ = run_worker(&node, &Arc::new(AtomicU32::new(0)));
     }
     let s = node.stats();
-    assert_eq!(s.total_started, 0, "membrane breach arms no guard");
+    assert_eq!(s.total_started, 0, "boundary breach arms no guard");
     assert_eq!(
         s.reported[snubber::FaultKind::PoisonedPayload.index()],
         1,

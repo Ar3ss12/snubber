@@ -73,10 +73,10 @@ fn frame_parser_fuzzer() {
         wire.extend_from_slice(&f.to_bytes());
     }
     let d = drain_of(wire.clone());
-    let heir = d.take_state().expect("intact stream promotes");
-    assert_eq!(heir, digest, "bit-exact reassembly");
+    let recovered = d.take_state().expect("intact stream promotes");
+    assert_eq!(recovered, digest, "bit-exact reassembly");
 
-    // IRON INVARIANT: a 1-bit mutant either promotes NOTHING or the
+    // INVARIANT: a 1-bit mutant either promotes NOTHING or the
     // bit-exact original. Benign flips exist by design (frame-2 zero
     // pad outside CRC coverage; `task.min(2)` seq clamp; in-order
     // overwrite of a reseated slot) — all must still reassemble to
@@ -90,9 +90,9 @@ fn frame_parser_fuzzer() {
             let d = drain_of(mutant);
             match d.last_state() {
                 None => rejected += 1,
-                Some(heir) => {
+                Some(state) => {
                     assert_eq!(
-                        heir, digest,
+                        state, digest,
                         "1-bit mutant byte {pos} bit {bit} promoted CORRUPT data"
                     );
                     identical += 1;

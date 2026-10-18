@@ -4,7 +4,7 @@
 //!
 //! Path-1 + Path-2 in one scene, no `unsafe`, no deps:
 //! * supervisor spawns the worker with `SNUBBER_GEN` + a piped stdout;
-//! * `PipeDrain` drains 40-byte tokens in real time (no 64 KB choke);
+//! * `PipeDrain` drains 40-byte tokens in real time (no 64 KB buffer block);
 //! * worker arms a token, then dies via `std::process::abort()` mid-flight;
 //! * supervisor sees `EOF`, runs the opcode handler, bumps generation,
 //! * a fresh worker re-handshakes at `gen+1, epoch=1` — stale generation packets rejected.

@@ -2,7 +2,7 @@
 //!
 //! Four production scenarios demonstrating edge validation and deterministic recovery:
 //! * Scenario 1: Zero interval flood       -> `InvariantBreach`, zero events reach core
-//! * Scenario 2: Clock overflow prevention  -> `InvariantBreach` caught at membrane boundary
+//! * Scenario 2: Clock overflow prevention  -> `InvariantBreach` caught at admission boundary
 //! * Scenario 3: High-frequency flapping    -> Leading edge admitted, duplicates rejected
 //! * Scenario 4: Resource hold with abort   -> Single-shot rollback releases resource
 //!
@@ -18,7 +18,7 @@ const fn interval_ms(hr: u64, min: u64, sec: u64, ms: u64) -> u64 {
     (hr * 3_600_000) + (min * 60_000) + (sec * 1_000) + ms
 }
 
-/// Membrane predicate: the physical law of clicker software.
+/// Admission boundary predicate: the physical law of clicker software.
 /// interval == 0 floods every frame; interval > MAX would make
 /// `Instant::now().checked_sub(interval).unwrap()` return None -> panic.
 fn click_invariant(interval: u64) -> Result<(), &'static str> {
@@ -44,7 +44,7 @@ fn main() {
         let r = node.enter_checked(1, 1, &interval, |p| click_invariant(*p), || {});
         match r {
             Err(EnterError::InvariantBreach(reason)) => {
-                println!("[scene1] zero interval cut at membrane: {reason}");
+                println!("[scene1] zero interval cut at admission boundary: {reason}");
                 passed += 1;
             }
             Err(other) => panic!("[scene1] wrong rejection: {other:?}"),

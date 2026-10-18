@@ -32,11 +32,11 @@ fn digest_42_survives() {
         }
         std::thread::yield_now();
     }
-    let heir = drain.take_state().expect("kept");
-    assert_eq!(heir.bytes[0], 42);
-    assert_eq!(heir, digest);
+    let recovered = drain.take_state().expect("kept");
+    assert_eq!(recovered.bytes[0], 42);
+    assert_eq!(recovered, digest);
     assert!(drain.take_armed().is_none());
-    println!("\n[HANDOFF]: published=64 kept=64 mark=42 heir=42 torn=0 poison=0");
+    println!("\n[HANDOFF]: published=64 kept=64 mark=42 recovered=42 torn=0 poison=0");
 }
 #[test]
 fn torn_half_dropped_last_whole_kept() {
@@ -45,7 +45,7 @@ fn torn_half_dropped_last_whole_kept() {
     use std::net::{TcpListener, TcpStream};
     let mut g = [0u8; 64];
     g[0] = 7;
-    let grandpa = StateDigest::new(g);
+    let initial = StateDigest::new(g);
     let mut t = [0u8; 64];
     t[0] = 9;
     let torn = StateDigest::new(t);
@@ -53,7 +53,7 @@ fn torn_half_dropped_last_whole_kept() {
     let addr = listener.local_addr().expect("a");
     let wh = std::thread::spawn(move || {
         let mut w = TcpStream::connect(addr).expect("c");
-        for f in grandpa.to_frames() {
+        for f in initial.to_frames() {
             w.write_all(&f.to_bytes()).unwrap();
         }
         let fr = torn.to_frames();
@@ -70,8 +70,8 @@ fn torn_half_dropped_last_whole_kept() {
         }
         std::thread::yield_now();
     }
-    let heir = drain.last_state().expect("grandpa");
-    assert_eq!(heir.bytes[0], 7);
+    let recovered = drain.last_state().expect("initial");
+    assert_eq!(recovered.bytes[0], 7);
 }
 #[test]
 fn bitten_frame_crc_dropped() {

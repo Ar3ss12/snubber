@@ -132,14 +132,14 @@ fn drain_holds_last_armed_and_eof_fires_it() {
     // Anonymous-pipe stand-in on stable `std`: loopback TCP is a byte
     // stream with kernel buffering + EOF-on-close — same contract as a
     // `std::process` pipe (drain in real time, EOF means death).
-    // Proves the CHOKE fix: reader drains while writer hammers.
+    // Proves the backpressure fix: reader drains while writer hammers.
     let listener = TcpListener::bind("127.0.0.1:0").expect("loopback");
     let addr = listener.local_addr().expect("addr");
     let (tx_done, rx_done) = std::sync::mpsc::channel::<()>();
     let writer_h = std::thread::spawn(move || {
         let mut w = TcpStream::connect(addr).expect("connect");
         // Arm token (opcode 7) then 2000 commits — drain must keep up,
-        // kernel buffer must never choke the writer.
+        // kernel buffer must never block the writer.
         let mut payload = [0u8; 28];
         payload[0] = 0xEE;
         let armed = ProcessToken::new(4242, 7, payload);

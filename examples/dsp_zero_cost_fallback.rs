@@ -1,5 +1,5 @@
 //! Real-time audio (48 kHz): NaN/overflow must become silence, never a
-//! 140 dB blast. Core-only path: static membrane, zero-alloc rollback.
+//! 140 dB blast. Core-only path: static boundary, zero-alloc rollback.
 //!
 //! Run: `cargo run --example audio_silence`
 
@@ -12,7 +12,7 @@ fn main() {
     buf[7] = f32::NAN;
     let header = TransactionHeader::new(1, 1);
     assert!(gate.observe(&header), "fresh block admitted");
-    // Membrane: finite + in [-1, 1], else the block becomes silence.
+    // Boundary: finite + in [-1, 1], else the block becomes silence.
     let poisoned = buf.iter().any(|s| !s.is_finite() || s.abs() > 1.0);
     if poisoned {
         buf.fill(0.0); // rollback = digital silence (no blast)

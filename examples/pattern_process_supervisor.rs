@@ -1,6 +1,6 @@
 //! Pattern 04: Process Supervisor & Pipe Drain
 //!
-//! Demonstrates Floor 5 multi-process supervision:
+//! Demonstrates Layer 4 multi-process supervision:
 //! Running an untrusted or crash-prone child process (e.g. WebView, plugin, GPU worker)
 //! across a framed IPC boundary. If the child process is abruptly killed by the OS
 //! (SIGKILL, TerminateProcess), the supervisor detects EOF without deadlocking and

@@ -135,16 +135,16 @@ fn registry_boards_explicit_handles() {
 }
 
 #[test]
-fn assert_macro_is_green_on_quiet_red_on_sick() {
+fn assert_macro_is_green_on_quiet_red_on_faulty() {
     let quiet = SnubberNode::builder("macro_quiet").build();
     let g = quiet.enter(1, 1, || {}).expect("admit");
     g.commit();
     assert_no_anomalies!(&quiet);
 
-    let sick = SnubberNode::builder("macro_sick").build();
-    sick.report(FaultKind::Panic, 1, 1);
+    let faulty = SnubberNode::builder("macro_faulty").build();
+    faulty.report(FaultKind::Panic, 1, 1);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert_no_anomalies!(&sick);
+        assert_no_anomalies!(&faulty);
     }));
     assert!(caught.is_err(), "macro must fail red on catastrophic fault");
 }

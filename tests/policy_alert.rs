@@ -1,4 +1,4 @@
-//! Node tests D: policy alert flag, silent kinds, membrane pattern,
+//! Node tests D: policy alert flag, silent kinds, admission boundary pattern,
 //! horizon kind. Public API only.
 
 use snubber::{FaultAction, FaultKind, FaultPolicy, LogLevel, OverflowPolicy, SnubberNode};
@@ -37,8 +37,8 @@ fn silent_policy_moves_counters_without_noise() {
 }
 
 #[test]
-fn membrane_example_rejects_poison_before_hardware() {
-    // The documented pattern: validate at the membrane, name the fault,
+fn boundary_example_rejects_poison_before_hardware() {
+    // The documented pattern: validate at the admission boundary, name the fault,
     // hardware is never touched.
     fn validate_cps(cps: f64) -> Result<(), &'static str> {
         if !(cps > 0.0 && cps <= 150.0) {
@@ -46,13 +46,13 @@ fn membrane_example_rejects_poison_before_hardware() {
         }
         Ok(())
     }
-    let node = SnubberNode::builder("membrane")
+    let node = SnubberNode::builder("boundary")
         .policy(
             FaultKind::PoisonedPayload,
             FaultPolicy::arm(
                 FaultAction::DiscardSilently,
                 LogLevel::Error,
-                "invalid parameters rejected at membrane",
+                "invalid parameters rejected at admission boundary",
                 "poisoned_payloads_total",
             ),
         )

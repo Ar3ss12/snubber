@@ -48,35 +48,35 @@ fn spawn_guarded_refusal_surfaces_in_join() {
     let res = join.join().expect("joined");
     match res {
         Err(SnubberError::Admission(_)) => {}
-        other => panic!("honest membrane refusal, got {other:?}"),
+        other => panic!("honest admission boundary refusal, got {other:?}"),
     }
-    println!("\n[SPAWN]: refusal=membrane work=never poison=0");
+    println!("\n[SPAWN]: refusal=admission work=never poison=0");
 }
 #[test]
 fn stdin_digest_chain_is_closed_tick0() {
     use snubber::{StateDigest, STATE_LEN};
-    // Heir binary: examples/digest_heir.rs reads stdin tick 0 via
+    // Replacement binary: examples/digest_heir.rs reads stdin tick 0 via
     // take_stdin_digest() and exits with bytes[0] as its code.
     // Parent half: build the example, spawn it with piped stdin,
     // write 64 B + EOF exactly like spawn_with_digest does.
     let mut bytes = [0u8; STATE_LEN];
     bytes[0] = 42;
     let exe = std::env::current_exe().expect("exe");
-    let heir = exe
+    let successor = exe
         .parent()
         .expect("deps dir")
         .parent()
         .expect("debug dir")
         .join("examples")
         .join("digest_heir");
-    let heir = if cfg!(windows) {
-        heir.with_extension("exe")
+    let successor = if cfg!(windows) {
+        successor.with_extension("exe")
     } else {
-        heir
+        successor
     };
-    assert!(heir.exists(), "build examples first: {heir:?}");
+    assert!(successor.exists(), "build examples first: {successor:?}");
     let digest = StateDigest::new(bytes);
-    let mut cmd = std::process::Command::new(&heir);
+    let mut cmd = std::process::Command::new(&successor);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
@@ -84,18 +84,18 @@ fn stdin_digest_chain_is_closed_tick0() {
     // test must prove the CONTRACT, not call the fn blindly — the
     // fn itself is covered by compilation + the sink half below).
     use std::io::Write;
-    let mut child = cmd.spawn().expect("spawn heir");
+    let mut child = cmd.spawn().expect("spawn replacement process");
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(&digest.bytes).expect("64 B, no block");
     }
-    let status = child.wait().expect("reap heir");
+    let status = child.wait().expect("reap replacement process");
     assert_eq!(status.code(), Some(42), "mark 42 survived real spawn");
     // Parent half via the REAL fn: sink child exits fast, no stall.
-    let mut sink = std::process::Command::new(&heir);
+    let mut sink = std::process::Command::new(&successor);
     sink.stdout(std::process::Stdio::null());
     sink.stderr(std::process::Stdio::null());
     let mut child2 = snubber::Supervisor::spawn_with_digest(sink, &digest).expect("spawn via fn");
     let st = child2.wait().expect("reap");
     assert_eq!(st.code(), Some(42), "fn path delivers too");
-    println!("\n[DIGEST]: spawned=2 mark=42 heir=42 stdin=closed");
+    println!("\n[DIGEST]: spawned=2 mark=42 successor=42 stdin=closed");
 }

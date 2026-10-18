@@ -1,6 +1,6 @@
 //! Node tests E: invariant customs gate (`enter_checked`).
 //!
-//! Poison must die at the membrane: no slot, no epoch advance,
+//! Poison must be rejected at the admission boundary: no slot, no epoch advance,
 //! policy fires with the predicate's static reason. Public API only.
 
 use snubber::{EnterError, FaultAction, FaultKind, FaultPolicy, LogLevel, SnubberNode};
@@ -37,7 +37,7 @@ fn valid_params_arm_normally() {
 }
 
 #[test]
-fn zero_cps_dies_at_the_membrane() {
+fn zero_cps_rejected_at_the_admission_boundary() {
     let node = SnubberNode::builder("customs_zero").build();
     let p = ClickParams {
         cps: 0,
@@ -84,7 +84,7 @@ fn breach_fires_poison_policy_with_custom_command() {
             FaultPolicy::arm(
                 FaultAction::Custom(reset),
                 LogLevel::Error,
-                "invalid parameters rejected at membrane",
+                "invalid parameters rejected at admission boundary",
                 "poisoned_payloads_total",
             ),
         )

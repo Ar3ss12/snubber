@@ -69,7 +69,7 @@ fn gate_admits_and_classifies_every_refusal() {
     assert_eq!(
         classify(&EnterError::BreakerOpen),
         Refusal::FailFast,
-        "sick downstream → fallback"
+        "degraded downstream → fallback"
     );
     assert_eq!(
         classify(&EnterError::StaleEpoch),

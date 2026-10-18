@@ -108,7 +108,7 @@ fn trip_breaker_policy_isolates_immediately() {
             FaultPolicy::arm(
                 FaultAction::TripBreaker,
                 LogLevel::Error,
-                "invalid parameters rejected at membrane",
+                "invalid parameters rejected at admission boundary",
                 "poisoned_payloads_total",
             ),
         )

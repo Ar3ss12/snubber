@@ -1,5 +1,5 @@
 //! CNC mill / 3D printer / laser engraver: the dangerous state is a LIVE
-//! tool. Membrane rejects out-of-bed coordinates; Drop kills the beam.
+//! tool. Boundary rejects out-of-bed coordinates; Drop kills the beam.
 //!
 //! Run: `cargo run --example laser_cnc`
 
@@ -15,10 +15,10 @@ struct Coords {
 
 fn main() {
     let node = SnubberNode::embedded("cnc/laser");
-    // Out-of-bed job: cut at the membrane, beam never arms.
+    // Out-of-bed job: cut at the boundary, beam never arms.
     let bad = Coords { x: 999.0, y: 10.0 };
     let r = node.enter_checked(1, 1, &bad, physics, laser_off);
-    assert!(r.is_err(), "out-of-bed job must die at membrane");
+    assert!(r.is_err(), "out-of-bed job must be rejected at boundary");
     assert_eq!(node.stats().total_started, 0);
     // Valid job, trajectory panics mid-burn: Drop kills the beam.
     let good = Coords { x: 10.0, y: 20.0 };
@@ -27,7 +27,7 @@ fn main() {
         .expect("valid job arms");
     laser_on();
     let _ = guard; // panic / ? here → laser_off() via Drop
-    println!("LASER_CNC: beam owned by guard, membrane holds the bed edge");
+    println!("LASER_CNC: beam owned by guard, boundary holds the bed edge");
 }
 
 fn physics(c: &Coords) -> Result<(), &'static str> {
