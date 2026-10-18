@@ -1,5 +1,4 @@
-//! Newton's 3rd law: the wall pushes back with MEASURED resistance.
-//! AdviseOnly reads, AdaptiveBlock parks, Custom reacts, friction bends.
+//! Backpressure telemetry & pacing: AdviseOnly, AdaptiveBlock, Custom, and friction curves.
 
 use snubber::{BackpressurePolicy, EnterError, FaultKind, SnubberNode};
 
@@ -94,7 +93,7 @@ fn custom_reaction_fires_with_readings() {
 }
 
 #[test]
-fn custom_friction_bends_the_spring() {
+fn custom_friction_curve_calculates_backpressure_delay() {
     // Quadratic curve: full bulkhead of 1 → 10 + 500 = 510ms advised.
     fn quad(in_flight: u32, max: u32) -> u64 {
         let r = in_flight as f32 / max.max(1) as f32;

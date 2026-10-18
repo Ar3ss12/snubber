@@ -1,9 +1,25 @@
-//! Async metal: waker queue, stages, pacing, bounded `try_send`.
-//! No runtime: 20-line `block_on` polls with a thread parker.
-
 use snubber::{AsyncLease, FaultKind, LeaseChannel, SnubberNode};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{RawWaker, RawWakerVTable, Waker};
+
+static WOKEN: AtomicBool = AtomicBool::new(false);
+
+fn create_tracked_waker() -> Waker {
+    unsafe fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VT)
+    }
+    unsafe fn wake(_: *const ()) {
+        WOKEN.store(true, Ordering::SeqCst);
+    }
+    unsafe fn wake_by_ref(_: *const ()) {
+        WOKEN.store(true, Ordering::SeqCst);
+    }
+    unsafe fn drop(_: *const ()) {}
+
+    static VT: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) }
+}
 
 /// Minimal executor: yield until the waker fires.
 fn block_on<F: std::future::Future>(mut fut: F) -> F::Output {
@@ -25,32 +41,39 @@ fn block_on<F: std::future::Future>(mut fut: F) -> F::Output {
     }
 }
 
-/// Probe helper: poll once with a noop waker, return the verdict.
-fn poll_once<F: std::future::Future + Unpin>(fut: &mut F) -> std::task::Poll<F::Output> {
-    fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VT)
-    }
-    fn wake(_: *const ()) {}
-    fn wake_by_ref(_: *const ()) {}
-    fn drop(_: *const ()) {}
-    static VT: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-    let w: Waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VT)) };
-    let mut cx = std::task::Context::from_waker(&w);
-    std::pin::Pin::new(fut).poll(&mut cx)
-}
-
 #[test]
 fn waker_queue_sleeps_and_wakes_on_commit() {
+    WOKEN.store(false, Ordering::SeqCst);
     let node = SnubberNode::builder("async/waker").max_in_flight(1).build();
     let gate = node.enter(1, 1, || {}).expect("slot 1");
-    let mut fut = node.enter_async(2, 2, || {});
-    assert!(poll_once(&mut fut).is_pending(), "full -> Pending");
-    assert_eq!(node.waiter_len(), 1, "waker parked in the queue");
-    drop(gate); // implicit drop: slot freed + waiter woken, drop counted
 
-    // The SAME future completes cleanly on wake without burning the rollback!
-    let g = block_on(fut).expect("fut completes on wake");
-    g.commit();
+    let mut fut = node.enter_async(2, 2, || {});
+
+    // Poll with our tracked waker:
+    let waker = create_tracked_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(core::pin::Pin::new(&mut fut).poll(&mut cx).is_pending());
+    assert!(
+        !WOKEN.load(Ordering::SeqCst),
+        "must not be woken while slot held"
+    );
+    assert_eq!(node.waiter_len(), 1, "waker parked in the queue");
+
+    // Release slot: node MUST explicitly invoke waker.wake()
+    drop(gate);
+    assert!(
+        WOKEN.load(Ordering::SeqCst),
+        "node MUST explicitly invoke waker.wake() on slot release"
+    );
+
+    // Now the future claims the slot on next poll:
+    match core::pin::Pin::new(&mut fut).poll(&mut cx) {
+        std::task::Poll::Ready(Ok(guard)) => {
+            guard.commit();
+        }
+        std::task::Poll::Ready(Err(e)) => panic!("expected Ready(Ok(guard)), got Err({e:?})"),
+        std::task::Poll::Pending => panic!("expected Ready(Ok(guard)), got Pending"),
+    }
     assert_eq!(node.stats().committed, 1, "woken slot settled");
     assert_eq!(node.stats().implicit_drops, 1, "dropped gate counted");
     assert_eq!(node.waiter_len(), 0, "queue drained");
@@ -71,12 +94,14 @@ fn stage_survives_kill_and_lands_in_record() {
         .build();
     {
         let mut g = node.enter(1, 1, || {}).expect("admit");
-        g.set_stage(1);
-        assert_eq!(g.stage(), 1);
+        g.checkpoint(2, "headers_sent");
+        assert_eq!(g.stage(), 2);
     }
     let s = node.stats();
     assert_eq!(s.implicit_drops, 1);
-    assert_eq!(s.last_fault.expect("record kept").stage, 1);
+    let fault = s.last_fault.expect("record kept");
+    assert_eq!(fault.stage, 2);
+    assert_eq!(fault.stage_label, Some("headers_sent"));
 }
 
 #[test]

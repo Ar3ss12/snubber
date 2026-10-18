@@ -59,7 +59,7 @@ fn gate_admits_and_classifies_every_refusal() {
     match gate.admit(2, 2, || {}) {
         Err(EnterError::BulkheadFull) => {}
         Err(_) => panic!("wrong refusal kind"),
-        Ok(_) => panic!("wall must push back"),
+        Ok(_) => panic!("admission must be rejected when capacity is saturated"),
     }
     let bulk = EnterError::BulkheadFull;
     assert_eq!(classify(&bulk), Refusal::Backoff);
@@ -140,4 +140,34 @@ fn cancel_closes_slot_honestly() {
     // Slot is home: next admission passes (no leak).
     gate.admit(2, 2, || {}).expect("slot home").commit();
     assert_eq!(node.stats().committed, 1);
+}
+
+#[test]
+fn gate_admit_checked_enforces_invariants_without_burning_slots() {
+    let node = SnubberNode::builder("async/checked")
+        .max_in_flight(1)
+        .build();
+    let gate = AsyncGate::new(node.clone()).expect("clean");
+
+    let res = gate.admit_checked(
+        1,
+        1,
+        &0,
+        |&val| {
+            snubber::snub_check!(val > 0, "value must be positive");
+            Ok(())
+        },
+        || {},
+    );
+
+    assert!(matches!(
+        res,
+        Err(EnterError::InvariantBreach("value must be positive"))
+    ));
+    assert_eq!(
+        node.stats().total_started,
+        0,
+        "rejected input must never burn started count"
+    );
+    assert_eq!(node.stats().poisoned_rejected, 1);
 }
