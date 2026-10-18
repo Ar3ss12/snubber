@@ -1,33 +1,24 @@
-//! Lifecycle supervisor: Path-1 spine + Path-2 token scalpel.
+//! Lifecycle supervisor: dual-path process monitoring, restart tracking, and token recovery.
 //!
-//! PATH-1 (spine, 90%): death/hang = reap the process + emit
-//! `SnubberEvent::Aborted { ProcessDied }` + restart at `generation + 1`.
-//! [`EpochGate`](crate::EpochGate) rejects stale generation packets itself.
+//! PATH 1: Process exit / hang monitoring. Reaps the child process, emits
+//! `SnubberEvent::Aborted { reason: "process died" }`, and triggers policy-based restart
+//! at `generation + 1`. [`EpochGate`](crate::EpochGate) rejects stale generation packets.
 //!
-//! PATH-2 (scalpel, 10%): last-armed 40-byte token over an anonymous
-//! `std::process` pipe (ZERO `unsafe`, ZERO deps).
+//! PATH 2: Emergency token recovery. The worker maintains an armed 40-byte token over an
+//! anonymous pipe. The supervisor background reader thread drains the pipe in real time.
+//! On clean commit (`OP_COMMIT`), the armed token is cleared. On process abort (`EOF` while
+//! armed), the un-settled token executes emergency rollback on the supervisor side.
 //!
-//! PIPE-CHOKE CONTRACT: drain the pipe in a background reader thread in
-//! real time (kernel buffer is 4-64 KB; 1600 x 40 B stall the WORKER on
-//! `write()`). Drain keeps ONE last-armed token, clears on `OP_COMMIT`.
-//! On `EOF` an un-cleared token fires the emergency rollback.
+//! PIPE-CHOKE CONTRACT: Drain the pipe in a background reader thread in real time
+//! (OS kernel buffer is 4-64 KB; un-drained stdout stalls the child on `write()`).
+//! Drain retains at most ONE last-armed token, cleared on `OP_COMMIT`.
 //!
-//! Dumb as a rail: spawn / drain / wait / emit / restart. No policies.
+//! RESTART LOGIC: The caller owns process spawn and wait. The supervisor provides
+//! decision math via [`RestartPolicy`], [`Backoff`], and [`RestartTracker`].
 //!
-//! Phase 2 adds the declarative restart half (still dumb-spine): the
-//! caller owns spawn/wait/sleep, the crate owns ONLY the decision math
-//! (`RestartPolicy` + `Backoff` + `RestartTracker`). The tracker never
-//! sleeps, never spawns, never touches a pipe — it returns a `delay_ms`
-//! the CALLER sleeps (injected sleeper, same contract as
-//! [`crate::AsyncSleeper`]: Tokio callers `tokio::time::sleep`, sync
-//! callers `std::thread::sleep`, tests sleep nothing and assert deltas).
-//!
-//! Phase 6 adds the orphan contract ([`OrphanGuard`]): the crate names
-//! the guarantee (parent death = satellites reaped), the APP implements
-//! it (Win32 Job Objects need `unsafe` + `windows-sys` — forbidden in
-//! this crate by `forbid(unsafe_code)` + zero-dep). Portable no-op
-//! included ([`NoOrphanGuard`]); real impl lives in
-//! `examples/orphan_guard.rs` as documented pattern.
+//! ORPHAN CONTRACT: Defines the guarantee that child processes terminate with the parent.
+//! Portable no-op included ([`NoOrphanGuard`]); OS-level implementation documented in
+//! `examples/orphan_guard.rs`.
 
 use super::{SnubberEvent, TransactionHeader};
 use std::collections::VecDeque;
@@ -108,16 +99,16 @@ impl DeathCause {
     }
 }
 
-/// When the supervisor reanimates a dead satellite (Phase 2).
+/// When the supervisor restarts an exited worker process (Phase 2).
 ///
 /// Plain `Copy` data — no logic lives here. The [`RestartTracker`]
 /// interprets it against the storm window:
-/// * `Never` — one-shot tasks (export, migration): no re-spawn.
-/// * `OnCrash` — clean `exit(0)` is a planned landing (no restart);
-///   any other death (`exit(1)`, segfault, `TerminateProcess`,
-///   `HangTimeout`) is a crash worth one reanimation.
-/// * `Always` — daemons that must live forever: even `exit(0)`
-///   is re-spawned (operator stop = `Never` at a higher layer).
+/// * `Never` — one-shot tasks (export, migration): no respawn.
+/// * `OnCrash` — clean `exit(0)` is a graceful shutdown (no restart);
+///   any other termination (`exit(1)`, segfault, `TerminateProcess`,
+///   `HangTimeout`) is a crash that triggers a restart.
+/// * `Always` — daemons that must run continuously: even `exit(0)`
+///   is respawned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum RestartPolicy {
     /// Never re-spawn (one-shot tasks).
@@ -130,7 +121,7 @@ pub enum RestartPolicy {
 }
 
 impl RestartPolicy {
-    /// `true` if this death deserves a reanimation attempt.
+    /// `true` if this death deserves a restart attempt.
     /// `exit_code: None` = killed/hung from outside (always a crash).
     #[inline]
     #[must_use]
@@ -143,7 +134,7 @@ impl RestartPolicy {
     }
 }
 
-/// Pause between reanimations (Phase 2).
+/// Pause between process restarts (Phase 2).
 ///
 /// `Copy`, `const`-friendly. [`Backoff::delay_for_attempt`] is pure
 /// math (`saturating` shifts, no clock, no sleep): attempt 0 waits
@@ -177,7 +168,7 @@ impl Backoff {
         }
     }
 
-    /// Pause before reanimation attempt `n` (0-based), ms.
+    /// Pause before restart attempt `n` (0-based), ms.
     /// Pure saturating math: `base << n`, capped at `max_ms`.
     /// `n >= 63` saturates (never panics, MSRV 1.70-safe loop).
     #[inline]
@@ -217,7 +208,7 @@ impl Default for Backoff {
 /// the timestamp deque; this struct is the declarative half.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RestartWindow {
-    /// Max reanimations inside the window (`0` = unlimited).
+    /// Max restarts inside the window (`0` = unlimited).
     pub max_restarts: u32,
     /// Window length, ms.
     pub within_ms: u64,
@@ -271,12 +262,12 @@ pub enum RestartDecision {
     Restart {
         /// Caller-owned cooling pause, ms (`0` = immediate).
         delay_ms: u64,
-        /// Which reanimation this is (0-based, for logging).
+        /// Which restart attempt this is (0-based, for logging).
         attempt: u32,
     },
 }
 
-/// Dumb-spine restart accountant (Phase 2).
+/// Restart rate accountant (Phase 2).
 ///
 /// Owns: storm-window timestamps (`VecDeque<u64>`, pruned per report),
 /// attempt counter, generation clock. Owns NOT: spawning, sleeping,
@@ -372,7 +363,7 @@ impl RestartTracker {
         self.attempts
     }
 
-    /// Reanimations authorized so far.
+    /// Restarts authorized so far.
     #[must_use]
     pub fn restarts(&self) -> u32 {
         self.restarts
@@ -539,7 +530,7 @@ pub const STATE_LEN: usize = 64;
 // COMPILE-TIME GATES (hot-handoff wire math; this module is `std`-gated,
 // so `no_std` builds never see these — `cargo check --no-default-features`
 // stays green):
-// * passport = exactly one L1 cache line (64 B);
+// * state snapshot = exactly one L1 cache line (64 B);
 // * token BODY = 8 (task) + 4 (opcode) + 28 (payload) = 40 B;
 // * token WIRE = 40 B body + 4 B `SNUB` magic = 44 B (NOT 44 in-struct!);
 // * digest split = 24 + 24 + 16 chunks = 64 B (`to_frames` arithmetic);
@@ -596,19 +587,19 @@ const _: () = {
     );
 };
 
-/// Hot state digest (Phase 3): the satellite's genetic passport.
+/// Hot state digest (Phase 3): 64-byte process state snapshot.
 ///
 /// Fixed 64 B of OPAQUE bytes + CRC32 — one cache line, ~1 ns copy.
-/// The crate NEVER interprets the payload: flat-packed coordinates
-/// (38 B cover x/y/w/h/cps/flags/clicks/preset) or a wardrobe ticket
-/// (checkpoint id + file offset + hash) for 100 MB states on disk.
-/// The crate is the armored postman — encode, CRC, deliver.
+/// The crate never interprets the payload: user-defined flat-packed coordinates
+/// or checkpoint references (checkpoint id + file offset + hash) for states on disk.
+/// Framed pipe transport guarantees encoding, CRC integrity verification, and in-order delivery.
 ///
-/// Wire: THREE `OP_STATE` frames (`task` = seq 0/1/2). Each body =
-/// `[seq u64 | chunk | crc u32]` where chunk = 28/28/8 digest bytes.
-/// Frame CRC covers its own chunk; full-digest CRC verified on
-/// reassembly. Torn frames dropped — heir gets the last WHOLE
-/// passport or nothing, never a corrupt fragment.
+/// Wire format: THREE `OP_STATE` frames (`task` = seq 0/1/2).
+/// Frame 0 & 1 carry 24 bytes of data + 4 bytes of chunk CRC.
+/// Frame 2 carries 16 bytes of data + 4 bytes of full-digest CRC + 4 bytes padding + 4 bytes chunk CRC.
+/// Reassembly verifies individual chunk CRCs and validates the full 64-byte payload against the full-digest CRC.
+/// Torn or mismatched frames dropped — replacement process receives the last verified complete
+/// state digest, never a corrupt or Franken-state fragment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StateDigest {
     /// Opaque state bytes (user-packed, user-read).
@@ -640,7 +631,7 @@ fn state_crc(data: &[u8]) -> u32 {
 }
 
 impl StateDigest {
-    /// Wrap raw bytes (user-packed flat struct or wardrobe ticket).
+    /// Wrap raw bytes (user-packed flat struct or checkpoint reference).
     #[inline]
     #[must_use]
     pub const fn new(bytes: [u8; STATE_LEN]) -> Self {
@@ -656,20 +647,27 @@ impl StateDigest {
 
     /// Split into three `OP_STATE` wire frames (seq in `task`).
     /// Body layout per frame: `[chunk | crc u32]` where chunk =
-    /// 24/24/16 digest bytes at `payload[0..take]`, CRC of that chunk
-    /// at `payload[24..28]` (frames 0/1 carry 24 B data + CRC; frame 2
-    /// carries 16 B data + 8 B zero pad + CRC of its 16 B).
-    /// CRC covers that frame's chunk only; torn frames drop silently.
+    /// 24/24/16 digest bytes at `payload[0..take]`. Frame 2 embeds the full-digest
+    /// CRC32 at `payload[16..20]`. Frame CRC at `payload[24..28]` covers the chunk
+    /// payload (frames 0/1 cover 24 B; frame 2 covers 16 B data + 4 B full CRC = 20 B).
+    /// Torn or corrupted frames drop silently.
     #[must_use]
     pub fn to_frames(self) -> [ProcessToken; 3] {
+        let full_crc = self.crc();
         let mut frames = [ProcessToken::tagged(OP_STATE, 0); 3];
         let mut off = 0usize;
         for (seq, frame) in frames.iter_mut().enumerate() {
             let take = if seq < 2 { 24 } else { 16 };
             let mut payload = [0u8; 28];
             payload[0..take].copy_from_slice(&self.bytes[off..off + take]);
-            let crc = state_crc(&self.bytes[off..off + take]);
-            payload[24..28].copy_from_slice(&crc.to_le_bytes());
+            if seq == 2 {
+                payload[16..20].copy_from_slice(&full_crc.to_le_bytes());
+                let crc = state_crc(&payload[0..20]);
+                payload[24..28].copy_from_slice(&crc.to_le_bytes());
+            } else {
+                let crc = state_crc(&self.bytes[off..off + take]);
+                payload[24..28].copy_from_slice(&crc.to_le_bytes());
+            }
             *frame = ProcessToken {
                 task: seq as u64,
                 opcode: OP_STATE,
@@ -707,7 +705,7 @@ pub fn death_event(header: TransactionHeader, cause: DeathCause) -> SnubberEvent
 }
 
 /// Drain state: exactly ONE slot (last un-settled token) + liveness clock
-/// + hot handoff (last WHOLE `StateDigest` + 3-frame reassembly scratch).
+/// + hot handoff (last verified complete `StateDigest` + 3-frame reassembly scratch).
 ///
 /// `last_seen_ms`: wall-clock of the last valid 40 B frame (token,
 /// commit, heartbeat OR state — any traffic proves the worker pumps).
@@ -716,12 +714,12 @@ pub fn death_event(header: TransactionHeader, cause: DeathCause) -> SnubberEvent
 struct DrainState {
     armed: Option<ProcessToken>,
     last_seen_ms: u64,
-    /// Last WHOLE verified digest (heir reads it on tick 0).
+    /// Last verified complete StateDigest.
     state: Option<StateDigest>,
-    /// Reassembly scratch: chunks per seq (28/28/8) + got-mask.
-    /// `got == 0b111` + CRC trio clean → promote to `state`.
+    /// Reassembly scratch: chunks per seq (24/24/16) + got-mask + full CRC.
     scratch: [[u8; 28]; 3],
     scratch_got: u8,
+    scratch_full_crc: u32,
 }
 
 /// Monotonic millisecond clock (supervisor side, `std`).
@@ -754,7 +752,7 @@ impl PipeDrain {
         let s = Arc::clone(&state);
         let d = Arc::clone(&done);
         std::thread::spawn(move || {
-            let mut reader = reader;
+            let mut reader = std::io::BufReader::with_capacity(4096, reader);
             let mut window = [0u8; 4];
             let mut one = [0u8; 1];
 
@@ -778,30 +776,44 @@ impl PipeDrain {
                             }
                         } else if token.opcode == OP_STATE {
                             // Hot handoff chunk: seq = task (0/1/2).
-                            // Layout: payload[0..take] = data (24/24/16),
-                            // payload[24..28] = frame CRC of that chunk.
+                            // Layout: payload[0..take] = data (24/24/16).
+                            // Frame 2 carries authoritative full-digest CRC at payload[16..20].
+                            // Frame CRC at payload[24..28].
                             let seq = (token.task.min(2)) as usize;
                             let take = if seq < 2 { 24 } else { 16 };
                             let mut want = [0u8; 4];
                             want.copy_from_slice(&token.payload[24..28]);
                             let want = u32::from_le_bytes(want);
-                            if state_crc(&token.payload[0..take]) == want {
+
+                            let valid_chunk = if seq == 2 {
+                                state_crc(&token.payload[0..20]) == want
+                            } else {
+                                state_crc(&token.payload[0..take]) == want
+                            };
+
+                            if valid_chunk {
                                 st.scratch[seq][0..take].copy_from_slice(&token.payload[0..take]);
+                                if seq == 2 {
+                                    let mut fcrc = [0u8; 4];
+                                    fcrc.copy_from_slice(&token.payload[16..20]);
+                                    st.scratch_full_crc = u32::from_le_bytes(fcrc);
+                                }
                                 st.scratch_got |= 1 << seq;
                                 if st.scratch_got == 0b111 {
                                     let mut bytes = [0u8; STATE_LEN];
                                     bytes[0..24].copy_from_slice(&st.scratch[0][0..24]);
                                     bytes[24..48].copy_from_slice(&st.scratch[1][0..24]);
                                     bytes[48..64].copy_from_slice(&st.scratch[2][0..16]);
-                                    st.state = Some(StateDigest::new(bytes));
-                                    // Fresh passport starts here: reset the
-                                    // mask so a torn tail of the NEXT digest
-                                    // can never mix with this one's chunks.
+                                    let candidate = StateDigest::new(bytes);
+                                    if candidate.crc() == st.scratch_full_crc {
+                                        st.state = Some(candidate);
+                                    }
+                                    // Reset mask so subsequent digests reassemble cleanly
                                     st.scratch_got = 0;
                                 }
                             }
-                            // Torn frame: dropped silently, scratch keeps
-                            // the older halves — heir gets last whole.
+                            // Corrupt or mismatched frame: dropped silently,
+                            // replacement process gets the last verified whole state.
                         } else {
                             st.armed = Some(token);
                         }
@@ -820,8 +832,8 @@ impl PipeDrain {
         self.state.lock().ok().and_then(|mut st| st.armed.take())
     }
 
-    /// Take the last WHOLE verified `StateDigest`, if any (Phase 3).
-    /// Call after reap, hand the bytes to the heir on tick 0 (child
+    /// Take the last verified complete `StateDigest`, if any (Phase 3).
+    /// Call after process exit, hand the bytes to the replacement process at startup (child
     /// stdin/env/file — the crate delivers, the app injects). `Copy`
     /// out under one short lock — no alloc, never panics.
     #[must_use]
@@ -829,7 +841,7 @@ impl PipeDrain {
         self.state.lock().ok().and_then(|st| st.state)
     }
 
-    /// Peek without taking (supervisor polls before spawning the heir).
+    /// Peek without taking (supervisor polls before spawning replacement process).
     #[must_use]
     pub fn last_state(&self) -> Option<StateDigest> {
         self.state.lock().ok().and_then(|st| st.state)
@@ -876,13 +888,13 @@ pub type TokenRollback = fn(u32, [u8; 28]);
 pub struct Supervisor;
 
 impl Supervisor {
-    /// Spawn `cmd` with `digest` on the heir's stdin tick 0 (debt 2).
+    /// Spawn `cmd` with `digest` written to the replacement process's stdin at startup.
     ///
     /// Caller builds the `Command` (exe + args + env — the crate never
     /// guesses); we pipe stdin, `write_all` the 64 B (fits any 4 KB
     /// kernel pipe buffer — never blocks), `drop(stdin)` for EOF, and
-    /// hand back the live `Child`. The heir reads it on its first line
-    /// via [`take_stdin_digest`]. Chain closed 100% in-crate.
+    /// hand back the live `Child`. The replacement process reads it on its first line
+    /// via [`take_stdin_digest`].
     pub fn spawn_with_digest(
         mut cmd: std::process::Command,
         digest: &StateDigest,
@@ -892,7 +904,7 @@ impl Supervisor {
         let mut child = cmd.spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(&digest.bytes);
-            // EOF: heir's read_exact lands, no deadlock.
+            // EOF: child's read_exact completes without deadlock.
         }
         Ok(child)
     }
@@ -1019,11 +1031,11 @@ impl OrphanGuard for NoOrphanGuard {
     }
 }
 
-/// Read the heir's passport from stdin tick 0 (debt 2, heir side).
+/// Read the state snapshot from stdin at startup (replacement process side).
 ///
-/// Dumb + reliable `read_exact`: 64 B delivered → `Some`, fewer bytes
-/// (torn write) or no stdin at all (Windows GUI) → `None`, never a
-/// panic. Call ONCE on the first line of `main` — second call sees EOF.
+/// Deterministic `read_exact`: 64 B delivered -> `Some(StateDigest)`, fewer bytes
+/// (torn write) or no stdin available -> `None`.
+/// Call ONCE on the first line of `main` — subsequent calls observe EOF.
 #[must_use]
 pub fn take_stdin_digest() -> Option<StateDigest> {
     use std::io::Read;

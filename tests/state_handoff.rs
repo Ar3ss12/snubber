@@ -103,3 +103,52 @@ fn bitten_frame_crc_dropped() {
     }
     assert!(drain.last_state().is_none());
 }
+
+#[test]
+fn mismatched_generation_chunks_rejected_by_full_crc() {
+    use snubber::StateDigest;
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+
+    let mut a_bytes = [0xAAu8; 64];
+    a_bytes[0] = 1;
+    let digest_a = StateDigest::new(a_bytes);
+
+    let mut b_bytes = [0xBBu8; 64];
+    b_bytes[0] = 2;
+    let digest_b = StateDigest::new(b_bytes);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("l");
+    let addr = listener.local_addr().expect("a");
+
+    let wh = std::thread::spawn(move || {
+        let mut w = TcpStream::connect(addr).expect("c");
+        let frames_a = digest_a.to_frames();
+        let frames_b = digest_b.to_frames();
+
+        // Send frames 0 & 1 from revision A
+        w.write_all(&frames_a[0].to_bytes()).unwrap();
+        w.write_all(&frames_a[1].to_bytes()).unwrap();
+
+        // Send frame 2 from revision B (simulating fragmented/interleaved buffer state)
+        w.write_all(&frames_b[2].to_bytes()).unwrap();
+        w.flush().unwrap();
+    });
+
+    let (reader, _) = listener.accept().expect("a");
+    let drain = snubber::PipeDrain::spawn(reader);
+    wh.join().expect("w");
+
+    for _ in 0..5000 {
+        if drain.eof() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    // Full CRC mismatch MUST reject the Franken-state
+    assert!(
+        drain.last_state().is_none(),
+        "Mismatched chunks from different revisions must NOT be promoted to valid state"
+    );
+}
