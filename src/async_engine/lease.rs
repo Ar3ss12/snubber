@@ -8,7 +8,7 @@
 //! Used by background cleanup tasks: `Drop` fires `try_send` (never blocks), the
 //! background task drains and runs the heavy rollback.
 
-use super::policy::FaultKind;
+use crate::policy::FaultKind;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 
 /// One lease event: what died at which stage.

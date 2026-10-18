@@ -15,8 +15,8 @@
 //! No `tokio` in `[dependencies]`, ever. Runtimes live in YOUR binary
 //! and in `examples/async_gateway.rs` (which is `no_run` without them).
 
-use super::node::{EnterError, SnubberNode, TrackedGuard};
-use super::policy::Backpressure;
+use crate::node::{EnterError, SnubberNode, TrackedGuard};
+use crate::policy::Backpressure;
 
 /// Async entry checkpoint: [`SnubberNode`] that refuses fast, never sleeps.
 ///

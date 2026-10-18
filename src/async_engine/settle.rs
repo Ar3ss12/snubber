@@ -13,7 +13,7 @@
 //!
 //! No runtime inside, no `block_on` — the caller `.await`s in ITS runtime.
 
-use super::node::TrackedGuard;
+use crate::node::TrackedGuard;
 
 /// Run `work` to completion, then settle: `Ok(v)` → `commit()` + `v`,
 /// `Err(e)` → `abort(reason)` + `e`. The guard crosses the `.await` legally

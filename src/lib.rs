@@ -65,25 +65,13 @@ pub mod node;
 pub mod supervisor;
 
 #[cfg(feature = "std")]
-pub mod async_entry;
+pub mod async_engine;
 
 #[cfg(feature = "std")]
-pub mod async_lease;
+pub mod conduit;
 
 #[cfg(feature = "std")]
-pub mod async_pace;
-
-#[cfg(feature = "std")]
-pub mod async_settle;
-
-#[cfg(feature = "std")]
-pub mod async_gate;
-
-#[cfg(feature = "std")]
-pub mod intercom;
-
-#[cfg(feature = "std")]
-pub mod gateway;
+pub mod channel;
 
 pub mod policy;
 
@@ -96,7 +84,7 @@ pub mod diagnostics;
 pub mod protect;
 
 #[cfg(feature = "alloc")]
-pub mod closure;
+pub mod erased;
 
 pub use policy::{
     Backpressure, BackpressurePolicy, FaultAction, FaultDetail, FaultKind, FaultPolicy, FrictionFn,
@@ -104,7 +92,7 @@ pub use policy::{
 };
 
 #[cfg(feature = "alloc")]
-pub use closure::{ClosurePolicy, ErasedGuard};
+pub use erased::{ClosurePolicy, ErasedGuard};
 
 #[cfg(feature = "std")]
 pub use node::{
@@ -141,25 +129,16 @@ pub use supervisor::{
 };
 
 #[cfg(feature = "std")]
-pub use async_entry::EnterFuture;
+pub use async_engine::{
+    backpressure_of, classify, enter_paced_async, retry_after_ms, settle_async, AsyncGate,
+    AsyncLease, EnterFuture, GateError, LeaseChannel, LeaseEvent, Refusal,
+};
 
 #[cfg(feature = "std")]
-pub use async_lease::{AsyncLease, LeaseChannel, LeaseEvent};
+pub use conduit::{Directive, ResumeFuture, TaskConduit, TaskHandle};
 
 #[cfg(feature = "std")]
-pub use async_pace::enter_paced_async;
-
-#[cfg(feature = "std")]
-pub use async_settle::settle_async;
-
-#[cfg(feature = "std")]
-pub use async_gate::{backpressure_of, classify, retry_after_ms, AsyncGate, GateError, Refusal};
-
-#[cfg(feature = "std")]
-pub use intercom::{Directive, ResumeFuture, TaskConduit, TaskHandle};
-
-#[cfg(feature = "std")]
-pub use gateway::{
+pub use channel::{
     gateway, GatewayHost, GatewayRecvError, GatewaySendError, GatewaySender, GatewayStats,
 };
 

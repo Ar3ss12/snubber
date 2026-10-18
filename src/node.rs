@@ -1268,7 +1268,7 @@ impl SnubberNode {
         Sf: FnOnce(u64) -> SfFut,
         SfFut: core::future::Future<Output = ()>,
     {
-        crate::async_pace::enter_paced_async(self, epoch, task_id, rollback, sleep_fn).await
+        crate::async_engine::pace::enter_paced_async(self, epoch, task_id, rollback, sleep_fn).await
     }
 
     /// Copy-snapshot of the live telemetry counters.
@@ -3364,7 +3364,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
     where
         Fut: core::future::Future<Output = Result<T, E>>,
     {
-        crate::async_settle::settle_async(self, "async_settle_failed", commit_fut).await
+        crate::async_engine::settle::settle_async(self, "async_settle_failed", commit_fut).await
     }
 
     /// Settle asynchronously with an explicit abort reason on error.
@@ -3376,7 +3376,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
     where
         Fut: core::future::Future<Output = Result<T, E>>,
     {
-        crate::async_settle::settle_async(self, reason, commit_fut).await
+        crate::async_engine::settle::settle_async(self, reason, commit_fut).await
     }
 
     /// Arming header (stamped at `enter`).

@@ -7,7 +7,7 @@
 //!
 //! Zero deps: `Future` is `core`, the sleeper is a caller-supplied async fn.
 
-use super::node::{EnterError, SnubberNode, TrackedGuard};
+use crate::node::{EnterError, SnubberNode, TrackedGuard};
 
 /// Admit with an async pace: compute the friction wait, sleep in YOUR
 /// runtime, then admit once. `sleep_fn(wait_ms)` is YOUR timer

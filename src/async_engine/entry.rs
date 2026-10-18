@@ -9,7 +9,7 @@
 //! Queue is capped (1024, oldest evicted); atomic admission reserves the slot
 //! and only consumes the rollback on success — no lost wakeup, no burnt `FnOnce`.
 
-use super::node::{EnterError, SnubberNode, TrackedGuard};
+use crate::node::{self, EnterError, SnubberNode, TrackedGuard};
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -39,7 +39,7 @@ impl<F: FnOnce()> EnterFuture<F> {
             task_id,
             rollback: Some(rollback),
             loc,
-            enqueued_at_ms: super::node::now_ms(),
+            enqueued_at_ms: node::now_ms(),
         }
     }
 }
