@@ -54,7 +54,9 @@ impl GatewayStats {
     /// All `send` outcomes observed: landed + paced + dropped.
     #[must_use]
     pub fn total_attempts(&self) -> u64 {
-        self.sent.saturating_add(self.shed).saturating_add(self.throttled)
+        self.sent
+            .saturating_add(self.shed)
+            .saturating_add(self.throttled)
     }
 
     /// Delivery ratio per-mille (0..1000), float-free telemetry:
