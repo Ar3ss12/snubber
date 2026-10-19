@@ -20,9 +20,10 @@ use super::{SnubberNode, SnubberStats};
 /// Snapshot wire size: exactly 512 bytes, zero-padded, CRC32 in last 4.
 pub const SNAPSHOT_LEN: usize = 512;
 /// Snapshot format version (bytes 4..8, LE).
-/// v2: `reported` grew `COUNT 11 -> 12` for `FaultKind::Preempted`
-/// (Phase 1). v1 frames refuse as `BadVersion`, never half-parse.
-pub const SNAPSHOT_VERSION: u32 = 2;
+/// v3: `pulse_stalls` + `max_pulse_lag_ms` (Front 4: missed WorkerPulse
+/// verdicts land in the cold frame). v2/v1 frames refuse as
+/// `BadVersion`, never half-parse.
+pub const SNAPSHOT_VERSION: u32 = 3;
 /// Snapshot magic: `b"SNUB"` (bytes 0..4).
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SNUB";
 /// CRC covers bytes `0..508`; stored LE at `508..512`.
@@ -30,7 +31,8 @@ pub const SNAPSHOT_CRC_RANGE: usize = 508;
 
 // COMPILE-TIME GATES (cold-frame wire math, always compiled):
 // the 512 B frame = 508 B payload + 4 B CRC; the `reported` tail must
-// track `FaultKind::COUNT` (v2 grew 11 -> 12 for Preempted).
+// track `FaultKind::COUNT` (v2 grew 11 -> 12 for Preempted);
+// v3 appends `pulse_stalls` + `max_pulse_lag_ms` (Front 4).
 const _: () = {
     assert!(
         SNAPSHOT_LEN == 512,
@@ -85,6 +87,11 @@ pub struct SnapshotV1 {
     pub generation: u64,
     /// Per-kind explicit-report counters (`FaultKind::index` order).
     pub reported: [u64; super::FaultKind::COUNT],
+    /// Missed `WorkerPulse` verdicts (Front 4: watcher saw a frozen tick
+    /// past the lease). Zero in v2 frames (refuse as `BadVersion`).
+    pub pulse_stalls: u64,
+    /// Worst pulse lag observed, ms (saturating max).
+    pub max_pulse_lag_ms: u64,
     /// Breaker position: 0 = Closed, 1 = Open, 2 = HalfOpen.
     pub breaker_state: u8,
 }
@@ -171,6 +178,8 @@ impl SnapshotV1 {
         for v in self.reported {
             w64!(v);
         }
+        w64!(self.pulse_stalls);
+        w64!(self.max_pulse_lag_ms);
         out[o] = self.breaker_state;
         let crc = crc32_ieee(&out[..SNAPSHOT_CRC_RANGE]);
         out[SNAPSHOT_CRC_RANGE..SNAPSHOT_LEN].copy_from_slice(&crc.to_le_bytes());
@@ -233,11 +242,15 @@ impl SnapshotV1 {
             poison_recoveries: r64!(),
             generation: r64!(),
             reported: [0; super::FaultKind::COUNT],
+            pulse_stalls: 0,
+            max_pulse_lag_ms: 0,
             breaker_state: 0,
         };
         for v in snap.reported.iter_mut() {
             *v = r64!();
         }
+        snap.pulse_stalls = r64!();
+        snap.max_pulse_lag_ms = r64!();
         snap.breaker_state = bytes[o];
         Ok(snap)
     }
@@ -266,6 +279,8 @@ impl SnapshotV1 {
             poison_recoveries: stats.poison_recoveries,
             generation,
             reported: stats.reported,
+            pulse_stalls: stats.pulse_stalls,
+            max_pulse_lag_ms: stats.max_pulse_lag_ms,
             breaker_state: match stats.breaker_state {
                 super::BreakerState::Closed => 0,
                 super::BreakerState::Open => 1,
@@ -364,6 +379,10 @@ pub enum AnomalyKind {
     /// juniors — either the Background lane is starved by design or
     /// priorities are inverted upstream. Operational shedding, never catastrophic.
     PreemptStorm,
+    /// `pulse_stalls > 0`: the worker's heartbeat froze past the lease
+    /// (Front 4). The engine lagged but never died — `count` = missed
+    /// verdicts, `pct` carries `max_pulse_lag_ms` capped at 100.
+    PulseStall,
 }
 
 impl AnomalyKind {
@@ -376,6 +395,7 @@ impl AnomalyKind {
             Self::Desync => "epoch_desync",
             Self::Catastrophic => "catastrophic_fault",
             Self::PreemptStorm => "preempt_storm",
+            Self::PulseStall => "pulse_stall",
         }
     }
 }
@@ -484,6 +504,16 @@ pub fn find_anomalies_for_snapshot(
             node,
             pct: 1,
             count: snap.shed_stale(),
+        });
+    }
+    // Front 4: missed heartbeats ignore `min_sample` (like desync) — a
+    // single frozen pulse on an idle node is still a lag verdict.
+    if snap.pulse_stalls > 0 {
+        out.push(Anomaly {
+            kind: AnomalyKind::PulseStall,
+            node,
+            pct: snap.max_pulse_lag_ms.min(100) as u8,
+            count: snap.pulse_stalls,
         });
     }
     let total = snap.admission_total();

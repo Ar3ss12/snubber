@@ -34,10 +34,24 @@ fn four_senders_one_host_reject_new() {
                 } else {
                     ClickerCommand::Tick
                 };
-                match door.send(c) {
-                    Ok(()) => ok += 1,
-                    Err(GatewaySendError::Full) => shed += 1,
-                    Err(GatewaySendError::Disconnected) => break,
+                // Throttle is pacing, not loss: sleep the advised wait and retry.
+                loop {
+                    match door.send(c) {
+                        Ok(()) => {
+                            ok += 1;
+                            break;
+                        }
+                        Err(GatewaySendError::Full) => {
+                            shed += 1;
+                            break;
+                        }
+                        Err(GatewaySendError::Throttled { retry_after_ms, .. }) => {
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                retry_after_ms.min(5),
+                            ));
+                        }
+                        Err(GatewaySendError::Disconnected) => return (ok, shed),
+                    }
                 }
             }
             (ok, shed)
@@ -83,13 +97,14 @@ fn four_senders_one_host_reject_new() {
     }
     let st = host.stats();
     println!(
-        "\n[GATE]: senders=4 sent={} admitted={} shed={} tail={}",
-        st.sent, st.admitted, st.shed, tail
+        "\n[GATE]: senders=4 sent={} admitted={} shed={} throttled={} tail={}",
+        st.sent, st.admitted, st.shed, st.throttled, tail
     );
     assert_eq!(st.sent, ok_sum);
     assert_eq!(st.shed, shed_sum);
     assert_eq!(st.sent, st.admitted + tail);
-    assert!(st.shed > 0);
+    assert!(st.throttled > 0, "throttle must pace before hard-full");
+    assert_eq!(ok_sum, 800, "paced senders lose nothing");
     assert_eq!(node.stats().poison_recoveries, 0);
 }
 

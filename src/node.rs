@@ -175,6 +175,14 @@ pub struct SnubberStats {
     pub breaker_state: BreakerState,
     /// Watchdog timeouts fired via `check_timeout`.
     pub timeouts_fired: u64,
+    /// Watchdog timeouts settled as `DeadlockSuspected`: wall silence at
+    /// the stall ceiling with no CPU growth (wedged lock / dead pipe).
+    pub deadlock_suspected: u64,
+    /// Missed `WorkerPulse` verdicts (Front 4: watcher saw a frozen tick
+    /// past the lease — engine lagged, never died).
+    pub pulse_stalls: u64,
+    /// Worst pulse lag observed, ms (saturating max).
+    pub max_pulse_lag_ms: u64,
     /// Token-bucket rejections (`rate_per_sec` over limit).
     pub rate_rejected: u64,
     /// Sliding-window position: settled outcomes in the open window.
@@ -249,6 +257,29 @@ impl SnubberStats {
     #[must_use]
     pub fn shed_preempted(&self) -> u64 {
         self.preempted
+    }
+
+    /// Admission first-pass shed: capacity, token, stale and breaker
+    /// drops at the perimeter (`preempted` excluded — its own column).
+    /// The complement of `started` in the admission sum.
+    #[must_use]
+    pub fn shed_total(&self) -> u64 {
+        self.bulkhead_rejections
+            .saturating_add(self.stale_epochs_rejected)
+            .saturating_add(self.rate_rejected)
+            .saturating_add(self.evicted)
+            .saturating_add(self.breaker_rejections)
+    }
+
+    /// Success ratio per-mille (0..1000), float-free telemetry:
+    /// `committed * 1000 / total_started`. `1000` when no work started
+    /// (empty nodes report healthy, never a division trap).
+    #[must_use]
+    pub fn success_rate_per_mille(&self) -> u64 {
+        if self.total_started == 0 {
+            return 1000;
+        }
+        self.committed.saturating_mul(1000) / self.total_started
     }
 
     /// Wall depth 0..=255 for console frames (in-flight pressure gauge).
@@ -418,6 +449,8 @@ pub struct SnubberNodeBuilder {
     failure_window: u32,
     failure_threshold_percent: u8,
     timeout_ms: u64,
+    cpu_budget_ms: u64,
+    stall_ceiling_ms: u64,
     task_ttl_ms: u64,
     payload_budget_bytes: usize,
     storage: StorageKind,
@@ -445,6 +478,8 @@ impl SnubberNodeBuilder {
             failure_window: 0,
             failure_threshold_percent: 50,
             timeout_ms: 0,
+            cpu_budget_ms: 0,
+            stall_ceiling_ms: 0,
             task_ttl_ms: 0,
             payload_budget_bytes: 0,
             storage: StorageKind::InMemory,
@@ -565,6 +600,37 @@ impl SnubberNodeBuilder {
     #[must_use]
     pub fn timeout_ms(mut self, ms: u64) -> Self {
         self.timeout_ms = ms;
+        self
+    }
+
+    /// CPU-spin budget in milliseconds. `0` = disabled (default,
+    /// wall-only mode: `classify_stall` never reports `CpuSpin`).
+    ///
+    /// Second signal for hot `loop {}` spins: when the wall lease blows
+    /// AND the thread consumed `>= cpu_budget_ms` of CPU time, the stall
+    /// classifies as `CpuSpin` instead of `SleepBlocked`. The CPU sample
+    /// comes from the application's `CpuClock` backend (`GetThreadTimes`,
+    /// `clock_gettime`, `DWT_CYCCNT`) — the crate never touches syscalls.
+    /// A deadlocked `Mutex` wait keeps `cpu_delta == 0`, so it still
+    /// reports `SleepBlocked` below the stall ceiling.
+    #[must_use]
+    pub fn cpu_budget_ms(mut self, ms: u64) -> Self {
+        self.cpu_budget_ms = ms;
+        self
+    }
+
+    /// Silence ceiling in milliseconds. `0` = disabled (default:
+    /// two-circuit behavior, an eternal `SleepBlocked` never settles).
+    ///
+    /// Third circuit for wedged locks and dead pipes: a blown wall lease
+    /// with still CPU at or above the ceiling classifies as
+    /// `DeadlockStall` (`check_timeout` settles as `DeadlockSuspected`).
+    /// Short OS/EDR pauses below the ceiling stay `SleepBlocked` and are
+    /// tolerated. Suggested: `wall_budget * 20`, minimum 2000 ms. Works
+    /// in wall-only mode (no sampler needed).
+    #[must_use]
+    pub fn stall_ceiling_ms(mut self, ms: u64) -> Self {
+        self.stall_ceiling_ms = ms;
         self
     }
 
@@ -748,6 +814,8 @@ impl SnubberNodeBuilder {
                 failure_window: self.failure_window,
                 failure_threshold_percent: self.failure_threshold_percent,
                 timeout_ms: self.timeout_ms,
+                cpu_budget_ms: self.cpu_budget_ms,
+                stall_ceiling_ms: self.stall_ceiling_ms,
                 task_ttl_ms: self.task_ttl_ms,
                 payload_budget_bytes: self.payload_budget_bytes,
                 storage: self.storage,
@@ -778,6 +846,9 @@ impl SnubberNodeBuilder {
                 console_used: 0,
                 alert_pending: false,
                 timeouts_fired: 0,
+                deadlock_suspected: 0,
+                pulse_stalls: 0,
+                max_pulse_lag_ms: 0,
                 rate_rejected: 0,
                 auto_seq: AtomicU64::new(1),
                 stats: SnubberStats::default(),
@@ -795,6 +866,8 @@ struct NodeInner {
     failure_window: u32,
     failure_threshold_percent: u8,
     timeout_ms: u64,
+    cpu_budget_ms: u64,
+    stall_ceiling_ms: u64,
     task_ttl_ms: u64,
     payload_budget_bytes: usize,
     storage: StorageKind,
@@ -840,6 +913,9 @@ struct NodeInner {
     /// Set by `RollbackAndAlert`: notification latch polled by the UI layer.
     alert_pending: bool,
     timeouts_fired: u64,
+    deadlock_suspected: u64,
+    pulse_stalls: u64,
+    max_pulse_lag_ms: u64,
     rate_rejected: u64,
     auto_seq: AtomicU64,
     stats: SnubberStats,
@@ -868,15 +944,34 @@ fn hard_clamp_slots(inner: &mut NodeInner) {
     }
 }
 
-/// Monotonic millisecond clock (one syscall per `enter`, not per fault).
-/// `std`-only; the core stays timeless on purpose.
+/// Monotonic millisecond clock (`std` backend for [`MonotonicMs`]).
+///
+/// Boot-relative `Instant`: never jumps on NTP sync, DST change, or
+/// manual edits — unlike `SystemTime`. Zero-size, `Copy`; safe to hold
+/// in every guard checkpoint. Origin = first call (process boot tick).
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+#[cfg(feature = "std")]
+impl crate::MonotonicMs for SystemClock {
+    #[inline]
+    fn now_ms(self) -> u64 {
+        use std::time::Instant;
+        static ONCE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let boot = *ONCE.get_or_init(Instant::now);
+        boot.elapsed().as_millis() as u64
+    }
+}
+
+/// Process clock: `std` wall/monotonic source for node + supervisor.
+///
+/// Thin wrapper over [`SystemClock`]; kept as a free function so the
+/// hot paths (`enter`, drain, `check_timeout`) pay one call, not a
+/// trait-object dispatch. Firmware passes its own tick explicitly.
 #[cfg(feature = "std")]
 pub(crate) fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::MonotonicMs::now_ms(SystemClock)
 }
 
 /// Entry rejection reason (returned by `enter` without arming a guard).
@@ -1322,6 +1417,21 @@ impl SnubberNode {
     pub fn snapshot_v1_in(&self, generation: u64) -> crate::SnapshotV1 {
         let stats = self.stats();
         crate::SnapshotV1::from_stats(&stats, generation)
+    }
+
+    /// Record one missed `WorkerPulse` verdict (Front 4).
+    ///
+    /// Called by YOUR watcher thread when `PulseWatch::observe` returns
+    /// `false`: increments `pulse_stalls`, raises `max_pulse_lag_ms`.
+    /// Integers only, saturating, never trips the breaker (lag is a
+    /// lag verdict, not a failure streak). The next cold snapshot
+    /// carries the trace into `SnapshotV1` + `AnomalyKind::PulseStall`.
+    pub fn note_pulse_stall(&self, lag_ms: u64) {
+        let mut inner = self.lock();
+        inner.pulse_stalls = inner.pulse_stalls.saturating_add(1);
+        inner.max_pulse_lag_ms = inner.max_pulse_lag_ms.max(lag_ms);
+        inner.stats.pulse_stalls = inner.pulse_stalls;
+        inner.stats.max_pulse_lag_ms = inner.max_pulse_lag_ms;
     }
 
     /// Fallback strategy value for an isolated module (`None` = no fallback armed).
@@ -2580,6 +2690,8 @@ impl SnubberNode {
         let node_name = inner.name;
         let was_half_open = inner.breaker == BreakerState::HalfOpen;
         let deadline = inner.timeout_ms;
+        let cpu_budget = inner.cpu_budget_ms;
+        let stall_ceiling = inner.stall_ceiling_ms;
         drop(inner);
 
         Ok(TrackedGuard {
@@ -2592,6 +2704,10 @@ impl SnubberNode {
             priority,
             armed_at_ms: now_ms(),
             deadline_ms: deadline,
+            cpu_budget_ms: cpu_budget,
+            stall_ceiling_ms: stall_ceiling,
+            cpu_sampler: None,
+            armed_cpu_ms: 0,
             stage: 0,
             stage_label: None,
             queue_wait_ms: 0,
@@ -2863,6 +2979,8 @@ impl SnubberNode {
 
         let is_probe = inner.breaker == BreakerState::HalfOpen;
         let deadline_ms = inner.timeout_ms;
+        let cpu_budget_ms = inner.cpu_budget_ms;
+        let stall_ceiling_ms = inner.stall_ceiling_ms;
         let node_arc = self.inner.clone();
         let node_name = inner.name;
         drop(inner);
@@ -2888,6 +3006,10 @@ impl SnubberNode {
             node_name,
             arming,
             deadline_ms,
+            cpu_budget_ms,
+            stall_ceiling_ms,
+            cpu_sampler: None,
+            armed_cpu_ms: 0,
             armed_at_ms: now,
             settled: false,
             is_probe,
@@ -2967,6 +3089,9 @@ impl SnubberNode {
             breaker_trips: s.breaker_trips,
             breaker_state: s.breaker_state,
             timeouts_fired: s.timeouts_fired,
+            deadlock_suspected: s.deadlock_suspected,
+            pulse_stalls: s.pulse_stalls,
+            max_pulse_lag_ms: s.max_pulse_lag_ms,
             rate_rejected: s.rate_rejected,
             window_outcomes: s.window_outcomes,
             window_failures: s.window_failures,
@@ -3308,6 +3433,10 @@ pub struct TrackedGuard<F: FnOnce()> {
     priority: Priority,
     armed_at_ms: u64,
     deadline_ms: u64,
+    cpu_budget_ms: u64,
+    stall_ceiling_ms: u64,
+    cpu_sampler: Option<fn() -> u64>,
+    armed_cpu_ms: u64,
     stage: u32,
     stage_label: Option<&'static str>,
     queue_wait_ms: u64,
@@ -3322,6 +3451,15 @@ pub enum TimeoutCheck {
     WithinBudget,
     /// Deadline passed: rollback RAN, `Timeout` policy fired.
     TimedOut,
+    /// Wall lease blown AND CPU budget consumed: hot spin detected.
+    /// Rollback RAN exactly like `TimedOut`; the variant tells the
+    /// caller the iron was spinning, not sleeping.
+    SpinDetected,
+    /// Wall silence at/above the stall ceiling with no CPU growth:
+    /// wedged lock, dead pipe, or over-long OS suspension. Rollback
+    /// RAN exactly like `TimedOut`; the variant names the silence for
+    /// the post-mortem dump.
+    DeadlockSuspected,
 }
 
 impl<F: FnOnce()> TrackedGuard<F> {
@@ -3403,6 +3541,42 @@ impl<F: FnOnce()> TrackedGuard<F> {
     pub fn with_retry_count(mut self, retries: u32) -> Self {
         self.retry_count = retries;
         self
+    }
+
+    /// Attach a CPU-time sampler (`CpuClock` backend from the app).
+    ///
+    /// The sampler is a plain `fn() -> u64` (no closure, no alloc, no
+    /// lock): ms the current thread spent on-CPU. Armed once — the
+    /// arming sample is taken NOW so `check_timeout` measures deltas.
+    /// Without a sampler the guard runs wall-only (as before).
+    #[inline]
+    pub fn with_cpu_sampler(mut self, sampler: fn() -> u64) -> Self {
+        self.armed_cpu_ms = sampler();
+        self.cpu_sampler = Some(sampler);
+        self
+    }
+
+    /// Stall verdict right now without settling: wall-only when no CPU
+    /// sampler is attached, SPIN vs SLEEP when it is, DEADLOCK at the
+    /// stall ceiling when the CPU stayed still past it.
+    #[inline]
+    #[must_use]
+    pub fn stall_kind(&self) -> crate::StallKind {
+        if self.settled || self.deadline_ms == 0 {
+            return crate::StallKind::WithinBudget;
+        }
+        let wall_delta = now_ms().saturating_sub(self.armed_at_ms);
+        let cpu_delta = match self.cpu_sampler {
+            Some(sample) => sample().saturating_sub(self.armed_cpu_ms),
+            None => 0,
+        };
+        crate::classify_stall_ceiling(
+            wall_delta,
+            cpu_delta,
+            self.deadline_ms,
+            self.cpu_budget_ms,
+            self.stall_ceiling_ms,
+        )
     }
 
     /// Copy-snapshot of the guard's current state (stage, timing, deadline, retries).
@@ -3518,17 +3692,35 @@ impl<F: FnOnce()> TrackedGuard<F> {
     /// * No deadline armed (`timeout_ms = 0`) → `WithinBudget`, zero cost
     ///   beyond one clock read.
     /// * Within budget → `WithinBudget`.
-    /// * Deadline passed → hardware rollback runs NOW (guard consumed),
-    ///   `Timeout` policy fires with the CHECK coordinates, streak fed,
-    ///   `Err(TimeoutCheck::TimedOut)` returned. The caller MUST stop
-    ///   working and propagate — the transaction is already settled.
+    /// * Wall lease blown → hardware rollback runs NOW (guard consumed),
+    ///   `Timeout` policy fires with the CHECK coordinates, streak fed.
+    ///   The verdict distinguishes the cause: `TimedOut` (sleep / block /
+    ///   wall-only, no CPU sampler) vs `SpinDetected` (CPU budget also
+    ///   consumed — hot `loop {}`) vs `DeadlockSuspected` (silence at the
+    ///   stall ceiling with still CPU — wedged lock / dead pipe). All
+    ///   settle identically; the caller MUST stop working and propagate —
+    ///   transaction already settled.
     pub fn check_timeout(mut self) -> Result<Self, TimeoutCheck> {
         if self.settled {
             return Ok(self);
         }
-        if self.deadline_ms == 0 || now_ms().saturating_sub(self.armed_at_ms) <= self.deadline_ms {
+        let wall_delta = now_ms().saturating_sub(self.armed_at_ms);
+        if self.deadline_ms == 0 || wall_delta <= self.deadline_ms {
             return Ok(self);
         }
+        let cpu_delta = match self.cpu_sampler {
+            Some(sample) => sample().saturating_sub(self.armed_cpu_ms),
+            None => 0,
+        };
+        let verdict = crate::classify_stall_ceiling(
+            wall_delta,
+            cpu_delta,
+            self.deadline_ms,
+            self.cpu_budget_ms,
+            self.stall_ceiling_ms,
+        );
+        let spin = verdict == crate::StallKind::CpuSpin;
+        let dead = verdict == crate::StallKind::DeadlockStall;
         // Deadline blown: settle as Timeout (rollback + policy + streak).
         self.settled = true;
         let loc = core::panic::Location::caller();
@@ -3548,6 +3740,10 @@ impl<F: FnOnce()> TrackedGuard<F> {
         inner.timeouts_fired = inner.timeouts_fired.saturating_add(1);
         inner.stats.reported[FaultKind::Timeout.index()] =
             inner.stats.reported[FaultKind::Timeout.index()].saturating_add(1);
+        if dead {
+            inner.deadlock_suspected = inner.deadlock_suspected.saturating_add(1);
+            inner.stats.deadlock_suspected = inner.deadlock_suspected;
+        }
         Self::note_outcome(&mut inner, true);
         inner.stats.timeouts_fired = inner.timeouts_fired;
         inner.stats.window_outcomes = inner.window_outcomes;
@@ -3558,7 +3754,13 @@ impl<F: FnOnce()> TrackedGuard<F> {
             file: loc.file(),
             line: loc.line(),
             header,
-            detail: Some(FaultDetail::Static("deadline exceeded")),
+            detail: Some(FaultDetail::Static(if spin {
+                "cpu spin past budget"
+            } else if dead {
+                "silence past stall ceiling"
+            } else {
+                "deadline exceeded"
+            })),
             stage: self.stage,
             stage_label: self.stage_label,
             queue_wait_ms: self.queue_wait_ms,
@@ -3574,7 +3776,13 @@ impl<F: FnOnce()> TrackedGuard<F> {
             w.wake();
         }
         core::mem::forget(self);
-        Err(TimeoutCheck::TimedOut)
+        Err(if spin {
+            TimeoutCheck::SpinDetected
+        } else if dead {
+            TimeoutCheck::DeadlockSuspected
+        } else {
+            TimeoutCheck::TimedOut
+        })
     }
 
     /// Feed BOTH breaker modes from one settled outcome: reset the

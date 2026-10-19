@@ -244,3 +244,30 @@ fn stats_hot_smoke_docs_f10_scope() {
     }
     assert_eq!(node.stats().shed_stale(), 160);
 }
+
+#[test]
+fn pulse_stall_lands_in_snapshot_and_anomaly() {
+    let node = SnubberNode::builder("pulse_watch").build();
+    // Watcher saw a frozen tick with 2400 ms lag (Front 4 hook).
+    node.note_pulse_stall(2400);
+    node.note_pulse_stall(800);
+    assert_eq!(node.stats().pulse_stalls, 2);
+    assert_eq!(node.stats().max_pulse_lag_ms, 2400);
+
+    // Cold frame carries the trace (v3 roundtrip).
+    let snap = node.snapshot_v1();
+    assert_eq!(snap.pulse_stalls, 2);
+    assert_eq!(snap.max_pulse_lag_ms, 2400);
+    let bytes = snap.encode();
+    let back = SnapshotV1::decode(&bytes).expect("v3 frame decodes");
+    assert_eq!(back, snap);
+
+    // Anomaly scan fires PulseStall even on an idle node (no min_sample).
+    let hits = find_anomalies_for_snapshot("pulse_watch", &back, &AnomalyPolicy::default());
+    let stall = hits
+        .iter()
+        .find(|h| h.kind == AnomalyKind::PulseStall)
+        .expect("pulse stall verdict");
+    assert_eq!(stall.count, 2);
+    assert_eq!(AnomalyKind::PulseStall.code(), "pulse_stall");
+}

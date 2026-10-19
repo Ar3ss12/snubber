@@ -73,6 +73,10 @@ pub mod conduit;
 #[cfg(feature = "std")]
 pub mod channel;
 
+pub mod clock;
+
+pub mod isr;
+
 pub mod policy;
 
 pub mod contract;
@@ -91,6 +95,16 @@ pub use policy::{
     LogLevel, MetricSample, PressureFn, Priority,
 };
 
+pub use clock::{
+    classify_stall, classify_stall_ceiling, CpuClock, IdlePark, MonotonicMs, NoWdt, PulseWatch,
+    SpinPark, StallKind, WdtSink, WorkerPulse,
+};
+
+pub use isr::{
+    IsrBridge, IsrPushError, IsrSignal, ISR_RING_CAP, ISR_RING_MASK, OP_EMERGENCY_TRIP, OP_PAUSE,
+    OP_PULSE,
+};
+
 #[cfg(feature = "alloc")]
 pub use erased::{ClosurePolicy, ErasedGuard};
 
@@ -98,7 +112,7 @@ pub use erased::{ClosurePolicy, ErasedGuard};
 pub use node::{
     BreakerState, EnterError, FaultHook, FaultRecord, FlightSlot, GuardSnapshot, LegalMove,
     OverflowPolicy, ScopeToken, SnubberError, SnubberNode, SnubberNodeBuilder, SnubberStats,
-    SpawnedGuard, StaticNode, StorageKind, TelemetrySink, TimeoutCheck, TrackedGuard,
+    SpawnedGuard, StaticNode, StorageKind, SystemClock, TelemetrySink, TimeoutCheck, TrackedGuard,
     DEFAULT_POLICIES,
 };
 

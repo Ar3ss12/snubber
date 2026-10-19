@@ -7,6 +7,11 @@
 >
 > Zero dependencies, no `unsafe`, works from bare-metal firmware
 > (`core`-only) to high-throughput desktop and server daemons (`std`). MSRV 1.70.
+>
+> Hang layer (v0.5): monotonic `Instant` clock (no `SystemTime` jumps),
+> CPU-spin classifier (`TimedOut` vs `SpinDetected` vs `DeadlockSuspected`,
+> silence ceiling optional), 8-byte `WorkerPulse`
+> heartbeat. See [Layer 1.5](#layer-15-hang-classification-spin-vs-sleep-vs-deadlock--pulse).
 
 ---
 
@@ -74,6 +79,126 @@ How it works: the guard owns your rollback closure. `commit()` disarms it (succe
 4. **Memory ordering:** The node's mutex protects node books only. Every guard runs a `SeqCst` fence before the rollback body (free on x86/x64) — but a fence pairs with NOTHING. If your rollback publishes to shared state that another thread reads, pair it yourself: store with `Release`, load with `Acquire` (or guard the state with your own lock). `Relaxed`×2 reads stale data (F13).
 5. **Bind resource to guard:** Wrap the handle in `Protected::new(res, guard)` — `commit()` disarms the guard and returns the resource; any other exit executes rollback and drops the resource. Post-crash access becomes a compile error, not a forgotten `if`.
 6. **Seal the scope:** Prefer `node.scoped_sealed(rb, work)` where thread-leakage is the threat — the `!Send` `ScopeToken` makes `spawn` with context a compile error (E0277).
+
+---
+
+## Layer 1.5: Hang Classification (SPIN vs SLEEP vs DEADLOCK + Pulse)
+
+Wall-clock timeouts cannot tell a hot `loop {}` spin from a thread
+blocked in a syscall: both blow the wall lease. The hang layer adds a
+second signal — thread CPU time — and a third circuit: a silence ceiling
+that names an eternal deadlock instead of an eternal `SleepBlocked`. An
+8-byte heartbeat completes the layer. All math is
+`core` + `Copy` (`src/clock.rs`, no `unsafe`, no `std`); OS backends
+(`GetThreadTimes`, `clock_gettime`, `DWT_CYCCNT`) live in YOUR app.
+
+### Clock: monotonic, never `SystemTime`
+
+`std` time comes from boot-relative `Instant` (`SystemClock`): NTP
+sync, DST changes, and manual edits never move deadlines. Firmware
+passes its own tick (`SysTick` / cycle counter) via `MonotonicMs`.
+
+### Classifier: `classify_stall(wall, cpu, wall_budget, cpu_budget)` / `classify_stall_ceiling(.., stall_ceiling)`
+
+| `wall_delta` | `cpu_delta` | ceiling | Verdict | Meaning |
+|---|---|---|---|---|
+| `<= wall_budget` | any | — | `WithinBudget` | keep working |
+| `> wall_budget`, `cpu_budget == 0` | any | below | `SleepBlocked` | wall-only mode: blown lease, short pause — tolerated |
+| `> wall_budget` | `< cpu_budget` | below | `SleepBlocked` | blocked in syscall / `Condvar` / driver / brief EDR pause — do NOT treat as spin |
+| `> wall_budget` | `>= cpu_budget` | any | `CpuSpin` | hot spin — de-energize iron past the thread, never kill the thread |
+| `> wall_budget` | `< cpu_budget` | `>= ceil` | `DeadlockStall` | wedged lock / dead pipe / over-long suspension (ceiling = default `0` disables) |
+
+### Guard wiring: CPU budget + sampler
+
+```rust
+use snubber::{SnubberNode, StallKind, TimeoutCheck};
+
+static CPU_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn thread_cpu_ms() -> u64 {
+    // App backend: GetThreadTimes / clock_gettime / DWT_CYCCNT delta.
+    CPU_MS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+let node = SnubberNode::builder("laser")
+    .timeout_ms(100)      // wall lease
+    .cpu_budget_ms(50)    // CPU lease: 0 = wall-only (default)
+    .stall_ceiling_ms(2000) // silence ceiling: 0 disables (default); suggested wall_budget*20
+    .build();
+let guard = node.enter(1, 1, || laser_off())?.with_cpu_sampler(thread_cpu_ms);
+
+// Non-destructive probe (no settle):
+assert!(matches!(guard.stall_kind(), StallKind::WithinBudget));
+
+// Cooperative checkpoint — settle is IDENTICAL for all three causes,
+// only the verdict differs:
+match guard.check_timeout() {
+    Ok(g) => { /* within budget, keep working */ }
+    Err(TimeoutCheck::TimedOut) => { /* sleep/block under ceiling — rollback RAN */ }
+    Err(TimeoutCheck::SpinDetected) => { /* hot spin — rollback RAN */ }
+    Err(TimeoutCheck::DeadlockSuspected) => { /* silence past ceiling — rollback RAN */ }
+}
+```
+
+`with_cpu_sampler` takes a plain `fn() -> u64` (no closure, no alloc,
+no lock); the arming sample is captured at attach time so deltas are
+measured from arming, not from boot.
+
+### Heartbeat: `WorkerPulse` (8 bytes) + `PulseWatch`
+
+```rust
+use snubber::{PulseWatch, WorkerPulse};
+
+let pulse = WorkerPulse::new();          // worker side: 8 B
+let mut watch = PulseWatch::new(2000);   // watcher side: 2 s lease
+// worker loop: pulse.kick();            // one Release store / iter
+// watcher tick: watch.observe(pulse.tick(), wall_now_ms)
+//   true  = tick advanced or lease intact
+//   false = tick frozen past lease → de-energize iron + report Timeout
+```
+
+Contract: the watcher MUST NOT kill the worker thread or drop its
+guard from outside (poisoned mutexes, leaked allocator state). On a
+missed pulse it drives iron to safe state past the thread and reports
+via `node.note_pulse_stall(lag_ms)` — the lag lands in `SnapshotV1`
+(v3: `pulse_stalls` + `max_pulse_lag_ms`) and fires
+`AnomalyKind::PulseStall`, so the post-mortem dump answers lag with
+`[DIAG 0x… <node> pulse_stall <lag>%]`. The worker settles itself at
+its next `check_timeout`.
+On firmware the same `kick()` strokes the hardware WDT (`WdtSink`;
+`NoWdt` is the `std` no-op). See `examples/11_hang_classifier.rs`.
+
+### ISR bridge: `IsrBridge` (66 B SPSC ring, no `unsafe`)
+
+A hardware ISR cannot take a mutex, sleep, or call `enter()`. It
+pushes a packed `IsrSignal` (`opcode:8 | reason:8 | value:16` in one
+`AtomicU32`); the main loop pops and steers. `head`/`tail` are
+`AtomicU8` — M0-safe byte atomics, no CAS, no `cpsid i`.
+
+```rust
+use snubber::{IsrBridge, IsrSignal, OP_EMERGENCY_TRIP, OP_PULSE};
+
+static BRIDGE: IsrBridge = IsrBridge::new();
+// ISR: BRIDGE.try_push(IsrSignal::new(OP_EMERGENCY_TRIP, sensor_id, reading));
+// main loop:
+while let Some(signal) = BRIDGE.try_pop() {
+    match signal.opcode() {
+        OP_EMERGENCY_TRIP => { guard.abort("hardware_isr_trip"); break; }
+        OP_PULSE => pulse.kick(),
+        _ => {}
+    }
+}
+```
+
+`try_push` fails `Full` instead of blocking or evicting — an unread
+trip is never overwritten. See `examples/12_isr_bridge.rs`.
+
+### Idle park: `IdlePark` (`Condvar` on `std`, `wfi` on firmware)
+
+`park()` names the 0%-CPU sleep: the `std` worker already parks on a
+`Condvar` (`TaskConduit::wait_while_paused`); firmware overrides
+`IdlePark::park` with `wfi` (core stops its clock until the next
+interrupt — the `unsafe` asm lives in YOUR app, never here).
+`SpinPark` is the default for bare `core` targets.
 
 ---
 
@@ -681,13 +806,24 @@ profiler at 160 CPS).
 | `snub_check!(cond, reason)` | 1 / core | ~0 ns (single branch) | Universal invariant check, returns `Err` |
 | `SnubberGuard::new` | 1 / core | **~1.5 ns** (stack move) | Single function synchronous rollback |
 | `EpochGate::observe` | 1 / core | **~2.6 ns** | Monotonic ordering & reboot re-handshake |
+| `classify_stall(wall, cpu, wb, cb)` / `classify_stall_ceiling(.., ceiling)` | 1 / core | const math, 0 ns | SPIN vs SLEEP vs DEADLOCK verdict from one sample pair (+ silence ceiling) |
+| `WorkerPulse::kick` + `PulseWatch::observe` | 1 / core | 8 B, 1 atomic store | Heartbeat: missed pulse = de-energize past thread, never kill it |
+| `SystemClock` (`MonotonicMs`) | 1 / `std` | 1 `Instant` read | Boot-relative monotonic ms; NTP/DST edits never move deadlines |
+| `node.cpu_budget_ms(n)` + `node.stall_ceiling_ms(n)` + `guard.with_cpu_sampler(f)` | 2 / std | 1 fn call at arming | CPU-spin budget + silence ceiling; `check_timeout` settles spin/deadlock distinctly |
+| `guard.stall_kind()` | 2 / std | 1 clock + 1 sample | Non-destructive hang verdict (no settle) |
+| `guard.check_timeout()` | 2 / std | 1 clock + 1 sample | Cooperative watchdog: `WithinBudget` / `TimedOut` / `SpinDetected` / `DeadlockSuspected` |
+| `IsrBridge::try_push/pop` + `trip/take_trips` + `IsrSignal` | 1 / core | 80 B, ~2 bus cycles | ISR signal into main loop; trip latch bypasses a full ring; no mutex/alloc/`unsafe` (M0-safe byte atomics); `head`/`tail` separated by 64 B cells, no `align(64)` pads |
+| `IsrSignal::new(opc, reason, value)` | 1 / core | 4 B, const | Pack `OP_EMERGENCY_TRIP` / `OP_PULSE` / `OP_PAUSE` |
+| `IdlePark::park` (`SpinPark`/firmware `wfi`/`wfe`) | 1 / core | 0% CPU | 0%-CPU park: `Condvar` on `std`, `wfi`/`wfe` impl on firmware (`wfe` needs `SEVONPEND=1` at boot) |
+| `WdtSink::feed` / `NoWdt` | 1 / core | no-op on std | Stroke HW WDT on firmware (same `kick()` feeds it) |
+| `node.note_pulse_stall(lag_ms)` | 2 / std | 1 atomic max | Record missed pulse into `SnapshotV1` v3 + `AnomalyKind::PulseStall` |
 | `node.transition(&mut s, next, rb, work)` | 2 / std | **~86.5 ns** | ONE enum state machine, no flag drift |
 | `node.transition_checked(s, rb, work)` + `LegalMove` | 2 / std | same + 0 ns | Closed graphs: illegal edges rejected at compile (E0277) |
 | `node.enter_with_priority(prio)` | 2 / std | **~73.6 ns** | Critical over Background yields cooperatively |
 | `Protected::new(res, guard)` + `commit()` | 1 / core | 0 ns (generics) | Resource burns with guard unless committed |
 | `node.scoped_sealed(rb, work)` + `ScopeToken` | 2 / std | same as `scoped` | `!Send` seal: thread-leak fails at compile |
 | `StaticNode::<I, Q>::build(name)` | 2 / std | same as builder | Capacities validated FIRST in `build()` |
-| `gateway::<T>(cap)` + `host.recv()` | 2 / std | ~10 ns | Multiple senders, one receiver channel |
+| `gateway::<T>(cap)` + `host.recv()` | 2 / std | ~10 ns | Multiple senders, one receiver channel; HWM/LWM throttle paces at 75%/50% with integer `retry_after_ms`, `send_critical` bypasses |
 | `RestartTracker::note_death(code, now)` | 2 / std | pure math | Process respawn backoff tracker, caller sleeps |
 | `StateDigest` + `take_state()` | 2 / std | 64 B, ~1 ns | Hot handoff: memory survives death |
 | `NoOrphanGuard` / `OrphanGuard` | 2 / std | trait only | Parent death = child processes reaped (app impl) |

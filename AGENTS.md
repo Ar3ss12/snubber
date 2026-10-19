@@ -16,8 +16,8 @@ cargo check --no-default-features
 cargo test --release --test concurrency_stress
 ```
 
-`cargo test` today = **206 passed** (7 unit + 199 integration in 33 files)
-+ 21 doc-tests = **227 green**. If your change moves a documented number,
+`cargo test` today = **211 passed** (17 unit + 194 integration in 36 files)
++ 21 doc-tests = **232 green**. If your change moves a documented number,
 update it in the SAME commit (README + tech.md + AGENTS.md). Stale numbers send the
 next agent hunting ghosts.
 
@@ -153,11 +153,12 @@ incremental cache (`os error 32` here, `os error 1455` there):
 |---|---|---|
 | fmt | `cargo fmt --check` | clean |
 | lint | `cargo clippy --all-targets -- -D warnings` | clean |
-| unit+integration | `cargo test` | 206 + 21 doc = 227 green |
+| unit+integration | `cargo test` | 211 + 21 doc = 232 green |
 | features | `cargo check --no-default-features` | ok |
+| bench compile | `cargo bench --bench admission_bench --no-run` | ok |
 | miri (lib UB check) | `cargo +nightly miri test --lib` | 6 unit tests ok (0 UB) |
 | miri (integration suite) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test guard --test scoped_transactions --test erased --test invariants --test watchdog --test memory_boundary --test presets --test supervisor` | integration tests ok (0 UB) |
-| miri (new cold suites) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test diagnostics --test fault_classification` | tests ok (0 UB) |
+| miri (new cold suites) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test diagnostics --test fault_classification --test clock_pulse` | tests ok (0 UB) |
 | clean rebuild | `rmdir /s /q target` then the gates above | — |
 
 
@@ -275,7 +276,7 @@ cargo test --release --test concurrency_stress
 Green = all above green in ONE run, same commit updates `README.md` +
 `AGENTS.md` + `tech.md` numbers. Version lives ONLY in `Cargo.toml`
 (`name`/`version`); docs quote it, never redefine it. Current:
-**v0.5.0**, **214 green** (194 tests + 20 doc-tests), MSRV 1.70.
+**v0.5.1**, **232 green** (211 tests + 21 doc-tests), MSRV 1.70.
 
 Publication honesty (R7): `.gitignore` has been added covering `target/`,
 local scratch logs, python artifacts, and OS temp files. Cargo package exclusions
@@ -313,12 +314,12 @@ Through non-technical, poetic language in the repository, this product failed to
 3. **Immediate replacement:**
    Any metaphorical or literary term must be replaced immediately with its direct technical equivalent.
 
-## 15. Examples Showcase Invariants (01_ .. 09_)
+## 15. Examples Showcase Invariants (01_ .. 12_)
 
 The `examples/` directory is the public showroom of the crate, NOT a draft cemetery:
 
-1. **Numbered sequence 01_ .. 10_:**
-   Every canonical recipe must start with its two-digit index (`01_hardware_fuse.rs` .. `10_persist_snapshot.rs`). The file name, first doc-comment line (`//! Pattern XX: ...`), console banner, and `cargo run --example XX_...` instruction MUST match exactly.
+1. **Numbered sequence 01_ .. 12_:**
+   Every canonical recipe must start with its two-digit index (`01_hardware_fuse.rs` .. `12_isr_bridge.rs`). The file name, first doc-comment line (`//! Pattern XX: ...`), console banner, and `cargo run --example XX_...` instruction MUST match exactly.
 2. **Real RAII rollback, never fake `println!`:**
    An example must NEVER simulate rollback with a bare `println!` while leaving real resource cleanup to a manual `if result.is_err()` in `main()`. The guard's Drop closure MUST perform the actual state reset (e.g. de-energize relay, disarm device). Manual caller cleanup defeats the entire value proposition of RAII unwinding.
 3. **Honest taxonomy:**

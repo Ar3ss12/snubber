@@ -117,4 +117,21 @@ jobs:
           cargo miri test --test task_engine
           cargo miri test --test transition_orphan
           cargo miri test --test regression_postmortems
+          cargo miri test --test clock_pulse
 
+  # 4. BENCHMARK COMPILE CHECK: verifies bench crate compiles (no measurement on CI)
+  bench-check:
+    name: Benchmark Compile Check
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Benchmark Compiles (no measurement)
+        run: cargo bench --bench admission_bench --no-run

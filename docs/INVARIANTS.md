@@ -39,6 +39,34 @@ In the multi-process supervisor (Layer 4), when a monitored child process termin
 - Pipe handles are closed without kernel deadlocks or thread starvation.
 - The external reservation held on behalf of the child is released unconditionally.
 
+### Invariant 5: Monotonic Hang Clock + Settled Spin Verdict
+For any armed guard with a wall lease (`timeout_ms > 0`):
+- The clock never moves backwards: NTP sync, DST change, or manual
+  edits cannot un-expire a deadline or rewind `elapsed_ms`
+  (boot-relative `Instant` on `std`, `MonotonicMs` tick on firmware —
+  never `SystemTime`).
+- `check_timeout` settles a blown wall lease exactly once (rollback runs
+  once, `Timeout` policy fires once, slot returns once) with a verdict
+  from pure `classify_stall` math: `SleepBlocked` when CPU stood still
+  (syscall / `Condvar` / deadlocked `Mutex`), `CpuSpin` only when
+  `cpu_delta >= cpu_budget_ms` (`0` = wall-only, never spin).
+
+### Invariant 6: Zero-Nesting Locks (Deadlock Impossibility)
+`SnubberNode`'s lock NEVER nests inside `TaskConduit`'s lock, and vice
+versa. Cross-module calls happen only AFTER `drop(guard)` (open-call):
+wakers fire outside the node lock, the conduit never arms guards.
+Nested locks (ABBA) are the only remaining deadlock class, so the law
+is enforced by `tests/lock_hierarchy.rs` as a grep-gate (doc-comments
+stripped, code hits trip).
+
+### Invariant 7: Pulse Lag Is Never Silent (Black-Box Trace)
+Every missed `WorkerPulse` verdict recorded via
+`SnubberNode::note_pulse_stall(lag_ms)` lands in the cold frame:
+`SnapshotV1.pulse_stalls` / `max_pulse_lag_ms` (v3, 512 B kept) and
+fires `AnomalyKind::PulseStall` (`pulse_stall`, ignores `min_sample`
+like desync). A post-mortem dump answers "did it lag?" with
+`[DIAG 0x… <node> pulse_stall <lag>%]` instead of "0 errors".
+
 ---
 
 ## 2. Verification Protocol
@@ -56,13 +84,25 @@ cargo test --test supervisor
 
 cargo test --test bulkhead_capacity
 cargo test --test circuit_breaker
+
+# Verify monotonic hang layer (SPIN vs SLEEP + pulse)
+cargo test --test clock_pulse
+
+# Verify ISR bridge SPSC ring (no unsafe, M0-safe)
+cargo test --lib isr
+
+# Verify zero-nesting lock law (deadlock impossibility)
+cargo test --test lock_hierarchy
+
+# Verify pulse black-box (stall verdicts in v3 snapshot + anomaly)
+cargo test --test diagnostics pulse_stall
 ```
 
 ---
 
 ## 3. Reporting a Discrepancy
 
-If you identify a scenario where any of the four invariants above fails using purely Safe Rust:
+If you identify a scenario where any of the seven invariants above fails using purely Safe Rust:
 
 1. **Minimal Reproduction:** Construct an isolated integration test demonstrating the violation (failing an explicit `assert!`).
 2. **Deterministic Trigger:** The test must run and fail within 30 seconds without requiring external infrastructure.

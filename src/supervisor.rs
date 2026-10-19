@@ -736,14 +736,13 @@ struct DrainState {
     scratch_full_crc: u32,
 }
 
-/// Monotonic millisecond clock (supervisor side, `std`).
+/// Monotonic millisecond clock (supervisor side, `std` backend).
+///
+/// Delegates to the node-side boot-relative `Instant` source so both
+/// halves of Layer 4 share one origin. Never `SystemTime`.
 #[inline]
 fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    super::node::now_ms()
 }
 
 /// Pipe drain: background reader keeping the kernel buffer empty.
