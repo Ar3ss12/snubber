@@ -14,6 +14,30 @@
 use super::SnubberGuard;
 use core::ops::{Deref, DerefMut};
 
+/// Poison-tolerant mutex access bound to a node ledger (`std` only).
+///
+/// Wraps the canonical recovery idiom used across `TrackedGuard`
+/// settlement paths: on lock poisoning recovers via `into_inner()`
+/// and records one `poison_recoveries` tick on `node` so the fault
+/// stays visible in telemetry instead of panicking the caller.
+///
+/// The calling thread MUST NOT hold the poisoned value: recovery
+/// extracts the inner guard and continues. Node slot bounds are
+/// re-clamped by the caller after recovery where slot counts matter.
+#[cfg(feature = "std")]
+pub trait SafeLockExt<T> {
+    /// Lock or recover: never panics on poisoned mutex.
+    fn safe_lock<'a>(&'a self, node: &super::SnubberNode) -> std::sync::MutexGuard<'a, T>;
+}
+
+#[cfg(feature = "std")]
+impl<T> SafeLockExt<T> for std::sync::Mutex<T> {
+    #[inline]
+    fn safe_lock<'a>(&'a self, node: &super::SnubberNode) -> std::sync::MutexGuard<'a, T> {
+        node.lock_poison_tolerant(self)
+    }
+}
+
 /// Resource bound to a transactional rollback guard.
 ///
 /// Wraps an underlying value `T` alongside an active [`SnubberGuard`].

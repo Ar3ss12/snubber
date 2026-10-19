@@ -1779,9 +1779,16 @@ impl SnubberNode {
         W: FnOnce() -> Result<T, E>,
     {
         let guard = self.enter_auto(rollback)?;
-        let outcome = work().map_err(SnubberError::Work)?;
-        guard.commit();
-        Ok(outcome)
+        match work() {
+            Ok(outcome) => {
+                guard.commit();
+                Ok(outcome)
+            }
+            Err(err) => {
+                guard.abort("work_error");
+                Err(SnubberError::Work(err))
+            }
+        }
     }
 
     /// Sealed scope: `scoped` + an opt-in `!Send + !Sync` context token.
@@ -1834,9 +1841,16 @@ impl SnubberNode {
     {
         let guard = self.enter_auto(rollback)?;
         let token = ScopeToken::new();
-        let outcome = work(&token).map_err(SnubberError::Work)?;
-        guard.commit();
-        Ok(outcome)
+        match work(&token) {
+            Ok(outcome) => {
+                guard.commit();
+                Ok(outcome)
+            }
+            Err(err) => {
+                guard.abort("work_error");
+                Err(SnubberError::Work(err))
+            }
+        }
     }
 
     /// Execute fallible work within a protected scope guarded by semantic parameter validation.
@@ -1875,9 +1889,16 @@ impl SnubberNode {
         W: FnOnce(&P) -> Result<T, E>,
     {
         let guard = self.enter_checked_auto(params, invariant, rollback)?;
-        let outcome = work(params).map_err(SnubberError::Work)?;
-        guard.commit();
-        Ok(outcome)
+        match work(params) {
+            Ok(outcome) => {
+                guard.commit();
+                Ok(outcome)
+            }
+            Err(err) => {
+                guard.abort("work_error");
+                Err(SnubberError::Work(err))
+            }
+        }
     }
 
     /// Transactional state machine (ONE enum, not three flags).
@@ -1923,10 +1944,17 @@ impl SnubberNode {
         W: FnOnce(&mut S) -> Result<T, E>,
     {
         let guard = self.enter_auto(rollback)?;
-        let outcome = work(state).map_err(SnubberError::Work)?;
-        *state = next;
-        guard.commit();
-        Ok(outcome)
+        match work(state) {
+            Ok(outcome) => {
+                *state = next;
+                guard.commit();
+                Ok(outcome)
+            }
+            Err(err) => {
+                guard.abort("work_error");
+                Err(SnubberError::Work(err))
+            }
+        }
     }
 
     /// Checked state machine: `transition` + compile-time legal edges.
@@ -1982,12 +2010,19 @@ impl SnubberNode {
     {
         let guard = self.enter_auto(rollback)?;
         let mut state = state;
-        let outcome = work(&mut state).map_err(SnubberError::Work)?;
-        // The rib IS the conversion: consume the old state, build the new.
-        // Zero `unsafe`, zero layout guessing — one impl per legal edge.
-        let next = S::convert(state);
-        guard.commit();
-        Ok((next, outcome))
+        match work(&mut state) {
+            Ok(outcome) => {
+                // The rib IS the conversion: consume the old state, build the new.
+                // Zero `unsafe`, zero layout guessing — one impl per legal edge.
+                let next = S::convert(state);
+                guard.commit();
+                Ok((next, outcome))
+            }
+            Err(err) => {
+                guard.abort("work_error");
+                Err(SnubberError::Work(err))
+            }
+        }
     }
 
     /// # 🟢 CANONICAL APPLICATION ENTRY (for threads, workers & daemons)
@@ -2878,6 +2913,35 @@ impl SnubberNode {
                 // slots to the hard ceiling so the breaker never reads rot.
                 hard_clamp_slots(&mut g);
                 g
+            }
+        }
+    }
+
+    /// Poison-tolerant lock of any FOREIGN `Mutex<T>` bound to this ledger.
+    ///
+    /// Success path is a plain `lock()`; on poisoning recovers via
+    /// `into_inner()` and ticks one `poison_recoveries` on this node.
+    /// The recovered guard is the live value — the caller continues safely.
+    /// NOTE: the poison flag is sticky — every `safe_lock` on an
+    /// already-poisoned mutex ticks again (one tick per recovery, honest).
+    pub fn lock_poison_tolerant<'a, T>(
+        &self,
+        m: &'a std::sync::Mutex<T>,
+    ) -> std::sync::MutexGuard<'a, T> {
+        match m.lock() {
+            Ok(g) => g,
+            Err(poison) => {
+                // Count the recovery WITHOUT re-locking our own ledger:
+                // a plain `note_poison_recovery()` would `self.lock()` while
+                // the caller may already hold it. Direct inner access only.
+                let mut inner = match self.inner.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                inner.stats.poison_recoveries = inner.stats.poison_recoveries.saturating_add(1);
+                hard_clamp_slots(&mut inner);
+                drop(inner);
+                poison.into_inner()
             }
         }
     }

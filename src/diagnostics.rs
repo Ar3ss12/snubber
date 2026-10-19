@@ -695,6 +695,108 @@ impl<'a> NodeRegistry<'a> {
     }
 }
 
+/// Borrowed in-memory node aggregate (no I/O, no threads, no paths).
+///
+/// `NodeSet` is the spec-name alias-shape over an explicit handle list:
+/// the app owns it (`let set = NodeSet::new(); set.register(..)`),
+/// polls cold snapshots, sums counters with `saturating_add`.
+/// For the owned builder variant see [`NodeRegistry`].
+#[cfg(feature = "std")]
+#[derive(Default)]
+pub struct NodeSet<'a> {
+    nodes: Vec<(&'static str, &'a SnubberNode)>,
+}
+
+#[cfg(feature = "std")]
+impl<'a> NodeSet<'a> {
+    /// Empty set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { nodes: Vec::new() }
+    }
+
+    /// Register one node handle (explicit, reversible via `clear`).
+    pub fn register(&mut self, name: &'static str, node: &'a SnubberNode) {
+        self.nodes.push((name, node));
+    }
+
+    /// Forget all handles (nodes keep living; only the set clears).
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+    }
+
+    /// Handles in the set.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// `true` when no handles registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// Sum of `catastrophic_faults()` over the set (saturating).
+    #[must_use]
+    pub fn total_faults(&self) -> u64 {
+        self.nodes
+            .iter()
+            .map(|(_, n)| n.stats().catastrophic_faults())
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// Catastrophic fault sum (same ledger as [`total_faults`](Self::total_faults);
+    /// kept as the spec-name alias so monitors read intent, not arithmetic).
+    #[must_use]
+    pub fn total_catastrophic_faults(&self) -> u64 {
+        self.total_faults()
+    }
+
+    /// Hydraulic shedding triple `(bulkhead, rate, stale)` summed over the set.
+    #[must_use]
+    pub fn total_hydraulic_shed(&self) -> (u64, u64, u64) {
+        let mut bulk = 0u64;
+        let mut rate = 0u64;
+        let mut stale = 0u64;
+        for (_, n) in &self.nodes {
+            let s = n.stats();
+            bulk = bulk.saturating_add(s.shed_bulkhead());
+            rate = rate.saturating_add(s.shed_rate());
+            stale = stale.saturating_add(s.shed_stale());
+        }
+        (bulk, rate, stale)
+    }
+
+    /// `true` when any member breaker is not `Closed`.
+    #[must_use]
+    pub fn is_any_breaker_tripped(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|(_, n)| n.stats().breaker_state != super::BreakerState::Closed)
+    }
+
+    /// One summary line per node into `sink` (cold path only).
+    pub fn dump_summary<F: FnMut(&str)>(&self, mut sink: F) {
+        for (name, node) in &self.nodes {
+            let s = node.stats();
+            // Fixed-width rendering without `format!` on the hot path:
+            // this runs on the cold diagnostic path only.
+            let line = format!(
+                "{} started={} committed={} aborts={} implicit={} catastrophic={} breaker={:?}",
+                name,
+                s.total_started,
+                s.committed,
+                s.explicit_aborts,
+                s.implicit_drops,
+                s.catastrophic_faults(),
+                s.breaker_state,
+            );
+            sink(&line);
+        }
+    }
+}
+
 /// Test/CI gate: fail red when the node sheds or breaches past policy.
 ///
 /// ```rust,no_run

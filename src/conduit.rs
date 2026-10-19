@@ -128,6 +128,10 @@ impl<S, D> TaskConduit<S, D> {
     }
 
     /// Synchronously wait until caller resumes or cancels. Blocks current OS thread using `Condvar`.
+    /// Zero polling: the worker sleeps in the OS kernel at 0% CPU until
+    /// `TaskHandle::resume` / `send_directive(Proceed|Cancel|Preempted)`
+    /// issues `condvar.notify_all()`. Spurious wakeups re-check the
+    /// directive word, so exit latency is one context switch, not a quantum.
     pub fn wait_for_resume(&self) -> Result<(), &'static str> {
         let mut reason_guard = self
             .inner
@@ -151,6 +155,39 @@ impl<S, D> TaskConduit<S, D> {
     pub fn wait_for_resume_async(&self) -> ResumeFuture<S, D> {
         ResumeFuture {
             inner: self.inner.clone(),
+        }
+    }
+
+    /// Blocking pause gate: sleep on the `Condvar` while a `Pause`
+    /// directive is armed, return the directive that released the worker.
+    ///
+    /// Canonical worker-loop shape (no `thread::sleep` polling):
+    /// ```rust,no_run
+    /// use snubber::{TaskConduit, Directive};
+    /// let (conduit, handle): (TaskConduit<u8>, _) = TaskConduit::pair(0);
+    /// loop {
+    ///     match conduit.wait_while_paused() {
+    ///         Directive::Proceed | Directive::SkipStage => { /* one unit */ }
+    ///         Directive::Pause => continue, // re-armed before wake; re-park
+    ///         Directive::Cancel(r) | Directive::Preempted(r) => break, // r: &'static str
+    ///     }
+    ///     let _ = &handle;
+    ///     break;
+    /// }
+    /// ```
+    pub fn wait_while_paused(&self) -> Directive {
+        // Fast path: no pause armed.
+        match self.check_directive() {
+            Directive::Pause => {}
+            other => return other,
+        }
+        // Slow path: kernel sleep; Cancel/Preempted surface as Err(reason).
+        match self.wait_for_resume() {
+            Ok(()) => self.check_directive(),
+            Err(reason) => match self.check_directive() {
+                Directive::Preempted(_) => Directive::Preempted(reason),
+                _ => Directive::Cancel(reason),
+            },
         }
     }
 

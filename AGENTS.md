@@ -16,8 +16,8 @@ cargo check --no-default-features
 cargo test --release --test concurrency_stress
 ```
 
-`cargo test` today = **194 passed** (7 unit + 187 integration in 32 files)
-+ 20 doc-tests = **214 green**. If your change moves a documented number,
+`cargo test` today = **207 passed** (7 unit + 200 integration in 33 files)
++ 21 doc-tests = **228 green**. If your change moves a documented number,
 update it in the SAME commit (README + tech.md + AGENTS.md). Stale numbers send the
 next agent hunting ghosts.
 
@@ -307,8 +307,8 @@ Through non-technical, poetic language in the repository, this product failed to
 
 The `examples/` directory is the public showroom of the crate, NOT a draft cemetery:
 
-1. **Numbered sequence 01_ .. 09_:**
-   Every canonical recipe must start with its two-digit index (`01_hardware_fuse.rs` .. `09_pipeline_supervisor.rs`). The file name, first doc-comment line (`//! Pattern XX: ...`), console banner, and `cargo run --example XX_...` instruction MUST match exactly.
+1. **Numbered sequence 01_ .. 10_:**
+   Every canonical recipe must start with its two-digit index (`01_hardware_fuse.rs` .. `10_persist_snapshot.rs`). The file name, first doc-comment line (`//! Pattern XX: ...`), console banner, and `cargo run --example XX_...` instruction MUST match exactly.
 2. **Real RAII rollback, never fake `println!`:**
    An example must NEVER simulate rollback with a bare `println!` while leaving real resource cleanup to a manual `if result.is_err()` in `main()`. The guard's Drop closure MUST perform the actual state reset (e.g. de-energize relay, disarm device). Manual caller cleanup defeats the entire value proposition of RAII unwinding.
 3. **Honest taxonomy:**

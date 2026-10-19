@@ -65,7 +65,8 @@ fn scoped_err_triggers_rollback_and_surfaces_work_error() {
 
     let stats = node.stats();
     assert_eq!(stats.committed, 0);
-    assert_eq!(stats.implicit_drops, 1); // Tracked as implicit drop (rollback executed)
+    assert_eq!(stats.explicit_aborts, 1);
+    assert_eq!(stats.implicit_drops, 0);
 }
 
 #[test]
@@ -222,4 +223,69 @@ fn scoped_sealed_commits_and_passes_scope_token() {
 fn scope_token_is_zero_sized() {
     use snubber::ScopeToken;
     assert_eq!(core::mem::size_of::<ScopeToken<'static>>(), 0);
+}
+
+#[test]
+fn scoped_business_errors_never_feed_catastrophe() {
+    use snubber::BreakerState;
+    let node = SnubberNode::builder("scoped_proof").build();
+    #[derive(Debug, PartialEq)]
+    enum BizErr {
+        NotFound,
+    }
+    for _ in 0..100 {
+        let res: Result<(), SnubberError<BizErr>> = node.scoped(|| {}, || Err(BizErr::NotFound));
+        assert!(matches!(res, Err(SnubberError::Work(BizErr::NotFound))));
+    }
+    let stats = node.stats();
+    assert_eq!(stats.explicit_aborts, 100);
+    assert_eq!(stats.implicit_drops, 0);
+    assert_eq!(stats.catastrophic_faults(), 0);
+    assert_eq!(stats.breaker_state, BreakerState::Closed);
+}
+
+#[test]
+fn scoped_family_err_paths_abort_explicitly() {
+    use snubber::{BreakerState, LegalMove};
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    enum S {
+        A,
+    }
+    #[derive(Debug, PartialEq)]
+    struct B;
+    impl LegalMove<B> for S {
+        fn convert(_from: Self) -> B {
+            B
+        }
+    }
+    // scoped_checked: work Err -> explicit abort, state untouched by guard.
+    let checked = SnubberNode::builder("scoped_checked_proof").build();
+    let params = 7i64;
+    let res: Result<i64, SnubberError<&'static str>> =
+        checked.scoped_checked(&params, |_| Ok(()), || {}, |_| Err("work_error"));
+    assert!(matches!(res, Err(SnubberError::Work("work_error"))));
+    // scoped_sealed: work Err -> explicit abort.
+    let sealed = SnubberNode::builder("scoped_sealed_proof").build();
+    let res: Result<(), SnubberError<&'static str>> =
+        sealed.scoped_sealed(|| {}, |_| Err("work_error"));
+    assert!(matches!(res, Err(SnubberError::Work("work_error"))));
+    // transition: work Err -> explicit abort, state NOT advanced.
+    let tr = SnubberNode::builder("transition_proof").build();
+    let mut st = 1u8;
+    let res: Result<(), SnubberError<&'static str>> =
+        tr.transition(&mut st, 2u8, || {}, |_| Err("work_error"));
+    assert!(matches!(res, Err(SnubberError::Work("work_error"))));
+    assert_eq!(st, 1u8);
+    // transition_checked: work Err -> explicit abort, no conversion.
+    let tc = SnubberNode::builder("transition_checked_proof").build();
+    let res: Result<(B, ()), SnubberError<&'static str>> =
+        tc.transition_checked(S::A, || {}, |_| Err("work_error"));
+    assert!(matches!(res, Err(SnubberError::Work("work_error"))));
+    for n in [&checked, &sealed, &tr, &tc] {
+        let s = n.stats();
+        assert_eq!(s.explicit_aborts, 1);
+        assert_eq!(s.implicit_drops, 0);
+        assert_eq!(s.catastrophic_faults(), 0);
+        assert_eq!(s.breaker_state, BreakerState::Closed);
+    }
 }
