@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use snubber::{
-    classify_stall_ceiling, gateway, IsrBridge, IsrSignal, Priority, PulseWatch, SnubberGuard,
-    SnubberNode, TaskConduit, TransactionHeader, WorkerPulse, OP_PULSE,
+    classify_stall_ceiling, gateway, EpochGate, IsrBridge, IsrSignal, Priority, PulseWatch,
+    SnubberGuard, SnubberNode, TaskConduit, TransactionHeader, WorkerPulse, OP_PULSE,
 };
 use std::time::Duration;
 
@@ -195,7 +195,7 @@ fn bench_telemetry(c: &mut Criterion) {
         }
         b.iter(|| {
             let r = tx.send(black_box(255));
-            black_box(r);
+            let _ = black_box(r);
         });
     });
 
