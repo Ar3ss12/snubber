@@ -78,7 +78,11 @@ Measured on AMD Ryzen 5 4600H release build
 | `node.transition_checked` + `LegalMove` | Layer 2 (`std`) | same + 0 ns | Closed state graphs: illegal moves fail at compile time (E0277) |
 | `enter_erased_auto` | Layer 2 (`alloc`) | **~85.6 ns** | Boxed rollback for dynamic struct fields |
 | `enter_async_auto` | Layer 3 (`std`) | **0% CPU** | Pure `core::task::Waker` parking, no runtime deps |
+| `static_node.enter + commit` | Layer 2 (`std`) | **~91.9 ns** | Compile-time capacity assert + bulkhead + auto-commit |
 | `node.note_pulse_stall(lag_ms)` | Layer 2 (`std`) | **1 atomic max** | Missed heartbeat lands in `SnapshotV1` v3 + `AnomalyKind::PulseStall` |
+| `process_token.to_bytes()` | Layer 4 (`core`) | **~7.5 ns** | 44-byte framed wire serialization (`to_le_bytes`) |
+| `state_digest.crc()` | Layer 4 (`core`) | **~261 ns** | 64-byte hardware cache line digest verification |
+| `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.1 µs** | 512-byte zero-allocation snapshot CRC32 codec |
 | `snapshot_v1()` + `find_anomalies()` | Layer 5 (cold) | **512 B, CRC32** | Zero-allocation telemetry; `assert_no_anomalies!()` CI gate |
 
 ---

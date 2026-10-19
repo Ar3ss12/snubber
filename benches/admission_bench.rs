@@ -251,9 +251,53 @@ fn bench_layer3(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_layer4_layer5(c: &mut Criterion) {
+    use snubber::{ProcessToken, StateDigest, StaticNode, STATE_LEN};
+
+    let mut g = c.benchmark_group("layer4_layer5_diagnostics");
+
+    // 1. ProcessToken wire framing (44-byte framed serialization)
+    g.bench_function("process_token_to_bytes", |b| {
+        let token = ProcessToken::new(black_box(42), black_box(7), [0xAA; 28]);
+        b.iter(|| black_box(token.to_bytes()));
+    });
+
+    // 2. StateDigest creation & CRC computation (64 bytes, cache line)
+    g.bench_function("state_digest_new_crc", |b| {
+        let bytes = [0x55u8; STATE_LEN];
+        b.iter(|| {
+            let digest = StateDigest::new(black_box(bytes));
+            black_box(digest.crc());
+        });
+    });
+
+    // 3. StaticNode compile-time bounded slot entry + commit
+    g.bench_function("static_node_enter_commit", |b| {
+        let node = StaticNode::<1024, 2048>::build("bench_static");
+        let mut epoch = 1u64;
+        b.iter(|| {
+            epoch = epoch.wrapping_add(1);
+            let guard = node
+                .enter(black_box(epoch), black_box(1), || {})
+                .expect("static");
+            black_box(guard.commit());
+        });
+    });
+
+    // 4. SnapshotV1 encode and CRC32 framing (512 bytes, zero-alloc)
+    g.bench_function("snapshot_v1_encode_crc", |b| {
+        let node = SnubberNode::builder("bench_snap").build();
+        let _ = node.enter_auto(|| {}).map(|g| g.commit());
+        let snap = node.snapshot_v1();
+        b.iter(|| black_box(snap.encode()));
+    });
+
+    g.finish();
+}
+
 criterion_group!(
     name = benches;
     config = fast();
-    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3
+    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_layer4_layer5
 );
 criterion_main!(benches);
