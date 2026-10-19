@@ -124,6 +124,16 @@ review-blocking defect — it smuggles foreign code under the mutex
 (F11). The order already holds in `commit` / `abort` / `settle_implicit`;
 this paragraph exists so the next refactor does not re-order it.
 
+## 6b. Node Board: One `NodeSet`, Never Two
+
+`src/diagnostics.rs` used to carry two identical handle lists (`NodeRegistry`
++ `NodeSet`). That duplication is deleted: `NodeSet` is the single board —
+it owns `register` / `clear` / `len` / `is_empty` / `snapshots` /
+`find_all_anomalies` plus the saturating aggregates (`total_faults`,
+`total_catastrophic_faults`, `total_hydraulic_shed`,
+`is_any_breaker_tripped`, `dump_summary`). Never re-introduce a second
+board type; a new aggregate goes on `NodeSet`, not beside it.
+
 ## 7. Docs policy
 
 Public: `README.md` only (+ `LICENSE` if added). `AGENTS.md`, `tech.md`,
@@ -143,7 +153,7 @@ incremental cache (`os error 32` here, `os error 1455` there):
 |---|---|---|
 | fmt | `cargo fmt --check` | clean |
 | lint | `cargo clippy --all-targets -- -D warnings` | clean |
-| unit+integration | `cargo test` | 168 + 20 doc = 188 green |
+| unit+integration | `cargo test` | 206 + 21 doc = 227 green |
 | features | `cargo check --no-default-features` | ok |
 | miri (lib UB check) | `cargo +nightly miri test --lib` | 6 unit tests ok (0 UB) |
 | miri (integration suite) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test guard --test scoped_transactions --test erased --test invariants --test watchdog --test memory_boundary --test presets --test supervisor` | integration tests ok (0 UB) |

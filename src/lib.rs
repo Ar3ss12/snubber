@@ -104,9 +104,8 @@ pub use node::{
 
 #[cfg(feature = "std")]
 pub use diagnostics::{
-    diagnostic_line, find_anomalies, print_health, Anomaly, AnomalyKind, AnomalyPolicy,
-    NodeSet, SnapshotError, SnapshotV1, SNAPSHOT_CRC_RANGE, SNAPSHOT_LEN,
-    SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
+    diagnostic_line, find_anomalies, print_health, Anomaly, AnomalyKind, AnomalyPolicy, NodeSet,
+    SnapshotError, SnapshotV1, SNAPSHOT_CRC_RANGE, SNAPSHOT_LEN, SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
 };
 
 #[cfg(not(feature = "std"))]
