@@ -1002,7 +1002,26 @@ impl Supervisor {
     /// - If `args` contains `--supervisor` and not `worker_flag`:
     ///   Spawns child with `worker_flag`, drains anonymous pipe, waits for death,
     ///   executes `on_dead_token` if worker died leaving an armed token, and returns `true` (exit main).
+    ///
+    /// Delegates to [`Self::run_supervised_guard_with_lease`] with `lease_ms = 0` (indefinite wait).
     pub fn run_supervised_guard<F>(worker_flag: &'static str, on_dead_token: F) -> bool
+    where
+        F: Fn(ProcessToken),
+    {
+        Self::run_supervised_guard_with_lease(worker_flag, 0, on_dead_token)
+    }
+
+    /// Inspect command line args and run the child process supervisor loop with an active silence lease (`lease_ms`).
+    ///
+    /// If `lease_ms > 0` and the child worker is silent (pipe open but no tokens/heartbeats)
+    /// for longer than `lease_ms`, the supervisor terminates the child process externally
+    /// via OS process termination (`child.kill()`), reclaims any armed `ProcessToken`
+    /// via [`PipeDrain::take_armed`], executes `on_dead_token`, and increments the generation clock.
+    pub fn run_supervised_guard_with_lease<F>(
+        worker_flag: &'static str,
+        lease_ms: u64,
+        on_dead_token: F,
+    ) -> bool
     where
         F: Fn(ProcessToken),
     {
@@ -1051,8 +1070,40 @@ impl Supervisor {
 
         if let Some(stdout) = child.stdout.take() {
             let drain = PipeDrain::spawn(stdout);
-            let status = child.wait();
-            println!("[SUPERVISOR:TERMINATED] child_pid={pid} status={status:?}");
+
+            if lease_ms > 0 {
+                // Active watchdog loop: check if worker has exited or if silence exceeded lease_ms
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            println!("[SUPERVISOR:TERMINATED] child_pid={pid} status={status:?}");
+                            break;
+                        }
+                        Ok(None) => {
+                            if drain.expired(lease_ms) {
+                                eprintln!(
+                                    "[SUPERVISOR:HANG_TIMEOUT] child_pid={pid} idle_ms={} lease_ms={lease_ms} action=terminate_process",
+                                    drain.idle_ms()
+                                );
+                                let _ = child.kill();
+                                let status = child.wait();
+                                println!("[SUPERVISOR:KILLED] child_pid={pid} status={status:?}");
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(e) => {
+                            eprintln!("[SUPERVISOR:WAIT_ERROR] child_pid={pid} error=\"{e}\"");
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break;
+                        }
+                    }
+                }
+            } else {
+                let status = child.wait();
+                println!("[SUPERVISOR:TERMINATED] child_pid={pid} status={status:?}");
+            }
 
             for _ in 0..50 {
                 if drain.eof() {

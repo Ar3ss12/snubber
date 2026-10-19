@@ -16,8 +16,8 @@ cargo check --no-default-features
 cargo test --release --test concurrency_stress
 ```
 
-`cargo test` today = **212 passed** (17 unit + 195 integration in 36 files)
-+ 23 doc-tests = **235 green**. If your change moves a documented number,
+`cargo test` today = **213 passed** (17 unit + 196 integration in 36 files)
++ 23 doc-tests = **236 green**. If your change moves a documented number,
 update it in the SAME commit (README + tech.md + AGENTS.md). Stale numbers send the
 next agent hunting ghosts.
 
@@ -276,7 +276,7 @@ cargo test --release --test concurrency_stress
 Green = all above green in ONE run, same commit updates `README.md` +
 `AGENTS.md` + `tech.md` numbers. Version lives ONLY in `Cargo.toml`
 (`name`/`version`); docs quote it, never redefine it. Current:
-**v0.5.1**, **235 green** (212 tests + 23 doc-tests), MSRV 1.70.
+**v0.5.1**, **236 green** (213 tests + 23 doc-tests), MSRV 1.70.
 
 Publication honesty (R7): `.gitignore` has been added covering `target/`,
 local scratch logs, python artifacts, and OS temp files. Cargo package exclusions

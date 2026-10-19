@@ -478,3 +478,126 @@ fn stdin_digest_chain_is_closed_tick0() {
     let st = child2.wait().expect("reap");
     assert_eq!(st.code(), Some(42), "fn path delivers too");
 }
+
+#[test]
+fn supervisor_with_lease_terminates_hung_worker_and_rescues_token() {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    struct ChannelReader {
+        rx: std::sync::mpsc::Receiver<Vec<u8>>,
+        pending: std::io::Cursor<Vec<u8>>,
+    }
+    impl Read for ChannelReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pending.position() < self.pending.get_ref().len() as u64 {
+                return self.pending.read(buf);
+            }
+            match self.rx.recv() {
+                Ok(chunk) => {
+                    self.pending = std::io::Cursor::new(chunk);
+                    self.pending.read(buf)
+                }
+                Err(_) => Ok(0),
+            }
+        }
+    }
+
+    // 1. Worker arms a token and sends it across the pipe
+    let token = ProcessToken::new(999, 13, [0xCC; 28]);
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+    let tx_holder = Arc::new(Mutex::new(Some(tx)));
+    let tx_for_worker = Arc::clone(&tx_holder);
+
+    let worker_terminated = Arc::new(AtomicBool::new(false));
+    let worker_term_signal = Arc::clone(&worker_terminated);
+
+    // Simulate worker process hanging in a deadlocked rollback/I/O:
+    // Holds the pipe open (silence, no EOF, no commit) until supervisor terminates it.
+    let worker_thread = std::thread::spawn(move || {
+        while !worker_term_signal.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Simulated OS termination: drops write handle, emitting EOF on reader
+        let _ = tx_for_worker.lock().unwrap().take();
+    });
+
+    // Warm up monotonic clock so now_ms() > 0
+    let _warmup = SnubberNode::builder("_warmup2").build();
+    std::thread::sleep(Duration::from_millis(2));
+
+    let reader = ChannelReader {
+        rx,
+        pending: std::io::Cursor::new(Vec::new()),
+    };
+
+    let drain = PipeDrain::spawn(reader);
+
+    // Send armed token + heartbeat to update last_seen_ms
+    let hb = ProcessToken::new(0, snubber::OP_HEARTBEAT, [0; 28]);
+    let mut payload = token.to_bytes().to_vec();
+    payload.extend_from_slice(&hb.to_bytes());
+
+    tx_holder
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .send(payload)
+        .expect("send token");
+
+    // Wait until drain processes the armed token
+    let mut spins = 0u32;
+    while drain.idle_ms() == 0 && spins < 5_000 {
+        std::thread::sleep(Duration::from_millis(1));
+        spins += 1;
+    }
+    assert!(spins < 5_000, "token received");
+
+    // Silence lease: 40 ms
+    let lease_ms = 40u64;
+    let mut killed = false;
+
+    // Supervisor watchdog loop (same logic as run_supervised_guard_with_lease)
+    for _ in 0..100 {
+        if drain.expired(lease_ms) {
+            // Hang timeout triggered! Supervisor terminates hung worker from outside.
+            worker_terminated.store(true, Ordering::SeqCst);
+            killed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        killed,
+        "supervisor must trigger termination on hang past lease_ms"
+    );
+    worker_thread.join().expect("worker terminated");
+
+    // Wait for EOF on pipe after termination
+    for _ in 0..50 {
+        if drain.eof() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(drain.eof(), "pipe must hit EOF after worker is killed");
+
+    // Reclaim armed token
+    let rescued = Arc::new(AtomicU32::new(0));
+    if let Some(t) = drain.take_armed() {
+        assert_eq!(t.task, 999);
+        assert_eq!(t.opcode, 13);
+        rescued.store(1, Ordering::SeqCst);
+    }
+
+    assert_eq!(
+        rescued.load(Ordering::SeqCst),
+        1,
+        "token rescued from hung worker"
+    );
+}
