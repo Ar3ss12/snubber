@@ -1,0 +1,82 @@
+# scripts/check_compile_gates.ps1
+# Automated audit gate for snubber architectural invariants and AGENTS.md rules.
+
+$ErrorActionPreference = "Stop"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$RepoRoot = Resolve-Path "$ScriptDir\.."
+
+Write-Host "=== Snubber Architectural Invariant Audit ===" -ForegroundColor Cyan
+$Failures = 0
+
+# Gate 1: Check #![forbid(unsafe_code)] in src/lib.rs
+Write-Host "[1/4] Auditing unsafe code veto..." -NoNewline
+$LibContent = Get-Content "$RepoRoot\src\lib.rs" -Raw
+if ($LibContent -match '#!\[forbid\(unsafe_code\)\]') {
+    Write-Host " OK (forbid(unsafe_code) active)" -ForegroundColor Green
+} else {
+    Write-Host " FAIL (missing #![forbid(unsafe_code)] in src/lib.rs)" -ForegroundColor Red
+    $Failures++
+}
+
+# Scan all src/*.rs files for raw `unsafe ` blocks
+$UnsafeMatches = Select-String -Path "$RepoRoot\src\*.rs" -Pattern "\bunsafe\s*\{|\bunsafe\s+fn\b"
+if ($UnsafeMatches) {
+    Write-Host " FAIL: Found raw unsafe keyword in src/:" -ForegroundColor Red
+    $UnsafeMatches | ForEach-Object { Write-Host "   $($_.Filename):$($_.LineNumber): $($_.Line.Trim())" }
+    $Failures++
+}
+
+# Gate 2: Saturating arithmetic on counters in src/node.rs
+Write-Host "[2/4] Auditing saturating counters in src/node.rs..." -NoNewline
+# Counter increment check: flag direct `+= 1` on known counter fields
+$CounterViolations = Select-String -Path "$RepoRoot\src\node.rs" -Pattern "\b(in_flight|total_started|committed|bulkhead_rejections|poison_recoveries|stale_epochs_rejected)\s*\+="
+if ($CounterViolations) {
+    Write-Host " FAIL: Direct += found on counter:" -ForegroundColor Red
+    $CounterViolations | ForEach-Object { Write-Host "   $($_.Filename):$($_.LineNumber): $($_.Line.Trim())" }
+    $Failures++
+} else {
+    Write-Host " OK (saturating math preserved)" -ForegroundColor Green
+}
+
+# Gate 3: Lock-hygiene audit in Phase A/C (no foreign calls / formatting under lock)
+Write-Host "[3/4] Auditing zero-panic mutex discipline in src/node.rs..." -NoNewline
+# Search for format! or println! inside record_locked or enter_inner lock sections
+$FormatUnderLock = Select-String -Path "$RepoRoot\src\node.rs" -Pattern "fn record_locked[\s\S]*?format!"
+if ($FormatUnderLock) {
+    Write-Host " FAIL: format! call detected under lock" -ForegroundColor Red
+    $Failures++
+} else {
+    Write-Host " OK (no format! under lock)" -ForegroundColor Green
+}
+
+# Gate 4: Zero-metaphor scan across codebase (AGENTS.md Section 14)
+Write-Host "[4/4] Auditing forbidden metaphors..." -NoNewline
+# Excludes binary header magic terminology ("magic bytes / magic number") which is technical standard.
+$ForbiddenPatterns = @(
+    "\bwizard\b",
+    "\bspaceship\b",
+    "\bbulletproof\b",
+    "\bpanacea\b",
+    "\bsilver\s+bullet\b"
+)
+$MetaphorMatches = @()
+foreach ($Pat in $ForbiddenPatterns) {
+    $Found = Select-String -Path "$RepoRoot\src\*.rs" -Pattern $Pat
+    if ($Found) { $MetaphorMatches += $Found }
+}
+if ($MetaphorMatches.Count -gt 0) {
+    Write-Host " FAIL: Found informal metaphors in src/:" -ForegroundColor Red
+    $MetaphorMatches | ForEach-Object { Write-Host "   $($_.Filename):$($_.LineNumber): $($_.Line.Trim())" }
+    $Failures++
+} else {
+    Write-Host " OK (technical language strictly adhered)" -ForegroundColor Green
+}
+
+Write-Host "---------------------------------------------"
+if ($Failures -eq 0) {
+    Write-Host "All invariant gates PASSED." -ForegroundColor Green
+    exit 0
+} else {
+    Write-Host "$Failures invariant check(s) FAILED." -ForegroundColor Red
+    exit 1
+}

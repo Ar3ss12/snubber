@@ -1148,13 +1148,37 @@ const _: () = {
 /// let node = StaticNode::<4, 16>::build("firm");
 /// assert!(node.bulkhead_has_room());
 /// ```
+///
+/// Compile-time capacity violations are rejected at compile time:
+/// ```compile_fail
+/// use snubber::StaticNode;
+/// // IN_FLIGHT = 0 fails compilation via const evaluation:
+/// let _node = StaticNode::<0, 16>::build("zero_inflight");
+/// ```
+///
+/// ```compile_fail
+/// use snubber::StaticNode;
+/// // QUEUE < IN_FLIGHT fails compilation via const evaluation:
+/// let _node = StaticNode::<10, 5>::build("queue_smaller_than_inflight");
+/// ```
 pub struct StaticNode<const IN_FLIGHT: usize, const QUEUE: usize>;
 
 impl<const IN_FLIGHT: usize, const QUEUE: usize> StaticNode<IN_FLIGHT, QUEUE> {
-    /// Build the node, validating capacities FIRST (before any arming).
+    const _CAPACITY_ASSERT: () = {
+        assert!(IN_FLIGHT > 0, "StaticNode: IN_FLIGHT cannot be zero");
+        assert!(
+            IN_FLIGHT <= 65536,
+            "StaticNode: IN_FLIGHT exceeded hard ceiling (65536)"
+        );
+        assert!(
+            QUEUE >= IN_FLIGHT,
+            "StaticNode: QUEUE must hold at least IN_FLIGHT"
+        );
+    };
+
+    /// Build the node, validating capacities at compile-time FIRST (before any arming).
     pub fn build(name: &'static str) -> SnubberNode {
-        assert!(IN_FLIGHT > 0, "StaticNode IN_FLIGHT cannot be zero");
-        assert!(QUEUE >= IN_FLIGHT, "StaticNode QUEUE must hold IN_FLIGHT");
+        let () = Self::_CAPACITY_ASSERT;
         SnubberNode::builder(name)
             .max_in_flight(IN_FLIGHT)
             .queue_limit(QUEUE)
@@ -3409,11 +3433,11 @@ fn level_from_u32(v: u32) -> LogLevel {
 }
 /// Guard armed through a [`SnubberNode`]: records telemetry on settlement.
 ///
-/// * `commit()` → `committed += 1`, breaker failure streak reset
+/// * `commit()` → `committed` saturating_add(1), breaker failure streak reset
 ///   (a probe success closes the breaker).
-/// * `abort(reason)` → `explicit_aborts += 1` (planned, no breaker trip).
-/// * Implicit `Drop` → `implicit_drops += 1` + `FaultRecord` with the
-///   ARMING coordinates, breaker streak +1, trip at the threshold.
+/// * `abort(reason)` → `explicit_aborts` saturating_add(1) (planned, no breaker trip).
+/// * Implicit `Drop` → `implicit_drops` saturating_add(1) + `FaultRecord` with the
+///   ARMING coordinates, breaker streak saturating_add(1), trip at the threshold.
 /// * `check_timeout()` → cooperative watchdog: if the per-guard deadline
 ///   (see [`SnubberNodeBuilder::timeout_ms`]) passed, rolls back NOW,
 ///   fires the `Timeout` policy and returns `Err(Timeout)`.

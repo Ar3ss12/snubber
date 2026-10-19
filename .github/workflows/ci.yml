@@ -35,6 +35,9 @@ jobs:
       - name: Pure Bare-Metal Layer 1 Check (no-default-features)
         run: cargo check --no-default-features
 
+      - name: Architectural Invariant & Compile Gates Audit
+        run: bash scripts/check_compile_gates.sh
+
       - name: Validate Documentation Links (cargo doc)
         run: cargo doc --no-deps --all-features
 

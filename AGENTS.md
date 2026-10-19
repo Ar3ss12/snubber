@@ -16,8 +16,8 @@ cargo check --no-default-features
 cargo test --release --test concurrency_stress
 ```
 
-`cargo test` today = **211 passed** (17 unit + 194 integration in 36 files)
-+ 21 doc-tests = **232 green**. If your change moves a documented number,
+`cargo test` today = **212 passed** (17 unit + 195 integration in 36 files)
++ 23 doc-tests = **235 green**. If your change moves a documented number,
 update it in the SAME commit (README + tech.md + AGENTS.md). Stale numbers send the
 next agent hunting ghosts.
 
@@ -153,7 +153,7 @@ incremental cache (`os error 32` here, `os error 1455` there):
 |---|---|---|
 | fmt | `cargo fmt --check` | clean |
 | lint | `cargo clippy --all-targets -- -D warnings` | clean |
-| unit+integration | `cargo test` | 211 + 21 doc = 232 green |
+| unit+integration | `cargo test` | 212 + 23 doc = 235 green |
 | features | `cargo check --no-default-features` | ok |
 | bench compile | `cargo bench --bench admission_bench --no-run` | ok |
 | miri (lib UB check) | `cargo +nightly miri test --lib` | 6 unit tests ok (0 UB) |
@@ -276,7 +276,7 @@ cargo test --release --test concurrency_stress
 Green = all above green in ONE run, same commit updates `README.md` +
 `AGENTS.md` + `tech.md` numbers. Version lives ONLY in `Cargo.toml`
 (`name`/`version`); docs quote it, never redefine it. Current:
-**v0.5.1**, **232 green** (211 tests + 21 doc-tests), MSRV 1.70.
+**v0.5.1**, **235 green** (212 tests + 23 doc-tests), MSRV 1.70.
 
 Publication honesty (R7): `.gitignore` has been added covering `target/`,
 local scratch logs, python artifacts, and OS temp files. Cargo package exclusions

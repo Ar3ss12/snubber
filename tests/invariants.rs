@@ -218,3 +218,20 @@ fn verify_slot_containment_and_single_shot_rollback() {
         "Invariant 3 Broken: Every aborted admission must trigger its rollback exactly once"
     );
 }
+
+#[test]
+fn static_node_const_capacities_valid() {
+    let node = snubber::StaticNode::<4, 16>::build("static_valid");
+    assert!(node.bulkhead_has_room());
+    // In-flight limit is 4: exactly 4 can be held concurrently with increasing epochs
+    let _g1 = node.enter(1, 1, || {}).expect("g1");
+    let _g2 = node.enter(2, 2, || {}).expect("g2");
+    let _g3 = node.enter(3, 3, || {}).expect("g3");
+    let _g4 = node.enter(4, 4, || {}).expect("g4");
+    // 5th attempt must be rejected under BulkheadFull
+    assert_eq!(
+        node.enter(5, 5, || {}).err(),
+        Some(snubber::EnterError::BulkheadFull),
+        "5th concurrent slot must exceed IN_FLIGHT=4"
+    );
+}

@@ -799,6 +799,53 @@ profiler at 160 CPS).
 
 ---
 
+## Multiplatform POSIX / Linux & Embedded Integration
+
+The crate maintains `#![forbid(unsafe_code)]` and zero external dependencies. Platform-specific system calls (`prctl`, `pidfd`, `clock_gettime`) belong in application code, behind the clean traits provided by `snubber`.
+
+### 1. No-Zombie Law: Application-Side `OrphanGuard` Implementations
+
+When a supervisor process terminates abnormally, child worker processes must not become orphaned zombies:
+
+| Target Platform | Kernel Mechanism | App-Side Implementation Pattern |
+|---|---|---|
+| **Windows** | Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) | Assign child process handle to a Job Object configured to terminate all processes on handle closure. |
+| **Linux (POSIX)** | `prctl(PR_SET_PDEATHSIG, SIGKILL)` | In child process (pre-exec or line 1 of child `main`): `libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL)`. |
+| **Linux 5.3+** | `pidfd_open` / `pidfd_send_signal` | Parent monitors child via pidfd without PID recycling races. |
+| **Container / k8s** | Subreaper / init daemon | Use `NoOrphanGuard` (reaping owned by container init PID 1 / dumb-init / tini). |
+
+#### Linux `OrphanGuard` Recipe:
+```rust,ignore
+pub struct LinuxPdeathsigGuard;
+
+impl snubber::OrphanGuard for LinuxPdeathsigGuard {
+    fn arm(&self, _pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "linux-prctl-pdeathsig"
+    }
+}
+```
+
+### 2. CPU Time Samplers for Hang Classification
+
+`with_cpu_sampler(sampler: fn() -> u64)` accepts a raw monotonic tick counter. The crate calculates differential math in pure `core`:
+
+| Target Platform | Syscall / Instruction | App-Side Sampler Implementation |
+|---|---|---|
+| **Windows** | `GetThreadTimes` | Returns `(KernelTime + UserTime) / 10_000` (ms). |
+| **Linux (glibc / musl)** | `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` | Returns `ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000`. |
+| **ARM Cortex-M (no_std)** | `DWT->CYCCNT` | Read cycle counter directly: `DWT::cycle_count() / (CPU_FREQ_HZ / 1000)`. |
+
+---
+
 ## API & Cost Quick Reference
 
 | Operation | Layer | Latency / Footprint | When to Use |
