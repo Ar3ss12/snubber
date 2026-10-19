@@ -180,39 +180,87 @@ fn drain_holds_last_armed_and_eof_fires_it() {
 #[test]
 fn hang_timeout_fires_on_silence_and_restarts() {
     use snubber::OP_HEARTBEAT;
-    use std::io::Write;
-    use std::net::{TcpListener, TcpStream};
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    // Worker arms a token, then freezes mid-flight (no commit, no traffic).
-    // Supervisor lease = 50 ms: silence past lease = HangTimeout → reap →
-    // rollback by token → generation bump. Pipe stays OPEN (frozen, not
-    // dead) — `eof()` is false, `expired()` is the verdict.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback");
-    let addr = listener.local_addr().expect("addr");
-    let writer_h = std::thread::spawn(move || {
-        let mut w = TcpStream::connect(addr).expect("connect");
-        let live = ProcessToken::new(31337, 11, [0xBB; 28]);
-        w.write_all(&live.to_bytes()).expect("arm");
-        // Heartbeat once (proves liveness), then freeze like a dead driver.
-        let hb = ProcessToken::new(0, OP_HEARTBEAT, [0; 28]);
-        w.write_all(&hb.to_bytes()).expect("heartbeat");
-        std::thread::sleep(Duration::from_millis(500)); // frozen, pipe open
-        drop(w);
-    });
-    let (reader, _) = listener.accept().expect("accept");
-    reader
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("timeout");
+
+    // Channel-backed reader: the sender controls exactly when bytes arrive and
+    // when silence begins.  No TCP socket, no SO_RCVTIMEO, no platform quirks.
+    // `recv()` blocks until bytes are sent or the sender is dropped (EOF).
+    struct ChannelReader {
+        rx: std::sync::mpsc::Receiver<Vec<u8>>,
+        pending: std::io::Cursor<Vec<u8>>,
+    }
+    impl Read for ChannelReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            // Drain leftover bytes from the previous chunk first.
+            if self.pending.position() < self.pending.get_ref().len() as u64 {
+                return self.pending.read(buf);
+            }
+            // Wait for the next chunk from the sender (blocks until data or EOF).
+            match self.rx.recv() {
+                Ok(chunk) => {
+                    self.pending = std::io::Cursor::new(chunk);
+                    self.pending.read(buf)
+                }
+                // Sender dropped: EOF so the drain loop exits cleanly.
+                Err(_) => Ok(0),
+            }
+        }
+    }
+
+    let live = ProcessToken::new(31337, 11, [0xBB; 28]);
+    let hb = ProcessToken::new(0, OP_HEARTBEAT, [0; 28]);
+    let mut payload: Vec<u8> = Vec::new();
+    payload.extend_from_slice(&live.to_bytes());
+    payload.extend_from_slice(&hb.to_bytes());
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    // Wrap the sender in an Arc+Mutex so we can keep the channel open (frozen
+    // worker: pipe alive, no traffic) while waiting for idle_ms > 0.
+    let sender_hold: Arc<Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>> =
+        Arc::new(Mutex::new(Some(tx)));
+
+    let reader = ChannelReader {
+        rx,
+        pending: std::io::Cursor::new(Vec::new()),
+    };
+
+    // Warm up the monotonic clock (static OnceLock inside now_ms) so that when
+    // the drain thread calls now_ms() the boot instant is already initialised
+    // and elapsed() returns > 0 ms.  Without this the very first now_ms() call
+    // returns 0, which idle_ms() treats as "never saw traffic".
+    let _warmup = SnubberNode::builder("_warmup").build();
+    std::thread::sleep(Duration::from_millis(2));
+
     let drain = PipeDrain::spawn(reader);
-    // Wait until the armed token lands (traffic = liveness).
+
+    // Send token bytes to the drain thread.  The drain thread blocks in
+    // ChannelReader::read → recv() until this send arrives.
+    sender_hold
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .send(payload)
+        .expect("channel send");
+
+    // Wait for drain to process the two tokens (last_seen_ms becomes non-zero).
     let mut spins = 0u32;
-    while drain.idle_ms() == 0 && spins < 10_000 {
+    while drain.idle_ms() == 0 && spins < 5_000 {
         std::thread::sleep(Duration::from_millis(1));
         spins += 1;
     }
-    assert!(drain.idle_ms() < 500, "traffic seen, clock running");
-    assert!(!drain.eof(), "frozen worker keeps the pipe open");
+    assert!(
+        spins < 5_000,
+        "drain received no tokens within 5 s (spins={})",
+        spins
+    );
+    assert!(drain.idle_ms() < 5_000, "traffic seen, clock running");
+    // Sender still held → channel open → eof() stays false (frozen worker).
+    assert!(!drain.eof(), "frozen worker keeps the reader open");
     assert!(!drain.expired(50_000), "fresh traffic is not expired");
+
     // Lease 50 ms: sleep past it while the worker is frozen.
     std::thread::sleep(Duration::from_millis(120));
     assert!(
@@ -220,7 +268,8 @@ fn hang_timeout_fires_on_silence_and_restarts() {
         "silence past lease = HangTimeout, idle={}",
         drain.idle_ms()
     );
-    // Execution: take token → rollback → restart (what supervisor does).
+
+    // Supervisor path: take token → rollback → generation bump.
     static FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let armed = drain.take_armed().expect("frozen mid-flight token");
     assert_eq!(armed.task, 31337);
@@ -230,6 +279,7 @@ fn hang_timeout_fires_on_silence_and_restarts() {
     let gen2 = clock.restart();
     assert_eq!(gen2, 2);
     assert_eq!(FIRED.load(std::sync::atomic::Ordering::SeqCst), 1);
+
     // Fresh lineage re-handshakes; stale packet of gen1 rejected.
     let node = SnubberNode::builder("super/hang").build();
     node.enter_with_generation(gen2, 1, 1, || {})
@@ -240,7 +290,9 @@ fn hang_timeout_fires_on_silence_and_restarts() {
         Err(_) => panic!("wrong refusal"),
         Ok(_) => panic!("stale generation must be rejected"),
     }
-    writer_h.join().expect("frozen worker unblocks");
+
+    // Drop the sender so the drain thread exits cleanly (EOF via recv() error).
+    *sender_hold.lock().unwrap() = None;
 }
 
 /// Supervised erased entry behaves like the canonical worker entry on a

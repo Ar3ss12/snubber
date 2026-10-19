@@ -10,6 +10,7 @@ enum ClickerCommand {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // sleep-based throttle retry is incompatible with Miri timing
 fn four_senders_one_host_reject_new() {
     let (gw, host) = gateway::<ClickerCommand>(8);
     let node = SnubberNode::builder("gw/host")
