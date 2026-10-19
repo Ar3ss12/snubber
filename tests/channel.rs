@@ -36,6 +36,7 @@ fn four_senders_one_host_reject_new() {
                     ClickerCommand::Tick
                 };
                 // Throttle is pacing, not loss: sleep the advised wait and retry.
+                // On transient Full under concurrent race, count shed and retry with yield.
                 loop {
                     match door.send(c) {
                         Ok(()) => {
@@ -44,7 +45,7 @@ fn four_senders_one_host_reject_new() {
                         }
                         Err(GatewaySendError::Full) => {
                             shed += 1;
-                            break;
+                            std::thread::yield_now();
                         }
                         Err(GatewaySendError::Throttled { retry_after_ms, .. }) => {
                             std::thread::sleep(std::time::Duration::from_millis(

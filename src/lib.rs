@@ -386,6 +386,10 @@ const _: () = {
         "CRITICAL: EpochGate must be exactly 16 bytes (2x u64)"
     );
     assert!(
+        core::mem::size_of::<EpochGate>() == core::mem::size_of::<u64>() * 2,
+        "PORTABILITY: EpochGate must be 2 fixed u64, never usize"
+    );
+    assert!(
         core::mem::size_of::<usize>() >= 4,
         "CRITICAL: snubber requires at least 32-bit usize for ticket minting"
     );

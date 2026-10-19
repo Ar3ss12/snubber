@@ -238,6 +238,26 @@ const _: () = {
         Priority::Critical as u8 == 2,
         "CRITICAL: Critical lane code drifted from 2"
     );
+    assert!(
+        Priority::Background.code() == 0
+            && Priority::Normal.code() == 1
+            && Priority::Critical.code() == 2,
+        "CRITICAL: Priority::code() must match enum discriminants"
+    );
+    // Catastrophic classification contract:
+    // Only uncommitted drops, panics, timeouts, and process deaths feed circuit breaker streaks.
+    assert!(FaultKind::ImplicitDrop.is_catastrophic());
+    assert!(FaultKind::Panic.is_catastrophic());
+    assert!(FaultKind::Timeout.is_catastrophic());
+    assert!(FaultKind::ProcessDied.is_catastrophic());
+    assert!(!FaultKind::ChannelDisconnected.is_catastrophic());
+    assert!(!FaultKind::BufferOverflow.is_catastrophic());
+    assert!(!FaultKind::StaleEpoch.is_catastrophic());
+    assert!(!FaultKind::BulkheadFull.is_catastrophic());
+    assert!(!FaultKind::EvictedOldest.is_catastrophic());
+    assert!(!FaultKind::BreakerOpen.is_catastrophic());
+    assert!(!FaultKind::PoisonedPayload.is_catastrophic());
+    assert!(!FaultKind::Preempted.is_catastrophic());
 };
 
 /// Telemetry metric sample capturing fault occurrences per node.

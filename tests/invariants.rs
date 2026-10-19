@@ -29,6 +29,14 @@ const _: () = {
     assert_send_sync::<snubber::ProcessToken>();
     assert_send_sync::<snubber::StaticNode<4, 16>>();
     assert_send_sync::<Protected<snubber::TransactionHeader, fn()>>();
+    assert_send_sync::<snubber::GenerationClock>();
+    assert_send_sync::<snubber::RestartPolicy>();
+    assert_send_sync::<snubber::Backoff>();
+    assert_send_sync::<snubber::RestartWindow>();
+    assert_send_sync::<snubber::DeathCause>();
+    assert_send_sync::<snubber::NoOrphanGuard>();
+    assert_send_sync::<snubber::RestartTracker>();
+    assert_send_sync::<snubber::PipeDrain>();
 };
 
 // ============================================================================

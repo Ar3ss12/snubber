@@ -1174,6 +1174,10 @@ impl<const IN_FLIGHT: usize, const QUEUE: usize> StaticNode<IN_FLIGHT, QUEUE> {
             QUEUE >= IN_FLIGHT,
             "StaticNode: QUEUE must hold at least IN_FLIGHT"
         );
+        assert!(
+            QUEUE <= 1_048_576,
+            "StaticNode: QUEUE exceeded hard ceiling (1048576)"
+        );
     };
 
     /// Build the node, validating capacities at compile-time FIRST (before any arming).

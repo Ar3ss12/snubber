@@ -42,6 +42,21 @@ const DIR_CANCEL: u8 = 2;
 const DIR_SKIP_STAGE: u8 = 3;
 const DIR_PREEMPTED: u8 = 4;
 
+// COMPILE-TIME GATES:
+// Directives must map to pairwise distinct atomic discriminants (0..=4).
+const _: () = {
+    assert!(DIR_PROCEED != DIR_PAUSE);
+    assert!(DIR_PROCEED != DIR_CANCEL);
+    assert!(DIR_PROCEED != DIR_SKIP_STAGE);
+    assert!(DIR_PROCEED != DIR_PREEMPTED);
+    assert!(DIR_PAUSE != DIR_CANCEL);
+    assert!(DIR_PAUSE != DIR_SKIP_STAGE);
+    assert!(DIR_PAUSE != DIR_PREEMPTED);
+    assert!(DIR_CANCEL != DIR_SKIP_STAGE);
+    assert!(DIR_CANCEL != DIR_PREEMPTED);
+    assert!(DIR_SKIP_STAGE != DIR_PREEMPTED);
+};
+
 struct IntercomInner<S, D> {
     directive: AtomicU8,
     cancel_reason: Mutex<Option<&'static str>>,

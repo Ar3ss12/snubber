@@ -37,6 +37,31 @@ const DEFAULT_SERVICE_MS: u64 = 1;
 /// Hard cap for the advised wait (60 s): saturating multiply output.
 const MAX_RETRY_AFTER_MS: u64 = 60_000;
 
+// COMPILE-TIME GATES (watermark math + threshold constants):
+// * HWM (3/4) must exceed LWM (1/2) to prevent hysteresis collapse;
+// * THROTTLE_MIN_CAP >= 4: below 4 slots two-threshold latch is meaningless;
+// * MAX_RETRY_AFTER_MS == 60_000: hard cap documented in the public API (60 s);
+// * DEFAULT_SERVICE_MS >= 1: a zero service time would produce divide-by-zero
+//   in retry_after computation (`depth * service_ms`).
+const _: () = {
+    assert!(
+        HWM_NUM * 2 > WM_DEN,
+        "CRITICAL: HWM (3/4) must be strictly greater than LWM (1/2)"
+    );
+    assert!(
+        THROTTLE_MIN_CAP >= 4,
+        "CRITICAL: throttle minimum capacity must be >= 4"
+    );
+    assert!(
+        MAX_RETRY_AFTER_MS == 60_000,
+        "CRITICAL: retry cap must be exactly 60 000 ms"
+    );
+    assert!(
+        DEFAULT_SERVICE_MS >= 1,
+        "CRITICAL: default service ms must be >= 1 (zero causes divide-by-zero in retry computation)"
+    );
+};
+
 /// Plain gateway counters (saturating, mutex-guarded, never panic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct GatewayStats {
