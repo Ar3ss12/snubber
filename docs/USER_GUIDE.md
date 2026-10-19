@@ -655,15 +655,15 @@ thread (e.g. `snapshot_v1_in(gen)` → `encode()` → tmp + rename every 10 s �
 That line is `diagnostic_line(node, anomaly, &snap)` — a FNV-1a hash
 over the counters plus the verdict. No screenshots, no guessing.
 
-### Multi-node board (explicit, never a `static`)
+### Multi-node set (explicit, never a `static`)
 
 ```rust
-use snubber::NodeRegistry;
+use snubber::NodeSet;
 
-let mut board = NodeRegistry::new();
-board.register("click_worker", &click_node);
-board.register("hotkey_listener", &hotkey_node);
-for anomaly in board.find_all_anomalies(&AnomalyPolicy::default()) {
+let mut set = NodeSet::new();
+set.register("click_worker", &click_node);
+set.register("hotkey_listener", &hotkey_node);
+for anomaly in set.find_all_anomalies(&AnomalyPolicy::default()) {
     eprintln!("{}", snubber::diagnostic_line(anomaly.node, &anomaly, &snap));
 }
 ```
@@ -698,4 +698,4 @@ profiler at 160 CPS).
 | `PipeDrain` + `ProcessToken` | 2 / std | 44-byte stream | Hardware rollback across process death (`kill -9`) |
 | `node.snapshot_v1()` + `encode()` | 2 / cold | 512 B, CRC32 | Crash-safe persistence, app-owned flush thread |
 | `find_anomalies()` / `assert_no_anomalies!` | 2 / cold | pure `u128` math | CI gate + diagnostics console + `[DIAG 0x…]` bug reports |
-| `NodeRegistry` board | 2 / cold | explicit `&Node` list | Multi-node pulse, never a `static` |
+| `NodeSet` set | 2 / cold | explicit `&Node` list + saturating aggregates | Multi-node pulse, never a `static` |

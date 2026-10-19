@@ -7,7 +7,7 @@
 use snubber::{
     assert_no_anomalies, diagnostic_line, find_anomalies, find_anomalies_for_snapshot,
     write_diagnostic_line, write_health, AnomalyKind, AnomalyPolicy, FaultKind, FaultPolicy,
-    FaultRecord, NodeRegistry, SnapshotV1, SnubberNode, SnubberStats, TelemetrySink, SNAPSHOT_LEN,
+    FaultRecord, NodeSet, SnapshotV1, SnubberNode, SnubberStats, TelemetrySink, SNAPSHOT_LEN,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -159,7 +159,7 @@ fn registry_boards_explicit_handles() {
     let click = SnubberNode::builder("click").build();
     let hotkey = SnubberNode::builder("hotkey").build();
     hotkey.report(FaultKind::Panic, 1, 1);
-    let mut board = NodeRegistry::new();
+    let mut board = NodeSet::new();
     assert!(board.is_empty());
     board.register("click", &click);
     board.register("hotkey", &hotkey);

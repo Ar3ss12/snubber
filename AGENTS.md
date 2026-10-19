@@ -16,8 +16,8 @@ cargo check --no-default-features
 cargo test --release --test concurrency_stress
 ```
 
-`cargo test` today = **207 passed** (7 unit + 200 integration in 33 files)
-+ 21 doc-tests = **228 green**. If your change moves a documented number,
+`cargo test` today = **206 passed** (7 unit + 199 integration in 33 files)
++ 21 doc-tests = **227 green**. If your change moves a documented number,
 update it in the SAME commit (README + tech.md + AGENTS.md). Stale numbers send the
 next agent hunting ghosts.
 

@@ -6,7 +6,7 @@
 //!   [`diagnostic_hash`] (FNV-1a), [`write_health`] (`fmt::Write`, no
 //!   alloc), CRC helpers. No `std`, no `alloc`, no threads, no files.
 //! * `std`-only: [`find_anomalies`] (pure over a `stats()` snapshot),
-//!   [`NodeRegistry`] (explicit `&Node` list, never a `static`),
+//!   [`NodeSet`] (explicit `&Node` list, never a `static`),
 //!   [`print_health`], [`diagnostic_line`], [`assert_no_anomalies`].
 //!
 //! The crate gives bytes and math; the APP gives threads, paths and
@@ -636,71 +636,10 @@ pub fn diagnostic_line(node: &'static str, anomaly: &Anomaly, snap: &SnapshotV1)
     )
 }
 
-/// Explicit multi-node board. NOT a `static`: the app owns it
-/// (`struct App { board: NodeRegistry<'a> }` or a local), registers
-/// `&Node` handles by hand, polls cold snapshots. Zero magic.
-#[cfg(feature = "std")]
-#[derive(Default)]
-pub struct NodeRegistry<'a> {
-    nodes: Vec<(&'static str, &'a SnubberNode)>,
-}
-
-#[cfg(feature = "std")]
-impl<'a> NodeRegistry<'a> {
-    /// Empty board.
-    #[must_use]
-    pub fn new() -> Self {
-        Self { nodes: Vec::new() }
-    }
-
-    /// Register one node handle (explicit, reversible via `clear`).
-    pub fn register(&mut self, name: &'static str, node: &'a SnubberNode) {
-        self.nodes.push((name, node));
-    }
-
-    /// Forget all handles (nodes keep living; only the board clears).
-    pub fn clear(&mut self) {
-        self.nodes.clear();
-    }
-
-    /// Handles on the board.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    /// `true` when no handles registered.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
-    }
-
-    /// Cold snapshots of every boarded node (oldest registration first).
-    #[must_use]
-    pub fn snapshots(&self) -> Vec<(&'static str, SnapshotV1)> {
-        self.nodes
-            .iter()
-            .map(|(name, node)| (*name, node.snapshot_v1()))
-            .collect()
-    }
-
-    /// Anomaly scan across the whole board (cold, pure math).
-    #[must_use]
-    pub fn find_all_anomalies(&self, policy: &AnomalyPolicy) -> Vec<Anomaly> {
-        let mut out = Vec::new();
-        for (name, node) in &self.nodes {
-            out.extend(find_anomalies(name, &node.stats(), policy));
-        }
-        out
-    }
-}
-
 /// Borrowed in-memory node aggregate (no I/O, no threads, no paths).
 ///
-/// `NodeSet` is the spec-name alias-shape over an explicit handle list:
-/// the app owns it (`let set = NodeSet::new(); set.register(..)`),
-/// polls cold snapshots, sums counters with `saturating_add`.
-/// For the owned builder variant see [`NodeRegistry`].
+/// The app owns it (`let set = NodeSet::new(); set.register(..)`),
+/// polls cold snapshots, scans anomalies, sums counters with `saturating_add`.
 #[cfg(feature = "std")]
 #[derive(Default)]
 pub struct NodeSet<'a> {
@@ -735,6 +674,25 @@ impl<'a> NodeSet<'a> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// Cold snapshots of every member node (oldest registration first).
+    #[must_use]
+    pub fn snapshots(&self) -> Vec<(&'static str, SnapshotV1)> {
+        self.nodes
+            .iter()
+            .map(|(name, node)| (*name, node.snapshot_v1()))
+            .collect()
+    }
+
+    /// Anomaly scan across the whole set (cold, pure math).
+    #[must_use]
+    pub fn find_all_anomalies(&self, policy: &AnomalyPolicy) -> Vec<Anomaly> {
+        let mut out = Vec::new();
+        for (name, node) in &self.nodes {
+            out.extend(find_anomalies(name, &node.stats(), policy));
+        }
+        out
     }
 
     /// Sum of `catastrophic_faults()` over the set (saturating).
