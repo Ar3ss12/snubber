@@ -71,6 +71,8 @@ const COVERED: &[&str] = &[
     "node_scoped_work_commit",
     "node_enter_critical_priority",
     "node_transition",
+    "node_passthrough_enter_commit",
+    "node_passthrough_scoped_commit",
     "gateway_roundtrip_send_recv",
     "gateway_send_throttled_latch",
     "conduit_check_directive",
@@ -97,10 +99,10 @@ fn bench_setup_outside_hot_loop() {
             fn_count += 1;
         }
     }
-    // 22 fixed-name benches + 3 sized contended (format!) + 1 cross-thread
-    // = 26 sites; COVERED holds 22 fixed + 4 prefix/marker entries = 26.
-    assert_eq!(fn_count, 26, "register new bench in COVERED");
-    assert_eq!(COVERED.len(), 26, "COVERED must list every bench");
+    // 24 fixed-name benches + 3 sized contended (format!) + 1 cross-thread
+    // = 28 sites; COVERED holds 24 fixed + 4 prefix/marker entries = 28.
+    assert_eq!(fn_count, 28, "register new bench in COVERED");
+    assert_eq!(COVERED.len(), 28, "COVERED must list every bench");
     for name in COVERED {
         // Prefix entries (contended_*_threads_) match sized format! benches:
         // verify their shared hoisted block, not the whole file.

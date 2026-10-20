@@ -78,6 +78,8 @@ Measured on AMD Ryzen 5 4600H release build
 | `node.transition` | Layer 2 (`std`) | **~86.5 ns** | ONE-enum state machine, zero flag drift |
 | `node.transition_checked` + `LegalMove` | Layer 2 (`std`) | same + 0 ns | Closed state graphs: illegal moves fail at compile time (E0277) |
 | `enter_erased_auto` | Layer 2 (`alloc`) | **~85.6 ns** | Boxed rollback for dynamic struct fields |
+| `node_passthrough_enter + commit` | Layer 2 (`std` canary) | **~86.7 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
+| `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~84.5 ns** | Same transit through `scoped()` — work runs, books stay clean |
 | `enter_async_auto` | Layer 3 (`std`) | **0% CPU** | Pure `core::task::Waker` parking, no runtime deps |
 | `static_node.enter + commit` | Layer 2 (`std`) | **~91.9 ns** | Compile-time capacity assert + bulkhead + auto-commit |
 | `node.note_pulse_stall(lag_ms)` | Layer 2 (`std`) | **1 atomic max** | Missed heartbeat lands in `SnapshotV1` v3 + `AnomalyKind::PulseStall` |

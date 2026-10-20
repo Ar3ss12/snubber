@@ -879,6 +879,8 @@ impl snubber::OrphanGuard for LinuxPdeathsigGuard {
 | `StateDigest` + `take_state()` | 2 / std | 64 B, ~1 ns | Hot handoff: memory survives death |
 | `NoOrphanGuard` / `OrphanGuard` | 2 / std | trait only | Parent death = child processes reaped (app impl) |
 | `node.enter_auto` | 2 / std | **~86.5 ns** | Monotonic auto sequence ticket minting |
+| `node_passthrough_enter` | 2 / std canary | **~86.7 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
+| `node_passthrough_scoped` | 2 / std canary | **~84.5 ns** | Same transit through `scoped()` — work runs, books stay clean |
 | `contended_node_enter` (6 threads, shared `enter_auto` allocator) | 2 / std contended | **~452 ns** | MESI cache-line bouncing on node mutex; StaleEpoch losers bounded-retry (cap 64 + yield), same contract as `concurrency_stress` |
 | `contended_node_scoped` (6 threads) | 2 / std contended | **~804 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
 | `contended_gateway_mpsc` (6 producers + drain) | 2 / std contended | **~132 ns** | Bounded multi-producer write under parallel core flood |

@@ -170,6 +170,37 @@ fn bench_layer2(c: &mut Criterion) {
         });
     });
 
+    // Pass-through transit (canary law): open doors — lock-free count +
+    // dummy guard, no slots/breaker/EpochGate. Node sealed BEFORE b.iter.
+    g.bench_function("node_passthrough_enter_commit", |b| {
+        let node = SnubberNode::builder("bench_passthrough")
+            .max_in_flight(1024)
+            .passthrough(true)
+            .build();
+        b.iter(|| {
+            let guard = node.enter_auto(|| {}).expect("transit never refuses");
+            black_box(guard.commit());
+        });
+    });
+
+    // Pass-through full scoped cycle: same transit through scoped().
+    g.bench_function("node_passthrough_scoped_commit", |b| {
+        let node = SnubberNode::builder("bench_passthrough_scoped")
+            .max_in_flight(1024)
+            .passthrough(true)
+            .build();
+        b.iter(|| {
+            let res = node.scoped(
+                || {},
+                || {
+                    black_box(42);
+                    Ok::<i32, &'static str>(42)
+                },
+            );
+            black_box(res).expect("scoped transit");
+        });
+    });
+
     g.finish();
 }
 
