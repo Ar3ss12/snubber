@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-236%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-237%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -84,6 +84,16 @@ Measured on AMD Ryzen 5 4600H release build
 | `state_digest.crc()` | Layer 4 (`core`) | **~261 ns** | 64-byte hardware cache line digest verification |
 | `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.1 µs** | 512-byte zero-allocation snapshot CRC32 codec |
 | `snapshot_v1()` + `find_anomalies()` | Layer 5 (cold) | **512 B, CRC32** | Zero-allocation telemetry; `assert_no_anomalies!()` CI gate |
+
+### ⚡ Contended Multi-Threaded Latencies (Real Cross-Core Saturation)
+Measured with half of available hardware cores active (6 concurrent threads under contention, AMD Ryzen 5 4600H):
+
+| Contended Operation | Concurrency | Measured Latency | Physical Phenomenon |
+|---|---|---|---|
+| `contended_node_enter` | 6 threads | **~452 ns** | L1 cache-line bouncing across physical cores on node mutex |
+| `contended_node_scoped` | 6 threads | **~804 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
+| `contended_gateway_mpsc` | 6 threads | **~132 ns** | Bounded multi-producer channel write under parallel core flood |
+| `cross_thread_isr_bridge` | 2 threads (inter-core) | **~35.6 ns** | Lock-free SPSC ring across physical core boundaries (bus latency) |
 
 ---
 

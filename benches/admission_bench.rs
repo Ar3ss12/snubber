@@ -295,9 +295,200 @@ fn bench_layer4_layer5(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_contended(c: &mut Criterion) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let mut g = c.benchmark_group("contended_multithreaded");
+
+    let concurrency = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).max(2))
+        .unwrap_or(4);
+    println!("Contended benches: concurrency={concurrency}");
+
+    // IDEAL-1: contended enter_auto+commit, ONE EpochGate lane (F3).
+    {
+        let node = Arc::new(
+            SnubberNode::builder("bench_contended_enter")
+                .max_in_flight(65536)
+                .trip_after_failures(0)
+                .build(),
+        );
+        let stale = Arc::new(AtomicU64::new(0));
+        let name = format!("contended_node_enter_threads_{concurrency}");
+        g.bench_function(name, |b| {
+            let node = Arc::clone(&node);
+            let stale = Arc::clone(&stale);
+            b.iter_custom(|iters| {
+                stale.store(0, Ordering::Relaxed);
+                let iters_per_thread = (iters as usize / concurrency).max(1);
+                let barrier = Arc::new(Barrier::new(concurrency + 1));
+                let mut handles = Vec::with_capacity(concurrency);
+                let start = std::time::Instant::now();
+                for _ in 0..concurrency {
+                    let n = Arc::clone(&node);
+                    let s = Arc::clone(&stale);
+                    let br = Arc::clone(&barrier);
+                    handles.push(thread::spawn(move || {
+                        br.wait();
+                        for _ in 0..iters_per_thread {
+                            for _ in 0..64 {
+                                match n.enter_auto(|| {}) {
+                                    Ok(guard) => {
+                                        black_box(guard.commit());
+                                        break;
+                                    }
+                                    Err(snubber::EnterError::StaleEpoch) => {
+                                        s.fetch_add(1, Ordering::Relaxed);
+                                        thread::yield_now();
+                                    }
+                                    Err(_) => thread::yield_now(),
+                                }
+                            }
+                        }
+                    }));
+                }
+                barrier.wait();
+                for h in handles {
+                    let _ = h.join();
+                }
+                start.elapsed()
+            });
+        });
+    }
+    // IDEAL-2: full scoped cycle under contention, same single lane.
+    {
+        let node = Arc::new(
+            SnubberNode::builder("bench_contended_scoped")
+                .max_in_flight(65536)
+                .trip_after_failures(0)
+                .build(),
+        );
+        let name = format!("contended_node_scoped_threads_{concurrency}");
+        g.bench_function(name, |b| {
+            let node = Arc::clone(&node);
+            b.iter_custom(|iters| {
+                let iters_per_thread = (iters as usize / concurrency).max(1);
+                let barrier = Arc::new(Barrier::new(concurrency + 1));
+                let mut handles = Vec::with_capacity(concurrency);
+                let start = std::time::Instant::now();
+                for _ in 0..concurrency {
+                    let n = Arc::clone(&node);
+                    let br = Arc::clone(&barrier);
+                    handles.push(thread::spawn(move || {
+                        br.wait();
+                        for _ in 0..iters_per_thread {
+                            for _ in 0..64 {
+                                let res: Result<
+                                    (),
+                                    snubber::SnubberError<std::convert::Infallible>,
+                                > = n.scoped(|| {}, || Ok(()));
+                                match res {
+                                    Ok(()) => break,
+                                    Err(_) => thread::yield_now(),
+                                }
+                            }
+                        }
+                    }));
+                }
+                barrier.wait();
+                for h in handles {
+                    let _ = h.join();
+                }
+                start.elapsed()
+            });
+        });
+    }
+    // IDEAL-3: MPSC gateway flood, N producers + 1 drain core.
+    {
+        let name = format!("contended_gateway_mpsc_threads_{concurrency}");
+        g.bench_function(name, |b| {
+            b.iter_custom(|iters| {
+                let (tx, rx) = gateway::<u64>(65536);
+                let iters_per_thread = (iters as usize / concurrency).max(1);
+                let barrier = Arc::new(Barrier::new(concurrency + 1));
+                let draining = Arc::new(AtomicBool::new(true));
+                let d_flag = Arc::clone(&draining);
+                let rx_handle = thread::spawn(move || {
+                    let mut count = 0usize;
+                    while d_flag.load(Ordering::Relaxed) {
+                        if rx.try_recv().is_some() {
+                            count += 1;
+                        } else {
+                            thread::yield_now();
+                        }
+                    }
+                    while rx.try_recv().is_some() {
+                        count += 1;
+                    }
+                    count
+                });
+                let mut handles = Vec::with_capacity(concurrency);
+                let start = std::time::Instant::now();
+                for _ in 0..concurrency {
+                    let sender = tx.clone();
+                    let br = Arc::clone(&barrier);
+                    handles.push(thread::spawn(move || {
+                        br.wait();
+                        for i in 0..iters_per_thread {
+                            let _ = black_box(sender.send_critical(black_box(i as u64)));
+                        }
+                    }));
+                }
+                barrier.wait();
+                for h in handles {
+                    let _ = h.join();
+                }
+                draining.store(false, Ordering::Relaxed);
+                let _ = rx_handle.join();
+                start.elapsed()
+            });
+        });
+    }
+    // IDEAL-4: inter-core SPSC bridge, push core + pop core.
+    {
+        let bridge = Arc::new(IsrBridge::new());
+        g.bench_function("cross_thread_isr_bridge_push_pop", |b| {
+            let bridge = Arc::clone(&bridge);
+            b.iter_custom(|iters| {
+                while bridge.try_pop().is_some() {}
+                let b_pop = Arc::clone(&bridge);
+                let running = Arc::new(AtomicBool::new(true));
+                let r_flag = Arc::clone(&running);
+                let pop_handle = thread::spawn(move || {
+                    let mut popped = 0u64;
+                    while r_flag.load(Ordering::Relaxed) || popped < iters {
+                        if let Some(sig) = b_pop.try_pop() {
+                            black_box(sig);
+                            popped += 1;
+                        } else {
+                            thread::yield_now();
+                        }
+                    }
+                    popped
+                });
+                let start = std::time::Instant::now();
+                for i in 0..iters {
+                    while bridge
+                        .try_push(IsrSignal::new(OP_PULSE, 0, (i & 0xFFFF) as u16))
+                        .is_err()
+                    {
+                        thread::yield_now();
+                    }
+                }
+                running.store(false, Ordering::Relaxed);
+                let _ = pop_handle.join();
+                start.elapsed()
+            });
+        });
+    }
+
+    g.finish();
+}
 criterion_group!(
     name = benches;
     config = fast();
-    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_layer4_layer5
+    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_layer4_layer5, bench_contended
 );
 criterion_main!(benches);

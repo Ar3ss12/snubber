@@ -96,6 +96,9 @@ cargo test --test lock_hierarchy
 
 # Verify pulse black-box (stall verdicts in v3 snapshot + anomaly)
 cargo test --test diagnostics pulse_stall
+
+# Verify bench hygiene (setup outside the hot loop, pure overhead only)
+cargo test --test bench_hygiene
 ```
 
 ---

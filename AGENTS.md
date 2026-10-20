@@ -16,8 +16,8 @@ cargo check --no-default-features
 cargo test --release --test concurrency_stress
 ```
 
-`cargo test` today = **213 passed** (17 unit + 196 integration in 36 files)
-+ 23 doc-tests = **236 green**. If your change moves a documented number,
+`cargo test` today = **214 passed** (17 unit + 197 integration in 37 files)
++ 23 doc-tests = **237 green**. If your change moves a documented number,
 update it in the SAME commit (README + tech.md + AGENTS.md). Stale numbers send the
 next agent hunting ghosts.
 
@@ -83,6 +83,20 @@ storm. Inside `snubber` itself `StaleEpoch` is a HARD refusal — `enter`
 returns `Err`, the gate does not advance, no hidden re-issue. NEVER move
 the retry inside the library: a hidden in-crate retry turns a fail-fast
 membrane into a parking lot and buries backpressure telemetry.
+
+## 3a. Bench hygiene: setup outside the hot loop
+
+Creating `SnubberNode` / `IsrBridge` / `TaskConduit` inside
+`b.iter(|| ...)` / `b.iter_custom(|iters| ...)` measures mutex allocation
+and structure memory, not pure transactional overhead. Setup belongs BEFORE
+the timing closure; inside only admission, `black_box` payload, and
+commit/abort may run. Enforced by `tests/bench_hygiene.rs`
+(`bench_setup_outside_hot_loop`): every `g.bench_function` site is
+registered in COVERED, heavy constructors are asserted absent from the
+timed half, and the four IDEAL contended blocks pin their hoisted nodes
+(`bench_contended_enter` / `bench_contended_scoped` / `IsrBridge::new()`).
+IDEAL-3's per-sample `gateway()` is channel lifecycle (own queue + drain
+thread per sample), not per-op alloc — explicitly allowed.
 
 ## 4. Green tests are guilty until proven with counters
 
