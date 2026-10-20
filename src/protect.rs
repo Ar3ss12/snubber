@@ -63,6 +63,7 @@ impl<T, F: FnOnce()> Protected<T, F> {
     #[inline]
     #[must_use]
     pub fn get(&self) -> &T {
+        // INVARIANT: Guaranteed Some by Protected::new(); only consumed by commit() or Drop.
         self.resource
             .as_ref()
             .expect("protected resource invariant")
@@ -72,6 +73,7 @@ impl<T, F: FnOnce()> Protected<T, F> {
     #[inline]
     #[must_use]
     pub fn get_mut(&mut self) -> &mut T {
+        // INVARIANT: Guaranteed Some by Protected::new(); only consumed by commit() or Drop.
         self.resource
             .as_mut()
             .expect("protected resource invariant")
@@ -85,6 +87,7 @@ impl<T, F: FnOnce()> Protected<T, F> {
         if let Some(guard) = self.guard.take() {
             guard.commit();
         }
+        // INVARIANT: Guaranteed Some by Protected::new(); only consumed by commit() or Drop.
         self.resource.take().expect("protected resource invariant")
     }
 
