@@ -133,12 +133,7 @@ jobs:
           cargo miri test --test industrial
           cargo miri test --test state_handoff
           cargo miri test --test worker_lifecycle
-          cargo miri test --test affordances
-          cargo miri test --test channel_throttle
-          cargo miri test --test frame_fuzz
-          cargo miri test --test industrial
-          cargo miri test --test state_handoff
-          cargo miri test --test worker_lifecycle
+          cargo miri test --test passthrough_canary
 
   # 4. BENCHMARK COMPILE CHECK: verifies bench crate compiles (no measurement on CI)
   bench-check:

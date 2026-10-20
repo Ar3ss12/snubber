@@ -90,9 +90,9 @@ fn test_low_level_entries_point_at_canonical() {
 fn test_readme_badge_mirrors_agent_totals() {
     let agents = std::fs::read_to_string("AGENTS.md").expect("read AGENTS.md");
     let readme = std::fs::read_to_string("README.md").expect("read README.md");
-    // AGENTS.md §0 declares: `cargo test` today = **214 passed** ...
-    // + 23 doc-tests = **237 green**.
-    for pin in ["**214 passed**", "+ 23 doc-tests", "**237 green**"] {
+    // AGENTS.md §0 declares: `cargo test` today = **219 passed** ...
+    // + 23 doc-tests = **242 green**.
+    for pin in ["**219 passed**", "+ 23 doc-tests", "**242 green**"] {
         assert!(
             agents.contains(pin),
             "TRIPWIRE FIRED: AGENTS.md lost totals pin '{pin}' — update §0",
@@ -100,7 +100,7 @@ fn test_readme_badge_mirrors_agent_totals() {
     }
     // README badge must carry the same grand total.
     assert!(
-        readme.contains("tests-237%20passed"),
+        readme.contains("tests-242%20passed"),
         "TRIPWIRE FIRED: README badge drifted from AGENTS.md totals — \
          sync the tests badge with the §0 grand total",
     );

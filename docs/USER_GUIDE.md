@@ -251,6 +251,10 @@ match node.enter_auto(|| release_locks()) {
 - `SnubberNode::embedded(name)` — tight and quiet, zero noise, for embedded/firmware.
 - `SnubberNode::server(name)` — wide bulkhead plus sliding-window breaker for backend daemons.
 
+### Selective Pass-Through (Canary Law, Tests-Only)
+
+`.passthrough(true)` seals a node as open doors at `build()` — immutable, no runtime toggle. Transit returns a dummy guard that never takes a slot, never touches the breaker or `EpochGate`, and drops the rollback uninvoked (`let _ = rollback;` frees captures without running the body). Every transit bumps `passthrough_admissions` lock-free (`Relaxed`, own column — never merged into `total_started`/`SnapshotV1`, the 512 B wire stays intact). Build two nodes (naked + guarded) and compare: naked leaks, guarded rescues. See `examples/13_canary_differential.rs` and `tests/passthrough_canary.rs`. Never seal a live production perimeter as passthrough.
+
 ---
 
 ### 2.5 Long-Lived Worker Daemon (Autonomous Slot Claiming)

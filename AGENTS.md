@@ -16,8 +16,8 @@ cargo check --no-default-features
 cargo test --release --test concurrency_stress
 ```
 
-`cargo test` today = **214 passed** (17 unit + 197 integration in 37 files)
-+ 23 doc-tests = **237 green**. If your change moves a documented number,
+`cargo test` today = **219 passed** (17 unit + 202 integration in 38 files)
++ 23 doc-tests = **242 green**. If your change moves a documented number,
 update it in the SAME commit (README + tech.md + AGENTS.md). Stale numbers send the
 next agent hunting ghosts.
 
@@ -171,7 +171,7 @@ incremental cache (`os error 32` here, `os error 1455` there):
 | features | `cargo check --no-default-features` | ok |
 | bench compile | `cargo bench --bench admission_bench --no-run` | ok |
 | miri (lib UB check) | `cargo +nightly miri test --lib` | 6 unit tests ok (0 UB) |
-| miri (integration suites) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test guard --test scoped_transactions --test erased --test invariants --test watchdog --test memory_boundary --test presets --test supervisor --test supervisor_restart --test diagnostics --test fault_classification --test clock_pulse --test affordances --test channel_throttle --test frame_fuzz --test industrial --test state_handoff --test worker_lifecycle` (lib + 32 suites, 0 UB) |
+| miri (integration suites) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test guard --test scoped_transactions --test erased --test invariants --test watchdog --test memory_boundary --test presets --test supervisor --test supervisor_restart --test diagnostics --test fault_classification --test clock_pulse --test affordances --test channel_throttle --test frame_fuzz --test industrial --test state_handoff --test worker_lifecycle --test passthrough_canary` (lib + 33 suites, 0 UB) |
 | clean rebuild | `rmdir /s /q target` then the gates above | — |
 
 
@@ -203,6 +203,7 @@ Owner table (R1 — one owner, no improvisation):
 | breaker verdict | `record_locked` / `note_outcome` / `reset_breaker` | `enter_inner` reads the flag, never writes it directly |
 | fallback value | builder arms, `fallback_value()` calls outside lock | UI polls, never arms |
 | rollback body | guard owner (`take` + `drop`) | node counts the settle, never runs the body |
+| passthrough law | builder seals (`passthrough(bool)`), funnel reads the outer flag | `is_passthrough()` / `passthrough_count()` observers, never a runtime toggle |
 
 Veto: a new builder flag without exactly one consumer + one test is a
 review-blocking defect (dead setting).
@@ -327,12 +328,12 @@ Through non-technical, poetic language in the repository, this product failed to
 3. **Immediate replacement:**
    Any metaphorical or literary term must be replaced immediately with its direct technical equivalent.
 
-## 15. Examples Showcase Invariants (01_ .. 12_)
+## 15. Examples Showcase Invariants (01_ .. 13_)
 
 The `examples/` directory is the public showroom of the crate, NOT a draft cemetery:
 
-1. **Numbered sequence 01_ .. 12_:**
-   Every canonical recipe must start with its two-digit index (`01_hardware_fuse.rs` .. `12_isr_bridge.rs`). The file name, first doc-comment line (`//! Pattern XX: ...`), console banner, and `cargo run --example XX_...` instruction MUST match exactly.
+1. **Numbered sequence 01_ .. 13_:**
+   Every canonical recipe must start with its two-digit index (`01_hardware_fuse.rs` .. `13_canary_differential.rs`). The file name, first doc-comment line (`//! Pattern XX: ...`), console banner, and `cargo run --example XX_...` instruction MUST match exactly.
 2. **Real RAII rollback, never fake `println!`:**
    An example must NEVER simulate rollback with a bare `println!` while leaving real resource cleanup to a manual `if result.is_err()` in `main()`. The guard's Drop closure MUST perform the actual state reset (e.g. de-energize relay, disarm device). Manual caller cleanup defeats the entire value proposition of RAII unwinding.
 3. **Honest taxonomy:**

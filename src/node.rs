@@ -194,6 +194,11 @@ pub struct SnubberStats {
     /// so the mutex is physically unpoisonable. Non-zero means foreign
     /// code panicked under the lock — investigate.
     pub poison_recoveries: u64,
+    /// Pass-through transit admissions (builder-sealed canary law).
+    /// Own column forever: counted lock-free on the transit path, never
+    /// merged into `total_started` / `admission_total` / `SnapshotV1`
+    /// (the 512 B wire frame stays untouched).
+    pub passthrough_admissions: u64,
     /// Last recorded fault (any kind).
     pub last_fault: Option<FaultRecord>,
     /// Per-kind explicit-report counters, indexed by [`FaultKind::index`].
@@ -464,6 +469,7 @@ pub struct SnubberNodeBuilder {
     policies: [FaultPolicy; FaultKind::COUNT],
     backpressure_policy: BackpressurePolicy,
     friction_fn: Option<FrictionFn>,
+    passthrough: bool,
 }
 
 // [ANCHOR: BUILDER] — node builder, presets (desktop/embedded/server).
@@ -493,6 +499,7 @@ impl SnubberNodeBuilder {
             policies: DEFAULT_POLICIES,
             backpressure_policy: BackpressurePolicy::AdviseOnly,
             friction_fn: None,
+            passthrough: false,
         }
     }
 
@@ -572,6 +579,18 @@ impl SnubberNodeBuilder {
     #[must_use]
     pub fn trip_after_failures(mut self, n: u32) -> Self {
         self.trip_after_failures = n;
+        self
+    }
+
+    /// Selective pass-through (canary/differential law): `true` seals this
+    /// node as open doors — `enter` returns a dummy guard that never takes
+    /// a slot, never touches the breaker or `EpochGate`, and never runs
+    /// the rollback. Immutable perimeter law: sealed at `build()`, no
+    /// runtime toggle — build two nodes (naked + guarded) for comparison.
+    /// Default `false` (guarded; every existing call path byte-identical).
+    #[must_use]
+    pub fn passthrough(mut self, on: bool) -> Self {
+        self.passthrough = on;
         self
     }
 
@@ -805,6 +824,11 @@ impl SnubberNodeBuilder {
     #[must_use]
     pub fn build(self) -> SnubberNode {
         SnubberNode {
+            // Passthrough law sealed OUTSIDE the mutex: transit never locks.
+            // `name` is Copy-mirrored for lock-free arming stamps.
+            passthrough: self.passthrough,
+            passthrough_name: self.name,
+            passthrough_admissions: Arc::new(AtomicU64::new(0)),
             inner: Arc::new(Mutex::new(NodeInner {
                 name: self.name,
                 max_in_flight: self.max_in_flight,
@@ -1196,6 +1220,15 @@ impl<const IN_FLIGHT: usize, const QUEUE: usize> StaticNode<IN_FLIGHT, QUEUE> {
 #[derive(Clone)]
 pub struct SnubberNode {
     inner: Arc<Mutex<NodeInner>>,
+    /// Builder-sealed pass-through law (immutable after `build()`).
+    /// Outside the mutex: transit reads it without locking.
+    passthrough: bool,
+    /// Node name mirrored outside the mutex (`&'static str`, `Copy`):
+    /// sealed at build, stamps dummy arming records without locking.
+    passthrough_name: &'static str,
+    /// Lock-free transit counter (`Relaxed`): every dummy admission bumps
+    /// it without touching the mutex. Read via `stats()` / observer.
+    passthrough_admissions: Arc<AtomicU64>,
 }
 
 impl SnubberNode {
@@ -1412,7 +1445,31 @@ impl SnubberNode {
     // reset_breaker, stats, take_alert, reported.
     pub fn stats(&self) -> SnubberStats {
         self.reap_timeouts();
-        self.lock().stats.clone()
+        let mut stats = self.lock().stats.clone();
+        // Pass-through column: lock-free read, filled outside the mutex.
+        stats.passthrough_admissions = self.passthrough_admissions.load(Ordering::Relaxed);
+        stats
+    }
+
+    /// Builder-sealed pass-through law: `true` = open doors (canary mode).
+    /// Immutable after `build()` — no runtime toggle.
+    #[must_use]
+    pub fn is_passthrough(&self) -> bool {
+        self.passthrough
+    }
+
+    /// Lock-free transit count observer (`Relaxed`).
+    /// Cheap enough for asserts; do not poll it in a hot loop.
+    #[must_use]
+    pub fn passthrough_count(&self) -> u64 {
+        self.passthrough_admissions.load(Ordering::Relaxed)
+    }
+
+    /// Node name mirrored outside the mutex (`&'static str`, `Copy`,
+    /// sealed at build): stamps dummy arming records with zero locking.
+    /// Guarded paths keep using the locked read.
+    fn passthrough_name(&self) -> &'static str {
+        self.passthrough_name
     }
 
     /// Instant health snapshot — ergonomic alias of [`SnubberNode::stats`].
@@ -1843,6 +1900,16 @@ impl SnubberNode {
         task_id: u64,
         rollback: F,
     ) -> Result<crate::ErasedGuard, EnterError> {
+        // Pass-through transit: count lock-free, drop the user rollback
+        // UNINVOKED, hand back an empty erased guard (its Drop runs `|| {}`,
+        // a no-op — hardware stays dirty by construction). No probe, no
+        // slot, no EpochGate. The `epoch`/`task_id` args are ignored.
+        if self.passthrough {
+            self.passthrough_admissions.fetch_add(1, Ordering::Relaxed);
+            let _ = rollback;
+            let _ = (epoch, task_id);
+            return Ok(crate::ErasedGuard::new(|| {}));
+        }
         // Single admission: reserve slot + epoch, commit the probe so the
         // books are clean, then hand the user a nameable rollback owner.
         // Rejection returns BEFORE boxing: zero cost on the cold path.
@@ -2433,6 +2500,13 @@ impl SnubberNode {
         priority: Priority,
         rollback: F,
     ) -> Result<TrackedGuard<F>, EnterError> {
+        // Pass-through transit (canary law, sealed at build): open doors —
+        // count lock-free, drop the rollback UNINVOKED (`let _` frees its
+        // captures without running the body), return a dummy guard that
+        // never touches slots/breaker/EpochGate. BEFORE any lock.
+        if self.passthrough {
+            return Ok(self.enter_passthrough_dummy(arming, rollback));
+        }
         let header = arming.header;
         let epoch = header.epoch;
         let task_id = header.task_id;
@@ -2728,6 +2802,7 @@ impl SnubberNode {
             guard: Some(super::SnubberGuard::new(epoch, task_id, rollback)),
             arming,
             settled: false,
+            is_passthrough: false,
             is_probe: was_half_open,
             priority,
             armed_at_ms: now_ms(),
@@ -2741,6 +2816,39 @@ impl SnubberNode {
             queue_wait_ms: 0,
             retry_count: 0,
         })
+    }
+
+    /// Pass-through dummy admission (canary law): lock-free count, drop the
+    /// user rollback UNINVOKED, return a guard that settles to no-op.
+    /// `let _ = rollback;` frees the closure captures WITHOUT executing
+    /// the body — the foreign resource stays dirty by construction.
+    fn enter_passthrough_dummy<F: FnOnce()>(
+        &self,
+        arming: FaultRecord,
+        rollback: F,
+    ) -> TrackedGuard<F> {
+        self.passthrough_admissions.fetch_add(1, Ordering::Relaxed);
+        let _ = rollback;
+        TrackedGuard {
+            node: self.inner.clone(),
+            node_name: arming.node,
+            guard: None,
+            arming,
+            settled: false,
+            is_passthrough: true,
+            is_probe: false,
+            priority: Priority::Normal,
+            armed_at_ms: now_ms(),
+            deadline_ms: 0,
+            cpu_budget_ms: 0,
+            stall_ceiling_ms: 0,
+            cpu_sampler: None,
+            armed_cpu_ms: 0,
+            stage: 0,
+            stage_label: None,
+            queue_wait_ms: 0,
+            retry_count: 0,
+        }
     }
 
     /// Manually close the breaker after an external recovery.
@@ -2807,6 +2915,26 @@ impl SnubberNode {
         waker: &core::task::Waker,
         enqueued_at_ms: u64,
     ) -> core::task::Poll<Result<TrackedGuard<F>, EnterError>> {
+        // Pass-through transit: ready dummy NOW, never park a Waker.
+        // Consumes the rollback UNINVOKED (`take` + `let _` frees captures
+        // without running the body). No lock, no queue, no EpochGate.
+        if self.passthrough {
+            let rb = rollback.take().expect("rollback present on admission");
+            let arming = FaultRecord {
+                kind: FaultKind::ImplicitDrop,
+                node: self.passthrough_name(),
+                file: loc.file(),
+                line: loc.line(),
+                header: TransactionHeader::new(epoch, task_id),
+                detail: None,
+                stage: 0,
+                stage_label: None,
+                queue_wait_ms: 0,
+                elapsed_ms: 0,
+                retry_count: 0,
+            };
+            return core::task::Poll::Ready(Ok(self.enter_passthrough_dummy(arming, rb)));
+        }
         let now = now_ms();
         let wait_ms = now.saturating_sub(enqueued_at_ms);
         let header = TransactionHeader::new(epoch, task_id);
@@ -3040,6 +3168,7 @@ impl SnubberNode {
             armed_cpu_ms: 0,
             armed_at_ms: now,
             settled: false,
+            is_passthrough: false,
             is_probe,
             priority: Priority::Normal,
             stage: 0,
@@ -3124,6 +3253,11 @@ impl SnubberNode {
             window_outcomes: s.window_outcomes,
             window_failures: s.window_failures,
             poison_recoveries: s.poison_recoveries,
+            // Pass-through column lives outside the mutex (lock-free atomic);
+            // `stats()` fills it after the lock. Internal snapshots copy the
+            // mirrored value (0 on guarded nodes, untouched on transit —
+            // transit never emits hooks).
+            passthrough_admissions: s.passthrough_admissions,
             last_fault: None,
             reported: s.reported,
         }
@@ -3457,6 +3591,9 @@ pub struct TrackedGuard<F: FnOnce()> {
     guard: Option<super::SnubberGuard<F>>,
     arming: FaultRecord,
     settled: bool,
+    /// Canary law: dummy transit guard — settles to no-op, never runs
+    /// rollback, never touches slots/breaker/wakers.
+    is_passthrough: bool,
     is_probe: bool,
     priority: Priority,
     armed_at_ms: u64,
@@ -3682,7 +3819,16 @@ impl<F: FnOnce()> TrackedGuard<F> {
 
     /// Success path: hardware rollback disarmed, books settled.
     /// Wakes ONE parked `enter_async` waiter (outside the lock, PHASE B).
+    /// Pass-through dummy: no-op — mark settled, return Committed, touch nothing.
     pub fn commit(mut self) -> SnubberEvent<()> {
+        if self.is_passthrough {
+            self.settled = true;
+            let event = SnubberEvent::Committed {
+                header: self.arming.header,
+            };
+            core::mem::forget(self);
+            return event;
+        }
         let guard = self.guard.take().expect("guard already settled");
         let event = guard.commit();
         self.settled = true;
@@ -3729,6 +3875,11 @@ impl<F: FnOnce()> TrackedGuard<F> {
     ///   settle identically; the caller MUST stop working and propagate —
     ///   transaction already settled.
     pub fn check_timeout(mut self) -> Result<Self, TimeoutCheck> {
+        // Pass-through dummy: no deadline armed (deadline_ms = 0 by
+        // construction) — always within budget, never settles.
+        if self.is_passthrough {
+            return Ok(self);
+        }
         if self.settled {
             return Ok(self);
         }
@@ -3847,7 +3998,17 @@ impl<F: FnOnce()> TrackedGuard<F> {
     /// Sliding-window position for dashboards: `(outcomes, failures)` in
     /// the current open window. Mirrored into `SnubberStats` on settle.
     /// Planned failure path: rollback NOW, no breaker trip.
+    /// Pass-through dummy: no-op — mark settled, return Aborted, touch nothing.
     pub fn abort(mut self, reason: &'static str) -> SnubberEvent<()> {
+        if self.is_passthrough {
+            self.settled = true;
+            let event = SnubberEvent::Aborted {
+                header: self.arming.header,
+                reason,
+            };
+            core::mem::forget(self);
+            return event;
+        }
         let guard = self.guard.take().expect("guard already settled");
         let event = guard.abort(reason);
         self.settled = true;
@@ -3889,7 +4050,13 @@ impl<F: FnOnce()> TrackedGuard<F> {
     /// success, `?`, panic, timeout — the counter always comes home.
     /// `EvictOldest` admission deliberately overbooks by one (the evicted
     /// owner's drop settles as its own implicit-drop — honest accounting).
+    /// Pass-through dummy: mark settled, touch nothing (rollback already
+    /// dropped uninvoked at admission; books never saw this guard).
     fn settle_implicit(&mut self) {
+        if self.is_passthrough {
+            self.settled = true;
+            return;
+        }
         self.settled = true;
         let stage = self.stage;
         let lane = self.priority.code().min(2) as usize;
