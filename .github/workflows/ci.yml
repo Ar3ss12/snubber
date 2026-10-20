@@ -41,6 +41,12 @@ jobs:
       - name: Validate Documentation Links (cargo doc)
         run: cargo doc --no-deps --all-features
 
+      - name: Package Integrity (dry-run publish)
+        run: cargo publish --dry-run
+
+      - name: Package Integrity (dry-run publish)
+        run: cargo publish --dry-run
+
   # 2. CROSS-PLATFORM TEST SUITE: Linux, Windows, macOS
   test-matrix:
     name: Test on ${{ matrix.os }}
@@ -121,6 +127,18 @@ jobs:
           cargo miri test --test transition_orphan
           cargo miri test --test regression_postmortems
           cargo miri test --test clock_pulse
+          cargo miri test --test affordances
+          cargo miri test --test channel_throttle
+          cargo miri test --test frame_fuzz
+          cargo miri test --test industrial
+          cargo miri test --test state_handoff
+          cargo miri test --test worker_lifecycle
+          cargo miri test --test affordances
+          cargo miri test --test channel_throttle
+          cargo miri test --test frame_fuzz
+          cargo miri test --test industrial
+          cargo miri test --test state_handoff
+          cargo miri test --test worker_lifecycle
 
   # 4. BENCHMARK COMPILE CHECK: verifies bench crate compiles (no measurement on CI)
   bench-check:

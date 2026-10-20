@@ -80,3 +80,28 @@ fn test_low_level_entries_point_at_canonical() {
         "TRIPWIRE FIRED: canonical header missing from enter_erased_auto.",
     );
 }
+
+/// README test-count badge must mirror the declared totals in AGENTS.md.
+///
+/// Manual badge numbers rot: one added test without a badge bump = README
+/// lies. This gate pins the badge to the AGENTS.md totals line so any
+/// count move without a badge sync goes red in CI.
+#[test]
+fn test_readme_badge_mirrors_agent_totals() {
+    let agents = std::fs::read_to_string("AGENTS.md").expect("read AGENTS.md");
+    let readme = std::fs::read_to_string("README.md").expect("read README.md");
+    // AGENTS.md §0 declares: `cargo test` today = **214 passed** ...
+    // + 23 doc-tests = **237 green**.
+    for pin in ["**214 passed**", "+ 23 doc-tests", "**237 green**"] {
+        assert!(
+            agents.contains(pin),
+            "TRIPWIRE FIRED: AGENTS.md lost totals pin '{pin}' — update §0",
+        );
+    }
+    // README badge must carry the same grand total.
+    assert!(
+        readme.contains("tests-237%20passed"),
+        "TRIPWIRE FIRED: README badge drifted from AGENTS.md totals — \
+         sync the tests badge with the §0 grand total",
+    );
+}

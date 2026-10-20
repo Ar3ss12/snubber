@@ -171,8 +171,7 @@ incremental cache (`os error 32` here, `os error 1455` there):
 | features | `cargo check --no-default-features` | ok |
 | bench compile | `cargo bench --bench admission_bench --no-run` | ok |
 | miri (lib UB check) | `cargo +nightly miri test --lib` | 6 unit tests ok (0 UB) |
-| miri (integration suite) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test guard --test scoped_transactions --test erased --test invariants --test watchdog --test memory_boundary --test presets --test supervisor` | integration tests ok (0 UB) |
-| miri (new cold suites) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test diagnostics --test fault_classification --test clock_pulse` | tests ok (0 UB) |
+| miri (integration suites) | `$env:MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"; cargo +nightly miri test --test guard --test scoped_transactions --test erased --test invariants --test watchdog --test memory_boundary --test presets --test supervisor --test supervisor_restart --test diagnostics --test fault_classification --test clock_pulse --test affordances --test channel_throttle --test frame_fuzz --test industrial --test state_handoff --test worker_lifecycle` (lib + 32 suites, 0 UB) |
 | clean rebuild | `rmdir /s /q target` then the gates above | — |
 
 
