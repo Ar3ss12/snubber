@@ -615,6 +615,231 @@ pub fn write_health<W: fmt::Write>(
     Ok(())
 }
 
+/// Counter deltas between two snapshots of the SAME node.
+///
+/// `before.diff(&after)` = `after - before`, every field saturating:
+/// a restarted process (generation bump, counters reset) yields zeros,
+/// never underflow. Pure `Copy` math — no wire change, no IO, no alloc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SnapshotDiff {
+    /// New admissions.
+    pub total_started: u64,
+    /// New clean commits.
+    pub committed: u64,
+    /// New planned aborts.
+    pub explicit_aborts: u64,
+    /// New implicit drops.
+    pub implicit_drops: u64,
+    /// New payload rejections.
+    pub poisoned_rejected: u64,
+    /// New stale-epoch cuts.
+    pub stale_epochs_rejected: u64,
+    /// New bulkhead rejections.
+    pub bulkhead_rejections: u64,
+    /// New evictions.
+    pub evicted: u64,
+    /// New preemptions.
+    pub preempted: u64,
+    /// New breaker fast rejections.
+    pub breaker_rejections: u64,
+    /// New breaker trips.
+    pub breaker_trips: u64,
+    /// New watchdog timeouts.
+    pub timeouts_fired: u64,
+    /// New rate rejections.
+    pub rate_rejected: u64,
+    /// New sliding-window outcomes.
+    pub window_outcomes: u64,
+    /// New sliding-window failures.
+    pub window_failures: u64,
+    /// New poison recoveries.
+    pub poison_recoveries: u64,
+    /// Generation delta (0 unless the process restarted).
+    pub generation: u64,
+    /// Per-kind report deltas ([`super::FaultKind::index`] order).
+    pub reported: [u64; super::FaultKind::COUNT],
+    /// New missed pulses.
+    pub pulse_stalls: u64,
+    /// Growth of the worst pulse lag.
+    pub max_pulse_lag_ms: u64,
+    /// Breaker position before the window (0 Closed, 1 Open, 2 HalfOpen).
+    pub breaker_state_from: u8,
+    /// Breaker position after the window.
+    pub breaker_state_to: u8,
+}
+
+impl SnapshotDiff {
+    /// No counter moved and the breaker position stayed put.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.total_started == 0
+            && self.committed == 0
+            && self.explicit_aborts == 0
+            && self.implicit_drops == 0
+            && self.poisoned_rejected == 0
+            && self.stale_epochs_rejected == 0
+            && self.bulkhead_rejections == 0
+            && self.evicted == 0
+            && self.preempted == 0
+            && self.breaker_rejections == 0
+            && self.breaker_trips == 0
+            && self.timeouts_fired == 0
+            && self.rate_rejected == 0
+            && self.window_outcomes == 0
+            && self.window_failures == 0
+            && self.poison_recoveries == 0
+            && self.generation == 0
+            && self.reported.iter().all(|&v| v == 0)
+            && self.pulse_stalls == 0
+            && self.max_pulse_lag_ms == 0
+            && self.breaker_state_from == self.breaker_state_to
+    }
+
+    /// Catastrophic deltas: panic + timeout + process-died + implicit drops.
+    #[must_use]
+    pub fn catastrophic_faults(&self) -> u64 {
+        self.reported[super::FaultKind::Panic.index()]
+            .saturating_add(self.reported[super::FaultKind::Timeout.index()])
+            .saturating_add(self.reported[super::FaultKind::ProcessDied.index()])
+            .saturating_add(self.implicit_drops)
+    }
+
+    /// Three ASCII lines into any `fmt::Write` (no allocation).
+    pub fn write_summary(&self, w: &mut impl fmt::Write) -> fmt::Result {
+        writeln!(
+            w,
+            "diff: admitted +{} committed +{} aborted +{} dropped +{}",
+            self.total_started, self.committed, self.explicit_aborts, self.implicit_drops
+        )?;
+        writeln!(
+            w,
+            "      bulkhead +{} evicted +{} preempted +{} rate +{} stale +{}",
+            self.bulkhead_rejections,
+            self.evicted,
+            self.preempted,
+            self.rate_rejected,
+            self.stale_epochs_rejected
+        )?;
+        writeln!(
+            w,
+            "      breaker {}->{} trips +{} timeouts +{} pulse +{} lag +{}ms",
+            breaker_name(self.breaker_state_from),
+            breaker_name(self.breaker_state_to),
+            self.breaker_trips,
+            self.timeouts_fired,
+            self.pulse_stalls,
+            self.max_pulse_lag_ms
+        )
+    }
+}
+
+impl SnapshotV1 {
+    /// Deltas from `self` (earlier) to `later` for the same node.
+    ///
+    /// All subtraction is saturating, so sampling across a process
+    /// restart degrades to zeros instead of wrapping.
+    #[must_use]
+    pub fn diff(&self, later: &Self) -> SnapshotDiff {
+        let d = |before: u64, after: u64| after.saturating_sub(before);
+        let mut reported = [0u64; super::FaultKind::COUNT];
+        for (slot, (&a, &b)) in reported
+            .iter_mut()
+            .zip(self.reported.iter().zip(later.reported.iter()))
+        {
+            *slot = b.saturating_sub(a);
+        }
+        SnapshotDiff {
+            total_started: d(self.total_started, later.total_started),
+            committed: d(self.committed, later.committed),
+            explicit_aborts: d(self.explicit_aborts, later.explicit_aborts),
+            implicit_drops: d(self.implicit_drops, later.implicit_drops),
+            poisoned_rejected: d(self.poisoned_rejected, later.poisoned_rejected),
+            stale_epochs_rejected: d(self.stale_epochs_rejected, later.stale_epochs_rejected),
+            bulkhead_rejections: d(self.bulkhead_rejections, later.bulkhead_rejections),
+            evicted: d(self.evicted, later.evicted),
+            preempted: d(self.preempted, later.preempted),
+            breaker_rejections: d(self.breaker_rejections, later.breaker_rejections),
+            breaker_trips: d(self.breaker_trips, later.breaker_trips),
+            timeouts_fired: d(self.timeouts_fired, later.timeouts_fired),
+            rate_rejected: d(self.rate_rejected, later.rate_rejected),
+            window_outcomes: d(self.window_outcomes, later.window_outcomes),
+            window_failures: d(self.window_failures, later.window_failures),
+            poison_recoveries: d(self.poison_recoveries, later.poison_recoveries),
+            generation: d(self.generation, later.generation),
+            reported,
+            pulse_stalls: d(self.pulse_stalls, later.pulse_stalls),
+            max_pulse_lag_ms: d(self.max_pulse_lag_ms, later.max_pulse_lag_ms),
+            breaker_state_from: self.breaker_state,
+            breaker_state_to: later.breaker_state,
+        }
+    }
+}
+
+/// Breaker position code as text (`0/1/2` → `CLOSED/OPEN/HALF`).
+#[must_use]
+fn breaker_name(code: u8) -> &'static str {
+    match code {
+        1 => "OPEN",
+        2 => "HALF",
+        _ => "CLOSED",
+    }
+}
+
+/// ASCII triage card for one node's cold snapshot (no allocation).
+///
+/// One verdict line + five counters lines, safe to `fmt::Write` into a
+/// stack buffer or a log sink on a cold path. Percentages use `u128`
+/// and a `total == 0` guard.
+pub fn write_triage(w: &mut impl fmt::Write, node: &str, snap: &SnapshotV1) -> fmt::Result {
+    let total = snap.admission_total();
+    let commit_pct = if total == 0 {
+        0
+    } else {
+        ((snap.committed as u128 * 100) / total as u128).min(100) as u8
+    };
+    let shed = snap
+        .shed_bulkhead()
+        .saturating_add(snap.shed_rate())
+        .saturating_add(snap.shed_stale())
+        .saturating_add(snap.shed_preempted());
+    let verdict = if snap.catastrophic_faults() > 0 {
+        "CRIT"
+    } else if shed > 0 || snap.pulse_stalls > 0 || snap.breaker_state != 0 {
+        "WARN"
+    } else {
+        "OK"
+    };
+    writeln!(w, "[SNUBBER TRIAGE] node=\"{node}\" verdict={verdict}")?;
+    writeln!(w, "  breaker  {}", breaker_name(snap.breaker_state))?;
+    writeln!(
+        w,
+        "  admits   {} (committed {} / {}%)",
+        total, snap.committed, commit_pct
+    )?;
+    writeln!(
+        w,
+        "  faults   drops={} panics={} timeouts={} died={}",
+        snap.implicit_drops,
+        snap.reported[super::FaultKind::Panic.index()],
+        snap.reported[super::FaultKind::Timeout.index()],
+        snap.reported[super::FaultKind::ProcessDied.index()]
+    )?;
+    writeln!(
+        w,
+        "  shed     bulk={} evict={} rate={} stale={} preempt={}",
+        snap.shed_bulkhead(),
+        snap.evicted,
+        snap.shed_rate(),
+        snap.shed_stale(),
+        snap.shed_preempted()
+    )?;
+    writeln!(
+        w,
+        "  pulse    stalls={} lag={}ms",
+        snap.pulse_stalls, snap.max_pulse_lag_ms
+    )
+}
+
 /// Std convenience: print the pulse table to stderr (dev hotkey /
 /// telemetry console trigger). Cold path — snapshot first, render outside the lock.
 #[cfg(feature = "std")]

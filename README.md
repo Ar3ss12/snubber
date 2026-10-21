@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-242%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-249%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -85,8 +85,10 @@ Measured on AMD Ryzen 5 4600H release build
 | `node.note_pulse_stall(lag_ms)` | Layer 2 (`std`) | **1 atomic max** | Missed heartbeat lands in `SnapshotV1` v3 + `AnomalyKind::PulseStall` |
 | `process_token.to_bytes()` | Layer 4 (`core`) | **~7.5 ns** | 44-byte framed wire serialization (`to_le_bytes`) |
 | `state_digest.crc()` | Layer 4 (`core`) | **~261 ns** | 64-byte hardware cache line digest verification |
+| `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | Layer 2 (`std`, opt-in) | 1 `Box` + 1 clock/stage | Stage wall/CPU breakdown; default `enter*` reads no profile clock |
 | `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.1 µs** | 512-byte zero-allocation snapshot CRC32 codec |
 | `snapshot_v1()` + `find_anomalies()` | Layer 5 (cold) | **512 B, CRC32** | Zero-allocation telemetry; `assert_no_anomalies!()` CI gate |
+| `before.diff(&after)` + `write_triage` | Layer 5 (cold) | pure `Copy` math + `fmt::Write` | Counter deltas since last sample; one ASCII verdict card |
 
 ### ⚡ Contended Multi-Threaded Latencies (Real Cross-Core Saturation)
 Measured with half of available hardware cores active (6 concurrent threads under contention, AMD Ryzen 5 4600H):
@@ -106,10 +108,10 @@ Measured with half of available hardware cores active (6 concurrent threads unde
 * 📘 **[User Guide (`docs/USER_GUIDE.md`)](docs/USER_GUIDE.md)** — Comprehensive architecture manual:
   * **Layer 1: Core RAII Guard:** Stack rollback, `EpochGate`, and universal ergonomics (`scoped`, `scoped_checked`, `snub_check!`).
   * **Layer 1.5: Hang Classification:** Monotonic clock (`MonotonicMs` / `SystemClock`), CPU-spin classifier (`classify_stall`, `TimedOut` vs `SpinDetected`), 8-byte `WorkerPulse` heartbeat + `WdtSink`, ISR bridge (`IsrBridge`, 80 B SPSC ring + 32-bit trip latch, `IsrBridge::trip` bypasses `Full`), idle-park (`IdlePark` / `wfi`/`wfe` on firmware, `wfe` needs `SEVONPEND=1` at boot), pulse black-box (`pulse_stalls` + `PulseStall` anomaly, snapshot v3).
-  * **Layer 2: Concurrency Bulkhead:** `SnubberNode`, presets, token buckets, sliding-window breakers, priority preemption, and builder-sealed `passthrough` canary transit.
+  * **Layer 2: Concurrency Bulkhead:** `SnubberNode`, presets, token buckets, sliding-window breakers, priority preemption, builder-sealed `passthrough` canary transit, and opt-in execution profiles (`enter_auto_profiled` → `commit_profiled`).
   * **Layer 3: Async Waker Queue:** Runtime-agnostic async execution (`enter_async_auto`, `settle_async`, `enter_paced_async`).
   * **Layer 4: Process Supervisor:** Out-of-process process supervisor, framed IPC tokens, `PipeDrain`, and generation bumps.
-  * **Layer 5: Diagnostics & Health:** Zero-allocation telemetry, `SnapshotV1`, anomaly detection, and CI verification gates.
+  * **Layer 5: Diagnostics & Health:** Zero-allocation telemetry, `SnapshotV1`, anomaly detection, `SnapshotDiff`, ASCII triage card, and CI verification gates.
 
 ---
 

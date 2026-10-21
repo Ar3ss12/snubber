@@ -187,17 +187,12 @@ fn retry_count_tracking_in_guard_and_snapshot() {
 }
 
 #[test]
-fn payload_budget_and_storage_kind_enforced() {
+fn payload_budget_enforced() {
     let node = SnubberNode::builder("test_budget")
         .payload_budget(1024)
-        .queue_storage(snubber::StorageKind::LockFreeRing)
         .build();
 
     assert_eq!(node.payload_budget_bytes(), 1024);
-    assert_eq!(
-        node.queue_storage_kind(),
-        snubber::StorageKind::LockFreeRing
-    );
 
     // Payload within budget passes
     let g1 = node
@@ -267,4 +262,13 @@ fn futures_lite_fake_waker_id(id: usize) -> core::task::Waker {
     unsafe fn drop(_: *const ()) {}
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
     unsafe { core::task::Waker::from_raw(RawWaker::new(id as *const (), &VTABLE)) }
+}
+
+#[test]
+fn queue_gauges_report_waiter_buffer() {
+    let node = SnubberNode::builder("queue_gauge")
+        .queue_capacity(8)
+        .build();
+    assert_eq!(node.queue_capacity(), 8);
+    assert_eq!(node.queue_depth(), 0);
 }

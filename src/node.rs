@@ -309,18 +309,6 @@ impl SnubberStats {
     }
 }
 
-/// Where wait queue entries live.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum StorageKind {
-    /// In-memory queue buffer (`VecDeque` of wakers/slots).
-    #[default]
-    InMemory,
-    /// Fast lock-free ring buffer for ultra-high CPS paths.
-    LockFreeRing,
-    /// External pipe / IPC stream storage.
-    ExternalPipe,
-}
-
 /// What to do when the bulkhead is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum OverflowPolicy {
@@ -458,7 +446,6 @@ pub struct SnubberNodeBuilder {
     stall_ceiling_ms: u64,
     task_ttl_ms: u64,
     payload_budget_bytes: usize,
-    storage: StorageKind,
     rate_per_sec: u32,
     fallback: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     console_cap: usize,
@@ -488,7 +475,6 @@ impl SnubberNodeBuilder {
             stall_ceiling_ms: 0,
             task_ttl_ms: 0,
             payload_budget_bytes: 0,
-            storage: StorageKind::InMemory,
             rate_per_sec: 0,
             fallback: None,
             console_cap: 8,
@@ -544,13 +530,6 @@ impl SnubberNodeBuilder {
     #[must_use]
     pub fn payload_budget(mut self, bytes: usize) -> Self {
         self.payload_budget_bytes = bytes;
-        self
-    }
-
-    /// Storage location for the wait queue entries.
-    #[must_use]
-    pub fn queue_storage(mut self, storage: StorageKind) -> Self {
-        self.storage = storage;
         self
     }
 
@@ -842,7 +821,6 @@ impl SnubberNodeBuilder {
                 stall_ceiling_ms: self.stall_ceiling_ms,
                 task_ttl_ms: self.task_ttl_ms,
                 payload_budget_bytes: self.payload_budget_bytes,
-                storage: self.storage,
                 rate_per_sec: self.rate_per_sec,
                 rate_tokens: self.rate_per_sec as f64,
                 rate_last_ms: now_ms(),
@@ -894,7 +872,6 @@ struct NodeInner {
     stall_ceiling_ms: u64,
     task_ttl_ms: u64,
     payload_budget_bytes: usize,
-    storage: StorageKind,
     rate_per_sec: u32,
     rate_tokens: f64,
     rate_last_ms: u64,
@@ -1322,10 +1299,22 @@ impl SnubberNode {
         self.lock().payload_budget_bytes
     }
 
-    /// Configured queue storage kind.
+    /// Async waiter queue depth right now (`waiters.len()`).
+    ///
+    /// Only the async admission path parks tasks in a queue. A synchronous
+    /// node has no waiter queue: `RejectNew` refuses immediately, and
+    /// `BlockCaller`/`AdaptiveBlock` park the caller thread in place —
+    /// that time is reported by `TrackedGuard::queue_wait_ms` instead.
     #[must_use]
-    pub fn queue_storage_kind(&self) -> StorageKind {
-        self.lock().storage
+    pub fn queue_depth(&self) -> usize {
+        self.lock().waiters.len()
+    }
+
+    /// Hard ceiling for [`queue_depth`](Self::queue_depth)
+    /// (`queue_limit` / `queue_capacity` builder knob).
+    #[must_use]
+    pub fn queue_capacity(&self) -> usize {
+        self.lock().queue_limit
     }
 
     /// Admit checking payload budget first. If `payload_size > payload_budget_bytes`,
@@ -1931,6 +1920,72 @@ impl SnubberNode {
     pub fn enter_auto<F: FnOnce()>(&self, rollback: F) -> Result<TrackedGuard<F>, EnterError> {
         let seq = self.next_sequence();
         self.enter(seq, seq, rollback)
+    }
+
+    /// Arm a guard with an execution profile, auto sequence IDs, `std` clock.
+    ///
+    /// Same admission pipeline as [`enter_auto`](Self::enter_auto); the
+    /// returned guard carries a boxed [`ProfileState`] so
+    /// [`TrackedGuard::checkpoint_timed`] and
+    /// [`TrackedGuard::commit_profiled`] can attribute wall/CPU time.
+    /// Plain `enter_auto` reads no clock and allocates nothing.
+    #[track_caller]
+    pub fn enter_auto_profiled<F: FnOnce()>(
+        &self,
+        rollback: F,
+    ) -> Result<TrackedGuard<F>, EnterError> {
+        self.enter_profiled_with_clock(std_mono_ns, None, rollback)
+    }
+
+    /// Arm a profiled guard with explicit epoch / task-id coordinates.
+    #[track_caller]
+    pub fn enter_profiled<F: FnOnce()>(
+        &self,
+        epoch: u64,
+        task_id: u64,
+        rollback: F,
+    ) -> Result<TrackedGuard<F>, EnterError> {
+        self.attach_profile(epoch, task_id, std_mono_ns, None, rollback)
+    }
+
+    /// Arm a profiled guard with injected nanosecond clocks.
+    ///
+    /// `wall` is required; `cpu` is the on-CPU sampler (same shape as
+    /// [`TrackedGuard::with_cpu_sampler`] but nanosecond). Auto sequence
+    /// IDs. Fake clocks in tests make every duration deterministic.
+    #[track_caller]
+    pub fn enter_profiled_with_clock<F: FnOnce()>(
+        &self,
+        wall: NanoClock,
+        cpu: Option<NanoClock>,
+        rollback: F,
+    ) -> Result<TrackedGuard<F>, EnterError> {
+        let seq = self.next_sequence();
+        self.attach_profile(seq, seq, wall, cpu, rollback)
+    }
+
+    #[track_caller]
+    fn attach_profile<F: FnOnce()>(
+        &self,
+        epoch: u64,
+        task_id: u64,
+        wall: NanoClock,
+        cpu: Option<NanoClock>,
+        rollback: F,
+    ) -> Result<TrackedGuard<F>, EnterError> {
+        let t_enter = wall();
+        let cpu_admit = cpu.map(|f| f()).unwrap_or(0);
+        let mut guard = self.enter(epoch, task_id, rollback)?;
+        let t_admit = wall();
+        guard.profile = Some(Box::new(ProfileState::new(
+            wall,
+            cpu,
+            t_enter,
+            t_admit,
+            cpu_admit,
+            guard.queue_wait_ms,
+        )));
+        Ok(guard)
     }
 
     /// ⚠️ *Low-level primitive.* If you are building a background worker or
@@ -2562,6 +2617,12 @@ impl SnubberNode {
             return Err(EnterError::StaleEpoch);
         }
 
+        // Caller-side parking time accumulated in the bulkhead branch.
+        // The caller is the queue here: `RejectNew` refuses immediately,
+        // `BlockCaller`/`AdaptiveBlock` sleep in place. The value lands in
+        // `FaultRecord.queue_wait_ms` and `TrackedGuard::queue_wait_ms`.
+        let mut parked_ms = 0u64;
+
         // 3. Bulkhead: bounded slots, policy-driven overflow.
         // `BlockCaller(ms)` per-kind action parks the CALLER (lock
         // released!) up to `ms`, then re-checks once. Admit if a slot freed,
@@ -2686,6 +2747,7 @@ impl SnubberNode {
                         }
                     }
                     let wait_ms = if legacy_ms > 0 { legacy_ms } else { park_ms };
+                    parked_ms = wait_ms;
                     if wait_ms > 0 {
                         drop(inner);
                         std::thread::sleep(core::time::Duration::from_millis(wait_ms));
@@ -2813,8 +2875,9 @@ impl SnubberNode {
             armed_cpu_ms: 0,
             stage: 0,
             stage_label: None,
-            queue_wait_ms: 0,
+            queue_wait_ms: parked_ms,
             retry_count: 0,
+            profile: None,
         })
     }
 
@@ -2848,6 +2911,7 @@ impl SnubberNode {
             stage_label: None,
             queue_wait_ms: 0,
             retry_count: 0,
+            profile: None,
         }
     }
 
@@ -2864,9 +2928,9 @@ impl SnubberNode {
     ///
     /// Returns a builder with the console reporter armed for at most
     /// `MAX_ERRORS` lines per node lifetime. The budget is a const
-    /// generic — `SnubberNode::<8>::capped("drv")` vs
-    /// `SnubberNode::<0>::capped("drv")` (silent) are different types
-    /// of intent, checked at compile time, with zero runtime cost.
+    /// generic — `SnubberNode::with_error_budget::<8>("drv")` vs
+    /// `SnubberNode::with_error_budget::<0>("drv")` (silent) are different
+    /// types of intent, checked at compile time, with zero runtime cost.
     ///
     /// When `MAX_ERRORS == 0` the node still records hooks + `stats()`,
     /// it just never prints.
@@ -3175,6 +3239,7 @@ impl SnubberNode {
             stage_label: None,
             queue_wait_ms: wait_ms,
             retry_count: 0,
+            profile: None,
         }))
     }
 
@@ -3569,6 +3634,336 @@ fn level_from_u32(v: u32) -> LogLevel {
         _ => LogLevel::Error,
     }
 }
+// [ANCHOR: PROFILE] — opt-in execution profile: four labeled stages,
+// zero clock reads on the default entry paths.
+/// Nanosecond monotonic clock injected by the app (or [`std_mono_ns`]).
+///
+/// Plain `fn() -> u64` — no closure, no alloc, no lock. Tests inject a
+/// fake clock (`static NOW_NS: AtomicU64`) through
+/// [`SnubberNode::enter_profiled_with_clock`].
+pub type NanoClock = fn() -> u64;
+
+/// Boot-relative nanosecond clock: the `std` default for profiling.
+///
+/// Same `Instant` origin as [`SystemClock`]; only the resolution differs.
+#[inline]
+#[must_use]
+pub fn std_mono_ns() -> u64 {
+    use std::time::Instant;
+    static ONCE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let boot = *ONCE.get_or_init(Instant::now);
+    boot.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+/// Stage slots carried inline by [`ExecutionProfile`] (no allocation).
+pub const PROFILE_STAGES: usize = 4;
+
+/// A CPU clock was attached: `work_cpu_us` and `cpu_utilization_pct` are real.
+pub const PROFILE_HAS_CPU: u16 = 1 << 0;
+/// At least one duration exceeded `u32` microseconds and was clamped.
+pub const PROFILE_SATURATED: u16 = 1 << 1;
+/// More than [`PROFILE_STAGES`] named stages were recorded; the rest merged.
+pub const PROFILE_STAGE_OVERFLOW: u16 = 1 << 2;
+
+/// How a timed stage spent its wall time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum StageKind {
+    /// On-CPU work (also the bucket for unnamed time inside the guard).
+    #[default]
+    Work = 0,
+    /// Waiting: sleep, external event, IO wait, parked slot.
+    Wait = 1,
+}
+
+impl StageKind {
+    /// `Copy` code for profiles crossing an FFI or log boundary.
+    #[inline]
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Work => 0,
+            Self::Wait => 1,
+        }
+    }
+
+    /// Decodes a code, saturating unknown values to [`StageKind::Work`].
+    #[inline]
+    #[must_use]
+    pub const fn from_code(code: u8) -> Self {
+        if code == 1 {
+            Self::Wait
+        } else {
+            Self::Work
+        }
+    }
+}
+
+/// One named stage of an [`ExecutionProfile`]: label + wall time + kind.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StageSpan {
+    /// Checkpoint label (`""` = unnamed segment, never stored).
+    pub label: &'static str,
+    /// Wall time attributed to this stage, microseconds.
+    pub wall_us: u32,
+    /// Work vs wait.
+    pub kind: StageKind,
+}
+
+/// Wall/CPU split of one guarded transaction, in microseconds.
+///
+/// Built only by the opt-in `enter_profiled*` + [`TrackedGuard::commit_profiled`]
+/// path: the default `enter`/`commit` never reads a profile clock.
+///
+/// Accounting is additive and non-overlapping:
+/// `dwell_us` (queue wait, before admission) + `work_wall_us` (guard
+/// lifetime up to the commit call) + `settle_us` (the commit call itself).
+/// `work_cpu_us` needs a CPU clock; without one [`Self::has_cpu`] is false.
+///
+/// Every duration saturates at `u32::MAX` microseconds (≈71 min) and raises
+/// [`PROFILE_SATURATED`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExecutionProfile {
+    /// Time spent inside the admission pipeline (`enter_*`).
+    pub admit_us: u32,
+    /// Pre-admission wait: sync caller parking (`queue_wait_ms`).
+    pub dwell_us: u32,
+    /// Guard lifetime from admission return to the commit call.
+    pub work_wall_us: u32,
+    /// CPU consumed inside the guard (`0` without a CPU clock).
+    pub work_cpu_us: u32,
+    /// The commit settlement itself (books + waker wake).
+    pub settle_us: u32,
+    /// Named stages recorded (at most [`PROFILE_STAGES`]).
+    pub stage_count: u8,
+    /// [`PROFILE_HAS_CPU`] | [`PROFILE_SATURATED`] | [`PROFILE_STAGE_OVERFLOW`].
+    pub flags: u16,
+    /// Recorded stages in checkpoint order; unused slots are zeroed.
+    pub stages: [StageSpan; PROFILE_STAGES],
+}
+
+// COMPILE-TIME GATE (64-bit): a 24-byte header + four 24-byte labeled
+// spans. Profile growth is a wire-format change for downstream loggers.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(core::mem::size_of::<StageSpan>() == 24);
+    assert!(core::mem::size_of::<ExecutionProfile>() == 120);
+};
+
+impl ExecutionProfile {
+    /// A CPU clock was attached at arming time.
+    #[inline]
+    #[must_use]
+    pub const fn has_cpu(&self) -> bool {
+        self.flags & PROFILE_HAS_CPU != 0
+    }
+
+    /// A duration was clamped at `u32::MAX` microseconds.
+    #[inline]
+    #[must_use]
+    pub const fn saturated(&self) -> bool {
+        self.flags & PROFILE_SATURATED != 0
+    }
+
+    /// More than [`PROFILE_STAGES`] named stages were recorded.
+    #[inline]
+    #[must_use]
+    pub const fn stage_overflow(&self) -> bool {
+        self.flags & PROFILE_STAGE_OVERFLOW != 0
+    }
+
+    /// CPU time as a percentage of guard wall time (0–100, saturating).
+    #[inline]
+    #[must_use]
+    pub fn cpu_utilization_pct(&self) -> u8 {
+        if self.work_wall_us == 0 {
+            return 0;
+        }
+        let pct = self.work_cpu_us as u64 * 100 / self.work_wall_us as u64;
+        pct.min(100) as u8
+    }
+
+    /// Guard spent under 20% CPU while holding a slot: IO-starved, not
+    /// compute-bound. Always `false` without a CPU clock.
+    #[inline]
+    #[must_use]
+    pub fn is_io_starved(&self) -> bool {
+        self.has_cpu() && self.cpu_utilization_pct() < 20
+    }
+
+    /// Longest recorded stage (`None` when no timed checkpoint ran).
+    #[must_use]
+    pub fn slowest_stage(&self) -> Option<StageSpan> {
+        self.stages[..self.stage_count as usize]
+            .iter()
+            .copied()
+            .max_by_key(|s| s.wall_us)
+    }
+
+    /// ASCII profile line + one line per stage (`fmt::Write`, no allocation).
+    pub fn write_summary(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+        writeln!(
+            out,
+            "profile admit={}us dwell={}us work={}us cpu={}us({}%) settle={}us stages={}{}{}",
+            self.admit_us,
+            self.dwell_us,
+            self.work_wall_us,
+            self.work_cpu_us,
+            self.cpu_utilization_pct(),
+            self.settle_us,
+            self.stage_count,
+            if self.saturated() { " sat" } else { "" },
+            if self.stage_overflow() {
+                " overflow"
+            } else {
+                ""
+            },
+        )?;
+        for span in &self.stages[..self.stage_count as usize] {
+            writeln!(
+                out,
+                "  {} {} {}us",
+                span.label,
+                match span.kind {
+                    StageKind::Work => "work",
+                    StageKind::Wait => "wait",
+                },
+                span.wall_us
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Boxed profiling state owned by one guard (opt-in only).
+struct ProfileState {
+    wall: NanoClock,
+    cpu: Option<NanoClock>,
+    last_ns: u64,
+    cpu_armed_ns: u64,
+    admit_ns: u64,
+    dwell_ns: u64,
+    work_ns: u64,
+    spans: [StageSpan; PROFILE_STAGES],
+    count: u8,
+    overflow: bool,
+    saturated: bool,
+    open_label: &'static str,
+    open_kind: StageKind,
+}
+
+/// Nanoseconds to saturated microseconds.
+#[inline]
+fn to_us(ns: u64) -> u32 {
+    (ns / 1_000).min(u32::MAX as u64) as u32
+}
+
+impl ProfileState {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        wall: NanoClock,
+        cpu: Option<NanoClock>,
+        t_enter: u64,
+        t_admit: u64,
+        cpu_admit: u64,
+        queue_wait_ms: u64,
+    ) -> Self {
+        Self {
+            wall,
+            cpu,
+            last_ns: t_admit,
+            cpu_armed_ns: cpu_admit,
+            admit_ns: t_admit.saturating_sub(t_enter),
+            dwell_ns: queue_wait_ms.saturating_mul(1_000_000),
+            work_ns: 0,
+            spans: [StageSpan::default(); PROFILE_STAGES],
+            count: 0,
+            overflow: false,
+            saturated: false,
+            open_label: "",
+            open_kind: StageKind::Work,
+        }
+    }
+
+    fn push_span(&mut self, label: &'static str, kind: StageKind, ns: u64) {
+        if label.is_empty() {
+            return;
+        }
+        if ns / 1_000 > u32::MAX as u64 {
+            self.saturated = true;
+        }
+        let idx = self.count as usize;
+        if idx < PROFILE_STAGES {
+            self.spans[idx] = StageSpan {
+                label,
+                wall_us: to_us(ns),
+                kind,
+            };
+            self.count += 1;
+        } else {
+            self.overflow = true;
+        }
+    }
+
+    fn checkpoint(&mut self, now: u64, label: &'static str, kind: StageKind) {
+        let delta = now.saturating_sub(self.last_ns);
+        self.work_ns = self.work_ns.saturating_add(delta);
+        let (prev_label, prev_kind) = (self.open_label, self.open_kind);
+        self.push_span(prev_label, prev_kind, delta);
+        self.last_ns = now;
+        self.open_label = label;
+        self.open_kind = kind;
+    }
+
+    fn snapshot_at(&self, now: u64, cpu_now: u64) -> ExecutionProfile {
+        let trailing = now.saturating_sub(self.last_ns);
+        let work_ns = self.work_ns.saturating_add(trailing);
+        let mut stages = self.spans;
+        let mut count = self.count;
+        let mut overflow = self.overflow;
+        if !self.open_label.is_empty() {
+            if (count as usize) < PROFILE_STAGES {
+                stages[count as usize] = StageSpan {
+                    label: self.open_label,
+                    wall_us: to_us(trailing),
+                    kind: self.open_kind,
+                };
+                count += 1;
+            } else {
+                overflow = true;
+            }
+        }
+        let mut flags = 0u16;
+        if self.cpu.is_some() {
+            flags |= PROFILE_HAS_CPU;
+        }
+        if overflow {
+            flags |= PROFILE_STAGE_OVERFLOW;
+        }
+        let ceiling = u32::MAX as u64 * 1_000;
+        if self.saturated || work_ns > ceiling || self.admit_ns > ceiling || self.dwell_ns > ceiling
+        {
+            flags |= PROFILE_SATURATED;
+        }
+        ExecutionProfile {
+            admit_us: to_us(self.admit_ns),
+            dwell_us: to_us(self.dwell_ns),
+            work_wall_us: to_us(work_ns),
+            work_cpu_us: if self.cpu.is_some() {
+                to_us(cpu_now.saturating_sub(self.cpu_armed_ns))
+            } else {
+                0
+            },
+            settle_us: 0,
+            stage_count: count,
+            flags,
+            stages,
+        }
+    }
+}
+
 /// Guard armed through a [`SnubberNode`]: records telemetry on settlement.
 ///
 /// * `commit()` → `committed` saturating_add(1), breaker failure streak reset
@@ -3606,6 +4001,9 @@ pub struct TrackedGuard<F: FnOnce()> {
     stage_label: Option<&'static str>,
     queue_wait_ms: u64,
     retry_count: u32,
+    /// Opt-in execution profile state. `None` on every default entry path:
+    /// no clock is read and the guard carries one pointer-sized field.
+    profile: Option<Box<ProfileState>>,
 }
 
 /// Watchdog outcome for [`TrackedGuard::check_timeout`].
@@ -3679,6 +4077,59 @@ impl<F: FnOnce()> TrackedGuard<F> {
     pub fn checkpoint(&mut self, stage: u32, label: &'static str) {
         self.stage = stage;
         self.stage_label = Some(label);
+    }
+
+    /// Timed checkpoint: close the previous stage and attribute its wall time.
+    ///
+    /// Same bookkeeping as [`checkpoint`](Self::checkpoint) (the fault
+    /// record still carries `stage` + `label`), plus the elapsed time since
+    /// the previous timed checkpoint lands in the guard's
+    /// [`ExecutionProfile`] under the previous label/kind.
+    ///
+    /// A guard armed by plain `enter*` has no profile: this degrades to
+    /// [`checkpoint`](Self::checkpoint) with zero clock reads.
+    #[inline]
+    pub fn checkpoint_timed(&mut self, stage: u32, label: &'static str, kind: StageKind) {
+        if let Some(p) = self.profile.as_mut() {
+            let now = (p.wall)();
+            p.checkpoint(now, label, kind);
+        }
+        self.stage = stage;
+        self.stage_label = Some(label);
+    }
+
+    /// Profile accumulated so far, without settling (`None` on plain guards).
+    #[must_use]
+    pub fn profile_snapshot(&self) -> Option<ExecutionProfile> {
+        let p = self.profile.as_ref()?;
+        let now = (p.wall)();
+        let cpu_now = p.cpu.map(|f| f()).unwrap_or(0);
+        Some(p.snapshot_at(now, cpu_now))
+    }
+
+    /// Settle paths forget the guard (`mem::forget`), so the boxed profile
+    /// must be released explicitly or it leaks one allocation per call.
+    #[inline]
+    fn release_profile(&mut self) {
+        drop(self.profile.take());
+    }
+
+    /// Commit and return the execution profile alongside the event.
+    ///
+    /// `work_wall_us` stops at the commit call; `settle_us` measures the
+    /// call itself, so the two never overlap. A plain guard (no profile)
+    /// returns a zeroed profile — no clocks were armed.
+    pub fn commit_profiled(mut self) -> (SnubberEvent<()>, ExecutionProfile) {
+        let Some(state) = self.profile.take() else {
+            return (self.commit(), ExecutionProfile::default());
+        };
+        let wall = state.wall;
+        let cpu_now = state.cpu.map(|f| f()).unwrap_or(0);
+        let mut profile = state.snapshot_at(wall(), cpu_now);
+        let settle_start = wall();
+        let event = self.commit();
+        profile.settle_us = to_us(wall().saturating_sub(settle_start));
+        (event, profile)
     }
 
     /// Milliseconds spent waiting in the queue before admission (0 for sync enter).
@@ -3826,6 +4277,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             let event = SnubberEvent::Committed {
                 header: self.arming.header,
             };
+            self.release_profile();
             core::mem::forget(self);
             return event;
         }
@@ -3835,6 +4287,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         let node = self.node.clone();
         let is_probe = self.is_probe;
         let lane = self.priority.code().min(2) as usize;
+        self.release_profile();
         core::mem::forget(self);
         let waker = {
             let mut inner = node.lock().unwrap_or_else(|p| {
@@ -3954,6 +4407,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         if let Some(w) = waker {
             w.wake();
         }
+        self.release_profile();
         core::mem::forget(self);
         Err(if spin {
             TimeoutCheck::SpinDetected
@@ -4006,6 +4460,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
                 header: self.arming.header,
                 reason,
             };
+            self.release_profile();
             core::mem::forget(self);
             return event;
         }
@@ -4015,6 +4470,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         let node = self.node.clone();
         let is_probe = self.is_probe;
         let lane = self.priority.code().min(2) as usize;
+        self.release_profile();
         core::mem::forget(self);
         let waker = {
             let mut inner = node.lock().unwrap_or_else(|p| {

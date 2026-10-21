@@ -6,8 +6,9 @@
 
 use snubber::{
     assert_no_anomalies, diagnostic_line, find_anomalies, find_anomalies_for_snapshot,
-    write_diagnostic_line, write_health, AnomalyKind, AnomalyPolicy, FaultKind, FaultPolicy,
-    FaultRecord, NodeSet, SnapshotV1, SnubberNode, SnubberStats, TelemetrySink, SNAPSHOT_LEN,
+    write_diagnostic_line, write_health, write_triage, AnomalyKind, AnomalyPolicy, FaultKind,
+    FaultPolicy, FaultRecord, NodeSet, SnapshotV1, SnubberNode, SnubberStats, TelemetrySink,
+    SNAPSHOT_LEN,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -270,4 +271,88 @@ fn pulse_stall_lands_in_snapshot_and_anomaly() {
         .expect("pulse stall verdict");
     assert_eq!(stall.count, 2);
     assert_eq!(AnomalyKind::PulseStall.code(), "pulse_stall");
+}
+
+#[test]
+fn snapshot_diff_is_saturating_and_classified() {
+    let mut panics = [0u64; FaultKind::COUNT];
+    panics[FaultKind::Panic.index()] = 1;
+    let before = SnapshotV1 {
+        total_started: 10,
+        committed: 8,
+        bulkhead_rejections: 2,
+        reported: panics,
+        ..SnapshotV1::default()
+    };
+
+    panics[FaultKind::Panic.index()] = 2;
+    let after = SnapshotV1 {
+        total_started: 15,
+        committed: 12,
+        bulkhead_rejections: 3,
+        reported: panics,
+        pulse_stalls: 1,
+        max_pulse_lag_ms: 40,
+        breaker_state: 2,
+        ..SnapshotV1::default()
+    };
+
+    let diff = before.diff(&after);
+    assert!(!diff.is_empty());
+    assert_eq!(diff.total_started, 5);
+    assert_eq!(diff.committed, 4);
+    assert_eq!(diff.bulkhead_rejections, 1);
+    assert_eq!(diff.reported[FaultKind::Panic.index()], 1);
+    assert_eq!(diff.catastrophic_faults(), 1);
+    assert_eq!(diff.pulse_stalls, 1);
+    assert_eq!(diff.max_pulse_lag_ms, 40);
+    assert_eq!(diff.breaker_state_from, 0);
+    assert_eq!(diff.breaker_state_to, 2);
+
+    let mut text = String::new();
+    diff.write_summary(&mut text).expect("fmt::Write");
+    assert!(text.contains("admitted +5"));
+    assert!(text.contains("breaker CLOSED->HALF"));
+    assert!(text.contains("pulse +1 lag +40ms"));
+
+    // A restart (counters reset) never underflows.
+    let backwards = after.diff(&before);
+    assert_eq!(backwards.total_started, 0);
+    assert_eq!(backwards.committed, 0);
+    assert_eq!(backwards.reported[FaultKind::Panic.index()], 0);
+    assert_eq!(backwards.breaker_state_from, 2);
+    assert_eq!(backwards.breaker_state_to, 0);
+}
+
+#[test]
+fn triage_card_renders_verdicts() {
+    let clean = SnapshotV1::default();
+    let mut text = String::new();
+    write_triage(&mut text, "idle", &clean).expect("fmt::Write");
+    assert!(text.contains("verdict=OK"));
+    assert!(text.contains("breaker  CLOSED"));
+
+    let hot = SnapshotV1 {
+        total_started: 100,
+        committed: 95,
+        bulkhead_rejections: 4,
+        rate_rejected: 1,
+        breaker_state: 1,
+        ..SnapshotV1::default()
+    };
+    text.clear();
+    write_triage(&mut text, "hot", &hot).expect("fmt::Write");
+    assert!(text.contains("verdict=WARN"));
+    assert!(text.contains("breaker  OPEN"));
+    assert!(text.contains("admits   105"));
+    assert!(text.contains("95 / 90%"));
+
+    let burned = SnapshotV1 {
+        implicit_drops: 3,
+        ..SnapshotV1::default()
+    };
+    text.clear();
+    write_triage(&mut text, "burned", &burned).expect("fmt::Write");
+    assert!(text.contains("verdict=CRIT"));
+    assert!(text.contains("drops=3"));
 }

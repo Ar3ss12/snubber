@@ -110,26 +110,29 @@ pub use erased::{ClosurePolicy, ErasedGuard};
 
 #[cfg(feature = "std")]
 pub use node::{
-    BreakerState, EnterError, FaultHook, FaultRecord, FlightSlot, GuardSnapshot, LegalMove,
-    OverflowPolicy, ScopeToken, SnubberError, SnubberNode, SnubberNodeBuilder, SnubberStats,
-    SpawnedGuard, StaticNode, StorageKind, SystemClock, TelemetrySink, TimeoutCheck, TrackedGuard,
-    DEFAULT_POLICIES,
+    std_mono_ns, BreakerState, EnterError, ExecutionProfile, FaultHook, FaultRecord, FlightSlot,
+    GuardSnapshot, LegalMove, NanoClock, OverflowPolicy, ScopeToken, SnubberError, SnubberNode,
+    SnubberNodeBuilder, SnubberStats, SpawnedGuard, StageKind, StageSpan, StaticNode, SystemClock,
+    TelemetrySink, TimeoutCheck, TrackedGuard, DEFAULT_POLICIES, PROFILE_HAS_CPU,
+    PROFILE_SATURATED, PROFILE_STAGES, PROFILE_STAGE_OVERFLOW,
 };
 
 #[cfg(feature = "std")]
 pub use diagnostics::{
     diagnostic_line, find_anomalies, print_health, Anomaly, AnomalyKind, AnomalyPolicy, NodeSet,
-    SnapshotError, SnapshotV1, SNAPSHOT_CRC_RANGE, SNAPSHOT_LEN, SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
+    SnapshotDiff, SnapshotError, SnapshotV1, SNAPSHOT_CRC_RANGE, SNAPSHOT_LEN, SNAPSHOT_MAGIC,
+    SNAPSHOT_VERSION,
 };
 
 #[cfg(not(feature = "std"))]
 pub use diagnostics::{
-    Anomaly, AnomalyKind, AnomalyPolicy, SnapshotError, SnapshotV1, SNAPSHOT_CRC_RANGE,
-    SNAPSHOT_LEN, SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
+    Anomaly, AnomalyKind, AnomalyPolicy, SnapshotDiff, SnapshotError, SnapshotV1,
+    SNAPSHOT_CRC_RANGE, SNAPSHOT_LEN, SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
 };
 
 pub use diagnostics::{
     crc32_ieee, diagnostic_hash, find_anomalies_for_snapshot, write_diagnostic_line, write_health,
+    write_triage,
 };
 
 pub use protect::Protected;

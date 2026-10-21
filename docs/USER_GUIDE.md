@@ -482,6 +482,43 @@ trips the breaker, never counted in `admission_total`).
 Never stand in the turnstile doorway while calling someone in. If you
 walked in yourself — nobody else gets through.
 
+### Execution profile: where the time went (opt-in)
+
+The default `enter*` paths read no profile clock and allocate nothing.
+When you need the breakdown, arm a profiled guard — the cost is one `Box`
+at admission plus one wall-clock read per timed checkpoint:
+
+```rust
+use snubber::{StageKind, SnubberNode};
+
+let node = SnubberNode::builder("export").build();
+let mut guard = node.enter_auto_profiled(|| rollback())?;
+
+guard.checkpoint_timed(1, "connect", StageKind::Work);
+guard.checkpoint_timed(2, "wait_remote", StageKind::Wait);
+guard.checkpoint_timed(3, "write_batch", StageKind::Work);
+
+let (_event, profile) = guard.commit_profiled();
+assert_eq!(profile.stage_count, 3);
+let slowest = profile.slowest_stage();   // label + wall_us + kind
+let pct = profile.cpu_utilization_pct(); // needs a CPU clock
+let starved = profile.is_io_starved();   // < 20% CPU while holding a slot
+```
+
+* `admit_us` — time inside the admission pipeline.
+* `dwell_us` — pre-admission wait (`queue_wait_ms` for sync caller parking).
+* `work_wall_us` — guard lifetime from admission return to the commit call.
+* `work_cpu_us` — on-CPU time; `0` unless a CPU clock was attached.
+* `settle_us` — the commit call itself (does not overlap `work_wall_us`).
+* Four stage slots (`PROFILE_STAGES`); further checkpoints set
+  `PROFILE_STAGE_OVERFLOW` and merge — they never allocate.
+
+Durations are microseconds, saturating at `u32::MAX` (`PROFILE_SATURATED`).
+`enter_profiled_with_clock(wall, cpu, rollback)` injects `fn() -> u64`
+nanosecond clocks, so tests can drive a static `AtomicU64` and get exact
+numbers. `profile.write_summary(&mut out)` renders the ASCII breakdown
+into any `core::fmt::Write`.
+
 ---
 
 ## Layer 3: Runtime-Agnostic Async (Tokio, Axum, gRPC)
@@ -547,12 +584,12 @@ let node = SnubberNode::builder("task_pipeline")
     .task_ttl(std::time::Duration::from_millis(50)) // tasks waiting longer than 50ms fail fast
     .shed_policy(OverflowPolicy::RejectNew)        // or OverflowPolicy::EvictOldest
     .payload_budget(1024 * 1024)                   // 1MB max payload cutoff
-    .queue_storage(StorageKind::InMemory)          // zero-dep waker buffer
     .build();
 ```
 
 * **`task_ttl`**: Tasks waiting longer than their lease fail fast with `Err(EnterError::QueueTtlExpired)`.
 * **`queue_capacity` & `shed_policy`**: At capacity, `RejectNew` returns `Err(EnterError::QueueFull)`, while `EvictOldest` discards the oldest waiter.
+* **`queue_depth()` / `queue_capacity()`**: Live waiter-queue gauge (`waiters.len()`) and its ceiling. Synchronous nodes have no waiter queue; their pre-admission wait is reported by `TrackedGuard::queue_wait_ms()`.
 * **`payload_budget`**: Rejects oversized inputs before memory allocation (`Err(EnterError::PayloadBudgetExceeded)`).
 
 ### 6. Bounded Reaper Channel (`AsyncLease` / `LeaseChannel`)
@@ -784,6 +821,45 @@ thread (e.g. `snapshot_v1_in(gen)` → `encode()` → tmp + rename every 10 s �
 That line is `diagnostic_line(node, anomaly, &snap)` — a FNV-1a hash
 over the counters plus the verdict. No screenshots, no guessing.
 
+### Snapshot diff: what changed since the last sample
+
+```rust
+let before = node.snapshot_v1();
+// ... 10 s later ...
+let after = node.snapshot_v1();
+
+let diff = before.diff(&after); // every field saturating: restarts yield zeros
+assert!(!diff.is_empty());
+let mut text = String::new();
+diff.write_summary(&mut text)?;
+// diff: admitted +120 committed +118 aborted +2 dropped +0
+//       bulkhead +3 evicted +0 preempted +0 rate +0 stale +0
+//       breaker CLOSED->CLOSED trips +0 timeouts +0 pulse +0 lag +0ms
+```
+
+`SnapshotDiff::catastrophic_faults()` gives the panic + timeout +
+process-died + implicit-drop delta; `breaker_state_from/to` show a
+transition inside the window. Pure `Copy` math — no wire change.
+
+### Triage card: one ASCII verdict per node
+
+```rust
+use snubber::write_triage;
+
+let mut card = String::new();
+write_triage(&mut card, "click_worker", &snap)?;
+// [SNUBBER TRIAGE] node="click_worker" verdict=OK
+//   breaker  CLOSED
+//   admits   124000 (committed 123858 / 99%)
+//   faults   drops=0 panics=0 timeouts=0 died=0
+//   shed     bulk=0 evict=0 rate=142 stale=0 preempt=0
+//   pulse    stalls=0 lag=0ms
+```
+
+`verdict=CRIT` on any catastrophic fault, `WARN` on shedding, a missed
+pulse, or a non-closed breaker, `OK` otherwise. Pure `fmt::Write`, no
+allocation — works on firmware and in a stack buffer.
+
 ### Multi-node set (explicit, never a `static`)
 
 ```rust
@@ -879,6 +955,10 @@ impl snubber::OrphanGuard for LinuxPdeathsigGuard {
 | `StateDigest` + `take_state()` | 2 / std | 64 B, ~1 ns | Hot handoff: memory survives death |
 | `NoOrphanGuard` / `OrphanGuard` | 2 / std | trait only | Parent death = child processes reaped (app impl) |
 | `node.enter_auto` | 2 / std | **~86.5 ns** | Monotonic auto sequence ticket minting |
+| `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | 2 / std | 1 `Box` at arm + 1 clock read/stage | Stage wall/CPU breakdown (opt-in; default path untouched) |
+| `guard.profile_snapshot()` | 2 / std | 1 wall + 1 CPU read | Mid-flight profile without settling |
+| `snapshot.diff(&later)` + `write_summary` | 2 / cold | pure `Copy` math | Counter deltas since the last sample |
+| `write_triage(&mut out, node, &snap)` | 2 / cold | `fmt::Write`, no alloc | One ASCII verdict card per node |
 | `node_passthrough_enter` | 2 / std canary | **~86.7 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
 | `node_passthrough_scoped` | 2 / std canary | **~84.5 ns** | Same transit through `scoped()` — work runs, books stay clean |
 | `contended_node_enter` (6 threads, shared `enter_auto` allocator) | 2 / std contended | **~452 ns** | MESI cache-line bouncing on node mutex; StaleEpoch losers bounded-retry (cap 64 + yield), same contract as `concurrency_stress` |
