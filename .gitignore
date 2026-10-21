@@ -32,7 +32,7 @@ Thumbs.db
 # Internal docs & scratch specs
 tech.md
 docs/DECISION_MATRIX.md
-implementation_plan.md
 CODEBASE_REPORT.md
 scripts/analyze_codebase_full.py
 AGENTS.md
+FUTURE_node_split.md
