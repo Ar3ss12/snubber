@@ -48,7 +48,7 @@ let receipt = node.scoped_checked(
 ## 🛡️ Architecture & Guarantees
 
 * **Zero-Boilerplate RAII Rollback:** No manual token tracking. Scoped executions auto-commit on success and guarantee resource release via `Drop` on panics, errors, or early returns.
-* **Sub-Nanosecond Overhead:** Base stack guard costs **~1.5 ns** and adds **+0 bytes** to executable size. Concurrency-limited nodes process over **13.8M ops/sec** (`core`-only / `std`).
+* **Single-Digit-Nanosecond Overhead:** Base stack guard costs **~5.4 ns** with full field drop (no `mem::forget` leak) and adds **+0 bytes** to executable size. Concurrency-limited nodes process over **8.2M ops/sec** (`core`-only / `std`).
 * **Strict Determinism:** `#![forbid(unsafe_code)]`, zero external dependencies. Predictable behavior across bare-metal microcontrollers and multi-socket servers alike.
 * **Runtime-Agnostic Async:** Bounded waker queue built on `core::task::Waker` consuming **0% CPU** without depending on Tokio, async-std, or background threads.
 * **Adaptive Backpressure & Pacing:** Refusals carry physical telemetry (`retry_after_ms`, queue depth 0..255) allowing clients to pace incoming traffic instead of overwhelming dead hardware.
@@ -66,31 +66,37 @@ let receipt = node.scoped_checked(
 
 Measured on AMD Ryzen 5 4600H release build
 (`cargo bench --bench admission_bench`, Criterion: 800 ms warmup,
-2 s measurement, 50 samples, isolated node per bench):
+2 s measurement, 50 samples, isolated node per bench; re-measured
+2026-10-22 after the zero-leak settlement fix):
 
 | Operation | Architecture Layer | Average Latency | Notes |
 |---|---|---|---|
-| `SnubberGuard::new` + `commit` | Layer 1 (`core`) | **~1.5 ns** | Pure stack move, zero heap allocation |
+| `SnubberGuard::new` + `commit` | Layer 1 (`core`) | **~5.4 ns** | Stack move + owned-field drop, zero heap allocation |
 | `EpochGate::observe` | Layer 1 (`core`) | **~2.6 ns** | 2-D generation + monotonic epoch filter |
-| `classify_stall` / `classify_stall_ceiling` | Layer 1 (`core`) | **~0 ns** (const math) | `SpinDetected` / `SleepBlocked` / `DeadlockSuspected` from one sample pair |
-| `node.enter + commit` | Layer 2 (`std`) | **~72.6 ns** | Full bulkhead, circuit breaker, auto-commit |
-| `node.enter_auto + commit` | Layer 2 (`std`) | **~86.5 ns** | + atomic sequence minting |
-| `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~73.6 ns** | Priority lane: +1 ns over plain enter |
-| `node.transition` | Layer 2 (`std`) | **~86.5 ns** | ONE-enum state machine, zero flag drift |
+| `classify_stall` / `classify_stall_ceiling` | Layer 1 (`core`) | **~2.1 ns** (const math) | `SpinDetected` / `SleepBlocked` / `DeadlockSuspected` from one sample pair |
+| `node.enter + commit` | Layer 2 (`std`) | **~121 ns** | Full bulkhead, circuit breaker, auto-commit |
+| `node.enter_auto + commit` | Layer 2 (`std`) | **~134 ns** | + atomic sequence minting |
+| `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~119 ns** | Priority lane: −2 ns vs plain enter |
+| `node.transition` | Layer 2 (`std`) | **~131 ns** | ONE-enum state machine, zero flag drift |
 | `node.transition_checked` + `LegalMove` | Layer 2 (`std`) | same + 0 ns | Closed state graphs: illegal moves fail at compile time (E0277) |
-| `enter_erased_auto` | Layer 2 (`alloc`) | **~85.6 ns** | Boxed rollback for dynamic struct fields |
-| `node_passthrough_enter + commit` | Layer 2 (`std` canary) | **~86.7 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
-| `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~84.5 ns** | Same transit through `scoped()` — work runs, books stay clean |
+| `enter_erased_auto` | Layer 2 (`alloc`) | **~130 ns** | Boxed rollback for dynamic struct fields |
+| `node_passthrough_enter + commit` | Layer 2 (`std` canary) | **~98.4 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
+| `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~99.6 ns** | Same transit through `scoped()` — work runs, books stay clean |
+| `ConflateSender::publish + take_latest` | Layer 2 (`std`) | **~22.5 ns** | One-slot latest wins, no allocation, no `Clone` bound |
+| `ConflateSender::publish` (occupied slot) | Layer 2 (`std`) | **~16.3 ns** | Replaced value counted, never queued |
+| `guard.commit_enveloped(64)` | Layer 2 (`std`) | **~152 ns** | Payload corridor exact; wall corridor only for profiled guards |
 | `enter_async_auto` | Layer 3 (`std`) | **0% CPU** | Pure `core::task::Waker` parking, no runtime deps |
 | `enter_async_auto_profiled` | Layer 3 (`std`, opt-in) | 1 `Box` + 2 clock reads | Same waker parking, profile arms on the admitting poll |
-| `static_node.enter + commit` | Layer 2 (`std`) | **~91.9 ns** | Compile-time capacity assert + bulkhead + auto-commit |
+| `static_node.enter + commit` | Layer 2 (`std`) | **~120 ns** | Compile-time capacity assert + bulkhead + auto-commit |
 | `node.note_pulse_stall(lag_ms)` | Layer 2 (`std`) | **1 atomic max** | Missed heartbeat lands in `SnapshotV1` v3 + `AnomalyKind::PulseStall` |
 | `node.note_memory_kb(used)` | Layer 2 (`std`, cold) | 1 lock + 1 atomic store | External memory sample → soft/hard verdict; admissions refuse lock-free above soft |
-| `process_token.to_bytes()` | Layer 4 (`core`) | **~7.5 ns** | 44-byte framed wire serialization (`to_le_bytes`) |
-| `state_digest.crc()` | Layer 4 (`core`) | **~261 ns** | 64-byte hardware cache line digest verification |
+| `process_token.to_bytes()` | Layer 4 (`core`) | **~7.7 ns** | 44-byte framed wire serialization (`to_le_bytes`) |
+| `ProcessToken::from_bytes()` | Layer 4 (`core`) | **~7.3 ns** | 40-byte body parse, no allocation |
+| `state_digest.crc()` | Layer 4 (`core`) | **~266 ns** | 64-byte hardware cache line digest verification |
+| `PipeDrain::drain_sync` | Layer 4 (`std`) | **~61 ns/frame** | 256 frames: 16.5M frames/s including per-stream drain state |
 | `run_supervised_guard_with_memory` | Layer 4 (`std`) | 1 sampler call / 10 ms tick | Soft logs `MEMORY_DRAIN`; hard `kill()` without draining (`DeathCause::MemoryLimit`) |
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | Layer 2 (`std`, opt-in) | 1 `Box` + 1 clock/stage | Stage wall/CPU breakdown; default `enter*` reads no profile clock |
-| `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.1 µs** | 512-byte zero-allocation snapshot CRC32 codec |
+| `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.13 µs** | 512-byte zero-allocation snapshot CRC32 codec |
 | `snapshot_v1()` + `find_anomalies()` | Layer 5 (cold) | **512 B, CRC32** | Zero-allocation telemetry; `assert_no_anomalies!()` CI gate |
 | `before.diff(&after)` + `write_triage` | Layer 5 (cold) | pure `Copy` math + `fmt::Write` | Counter deltas since last sample; one ASCII verdict card |
 | `memory_limits(soft, hard)` + admission | Layer 2 (`std`) | 1 relaxed load | Over soft → `EnterError::MemoryPressure` without taking the mutex |
@@ -100,10 +106,10 @@ Measured with half of available hardware cores active (6 concurrent threads unde
 
 | Contended Operation | Concurrency | Measured Latency | Physical Phenomenon |
 |---|---|---|---|
-| `contended_node_enter` | 6 threads | **~452 ns** | L1 cache-line bouncing across physical cores on node mutex |
-| `contended_node_scoped` | 6 threads | **~804 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
-| `contended_gateway_mpsc` | 6 threads | **~132 ns** | Bounded multi-producer channel write under parallel core flood |
-| `cross_thread_isr_bridge` | 2 threads (inter-core) | **~35.6 ns** | Lock-free SPSC ring across physical core boundaries (bus latency) |
+| `contended_node_enter` | 6 threads | **~893 ns** | L1 cache-line bouncing across physical cores on node mutex |
+| `contended_node_scoped` | 6 threads | **~874 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
+| `contended_gateway_mpsc` | 6 threads | **~151 ns** | Bounded multi-producer channel write under parallel core flood |
+| `cross_thread_isr_bridge` | 2 threads (inter-core) | **~35.3 ns** | Lock-free SPSC ring across physical core boundaries (bus latency) |
 
 ### ⚡ Multi-Lineage Termination Storm
 

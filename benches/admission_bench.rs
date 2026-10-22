@@ -1,7 +1,8 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use snubber::{
-    classify_stall_ceiling, gateway, EpochGate, IsrBridge, IsrSignal, Priority, PulseWatch,
-    SnubberGuard, SnubberNode, TaskConduit, TransactionHeader, WorkerPulse, OP_PULSE,
+    classify_stall_ceiling, gateway, ConflateSender, EpochGate, ExecutionEnvelope, IsrBridge,
+    IsrSignal, PipeDrain, Priority, ProcessToken, PulseWatch, SnubberGuard, SnubberNode,
+    TaskConduit, TransactionHeader, WorkerPulse, OP_PULSE,
 };
 use std::time::Duration;
 
@@ -282,8 +283,51 @@ fn bench_layer3(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_impedance(c: &mut Criterion) {
+    let mut g = c.benchmark_group("layer2_impedance");
+
+    // Empty slot: publish then sample. One short slot mutex each way,
+    // no payload clone, no allocation.
+    g.bench_function("conflate_publish_take", |b| {
+        let (tx, rx) = ConflateSender::<u64>::pair();
+        let mut v = 0u64;
+        b.iter(|| {
+            v = v.wrapping_add(1);
+            black_box(tx.publish(black_box(v)));
+            black_box(rx.take_latest());
+        });
+    });
+
+    // Occupied slot: latest wins and the replaced value is counted, never
+    // queued. Measures conflation cost, not consumer cadence.
+    g.bench_function("conflate_publish_replace", |b| {
+        let (tx, _rx) = ConflateSender::<u64>::pair();
+        let mut v = 0u64;
+        b.iter(|| {
+            v = v.wrapping_add(1);
+            black_box(tx.publish(black_box(v)));
+        });
+    });
+
+    // Envelope judgment on a plain (non-profiled) guard: payload half is
+    // exact, wall half stays Inside without clock evidence. In-corridor
+    // payload takes no telemetry lock.
+    g.bench_function("node_commit_enveloped_payload", |b| {
+        let node = SnubberNode::builder("bench_env")
+            .max_in_flight(1024)
+            .execution_envelope(ExecutionEnvelope::new(0, 0, 16, 1024))
+            .build();
+        b.iter(|| {
+            let guard = node.enter_auto(|| {}).expect("a");
+            black_box(guard.commit_enveloped(black_box(64)));
+        });
+    });
+
+    g.finish();
+}
+
 fn bench_layer4_layer5(c: &mut Criterion) {
-    use snubber::{ProcessToken, StateDigest, StaticNode, STATE_LEN};
+    use snubber::{StateDigest, StaticNode, STATE_LEN};
 
     let mut g = c.benchmark_group("layer4_layer5_diagnostics");
 
@@ -293,7 +337,15 @@ fn bench_layer4_layer5(c: &mut Criterion) {
         b.iter(|| black_box(token.to_bytes()));
     });
 
-    // 2. StateDigest creation & CRC computation (64 bytes, cache line)
+    // 2. ProcessToken body parse (40 bytes, LE fields, no alloc)
+    g.bench_function("process_token_parse", |b| {
+        let wire = ProcessToken::new(42, 7, [0xAA; 28]).to_bytes();
+        let mut body = [0u8; 40];
+        body.copy_from_slice(&wire[4..]);
+        b.iter(|| black_box(ProcessToken::from_bytes(black_box(&body))));
+    });
+
+    // 3. StateDigest creation & CRC computation (64 bytes, cache line)
     g.bench_function("state_digest_new_crc", |b| {
         let bytes = [0x55u8; STATE_LEN];
         b.iter(|| {
@@ -302,7 +354,7 @@ fn bench_layer4_layer5(c: &mut Criterion) {
         });
     });
 
-    // 3. StaticNode compile-time bounded slot entry + commit
+    // 4. StaticNode compile-time bounded slot entry + commit
     g.bench_function("static_node_enter_commit", |b| {
         let node = StaticNode::<1024, 2048>::build("bench_static");
         let mut epoch = 1u64;
@@ -315,7 +367,7 @@ fn bench_layer4_layer5(c: &mut Criterion) {
         });
     });
 
-    // 4. SnapshotV1 encode and CRC32 framing (512 bytes, zero-alloc)
+    // 5. SnapshotV1 encode and CRC32 framing (512 bytes, zero-alloc)
     g.bench_function("snapshot_v1_encode_crc", |b| {
         let node = SnubberNode::builder("bench_snap").build();
         let _ = node.enter_auto(|| {}).map(|g| g.commit());
@@ -323,6 +375,29 @@ fn bench_layer4_layer5(c: &mut Criterion) {
         b.iter(|| black_box(snap.encode()));
     });
 
+    g.finish();
+}
+
+fn bench_pipe_drain(c: &mut Criterion) {
+    use std::io::Cursor;
+
+    const FRAMES: u64 = 256;
+    let mut wire = Vec::with_capacity(FRAMES as usize * 44);
+    for i in 0..FRAMES {
+        wire.extend_from_slice(&ProcessToken::commit(i).to_bytes());
+    }
+
+    let mut g = c.benchmark_group("layer4_pipe_drain");
+    g.throughput(criterion::Throughput::Elements(FRAMES));
+    // `drain_sync` owns its state (one Arc + Mutex per stream), so the
+    // measurement covers stream setup plus scanning all 256 frames; the
+    // per-frame cost is what the throughput column reports.
+    g.bench_function("drain_sync_256_frames", |b| {
+        b.iter(|| {
+            let drain = PipeDrain::drain_sync(Cursor::new(black_box(&wire[..])));
+            black_box(drain.counters());
+        });
+    });
     g.finish();
 }
 
@@ -520,6 +595,6 @@ fn bench_contended(c: &mut Criterion) {
 criterion_group!(
     name = benches;
     config = fast();
-    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_layer4_layer5, bench_contended
+    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_impedance, bench_layer4_layer5, bench_pipe_drain, bench_contended
 );
 criterion_main!(benches);

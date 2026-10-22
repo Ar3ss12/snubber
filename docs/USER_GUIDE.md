@@ -70,7 +70,7 @@ risky_operation()?; // `?` or panic here → hardware released
 guard.commit();     // success: disarm the rollback
 ```
 
-How it works: the guard owns your rollback closure. `commit()` disarms it (success path). If the scope exits any other way, `Drop` runs the closure. This relies on stack unwinding — the normal Rust panic and `?` path — so it costs virtually nothing (~1.5 ns on AMD Ryzen 5 4600H) when nothing fails.
+How it works: the guard owns your rollback closure. `commit()` disarms it (success path). If the scope exits any other way, `Drop` runs the closure. This relies on stack unwinding — the normal Rust panic and `?` path — so it costs ~5.4 ns on AMD Ryzen 5 4600H when nothing fails (including the drop of every owned field).
 
 ### Rules for the rollback closure:
 1. **Safe to run twice:** Releasing a button twice is fine; sending money twice is not — put terminal forward actions in `commit()`.
@@ -1286,9 +1286,9 @@ impl snubber::OrphanGuard for LinuxPdeathsigGuard {
 | Operation | Layer | Latency / Footprint | When to Use |
 |---|---|---|---|
 | `snub_check!(cond, reason)` | 1 / core | ~0 ns (single branch) | Universal invariant check, returns `Err` |
-| `SnubberGuard::new` | 1 / core | **~1.5 ns** (stack move) | Single function synchronous rollback |
+| `SnubberGuard::new` | 1 / core | **~5.4 ns** (stack move + owned-field drop) | Single function synchronous rollback |
 | `EpochGate::observe` | 1 / core | **~2.6 ns** | Monotonic ordering & reboot re-handshake |
-| `classify_stall(wall, cpu, wb, cb)` / `classify_stall_ceiling(.., ceiling)` | 1 / core | const math, 0 ns | SPIN vs SLEEP vs DEADLOCK verdict from one sample pair (+ silence ceiling) |
+| `classify_stall(wall, cpu, wb, cb)` / `classify_stall_ceiling(.., ceiling)` | 1 / core | ~2.1 ns (const math, no clock reads) | SPIN vs SLEEP vs DEADLOCK verdict from one sample pair (+ silence ceiling) |
 | `WorkerPulse::kick` + `PulseWatch::observe` | 1 / core | 8 B, 1 atomic store | Heartbeat: missed pulse = de-energize past thread, never kill it |
 | `SystemClock` (`MonotonicMs`) | 1 / `std` | 1 `Instant` read | Boot-relative monotonic ms; NTP/DST edits never move deadlines |
 | `node.cpu_budget_ms(n)` + `node.stall_ceiling_ms(n)` + `guard.with_cpu_sampler(f)` | 2 / std | 1 fn call at arming | CPU-spin budget + silence ceiling; `check_timeout` settles spin/deadlock distinctly |
@@ -1303,35 +1303,36 @@ impl snubber::OrphanGuard for LinuxPdeathsigGuard {
 | `MemoryWatch` + `MemoryVerdict` | 1 / core | 32 B, `Copy` | Verdict math for firmware; `hard < soft` clamps up |
 | `MemoryPolicy::new(soft, hard)` + `note(used)` | 2 / std | pure integer compares | Supervisor verdict: soft drains, hard kills; `death_cause()` names `MemoryLimit` |
 | `Supervisor::run_supervised_guard_with_memory(..)` | 2 / std | 1 sampler call / 10 ms tick | Lease + RSS watchdog; soft logs `MEMORY_DRAIN`, hard `kill()` without draining |
-| `node.transition(&mut s, next, rb, work)` | 2 / std | **~86.5 ns** | ONE enum state machine, no flag drift |
+| `node.transition(&mut s, next, rb, work)` | 2 / std | **~131 ns** | ONE enum state machine, no flag drift |
 | `node.transition_checked(s, rb, work)` + `LegalMove` | 2 / std | same + 0 ns | Closed graphs: illegal edges rejected at compile (E0277) |
-| `node.enter_with_priority(prio)` | 2 / std | **~73.6 ns** | Critical over Background yields cooperatively |
+| `node.enter_with_priority(prio)` | 2 / std | **~119 ns** | Critical over Background yields cooperatively |
 | `Protected::new(res, guard)` + `commit()` | 1 / core | 0 ns (generics) | Resource burns with guard unless committed |
 | `node.scoped_sealed(rb, work)` + `ScopeToken` | 2 / std | same as `scoped` | `!Send` seal: thread-leak fails at compile |
 | `StaticNode::<I, Q>::build(name)` | 2 / std | same as builder | Capacities validated FIRST in `build()` |
-| `gateway::<T>(cap)` + `host.recv()` | 2 / std | ~10 ns | Multiple senders, one receiver channel; HWM/LWM throttle paces at 75%/50% with integer `retry_after_ms`, `send_critical` bypasses |
+| `gateway::<T>(cap)` + `host.recv()` | 2 / std | **~46 ns** send+receive roundtrip | Multiple senders, one receiver channel; HWM/LWM throttle paces at 75%/50% with integer `retry_after_ms`, `send_critical` bypasses |
 | `RestartTracker::note_death(code, now)` | 2 / std | pure math | Process respawn backoff tracker, caller sleeps |
 | `StateDigest` + `take_state()` | 2 / std | 64 B, ~1 ns | Hot handoff: memory survives death |
 | `NoOrphanGuard` / `OrphanGuard` | 2 / std | trait only | Parent death = child processes reaped (app impl) |
-| `node.enter_auto` | 2 / std | **~86.5 ns** | Monotonic auto sequence ticket minting |
+| `node.enter_auto` | 2 / std | **~134 ns** | Monotonic auto sequence ticket minting |
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | 2 / std | 1 `Box` at arm + 1 clock read/stage | Stage wall/CPU breakdown (opt-in; default path untouched) |
 | `enter_async_auto_profiled` | 3 / std | 1 `Box` + 2 clock reads | Profiled async admission; arms on the admitting poll |
 | `guard.profile_snapshot()` | 2 / std | 1 wall + 1 CPU read | Mid-flight profile without settling |
-| `ConflateSender::pair()` + `publish` / `take_latest` | 2 / std | 1 slot mutex + 1 relaxed counter | Latest-value channel (queue 0 or 1), coalescing counted, no `Clone` bound on payload |
-| `ExecutionEnvelope::new(..)` + `execution_envelope(env)` + `commit_enveloped(bytes)` | 2 / std | 16 B `Copy` header, judge at settle | Corridor catches too slow/too big and too fast/too small; underflow/overflow in own stats columns, breaker untouched |
+| `ConflateSender::pair()` + `publish` / `take_latest` | 2 / std | **~22.5 ns** pair; ~16.3 ns replace | Latest-value channel (queue 0 or 1), coalescing counted, no `Clone` bound on payload |
+| `ExecutionEnvelope::new(..)` + `execution_envelope(env)` + `commit_enveloped(bytes)` | 2 / std | 16 B `Copy` header; **~152 ns** settle with payload judge | Corridor catches too slow/too big and too fast/too small; underflow/overflow in own stats columns, breaker untouched |
 | `ProfileHarness` + `HarnessReport` / `run_boundary_harness` | 2 / std | one `Vec` of samples + sort | Deterministic PRNG, min/median/max/jitter/burst matrix, `report.envelope(headroom)` |
 | `snapshot.diff(&later)` + `write_summary` | 2 / cold | pure `Copy` math | Counter deltas + memory/queue window (`SnapshotDiff`) |
 | `write_triage(&mut out, node, &snap)` | 2 / cold | `fmt::Write`, no alloc | One ASCII verdict card per node |
-| `node_passthrough_enter` | 2 / std canary | **~86.7 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
-| `node_passthrough_scoped` | 2 / std canary | **~84.5 ns** | Same transit through `scoped()` — work runs, books stay clean |
-| `contended_node_enter` (6 threads, shared `enter_auto` allocator) | 2 / std contended | **~452 ns** | MESI cache-line bouncing on node mutex; StaleEpoch losers bounded-retry (cap 64 + yield), same contract as `concurrency_stress` |
-| `contended_node_scoped` (6 threads) | 2 / std contended | **~804 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
-| `contended_gateway_mpsc` (6 producers + drain) | 2 / std contended | **~132 ns** | Bounded multi-producer write under parallel core flood |
-| `cross_thread_isr_bridge` (push core + pop core) | 1 / core inter-core | **~35.6 ns** | Lock-free SPSC ring across physical cores (honest inter-core bus latency, not L1-hot loop) |
+| `node_passthrough_enter` | 2 / std canary | **~98.4 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
+| `node_passthrough_scoped` | 2 / std canary | **~99.6 ns** | Same transit through `scoped()` — work runs, books stay clean |
+| `contended_node_enter` (6 threads, shared `enter_auto` allocator) | 2 / std contended | **~893 ns** | MESI cache-line bouncing on node mutex; StaleEpoch losers bounded-retry (cap 64 + yield), same contract as `concurrency_stress` |
+| `contended_node_scoped` (6 threads) | 2 / std contended | **~874 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
+| `contended_gateway_mpsc` (6 producers + drain) | 2 / std contended | **~151 ns** | Bounded multi-producer write under parallel core flood |
+| `cross_thread_isr_bridge` (push core + pop core) | 1 / core inter-core | **~35.3 ns** | Lock-free SPSC ring across physical cores (honest inter-core bus latency, not L1-hot loop) |
 | `node.enter_async_auto` | 2 / std | 0% CPU waker park | Async admission under bounded concurrency |
 | `guard.settle_async(fut)` | 2 / std | zero lock during await | Commit across `.await` points |
 | `TaskConduit` / `TaskHandle` | 2 / std | lock-free atomics | 2-way live steering, pause/resume waker, drafts |
-| `PipeDrain` + `ProcessToken` | 2 / std | 44-byte stream | Hardware rollback across process death (`kill -9`) |
+| `PipeDrain` + `ProcessToken` | 2 / std | 44-byte stream; **~61 ns/frame** (256-frame sync drain) | Hardware rollback across process death (`kill -9`) |
+| `ProcessToken::from_bytes` / `to_bytes` | 1 / core | **~7.3 ns** parse / **~7.7 ns** frame | 44-byte wire frame, no allocation |
 | `node.snapshot_v1()` + `encode()` | 2 / cold | 512 B, CRC32 | Crash-safe persistence, app-owned flush thread |
 | `find_anomalies()` / `assert_no_anomalies!` | 2 / cold | pure `u128` math | CI gate + diagnostics console + `[DIAG 0x…]` bug reports |
 | `NodeSet` set | 2 / cold | explicit `&Node` list + saturating aggregates | Multi-node pulse, never a `static` |

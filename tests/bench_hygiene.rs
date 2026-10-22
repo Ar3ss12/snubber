@@ -56,9 +56,11 @@ const HEAVY: &[&str] = &[
     "SnubberNode::builder(",
     "IsrBridge::new(",
     "TaskConduit::new(",
+    "ConflateSender::<",
 ];
 
-/// Benches covered by this gate (prefix entries end with '_').
+/// Fixed-name benches; `bench_function(format!(...))` sites are pinned by
+/// their IDEAL markers below instead.
 const COVERED: &[&str] = &[
     "guard_new_commit",
     "epoch_gate_observe",
@@ -80,29 +82,69 @@ const COVERED: &[&str] = &[
     "node_stats_snapshot",
     "stats_telemetry_math",
     "erased_enter_auto_commit",
+    "conflate_publish_take",
+    "conflate_publish_replace",
+    "node_commit_enveloped_payload",
     "process_token_to_bytes",
+    "process_token_parse",
     "state_digest_new_crc",
     "static_node_enter_commit",
     "snapshot_v1_encode_crc",
+    "drain_sync_256_frames",
     "contended_node_enter_threads_",
     "contended_node_scoped_threads_",
     "contended_gateway_mpsc_threads_",
     "cross_thread_isr_bridge_push_pop",
 ];
 
+/// Extract literal names from `g.bench_function("name"` sites.
+fn static_bench_names(source: &str) -> Vec<String> {
+    const MARKER: &str = "g.bench_function(\"";
+    let mut names = Vec::new();
+    let mut rest = source;
+    while let Some(pos) = rest.find(MARKER) {
+        let after = &rest[pos + MARKER.len()..];
+        match after.find('"') {
+            Some(end) => names.push(after[..end].to_string()),
+            None => break,
+        }
+        rest = after;
+    }
+    names
+}
+
 #[test]
 fn bench_setup_outside_hot_loop() {
     let source = src("benches/admission_bench.rs");
-    let mut fn_count = 0usize;
-    for line in source.lines() {
-        if line.contains("g.bench_function(") {
-            fn_count += 1;
-        }
+    let discovered = static_bench_names(&source);
+    let mut unique = discovered.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), discovered.len(), "duplicate bench name");
+    for name in &discovered {
+        assert!(
+            COVERED.contains(&name.as_str()),
+            "bench '{name}' is not registered in COVERED"
+        );
     }
-    // 24 fixed-name benches + 3 sized contended (format!) + 1 cross-thread
-    // = 28 sites; COVERED holds 24 fixed + 4 prefix/marker entries = 28.
-    assert_eq!(fn_count, 28, "register new bench in COVERED");
-    assert_eq!(COVERED.len(), 28, "COVERED must list every bench");
+    for name in COVERED {
+        if name.ends_with('_') {
+            continue;
+        }
+        assert!(
+            discovered.iter().any(|n| n == name),
+            "COVERED entry '{name}' has no bench in the source"
+        );
+    }
+    // Sized contended benches build their name with format! and pass the
+    // variable; each prefix must have its IDEAL pin.
+    let sized = source.matches("g.bench_function(name,").count();
+    assert_eq!(sized, 3, "sized contended bench count changed");
+    assert_eq!(
+        COVERED.iter().filter(|n| n.ends_with('_')).count(),
+        sized,
+        "every sized bench needs one prefix in COVERED"
+    );
     for name in COVERED {
         // Prefix entries (contended_*_threads_) match sized format! benches:
         // verify their shared hoisted block, not the whole file.
