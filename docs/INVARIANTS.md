@@ -115,6 +115,33 @@ by an accidental unbounded queue.
   a non-overlapping run of `burst_len` consecutive samples strictly above
   the median.
 
+### Invariant 10: Complete Resource Reclaim on Settlement (Zero-Leak Gate)
+
+Every settlement path — `commit()`, `abort()`, `check_timeout()`, or an
+implicit `Drop` — MUST deallocate every owned guard field: the
+`Arc<Mutex<NodeInner>>` reference, the captured rollback closure and any
+boxed profile state. Disarming the rollback by calling `mem::forget(self)`
+is an architectural defect: it suppresses drop glue for the whole struct,
+so the `Arc` refcount never returns to 1 and the node's backing allocation
+outlives every transaction.
+
+- Settlement state lives in an internal `settled: bool` flag plus
+  `Option::take()` on single-owner fields. No settlement path may bypass
+  field destruction; the guard leaves scope normally and the compiler emits
+  full drop glue.
+- Net heap delta per settled transaction is exactly **0 bytes**: 100,000
+  `enter_auto` → `commit` cycles followed by the node's drop must restore
+  the allocator baseline (`tests/guard_alloc_budget.rs`).
+- Reintroducing one `mem::forget(self)` shows up as a stranded
+  `NodeInner` allocation (2,288 B in the reference build), not as a
+  statistic drift.
+- Closure ownership is observable: `Arc::strong_count` on a captured
+  handle must return to 1 after commit, abort, timeout and implicit drop,
+  and the admission slot must be reusable (`tests/guard_settle_reclaim.rs`).
+- The out-of-process harness enforces the runtime ceiling: supervisor
+  private-memory growth above `--MaxGrowthMb` / `--max-growth-mb`
+  (default 2.0 MB) fails the run even when every token was rescued.
+
 ---
 
 ## 2. Verification Protocol
@@ -163,13 +190,17 @@ cargo test --test execution_envelope
 
 # Verify harness determinism (scripted clock matrix, payload range, PRNG)
 cargo test --test harness
+
+# Verify zero-leak settlement: Arc/closure reclaim + byte-neutral 100k cycles
+cargo test --test guard_settle_reclaim
+cargo test --test guard_alloc_budget
 ```
 
 ---
 
 ## 3. Reporting a Discrepancy
 
-If you identify a scenario where any of the nine invariants above fails using purely Safe Rust:
+If you identify a scenario where any of the ten invariants above fails using purely Safe Rust:
 
 1. **Minimal Reproduction:** Construct an isolated integration test demonstrating the violation (failing an explicit `assert!`).
 2. **Deterministic Trigger:** The test must run and fail within 30 seconds without requiring external infrastructure.

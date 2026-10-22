@@ -79,6 +79,7 @@ How it works: the guard owns your rollback closure. `commit()` disarms it (succe
 4. **Memory ordering:** The node's mutex protects node books only. Every guard runs a `SeqCst` fence before the rollback body (free on x86/x64) — but a fence pairs with NOTHING. If your rollback publishes to shared state that another thread reads, pair it yourself: store with `Release`, load with `Acquire` (or guard the state with your own lock). `Relaxed`×2 reads stale data (F13).
 5. **Bind resource to guard:** Wrap the handle in `Protected::new(res, guard)` — `commit()` disarms the guard and returns the resource; any other exit executes rollback and drops the resource. Post-crash access becomes a compile error, not a forgotten `if`.
 6. **Seal the scope:** Prefer `node.scoped_sealed(rb, work)` where thread-leakage is the threat — the `!Send` `ScopeToken` makes `spawn` with context a compile error (E0277).
+7. **Never suppress guard drop:** Never use `std::mem::forget` on guards. A guard owns node references and telemetry allocations. Disarming is done strictly through `commit()`. `commit()` marks the transaction settled while allowing the guard's inner fields to cleanly release their allocations upon leaving scope.
 
 ---
 

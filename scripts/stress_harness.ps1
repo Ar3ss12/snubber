@@ -17,6 +17,7 @@ param(
     [string]$Profile = "release",
     [int]$StallTimeoutSec = 20,
     [int]$SupervisorWaitSec = 60,
+    [double]$MaxGrowthMb = 2.0,
     [string]$ReportPath = "target/termination_report.json",
     [string]$StatsPath = "target/stress_stats.json"
 )
@@ -470,6 +471,13 @@ if ($report) {
     $checks.Add([pscustomobject]@{ Name = "deadlock == false"; Ok = (-not [bool]$report.deadlock) })
     if ($Launch) { $checks.Add([pscustomobject]@{ Name = "supervisor exit == 0"; Ok = ($supExit -eq 0) }) }
 }
+if ($supSamples -gt 0) {
+    $privGrowth = $supPrivLast - $supPrivFirst
+    $checks.Add([pscustomobject]@{
+        Name = ("supervisor private growth {0:+0.00;-0.00;0.00} MB <= {1:N1} MB" -f $privGrowth, $MaxGrowthMb)
+        Ok   = ($privGrowth -le $MaxGrowthMb)
+    })
+}
 
 $failedChecks = @($checks | Where-Object { -not $_.Ok })
 $verdict = if ($completed -eq $Kills -and $failedChecks.Count -eq 0) {
@@ -608,6 +616,7 @@ $stats = [ordered]@{
     timer_resolution   = $timerRes
     kills_requested    = $Kills
     kills_completed    = $completed
+    max_growth_mb      = $MaxGrowthMb
     misses             = $misses
     not_found_polls    = $notFoundPolls
     stale_pid_polls    = $stalePolls

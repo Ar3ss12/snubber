@@ -14,15 +14,18 @@ PROFILE="release"
 REPORT="target/termination_report.json"
 STATS="target/stress_stats.json"
 SAMPLE_EVERY=5
+MAX_GROWTH_MB=2.0
 POS=()
-for a in "$@"; do
-    case "$a" in
+while [ $# -gt 0 ]; do
+    case "$1" in
         --launch) LAUNCH=1 ;;
         --build) BUILD=1 ;;
         --debug) PROFILE="debug" ;;
         --aggressive) AGGRESSIVE=1 ;;
-        *) POS+=("$a") ;;
+        --max-growth-mb) shift; MAX_GROWTH_MB="${1:-2.0}" ;;
+        *) POS+=("$1") ;;
     esac
+    shift
 done
 TARGET_PROCESS="${POS[0]:-$TARGET_PROCESS}"
 KILLS="${POS[1]:-$KILLS}"
@@ -258,6 +261,15 @@ fi
 if [ -n "$SUP_PID" ]; then
     [ "$SUP_EXIT" = "0" ] && add_check 1 "supervisor exit == 0" || add_check 0 "supervisor exit == 0"
 fi
+if [ "$SUP_RSS_N" -gt 0 ]; then
+    SUP_GROWTH_KB=$((SUP_RSS_LAST - SUP_RSS_FIRST))
+    GROWTH_MB=$(awk -v k="$SUP_GROWTH_KB" 'BEGIN { printf "%+.2f", k/1024 }')
+    if awk -v k="$SUP_GROWTH_KB" -v m="$MAX_GROWTH_MB" 'BEGIN { exit !(k/1024 <= m) }'; then
+        add_check 1 "supervisor RSS growth $GROWTH_MB MB <= $MAX_GROWTH_MB MB"
+    else
+        add_check 0 "supervisor RSS growth $GROWTH_MB MB <= $MAX_GROWTH_MB MB"
+    fi
+fi
 
 VERDICT="FAIL"
 if [ "$EXECUTED" -eq "$KILLS" ] && [ "$CHECKS_FAILED" -eq 0 ]; then
@@ -368,6 +380,7 @@ cat > "$STATS" <<EOF
   "workload": "$([ "$AGGRESSIVE" = 1 ] && echo spin || echo sleep)",
   "kills_requested": $KILLS,
   "kills_completed": $EXECUTED,
+  "max_growth_mb": $MAX_GROWTH_MB,
   "misses": $MISSES,
   "not_found_polls": $NOT_FOUND,
   "duration_ms": $DUR_MS,
