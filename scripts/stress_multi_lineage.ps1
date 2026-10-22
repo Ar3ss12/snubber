@@ -14,6 +14,10 @@ This measures cross-lineage contention (scheduler, handles, pipe drain under
 parallel death storms), not the single-lineage reflex gate. The single-lineage
 gate stays frozen in stress_harness.ps1.
 
+Cross-platform counterpart: scripts/stress_multi_lineage.py takes the same
+flags on Linux/macOS (SIGKILL, /proc or ps identity, JSON gates), and
+.github/workflows/stress.yml runs it on ubuntu-latest and macos-latest.
+
 Usage:
   powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive
   powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold

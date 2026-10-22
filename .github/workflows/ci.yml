@@ -44,9 +44,6 @@ jobs:
       - name: Package Integrity (dry-run publish)
         run: cargo publish --dry-run
 
-      - name: Package Integrity (dry-run publish)
-        run: cargo publish --dry-run
-
   # 2. CROSS-PLATFORM TEST SUITE: Linux, Windows, macOS
   test-matrix:
     name: Test on ${{ matrix.os }}

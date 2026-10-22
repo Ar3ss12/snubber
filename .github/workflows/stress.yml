@@ -1,0 +1,77 @@
+name: Stress
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+concurrency:
+  group: stress-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  multi-lineage-posix:
+    name: Multi-lineage storm (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Python Runtime
+        run: python3 --version
+
+      - name: Build Supervisor Example (release)
+        run: cargo build --release --example process_termination_loop
+
+      - name: Storm - armed hold (true ambush gate)
+        run: |
+          python3 scripts/stress_multi_lineage.py \
+            --lines 4 --kills-per-line 250 \
+            --armed-hold --aggressive \
+            --min-ambush-pct 70
+
+      - name: Upload Armed-Hold Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multi-lineage-armed-hold-${{ matrix.os }}
+          path: |
+            target/multi_lineage_stats.json
+            target/multi_lineage_report.json
+            target/multi_lineage/lane_*/supervisor.out
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Storm - free running (ambush/escape/stillborn split)
+        run: |
+          python3 scripts/stress_multi_lineage.py \
+            --lines 4 --kills-per-line 500 \
+            --aggressive \
+            --stats target/multi_lineage_stats_free.json \
+            --report target/multi_lineage_report_free.json
+
+      - name: Upload Free-Running Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multi-lineage-free-${{ matrix.os }}
+          path: |
+            target/multi_lineage_stats_free.json
+            target/multi_lineage_report_free.json
+          if-no-files-found: warn
+          retention-days: 14

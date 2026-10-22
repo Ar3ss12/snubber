@@ -741,6 +741,8 @@ The architecture has been verified against **10,000 real Windows `TerminateProce
 
 For capacity, scale by lineage rather than by threads: `scripts/stress_multi_lineage.ps1` runs N supervisors, each with its own pid file, pipe and killer. Measured 4 lanes x 2,500 kills: 390.6 kills/s armed-hold (100% ambush) and 719.8 kills/s free-running, with per-lane private growth <= 1.01 MB and handle growth <= +1.
 
+`scripts/stress_multi_lineage.py` is the Linux/macOS equivalent (Python 3 standard library only). It sends `SIGKILL` instead of `TerminateProcess` and verifies `(starttime, image basename)` before every kill: `/proc/<pid>/stat` field 22 plus `/proc/<pid>/exe` on Linux, `ps -o lstart=,comm=` on macOS. A recycled pid, a stale pid file or a foreign image therefore cannot redirect a kill, supervisors are excluded from the target set, and failed identity reads are never cached. Per-lane RSS growth is gated on both platforms; handle growth is sampled from `/proc/<pid>/fd` on Linux and reported as n/a on macOS. `.github/workflows/stress.yml` runs a 4 x 250 armed-hold storm (70% ambush gate) and a 4 x 500 free-running storm on `ubuntu-latest` and `macos-latest` for every push and pull request.
+
 ```powershell
 # 10,000-kill Rust integration target:
 cargo test --test supervisor_termination -- --ignored --nocapture
@@ -750,6 +752,11 @@ powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 1000 
 
 # 4 independent lineages under a parallel death storm:
 powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold
+```
+
+```bash
+# Same storm on Linux / macOS (SIGKILL path):
+python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggressive --armed-hold
 ```
 
 

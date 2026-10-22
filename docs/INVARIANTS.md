@@ -142,13 +142,21 @@ outlives every transaction.
   private-memory growth above `--MaxGrowthMb` / `--max-growth-mb`
   (default 2.0 MB) fails the run even when every token was rescued.
 - The multi-lineage harness gates per-lane handle growth
-  (`-MaxHandleGrowth`, default 16) alongside private growth; first, peak
-  and last samples are reported so a one-off warm-up delta is visible.
+  (`-MaxHandleGrowth` / `--max-handle-growth`, default 16) alongside private
+  growth; first, peak and last samples are reported so a one-off warm-up
+  delta is visible. Handle sampling is Linux-only (`/proc/<pid>/fd`); macOS
+  reports that gate as n/a and keeps the RSS gate.
 - Every reap is classified: **true ambush** (armed token left at death),
   **clean escape** (a commit was seen), or **stillborn** (no commit and no
-  armed token). `-ArmedHold` publishes the worker pid only after the first
-  arm frame, so `-MinAmbushPct 70` proves the killer terminates armed
-  workers instead of shooting during process startup.
+  armed token). `-ArmedHold` / `--armed-hold` publishes the worker pid only
+  after the first arm frame, so `-MinAmbushPct 70` / `--min-ambush-pct 70`
+  proves the killer terminates armed workers instead of shooting during
+  process startup.
+- The POSIX harness verifies process identity before `SIGKILL`: starttime
+  plus image basename from `/proc/<pid>/stat` and `/proc/<pid>/exe` (Linux)
+  or `ps -o lstart=,comm=` (macOS). A failed read is never cached, a killed
+  pid drops its cached identity, and supervisor pids are excluded, so a
+  recycled pid or a stale pid file cannot redirect a kill.
 
 ---
 
@@ -208,6 +216,9 @@ powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 1000 
 
 # Verify N independent lineages under a parallel death storm (Windows, 4 x 2,500 kills)
 powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold
+
+# Same storm on Linux/macOS (SIGKILL path, run by .github/workflows/stress.yml)
+python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggressive --armed-hold
 ```
 
 ---

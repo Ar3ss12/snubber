@@ -115,6 +115,8 @@ Measured with half of available hardware cores active (6 concurrent threads unde
 
 `scripts/stress_multi_lineage.ps1` runs N supervisors in parallel, each with its own worker, pid file, pipe and raw Win32 killer. One supervisor = one lineage: isolation needs no library changes because each lane runs in its own working directory. `--armed-hold` parks the worker armed and publishes its pid only after the arm frame, so an ambush-rate gate cannot be satisfied by shooting processes that never armed.
 
+`scripts/stress_multi_lineage.py` is the same harness for Linux and macOS: `SIGKILL` instead of `TerminateProcess`, process identity from `/proc/<pid>/stat` starttime (Linux) or `ps -o lstart` (macOS), so a recycled pid is never mistaken for the live worker. Python 3 standard library only, no dependencies. `.github/workflows/stress.yml` runs both the armed-hold and free-running storms on `ubuntu-latest` and `macos-latest` on every push.
+
 Measured on AMD Ryzen 5 4600H, release build, 4 lanes × 2,500 = 10,000 `TerminateProcess`:
 
 | Mode | Wall | Kills/s (avg / peak) | Dispatch p50 | Ambush | Escape | Stillborn |
@@ -131,6 +133,11 @@ powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 10000
 powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 1000 -Launch -RawKill -Aggressive -ArmedHold
 # 4 independent lineages, 2,500 kills each
 powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold
+```
+
+```bash
+# Linux / macOS: same storm, SIGKILL path, JSON gates
+python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggressive --armed-hold
 ```
 
 ---
