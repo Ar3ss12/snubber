@@ -150,7 +150,7 @@ pub use supervisor::{
 #[cfg(feature = "std")]
 pub use async_engine::{
     backpressure_of, classify, enter_paced_async, retry_after_ms, settle_async, AsyncGate,
-    AsyncLease, EnterFuture, GateError, LeaseChannel, LeaseEvent, Refusal,
+    AsyncLease, EnterFuture, GateError, LeaseChannel, LeaseEvent, ProfiledEnterFuture, Refusal,
 };
 
 #[cfg(feature = "std")]

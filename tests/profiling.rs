@@ -1,6 +1,7 @@
 //! Opt-in execution profile: fake clocks, stage attribution, CPU split,
 //! and sync caller-parking dwell.
 
+use core::future::Future;
 use core::sync::atomic::{AtomicU64, Ordering};
 use snubber::{BackpressurePolicy, StageKind, PROFILE_HAS_CPU, PROFILE_STAGES};
 use std::sync::Arc;
@@ -131,6 +132,81 @@ fn sync_parking_lands_in_dwell() {
 
     let wait_ms = guard.queue_wait_ms();
     assert!(wait_ms >= 1, "parked time must be recorded");
+    let (_, p) = guard.commit_profiled();
+    assert_eq!(p.dwell_us, (wait_ms * 1_000).min(u32::MAX as u64) as u32);
+}
+
+struct NoopWake;
+
+impl std::task::Wake for NoopWake {
+    fn wake(self: std::sync::Arc<Self>) {}
+}
+
+fn noop_waker() -> std::task::Waker {
+    std::task::Waker::from(std::sync::Arc::new(NoopWake))
+}
+
+#[test]
+fn async_profile_arms_on_successful_poll() {
+    static AW: AtomicU64 = AtomicU64::new(0);
+    static AC: AtomicU64 = AtomicU64::new(0);
+    fn aw() -> u64 {
+        AW.load(Ordering::Relaxed)
+    }
+    fn ac() -> u64 {
+        AC.load(Ordering::Relaxed)
+    }
+
+    let node = snubber::SnubberNode::builder("prof_async").build();
+    let mut fut = node.enter_async_profiled_with_clock(1, 1, aw, Some(ac), || {});
+
+    AW.store(1_000, Ordering::Relaxed);
+    let waker = noop_waker();
+    let mut cx = core::task::Context::from_waker(&waker);
+    let mut guard = match core::pin::Pin::new(&mut fut).poll(&mut cx) {
+        core::task::Poll::Ready(Ok(g)) => g,
+        core::task::Poll::Ready(Err(e)) => panic!("expected admission, got {e:?}"),
+        core::task::Poll::Pending => panic!("expected immediate admission, got Pending"),
+    };
+
+    AW.store(101_000, Ordering::Relaxed);
+    guard.checkpoint_timed(1, "io", StageKind::Wait);
+    AW.store(201_000, Ordering::Relaxed);
+    AC.store(50_000, Ordering::Relaxed);
+    let (_, p) = guard.commit_profiled();
+
+    assert_eq!(p.admit_us, 1);
+    assert_eq!(p.work_wall_us, 200);
+    assert_eq!(p.work_cpu_us, 50);
+    assert_eq!(p.stage_count, 1);
+    assert_eq!(p.stages[0].label, "io");
+    assert_eq!(p.stages[0].wall_us, 100);
+    assert_eq!(p.stages[0].kind, StageKind::Wait);
+}
+
+#[test]
+fn async_queue_dwell_lands_in_profile() {
+    let node = Arc::new(
+        snubber::SnubberNode::builder("prof_async_dwell")
+            .max_in_flight(1)
+            .build(),
+    );
+    let holder = node.enter_auto(|| {}).expect("first admission");
+    let mut fut = node.enter_async_auto_profiled(|| {});
+
+    let waker = noop_waker();
+    let mut cx = core::task::Context::from_waker(&waker);
+    assert!(core::pin::Pin::new(&mut fut).poll(&mut cx).is_pending());
+
+    std::thread::sleep(Duration::from_millis(3));
+    holder.commit();
+    let guard = match core::pin::Pin::new(&mut fut).poll(&mut cx) {
+        core::task::Poll::Ready(Ok(g)) => g,
+        core::task::Poll::Ready(Err(e)) => panic!("expected admission, got {e:?}"),
+        core::task::Poll::Pending => panic!("expected admission after slot release, got Pending"),
+    };
+    let wait_ms = guard.queue_wait_ms();
+    assert!(wait_ms >= 1, "async dwell must be recorded");
     let (_, p) = guard.commit_profiled();
     assert_eq!(p.dwell_us, (wait_ms * 1_000).min(u32::MAX as u64) as u32);
 }

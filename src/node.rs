@@ -1977,14 +1977,7 @@ impl SnubberNode {
         let cpu_admit = cpu.map(|f| f()).unwrap_or(0);
         let mut guard = self.enter(epoch, task_id, rollback)?;
         let t_admit = wall();
-        guard.profile = Some(Box::new(ProfileState::new(
-            wall,
-            cpu,
-            t_enter,
-            t_admit,
-            cpu_admit,
-            guard.queue_wait_ms,
-        )));
+        guard.arm_profile(wall, cpu, t_enter, t_admit, cpu_admit);
         Ok(guard)
     }
 
@@ -4112,6 +4105,26 @@ impl<F: FnOnce()> TrackedGuard<F> {
     #[inline]
     fn release_profile(&mut self) {
         drop(self.profile.take());
+    }
+
+    /// Arm profiling on an already-admitted guard (async entry hook).
+    #[inline]
+    pub(crate) fn arm_profile(
+        &mut self,
+        wall: NanoClock,
+        cpu: Option<NanoClock>,
+        t_enter: u64,
+        t_admit: u64,
+        cpu_admit: u64,
+    ) {
+        self.profile = Some(Box::new(ProfileState::new(
+            wall,
+            cpu,
+            t_enter,
+            t_admit,
+            cpu_admit,
+            self.queue_wait_ms,
+        )));
     }
 
     /// Commit and return the execution profile alongside the event.

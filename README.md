@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-249%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-251%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -81,6 +81,7 @@ Measured on AMD Ryzen 5 4600H release build
 | `node_passthrough_enter + commit` | Layer 2 (`std` canary) | **~86.7 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
 | `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~84.5 ns** | Same transit through `scoped()` — work runs, books stay clean |
 | `enter_async_auto` | Layer 3 (`std`) | **0% CPU** | Pure `core::task::Waker` parking, no runtime deps |
+| `enter_async_auto_profiled` | Layer 3 (`std`, opt-in) | 1 `Box` + 2 clock reads | Same waker parking, profile arms on the admitting poll |
 | `static_node.enter + commit` | Layer 2 (`std`) | **~91.9 ns** | Compile-time capacity assert + bulkhead + auto-commit |
 | `node.note_pulse_stall(lag_ms)` | Layer 2 (`std`) | **1 atomic max** | Missed heartbeat lands in `SnapshotV1` v3 + `AnomalyKind::PulseStall` |
 | `process_token.to_bytes()` | Layer 4 (`core`) | **~7.5 ns** | 44-byte framed wire serialization (`to_le_bytes`) |

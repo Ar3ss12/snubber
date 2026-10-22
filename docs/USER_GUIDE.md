@@ -513,6 +513,15 @@ let starved = profile.is_io_starved();   // < 20% CPU while holding a slot
 * Four stage slots (`PROFILE_STAGES`); further checkpoints set
   `PROFILE_STAGE_OVERFLOW` and merge — they never allocate.
 
+Async admission has the same opt-in wrapper — the profile arms on the
+poll that actually admits, so `admit_us` covers the queue wait:
+
+```rust
+let guard = node.enter_async_auto_profiled(|| rollback()).await?;
+// ... work ...
+let (_event, profile) = guard.commit_profiled();
+```
+
 Durations are microseconds, saturating at `u32::MAX` (`PROFILE_SATURATED`).
 `enter_profiled_with_clock(wall, cpu, rollback)` injects `fn() -> u64`
 nanosecond clocks, so tests can drive a static `AtomicU64` and get exact
@@ -956,6 +965,7 @@ impl snubber::OrphanGuard for LinuxPdeathsigGuard {
 | `NoOrphanGuard` / `OrphanGuard` | 2 / std | trait only | Parent death = child processes reaped (app impl) |
 | `node.enter_auto` | 2 / std | **~86.5 ns** | Monotonic auto sequence ticket minting |
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | 2 / std | 1 `Box` at arm + 1 clock read/stage | Stage wall/CPU breakdown (opt-in; default path untouched) |
+| `enter_async_auto_profiled` | 3 / std | 1 `Box` + 2 clock reads | Profiled async admission; arms on the admitting poll |
 | `guard.profile_snapshot()` | 2 / std | 1 wall + 1 CPU read | Mid-flight profile without settling |
 | `snapshot.diff(&later)` + `write_summary` | 2 / cold | pure `Copy` math | Counter deltas since the last sample |
 | `write_triage(&mut out, node, &snap)` | 2 / cold | `fmt::Write`, no alloc | One ASCII verdict card per node |

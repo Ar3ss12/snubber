@@ -9,7 +9,7 @@ pub mod lease;
 pub mod pace;
 pub mod settle;
 
-pub use entry::EnterFuture;
+pub use entry::{EnterFuture, ProfiledEnterFuture};
 pub use gate::{backpressure_of, classify, retry_after_ms, AsyncGate, GateError, Refusal};
 pub use lease::{AsyncLease, LeaseChannel, LeaseEvent};
 pub use pace::enter_paced_async;
