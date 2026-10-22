@@ -30,6 +30,8 @@ fn main() {
         .cloned()
         .unwrap_or_else(|| "target/termination_report.json".to_string());
 
+    let spin = args.iter().any(|a| a == "--spin");
+
     let pid_file = "target/supervised_worker.pid";
     if let Some(parent) = std::path::Path::new(pid_file).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -49,8 +51,12 @@ fn main() {
         let gen = clock.generation();
 
         // Spawn disposable child worker process
-        let mut child = Command::new(&current_exe)
-            .arg("--worker")
+        let mut cmd = Command::new(&current_exe);
+        cmd.arg("--worker");
+        if spin {
+            cmd.arg("--worker-spin");
+        }
+        let mut child = cmd
             .env("SNUBBER_SUPERVISED", "1")
             .env("SNUBBER_GEN", gen.to_string())
             .stdout(Stdio::piped())
@@ -163,6 +169,7 @@ fn main() {
 /// Supervised child worker: arms hardware tokens and commits rapidly in a tight loop.
 fn worker_main() {
     use std::io::Write;
+    let spin = std::env::args().any(|a| a == "--worker-spin");
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
@@ -178,7 +185,7 @@ fn worker_main() {
         }
 
         // Tiny window where token is actively armed (target for external termination)
-        std::thread::sleep(Duration::from_millis(3));
+        wait_ms(3, spin);
 
         // 2. Settle clean
         let commit = ProcessToken::commit(task_id);
@@ -187,6 +194,20 @@ fn worker_main() {
         }
 
         // Fast pacing
-        std::thread::sleep(Duration::from_millis(1));
+        wait_ms(1, spin);
+    }
+}
+
+/// Sleep pacing is subject to the OS timer quantum (~15.6 ms on Windows by default),
+/// which stretches the 3+1 ms cycle to ~30 ms. Spin pacing keeps the harness cycle
+/// at the real duration and is what `stress_harness -Aggressive` selects.
+fn wait_ms(ms: u64, spin: bool) {
+    if spin {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < deadline {
+            std::hint::spin_loop();
+        }
+    } else {
+        std::thread::sleep(Duration::from_millis(ms));
     }
 }
