@@ -4288,8 +4288,9 @@ impl<F: FnOnce()> TrackedGuard<F> {
         Some(p.snapshot_at(now, cpu_now))
     }
 
-    /// Settle paths forget the guard (`mem::forget`), so the boxed profile
-    /// must be released explicitly or it leaks one allocation per call.
+    /// Settle paths may drop the guard normally: `Drop` early-returns because
+    /// `settled` is set, and the `node` `Arc` inside the guard must be
+    /// released (`mem::forget` here leaked one `NodeInner` per transaction).
     #[inline]
     fn release_profile(&mut self) {
         drop(self.profile.take());
@@ -4531,7 +4532,6 @@ impl<F: FnOnce()> TrackedGuard<F> {
                 header: self.arming.header,
             };
             self.release_profile();
-            core::mem::forget(self);
             return event;
         }
         let guard = self.guard.take().expect("guard already settled");
@@ -4541,7 +4541,6 @@ impl<F: FnOnce()> TrackedGuard<F> {
         let is_probe = self.is_probe;
         let lane = self.priority.code().min(2) as usize;
         self.release_profile();
-        core::mem::forget(self);
         let waker = {
             let mut inner = node.lock().unwrap_or_else(|p| {
                 let mut g = p.into_inner();
@@ -4661,7 +4660,6 @@ impl<F: FnOnce()> TrackedGuard<F> {
             w.wake();
         }
         self.release_profile();
-        core::mem::forget(self);
         Err(if spin {
             TimeoutCheck::SpinDetected
         } else if dead {
@@ -4714,7 +4712,6 @@ impl<F: FnOnce()> TrackedGuard<F> {
                 reason,
             };
             self.release_profile();
-            core::mem::forget(self);
             return event;
         }
         let guard = self.guard.take().expect("guard already settled");
@@ -4724,7 +4721,6 @@ impl<F: FnOnce()> TrackedGuard<F> {
         let is_probe = self.is_probe;
         let lane = self.priority.code().min(2) as usize;
         self.release_profile();
-        core::mem::forget(self);
         let waker = {
             let mut inner = node.lock().unwrap_or_else(|p| {
                 let mut g = p.into_inner();
