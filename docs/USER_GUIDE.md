@@ -735,10 +735,21 @@ let guard = node.enter_supervised_erased(
 ```
 
 ### Out-of-Process Hard Termination Harness (10,000 OS Kills):
-The architecture has been verified against **10,000 real Windows `TerminateProcess` executions** at ~52 kills/sec without a single pipe deadlock or lost token:
+The architecture has been verified against **10,000 real Windows `TerminateProcess` executions** without a single pipe deadlock or lost token. Every reap is classified: **true ambush** (an armed token was still pending at death), **clean escape** (at least one commit was observed) or **stillborn** (no commit and no armed token, typically a kill during process startup). The three counters sum to `reaped` on every run.
+
+`--armed-hold` makes the worker arm once and park; the supervisor publishes the worker pid only after the first arm frame is parsed. A rescue gate of `-MinAmbushPct 70` therefore proves that armed workers were terminated, not startup processes. Measured single-lineage: 1,000/1,000 true ambush at 63.7 kills/s armed-hold; 2,000/2,000 at 78.6 kills/s free-running (64.0% ambush / 17.8% escape / 18.3% stillborn).
+
+For capacity, scale by lineage rather than by threads: `scripts/stress_multi_lineage.ps1` runs N supervisors, each with its own pid file, pipe and killer. Measured 4 lanes x 2,500 kills: 390.6 kills/s armed-hold (100% ambush) and 719.8 kills/s free-running, with per-lane private growth <= 1.01 MB and handle growth <= +1.
+
 ```powershell
-# Run the automated 10,000 kill stress test:
+# 10,000-kill Rust integration target:
 cargo test --test supervisor_termination -- --ignored --nocapture
+
+# Single-lineage release gate (raw Win32 killer, armed-hold rescue proof):
+powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 1000 -Launch -RawKill -Aggressive -ArmedHold
+
+# 4 independent lineages under a parallel death storm:
+powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold
 ```
 
 

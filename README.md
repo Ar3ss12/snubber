@@ -52,7 +52,7 @@ let receipt = node.scoped_checked(
 * **Strict Determinism:** `#![forbid(unsafe_code)]`, zero external dependencies. Predictable behavior across bare-metal microcontrollers and multi-socket servers alike.
 * **Runtime-Agnostic Async:** Bounded waker queue built on `core::task::Waker` consuming **0% CPU** without depending on Tokio, async-std, or background threads.
 * **Adaptive Backpressure & Pacing:** Refusals carry physical telemetry (`retry_after_ms`, queue depth 0..255) allowing clients to pace incoming traffic instead of overwhelming dead hardware.
-* **Out-of-Process Crash Recovery:** Automated stress harness verifies resilience through 10,000 hard Windows `TerminateProcess` (`kill -9`) executions with zero pipe deadlocks and 100% token rescue.
+* **Out-of-Process Crash Recovery:** Automated stress harness verifies resilience through 10,000 hard Windows `TerminateProcess` (`kill -9`) executions with zero pipe deadlocks and 100% token rescue. Every reap is classified as **true ambush** (armed token at death), **clean escape** (commit seen) or **stillborn** (killed during startup); a multi-lineage storm runs 4 independent supervisors in parallel with per-lane latency and handle gates.
 * **Isolated Error Domains:** `FaultKind::is_catastrophic()` cleanly separates unrecoverable failures (Panic, Timeout, ProcessDied, ImplicitDrop) from routine capacity shedding (bulkhead limits, rate limits, stale epochs). Shedding pressure never trips circuit breakers.
 * **Monotonic Hang Clock:** Boot-relative `Instant` (`SystemClock`) — NTP sync, DST changes, and manual edits never move a deadline. Firmware brings its own `SysTick` tick via `MonotonicMs`.
 * **SPIN vs SLEEP Classification:** A hot `loop {}` settles as `SpinDetected`, a blocked syscall as `TimedOut` — identical rollback, distinct verdict, no thread ever killed. 8-byte `WorkerPulse` heartbeat strokes the hardware WDT on firmware.
@@ -104,6 +104,28 @@ Measured with half of available hardware cores active (6 concurrent threads unde
 | `contended_node_scoped` | 6 threads | **~804 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
 | `contended_gateway_mpsc` | 6 threads | **~132 ns** | Bounded multi-producer channel write under parallel core flood |
 | `cross_thread_isr_bridge` | 2 threads (inter-core) | **~35.6 ns** | Lock-free SPSC ring across physical core boundaries (bus latency) |
+
+### ⚡ Multi-Lineage Termination Storm
+
+`scripts/stress_multi_lineage.ps1` runs N supervisors in parallel, each with its own worker, pid file, pipe and raw Win32 killer. One supervisor = one lineage: isolation needs no library changes because each lane runs in its own working directory. `--armed-hold` parks the worker armed and publishes its pid only after the arm frame, so an ambush-rate gate cannot be satisfied by shooting processes that never armed.
+
+Measured on AMD Ryzen 5 4600H, release build, 4 lanes × 2,500 = 10,000 `TerminateProcess`:
+
+| Mode | Wall | Kills/s (avg / peak) | Dispatch p50 | Ambush | Escape | Stillborn |
+|---|---|---|---|---|---|---|
+| `-Aggressive -ArmedHold` | 25.60 s | 390.6 / 462.7 | 360 µs | 10,000 (100%) | 0 | 0 |
+| `-Aggressive` (free-running) | 13.89 s | 719.8 / 822.2 | 376 µs | 2,023 (20.2%) | 91 (0.9%) | 7,886 (78.9%) |
+
+Armed-hold run: per-lane dispatch p50 354–366 µs, private-memory growth +0.61…+1.01 MB, handle growth 0…+1, final generation = kills + 1 on every lane, no pipe deadlock. Free-running shows what the rate costs: at 720 kills/s most shots land during process startup, not in the armed window.
+
+```powershell
+# Single-lineage release gate (10,000 kills)
+powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 10000 -Launch -RawKill -Aggressive
+# Armed-hold rescue proof (true ambush >= 70%)
+powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 1000 -Launch -RawKill -Aggressive -ArmedHold
+# 4 independent lineages, 2,500 kills each
+powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold
+```
 
 ---
 

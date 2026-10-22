@@ -141,6 +141,9 @@ outlives every transaction.
 - The out-of-process harness enforces the runtime ceiling: supervisor
   private-memory growth above `--MaxGrowthMb` / `--max-growth-mb`
   (default 2.0 MB) fails the run even when every token was rescued.
+- The multi-lineage harness gates per-lane handle growth
+  (`-MaxHandleGrowth`, default 16) alongside private growth; first, peak
+  and last samples are reported so a one-off warm-up delta is visible.
 - Every reap is classified: **true ambush** (armed token left at death),
   **clean escape** (a commit was seen), or **stillborn** (no commit and no
   armed token). `-ArmedHold` publishes the worker pid only after the first
