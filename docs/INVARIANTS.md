@@ -194,6 +194,9 @@ cargo test --test harness
 # Verify zero-leak settlement: Arc/closure reclaim + byte-neutral 100k cycles
 cargo test --test guard_settle_reclaim
 cargo test --test guard_alloc_budget
+
+# Verify N independent lineages under a parallel death storm (Windows, 4 x 2,500 kills)
+powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive
 ```
 
 ---
