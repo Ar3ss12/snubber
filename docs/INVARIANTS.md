@@ -67,6 +67,21 @@ fires `AnomalyKind::PulseStall` (`pulse_stall`, ignores `min_sample`
 like desync). A post-mortem dump answers "did it lag?" with
 `[DIAG 0x… <node> pulse_stall <lag>%]` instead of "0 errors".
 
+### Invariant 8: Memory Pressure Is a Refusal, Never a Fault
+External RSS samples (`SnubberNode::note_memory_kb`, `MemoryPolicy::note`)
+only move a `Copy` verdict; the crate never measures memory itself.
+- Above `soft_kb` every new admission fails `EnterError::MemoryPressure`
+  from ONE relaxed atomic load taken BEFORE the node mutex — a pressured
+  node never contends with its sampler or a snapshotter, and in-flight
+  guards keep running to settle (cooperative drain).
+- The refusal has its own column (`memory_rejections`): it never enters
+  the failure window, never moves `failure_streak`, and never trips the
+  breaker. `retry_after_ms()` is a fixed 1000 ms (`Refusal::Backoff`).
+- A hard kill exists only on the supervisor side, only at `used >= hard_kb`,
+  and is stamped `DeathCause::MemoryLimit`; soft crossings never kill.
+- `hard < soft` is clamped up to `soft`, so no configuration can skip the
+  drain phase.
+
 ---
 
 ## 2. Verification Protocol
@@ -97,6 +112,13 @@ cargo test --test lock_hierarchy
 # Verify pulse black-box (stall verdicts in v3 snapshot + anomaly)
 cargo test --test diagnostics pulse_stall
 
+# Verify memory refusal + snapshot v4 gauges (soft refuses, hard verdicts)
+cargo test --test memory_pressure
+
+# Verify supervisor euthanasia decisions and the real soft-drain loop
+cargo test --test supervisor_memory
+cargo test --test supervisor_memory_loop
+
 # Verify bench hygiene (setup outside the hot loop, pure overhead only)
 cargo test --test bench_hygiene
 ```
@@ -105,7 +127,7 @@ cargo test --test bench_hygiene
 
 ## 3. Reporting a Discrepancy
 
-If you identify a scenario where any of the seven invariants above fails using purely Safe Rust:
+If you identify a scenario where any of the eight invariants above fails using purely Safe Rust:
 
 1. **Minimal Reproduction:** Construct an isolated integration test demonstrating the violation (failing an explicit `assert!`).
 2. **Deterministic Trigger:** The test must run and fail within 30 seconds without requiring external infrastructure.

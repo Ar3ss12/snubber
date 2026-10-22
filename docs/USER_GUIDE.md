@@ -830,7 +830,9 @@ Supervisor::run_supervised_guard_with_memory(
 * `policy.watch()` exposes `used_kb()` / `peak_kb()` / limits for the
   postmortem; `policy.death_cause()` is `Some(MemoryLimit)` only at hard.
 * The whole chain — soft → refuse → digest → generation bump → successor
-  admits — runs in `examples/14_memory_recycle.rs`.
+  admits — runs in `examples/14_memory_recycle.rs`; the real two-process
+  loop (supervisor + worker, drain mode vs `--no-drain`) runs in
+  `examples/15_supervised_memory.rs`.
 
 ### 4.7 Orphan contract (Phase 6: no zombies)
 ```rust
