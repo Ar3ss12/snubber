@@ -797,6 +797,11 @@ pub fn death_event(header: TransactionHeader, cause: DeathCause) -> SnubberEvent
 struct DrainState {
     armed: Option<ProcessToken>,
     last_seen_ms: u64,
+    /// Parsed-frame counters: total, arm-class, commit. Let a supervisor
+    /// classify a dead worker (`commits > 0` = settled at least once).
+    frames: u64,
+    arms: u64,
+    commits: u64,
     /// Last verified complete StateDigest.
     state: Option<StateDigest>,
     /// Reassembly scratch: chunks per seq (24/24/16) + got-mask + full CRC.
@@ -812,6 +817,21 @@ struct DrainState {
 #[inline]
 fn now_ms() -> u64 {
     super::node::now_ms()
+}
+
+/// Frame counters observed by a drain since it started.
+///
+/// Lets a supervisor classify a dead worker without keeping per-frame
+/// history: `commits > 0` means the worker settled at least once;
+/// `arms > commits` means it was armed more often than it settled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainCounters {
+    /// Total parsed 40-byte frames (arms, commits, heartbeats, state chunks).
+    pub frames: u64,
+    /// Arm-class frames (any opcode outside commit/heartbeat/state).
+    pub arms: u64,
+    /// `OP_COMMIT` frames.
+    pub commits: u64,
 }
 
 /// Pipe drain: background reader keeping the kernel buffer empty.
@@ -852,8 +872,10 @@ impl PipeDrain {
                     let token = ProcessToken::from_body_bytes(&body);
                     if let Ok(mut st) = s.lock() {
                         st.last_seen_ms = now_ms();
+                        st.frames = st.frames.saturating_add(1);
                         if token.opcode == OP_COMMIT || token.opcode == OP_HEARTBEAT {
                             if token.opcode == OP_COMMIT {
+                                st.commits = st.commits.saturating_add(1);
                                 st.armed = None;
                             }
                         } else if token.opcode == OP_STATE {
@@ -897,6 +919,7 @@ impl PipeDrain {
                             // Corrupt or mismatched frame: dropped silently,
                             // replacement process gets the last verified whole state.
                         } else {
+                            st.arms = st.arms.saturating_add(1);
                             st.armed = Some(token);
                         }
                     }
@@ -932,8 +955,10 @@ impl PipeDrain {
                 let token = ProcessToken::from_body_bytes(&body);
                 if let Ok(mut st) = state.lock() {
                     st.last_seen_ms = now_ms();
+                    st.frames = st.frames.saturating_add(1);
                     if token.opcode == OP_COMMIT || token.opcode == OP_HEARTBEAT {
                         if token.opcode == OP_COMMIT {
+                            st.commits = st.commits.saturating_add(1);
                             st.armed = None;
                         }
                     } else if token.opcode == OP_STATE {
@@ -970,6 +995,7 @@ impl PipeDrain {
                             }
                         }
                     } else {
+                        st.arms = st.arms.saturating_add(1);
                         st.armed = Some(token);
                     }
                 }
@@ -984,6 +1010,19 @@ impl PipeDrain {
     #[must_use]
     pub fn take_armed(&self) -> Option<ProcessToken> {
         self.state.lock().ok().and_then(|mut st| st.armed.take())
+    }
+
+    /// Parsed-frame counters (cheap snapshot under one short lock).
+    #[must_use]
+    pub fn counters(&self) -> DrainCounters {
+        match self.state.lock() {
+            Ok(st) => DrainCounters {
+                frames: st.frames,
+                arms: st.arms,
+                commits: st.commits,
+            },
+            Err(_) => DrainCounters::default(),
+        }
     }
 
     /// Take the last verified complete `StateDigest`, if any (Phase 3).

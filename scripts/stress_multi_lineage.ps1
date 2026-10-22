@@ -16,6 +16,11 @@ gate stays frozen in stress_harness.ps1.
 
 Usage:
   powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive
+  powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold
+
+-ArmedHold makes every worker arm once and park without committing; the
+supervisor publishes the pid only after the arm frame, so every kill is a
+true ambush and the default gate is `-MinAmbushPct 70`.
 
 Exit code 0 = PASS, 1 = FAIL.
 #>
@@ -27,6 +32,9 @@ param(
     [int]$StallTimeoutSec = 20,
     [int]$SupervisorWaitSec = 60,
     [double]$MaxGrowthMb = 2.0,
+    [int]$MaxHandleGrowth = 16,
+    [switch]$ArmedHold,
+    [int]$MinAmbushPct = -1,
     [switch]$Aggressive,
     [switch]$Build,
     [ValidateSet("release", "debug")]
@@ -41,6 +49,7 @@ $ErrorActionPreference = "Stop"
 if ($env:OS -ne "Windows_NT") { throw "Multi-lineage storm uses the raw Win32 kill path and is Windows-only" }
 if ($Lines -lt 1 -or $Lines -gt 32) { throw "-Lines must be in 1..32" }
 if ($KillsPerLine -le 0) { throw "-KillsPerLine must be > 0" }
+$minAmbush = if ($MinAmbushPct -lt 0) { if ($ArmedHold) { 70 } else { 0 } } else { $MinAmbushPct }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 function Resolve-RepoPath([string]$p) {
@@ -129,6 +138,7 @@ Write-Host "==========================================================" -Foregro
 Write-Host ("Lines     : {0}   kills/lane: {1}   total: {2}" -f $Lines, $KillsPerLine, $totalTarget)
 Write-Host ("Model     : {0} supervisor processes, one pipe each, separate pid files" -f $Lines)
 Write-Host ("Workload  : {0}" -f $(if ($Aggressive) { "spin pacing (3 ms armed / 1 ms pace)" } else { "sleep pacing" }))
+Write-Host ("Ambush    : {0}   min true-ambush: {1}%" -f $(if ($ArmedHold) { "armed-hold worker (pid published only after arm)" } else { "free-running worker" }), $minAmbush)
 Write-Host ("Kill path : raw OpenProcess + image verify + creation-time identity + TerminateProcess, {0} runspace killer(s)" -f $Lines)
 Write-Host ("Timer     : {0}" -f $(if ($timerRes) { "winmm 1 ms request" } else { "system default" }))
 Write-Host "----------------------------------------------------------" -ForegroundColor DarkGray
@@ -156,6 +166,10 @@ for ($i = 0; $i -lt $Lines; $i++) {
         Exit      = $null
         Kill      = $null
         ReportObj = $null
+        Ambush    = 0
+        Escape    = 0
+        Stillborn = 0
+        AmbushPct = 0.0
         WsPeak    = 0.0; WsFirst = -1.0; WsLast = 0.0
         PrivPeak  = 0.0; PrivFirst = -1.0; PrivLast = 0.0
         HandlePeak = 0; HandleFirst = -1; HandleLast = 0
@@ -168,6 +182,7 @@ try {
     foreach ($lane in $lanes) {
         $supArgs = "--target-kills $KillsPerLine --report-path `"$($lane.Report)`""
         if ($Aggressive) { $supArgs = "$supArgs --spin" }
+        if ($ArmedHold) { $supArgs = "$supArgs --armed-hold" }
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $exe
         $psi.Arguments = $supArgs
@@ -400,6 +415,19 @@ try {
         if (Test-Path $lane.Report) {
             try { $lane.ReportObj = Get-Content -Raw $lane.Report | ConvertFrom-Json } catch { $lane.ReportObj = $null }
         }
+        if ($lane.ReportObj) {
+            if ($lane.ReportObj.PSObject.Properties['ambush_kills']) {
+                $lane.Ambush = [int]$lane.ReportObj.ambush_kills
+                $lane.Escape = [int]$lane.ReportObj.escape_kills
+                $lane.Stillborn = [int]$lane.ReportObj.stillborn_kills
+            } else {
+                # Older supervisor binary: no per-class split.
+                $lane.Ambush = [int]$lane.ReportObj.tokens_rescued
+                $lane.Escape = [int]$lane.ReportObj.clean_settles
+                $lane.Stillborn = 0
+            }
+            $lane.AmbushPct = if ([int]$lane.ReportObj.total_reaped -gt 0) { 100.0 * $lane.Ambush / [int]$lane.ReportObj.total_reaped } else { 0 }
+        }
     }
     $lanesFinalized = $true
 } finally {
@@ -434,14 +462,21 @@ $durationSec = [math]::Max($overall.Elapsed.TotalSeconds, 0.001)
 $completed = 0
 $totalRescued = 0
 $totalClean = 0
+$totalAmbush = 0
+$totalEscape = 0
+$totalStillborn = 0
 foreach ($lane in $lanes) {
     if ($lane.ReportObj) {
         $completed += [int]$lane.ReportObj.total_reaped
         $totalRescued += [int]$lane.ReportObj.tokens_rescued
         $totalClean += [int]$lane.ReportObj.clean_settles
+        $totalAmbush += $lane.Ambush
+        $totalEscape += $lane.Escape
+        $totalStillborn += $lane.Stillborn
     }
 }
 $rate = $completed / $durationSec
+$ambushPct = if ($completed -gt 0) { 100.0 * $totalAmbush / $completed } else { 0 }
 
 $checks = New-Object 'System.Collections.Generic.List[object]'
 foreach ($lane in $lanes) {
@@ -449,6 +484,10 @@ foreach ($lane in $lanes) {
     if ($lane.ReportObj) {
         $checks.Add([pscustomobject]@{ Name = "$tag reaped == $KillsPerLine"; Ok = ([int]$lane.ReportObj.total_reaped -eq $KillsPerLine) })
         $checks.Add([pscustomobject]@{ Name = "$tag rescue + clean == reaped"; Ok = (([int]$lane.ReportObj.tokens_rescued + [int]$lane.ReportObj.clean_settles) -eq [int]$lane.ReportObj.total_reaped) })
+        $checks.Add([pscustomobject]@{ Name = "$tag ambush + escape + stillborn == reaped"; Ok = (($lane.Ambush + $lane.Escape + $lane.Stillborn) -eq [int]$lane.ReportObj.total_reaped) })
+        if ($minAmbush -gt 0) {
+            $checks.Add([pscustomobject]@{ Name = ("$tag true ambush rate {0:N1}% >= {1}%" -f $lane.AmbushPct, $minAmbush); Ok = ($lane.AmbushPct -ge $minAmbush) })
+        }
         $checks.Add([pscustomobject]@{ Name = "$tag final_generation == kills + 1"; Ok = ([int]$lane.ReportObj.final_generation -eq $KillsPerLine + 1) })
         $checks.Add([pscustomobject]@{ Name = "$tag deadlock == false"; Ok = (-not [bool]$lane.ReportObj.deadlock) })
     } else {
@@ -458,12 +497,17 @@ foreach ($lane in $lanes) {
     $checks.Add([pscustomobject]@{ Name = "$tag killer reported no error/stall"; Ok = ($lane.Kill -and -not $lane.Kill.Error -and -not $lane.Kill.Stalled) })
     if ($lane.Samples -gt 0) {
         $growth = $lane.PrivLast - $lane.PrivFirst
+        $handleGrowth = $lane.HandleLast - $lane.HandleFirst
         $checks.Add([pscustomobject]@{ Name = ("$tag private growth {0:+0.00;-0.00;0.00} MB <= {1:N1} MB" -f $growth, $MaxGrowthMb); Ok = ($growth -le $MaxGrowthMb) })
+        $checks.Add([pscustomobject]@{ Name = ("$tag handle growth {0:+0;-0;0} <= {1}" -f $handleGrowth, $MaxHandleGrowth); Ok = ($handleGrowth -le $MaxHandleGrowth) })
     }
 }
 $checks.Add([pscustomobject]@{ Name = ("aggregate reaped {0} == {1}" -f $completed, $totalTarget); Ok = ($completed -eq $totalTarget) })
 $checks.Add([pscustomobject]@{ Name = "aggregate rescue + clean == reaped"; Ok = (($totalRescued + $totalClean) -eq $completed) })
 $checks.Add([pscustomobject]@{ Name = "aggregate no cross-lineage accounting drift"; Ok = (($totalRescued + $totalClean) -eq $totalTarget) })
+if ($minAmbush -gt 0) {
+    $checks.Add([pscustomobject]@{ Name = ("aggregate true ambush rate {0:N1}% >= {1}%" -f $ambushPct, $minAmbush); Ok = ($ambushPct -ge $minAmbush) })
+}
 
 $failedChecks = @($checks | Where-Object { -not $_.Ok })
 $verdict = if ($completed -eq $totalTarget -and $failedChecks.Count -eq 0) { "PASS" } else { "FAIL" }
@@ -486,15 +530,22 @@ Write-Host ("Aggregate rate  : {0:N1} kills/s avg | {1:N1} kills/s peak (250 ms 
 Write-Host ("Dispatch us     : min {0:N1} | p50 {1:N1} | p95 {2:N1} | p99 {3:N1} | p99.9 {4:N1} | max {5:N1}" -f `
     (Get-Pctl $sorted 0.0), (Get-Pctl $sorted 0.50), (Get-Pctl $sorted 0.95), (Get-Pctl $sorted 0.99), (Get-Pctl $sorted 0.999), (Get-Pctl $sorted 1.0))
 Write-Host ("Accounting      : tokens_rescued={0} clean_settles={1} rescue_rate={2:N1}%" -f $totalRescued, $totalClean, $(if ($completed -gt 0) { 100.0 * $totalRescued / $completed } else { 0 }))
+Write-Host ("Kill classes    : true_ambush={0} ({1:N1}%) clean_escape={2} stillborn={3} | armed_hold={4}" -f `
+    $totalAmbush, $ambushPct, $totalEscape, $totalStillborn, [bool]$ArmedHold)
 foreach ($lane in $lanes) {
     $k = $lane.Kill
     $r = $lane.ReportObj
     $rateL = if ($k -and $k.ElapsedMs -gt 0) { 1000.0 * $k.Completed / $k.ElapsedMs } else { 0 }
     $privGrowth = if ($lane.PrivFirst -ge 0) { $lane.PrivLast - $lane.PrivFirst } else { 0 }
-    Write-Host ("Lane {0} : sup={1} exit={2} killed={3} {4:N1} kills/s | reaped={5} rescued={6} clean={7} final_gen={8} | ws_peak={9:N2} MB priv_growth={10:+0.00;-0.00;0.00} MB handles_peak={11} threads_peak={12} | stale={13} dup={14} retries={15} miss_polls={16}" -f `
+    $handleGrowth = if ($lane.HandleFirst -ge 0) { $lane.HandleLast - $lane.HandleFirst } else { 0 }
+    $laneSorted = @()
+    if ($k) { $laneSorted = @($k.LatUs | Sort-Object) }
+    Write-Host ("Lane {0} : sup={1} exit={2} killed={3} {4:N1} kills/s | reaped={5} true_ambush={6} ({7:N1}%) escape={8} stillborn={9} final_gen={10}" -f `
         $lane.Index, $(if ($lane.Proc) { $lane.Proc.Id } else { 0 }), $lane.Exit, $(if ($k) { $k.Completed } else { 0 }), $rateL, `
-        $(if ($r) { $r.total_reaped } else { 0 }), $(if ($r) { $r.tokens_rescued } else { 0 }), $(if ($r) { $r.clean_settles } else { 0 }), $(if ($r) { $r.final_generation } else { 0 }), `
-        $lane.WsPeak, $privGrowth, $lane.HandlePeak, $lane.ThreadPeak, `
+        $(if ($r) { $r.total_reaped } else { 0 }), $lane.Ambush, $lane.AmbushPct, $lane.Escape, $lane.Stillborn, $(if ($r) { $r.final_generation } else { 0 }))
+    Write-Host ("         dispatch us: p50 {0:N1} | p95 {1:N1} | p99 {2:N1} | max {3:N1} | ws_peak {4:N2} MB | priv_growth {5:+0.00;-0.00;0.00} MB | handles first {6} peak {7} last {8} growth {9:+0;-0;0} | stale={10} dup={11} retries={12} miss_polls={13}" -f `
+        (Get-Pctl $laneSorted 0.50), (Get-Pctl $laneSorted 0.95), (Get-Pctl $laneSorted 0.99), (Get-Pctl $laneSorted 1.0), `
+        $lane.WsPeak, $privGrowth, $lane.HandleFirst, $lane.HandlePeak, $lane.HandleLast, $handleGrowth, `
         $(if ($k) { $k.Stale } else { 0 }), $(if ($k) { $k.Duplicates } else { 0 }), $(if ($k) { $k.Retries } else { 0 }), $(if ($k) { $k.Misses } else { 0 }))
     if ($k -and $k.Error) { Write-Host ("           killer error: {0}" -f $k.Error) -ForegroundColor Red }
 }
@@ -512,6 +563,8 @@ Write-Host "==========================================================" -Foregro
 $laneStats = @()
 foreach ($lane in $lanes) {
     $k = $lane.Kill
+    $laneSorted = @()
+    if ($k) { $laneSorted = @($k.LatUs | Sort-Object) }
     $laneStats += [ordered]@{
         index            = $lane.Index
         supervisor_pid   = $(if ($lane.Proc) { $lane.Proc.Id } else { 0 })
@@ -524,11 +577,27 @@ foreach ($lane in $lanes) {
         stalled          = $(if ($k) { [bool]$k.Stalled } else { $true })
         error            = $(if ($k) { $k.Error } else { $null })
         elapsed_ms       = $(if ($k) { $k.ElapsedMs } else { 0 })
+        dispatch_us      = [ordered]@{
+            p50   = [math]::Round((Get-Pctl $laneSorted 0.50), 1)
+            p95   = [math]::Round((Get-Pctl $laneSorted 0.95), 1)
+            p99   = [math]::Round((Get-Pctl $laneSorted 0.99), 1)
+            max   = [math]::Round((Get-Pctl $laneSorted 1.0), 1)
+            count = $laneSorted.Count
+        }
+        classification   = [ordered]@{
+            true_ambush = $lane.Ambush
+            escape      = $lane.Escape
+            stillborn   = $lane.Stillborn
+            ambush_pct  = [math]::Round($lane.AmbushPct, 1)
+        }
         report           = $lane.ReportObj
         resources        = [ordered]@{
             ws_peak_mb     = [math]::Round($lane.WsPeak, 3)
             private_growth_mb = [math]::Round($(if ($lane.PrivFirst -ge 0) { $lane.PrivLast - $lane.PrivFirst } else { 0 }), 3)
+            handles_first  = $lane.HandleFirst
             handles_peak   = $lane.HandlePeak
+            handles_last   = $lane.HandleLast
+            handles_growth = $(if ($lane.HandleFirst -ge 0) { $lane.HandleLast - $lane.HandleFirst } else { 0 })
             threads_peak   = $lane.ThreadPeak
             samples        = $lane.Samples
         }
@@ -549,6 +618,12 @@ $stats = [ordered]@{
     peak_rate_per_sec  = [math]::Round($peakRate, 1)
     tokens_rescued     = $totalRescued
     clean_settles      = $totalClean
+    armed_hold         = [bool]$ArmedHold
+    min_ambush_pct     = $minAmbush
+    true_ambush        = $totalAmbush
+    clean_escape       = $totalEscape
+    stillborn          = $totalStillborn
+    ambush_pct         = [math]::Round($ambushPct, 1)
     dispatch_us        = [ordered]@{
         min   = [math]::Round((Get-Pctl $sorted 0.0), 1)
         p50   = [math]::Round((Get-Pctl $sorted 0.50), 1)
@@ -559,6 +634,7 @@ $stats = [ordered]@{
         count = $allLat.Count
     }
     max_growth_mb      = $MaxGrowthMb
+    max_handle_growth  = $MaxHandleGrowth
     lanes              = $laneStats
     checks             = $checks.ToArray()
     verdict            = $verdict

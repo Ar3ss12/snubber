@@ -156,10 +156,10 @@ pub use protect::SafeLockExt;
 
 #[cfg(feature = "std")]
 pub use supervisor::{
-    take_stdin_digest, Backoff, DeathCause, GenerationClock, MemoryPolicy, NoOrphanGuard,
-    OrphanGuard, PipeDrain, ProcessToken, RestartDecision, RestartPolicy, RestartTracker,
-    RestartWindow, StateDigest, Supervisor, TokenRollback, OP_COMMIT, OP_HEARTBEAT, OP_SNAPSHOT,
-    OP_STATE, STATE_LEN,
+    take_stdin_digest, Backoff, DeathCause, DrainCounters, GenerationClock, MemoryPolicy,
+    NoOrphanGuard, OrphanGuard, PipeDrain, ProcessToken, RestartDecision, RestartPolicy,
+    RestartTracker, RestartWindow, StateDigest, Supervisor, TokenRollback, OP_COMMIT, OP_HEARTBEAT,
+    OP_SNAPSHOT, OP_STATE, STATE_LEN,
 };
 
 #[cfg(feature = "std")]

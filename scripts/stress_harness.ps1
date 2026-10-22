@@ -13,6 +13,9 @@ param(
     [int]$AmbushUs = 0,
     [switch]$HighPriority,
     [switch]$NoHighRes,
+    [switch]$ArmedHold,
+    [int]$MinAmbushPct = -1,
+    [int]$MaxHandleGrowth = 16,
     [ValidateSet("release", "debug")]
     [string]$Profile = "release",
     [int]$StallTimeoutSec = 20,
@@ -25,6 +28,9 @@ param(
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if ($Kills -le 0) { throw "-Kills must be > 0" }
+# Armed-hold workers never commit, so a low ambush rate means the killer
+# is shooting during process startup instead of at an armed token.
+$minAmbush = if ($MinAmbushPct -lt 0) { if ($ArmedHold) { 70 } else { 0 } } else { $MinAmbushPct }
 
 function Resolve-RepoPath([string]$p) {
     if ([System.IO.Path]::IsPathRooted($p)) { return $p }
@@ -110,6 +116,7 @@ Write-Host "==========================================================" -Foregro
 Write-Host ("Target   : {0}  ({1} kills requested)" -f $TargetProcess, $Kills)
 Write-Host ("Method   : {0}" -f $(if ($RawKill) { "raw OpenProcess + image-verify + TerminateProcess (no Get-Process, no exit wait)" } elseif ($isWindows) { "Process.Kill() = TerminateProcess" } else { "SIGKILL" }))
 Write-Host ("Workload : {0}" -f $(if ($Aggressive) { "spin pacing (precise 3 ms armed / 1 ms pace)" } else { "sleep pacing (default)" }))
+Write-Host ("Ambush   : {0}   min true-ambush: {1}%" -f $(if ($ArmedHold) { "armed-hold worker (pid published only after arm)" } else { "free-running worker (3 ms armed / 1 ms pace)" }), $minAmbush)
 if ($RawKill) {
     Write-Host ("Ambush   : 0-{0} us spin after PID publish   Priority: {1}" -f $AmbushUs, $(if ($HighPriority) { "High" } else { "Normal" }))
 }
@@ -243,6 +250,7 @@ try {
 
         $supArgs = "--target-kills $Kills --report-path `"$ReportPath`""
         if ($Aggressive) { $supArgs = "$supArgs --spin" }
+        if ($ArmedHold) { $supArgs = "$supArgs --armed-hold" }
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $exe
@@ -464,18 +472,41 @@ if ($wSamples -gt 0) {
 }
 
 $checks = New-Object 'System.Collections.Generic.List[object]'
+$ambush = 0; $escape = 0; $stillborn = 0
+if ($report) {
+    if ($report.PSObject.Properties['ambush_kills']) {
+        $ambush = [int]$report.ambush_kills
+        $escape = [int]$report.escape_kills
+        $stillborn = [int]$report.stillborn_kills
+    } else {
+        # Older supervisor binary: no per-class split, all rescues are ambushes.
+        $ambush = [int]$report.tokens_rescued
+    }
+}
+$ambushPct = if ($completed -gt 0) { 100.0 * $ambush / $completed } else { 0 }
 if ($report) {
     $checks.Add([pscustomobject]@{ Name = "reaped == kills"; Ok = ([int]$report.total_reaped -eq $completed) })
     $checks.Add([pscustomobject]@{ Name = "rescue + clean == reaped"; Ok = (([int]$report.tokens_rescued + [int]$report.clean_settles) -eq [int]$report.total_reaped) })
+    if ($report.PSObject.Properties['ambush_kills']) {
+        $checks.Add([pscustomobject]@{ Name = "ambush + escape + stillborn == reaped"; Ok = (($ambush + $escape + $stillborn) -eq [int]$report.total_reaped) })
+    }
+    if ($minAmbush -gt 0) {
+        $checks.Add([pscustomobject]@{ Name = ("true ambush rate {0:N1}% >= {1}%" -f $ambushPct, $minAmbush); Ok = ($ambushPct -ge $minAmbush) })
+    }
     $checks.Add([pscustomobject]@{ Name = "final_generation == kills + 1"; Ok = ([int]$report.final_generation -eq $completed + 1) })
     $checks.Add([pscustomobject]@{ Name = "deadlock == false"; Ok = (-not [bool]$report.deadlock) })
     if ($Launch) { $checks.Add([pscustomobject]@{ Name = "supervisor exit == 0"; Ok = ($supExit -eq 0) }) }
 }
 if ($supSamples -gt 0) {
     $privGrowth = $supPrivLast - $supPrivFirst
+    $handleGrowth = $supHandleLast - $supHandleFirst
     $checks.Add([pscustomobject]@{
         Name = ("supervisor private growth {0:+0.00;-0.00;0.00} MB <= {1:N1} MB" -f $privGrowth, $MaxGrowthMb)
         Ok   = ($privGrowth -le $MaxGrowthMb)
+    })
+    $checks.Add([pscustomobject]@{
+        Name = ("supervisor handle growth {0:+0;-0;0} <= {1}" -f $handleGrowth, $MaxHandleGrowth)
+        Ok   = ($handleGrowth -le $MaxHandleGrowth)
     })
 }
 
@@ -501,6 +532,8 @@ if ($report) {
     Write-Host ("Supervisor      : reaped={0} tokens_rescued={1} clean_settles={2} rescue_rate={3:N1}% final_gen={4} elapsed_ms={5} exit={6}" -f `
         $report.total_reaped, $report.tokens_rescued, $report.clean_settles, $rescueRate, `
         $report.final_generation, $report.elapsed_ms, $supExit)
+    Write-Host ("Kill classes    : true_ambush={0} ({1:N1}%) clean_escape={2} stillborn={3} | armed_hold={4}" -f `
+        $ambush, $ambushPct, $escape, $stillborn, [bool]$ArmedHold)
 }
 if ($supSamples -gt 0) {
     Write-Host ("Supervisor res  : ws peak {0:N2} MB avg {1:N2} MB growth {2:+0.00;-0.00;0.00} MB | private peak {3:N2} MB growth {4:+0.00;-0.00;0.00} MB | handles peak {5} growth {6:+0;-0;0} | threads peak {7}" -f `
@@ -617,6 +650,13 @@ $stats = [ordered]@{
     kills_requested    = $Kills
     kills_completed    = $completed
     max_growth_mb      = $MaxGrowthMb
+    max_handle_growth  = $MaxHandleGrowth
+    armed_hold         = [bool]$ArmedHold
+    min_ambush_pct     = $minAmbush
+    ambush_kills       = $ambush
+    escape_kills       = $escape
+    stillborn_kills    = $stillborn
+    ambush_pct         = [math]::Round($ambushPct, 1)
     misses             = $misses
     not_found_polls    = $notFoundPolls
     stale_pid_polls    = $stalePolls

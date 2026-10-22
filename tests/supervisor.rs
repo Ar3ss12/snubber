@@ -601,3 +601,22 @@ fn supervisor_with_lease_terminates_hung_worker_and_rescues_token() {
         "token rescued from hung worker"
     );
 }
+
+#[test]
+fn drain_counters_split_arms_commits_and_survive_noise() {
+    let mut wire = Vec::new();
+    wire.extend_from_slice(&ProcessToken::new(11, 7, [1u8; 28]).to_bytes());
+    wire.extend_from_slice(b"log noise between frames\n");
+    wire.extend_from_slice(&ProcessToken::commit(11).to_bytes());
+    wire.extend_from_slice(&ProcessToken::new(12, 7, [2u8; 28]).to_bytes());
+
+    let drain = PipeDrain::drain_sync(std::io::Cursor::new(wire));
+    let counters = drain.counters();
+    assert_eq!(counters.frames, 3);
+    assert_eq!(counters.arms, 2);
+    assert_eq!(counters.commits, 1);
+
+    let armed = drain.take_armed().expect("last arm stays armed");
+    assert_eq!(armed.task, 12);
+    assert_eq!(drain.counters(), counters, "counters are stable snapshots");
+}

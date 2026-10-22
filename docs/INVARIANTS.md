@@ -141,6 +141,11 @@ outlives every transaction.
 - The out-of-process harness enforces the runtime ceiling: supervisor
   private-memory growth above `--MaxGrowthMb` / `--max-growth-mb`
   (default 2.0 MB) fails the run even when every token was rescued.
+- Every reap is classified: **true ambush** (armed token left at death),
+  **clean escape** (a commit was seen), or **stillborn** (no commit and no
+  armed token). `-ArmedHold` publishes the worker pid only after the first
+  arm frame, so `-MinAmbushPct 70` proves the killer terminates armed
+  workers instead of shooting during process startup.
 
 ---
 
@@ -195,8 +200,11 @@ cargo test --test harness
 cargo test --test guard_settle_reclaim
 cargo test --test guard_alloc_budget
 
+# Verify out-of-process kill path under armed-hold (true ambush >= 70%)
+powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 1000 -Launch -RawKill -Aggressive -ArmedHold
+
 # Verify N independent lineages under a parallel death storm (Windows, 4 x 2,500 kills)
-powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive
+powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold
 ```
 
 ---
