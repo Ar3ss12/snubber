@@ -126,6 +126,17 @@ Measured on AMD Ryzen 5 4600H, release build, 4 lanes × 2,500 = 10,000 `Termina
 
 Armed-hold run: per-lane dispatch p50 354–366 µs, private-memory growth +0.61…+1.01 MB, handle growth 0…+1, final generation = kills + 1 on every lane, no pipe deadlock. Free-running shows what the rate costs: at 720 kills/s most shots land during process startup, not in the armed window.
 
+The same gates run in CI (`.github/workflows/stress.yml`, `--aggressive`, dispatch latency = `SIGKILL`/`TerminateProcess` call only):
+
+| Runner | Mode | Kills | Wall | Kills/s | Ambush | Escape | Stillborn | p50 / p99 |
+|---|---|---|---|---|---|---|---|---|
+| ubuntu-latest (2 vCPU) | armed-hold | 1,000 | 0.91 s | 1,095 | 100% | 0 | 0 | 5 / 11–14 µs |
+| ubuntu-latest (2 vCPU) | free-running | 2,000 | 1.11 s | 1,803 | 93.2% | 2.4% | 4.5% | 4 / 12–17 µs |
+| macos-latest (arm64) | armed-hold | 1,000 | 7.19 s | 139.1 | 100% | 0 | 0 | 22–24 / 344–554 µs |
+| macos-latest (arm64) | free-running | 2,000 | 31.82 s | 62.9 | 61.9% | 38.1% | 0 | 13–14 / 57–84 µs |
+
+Per-lane RSS growth ≤ 0.45 MB on both runners; Linux handle growth 0…+1. The macOS rate is lower because identity verification spawns `ps` for every new pid and process spawn is slower, so free-running kills mostly land after the commit (escape) instead of during startup (stillborn).
+
 ```powershell
 # Single-lineage release gate (10,000 kills)
 powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 10000 -Launch -RawKill -Aggressive
