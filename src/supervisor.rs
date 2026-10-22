@@ -790,13 +790,14 @@ pub fn death_event(header: TransactionHeader, cause: DeathCause) -> SnubberEvent
 /// Drain state: exactly ONE slot (last un-settled token) + liveness clock
 /// + hot handoff (last verified complete `StateDigest` + 3-frame reassembly scratch).
 ///
-/// `last_seen_ms`: wall-clock of the last valid 40 B frame (token,
-/// commit, heartbeat OR state — any traffic proves the worker pumps).
-/// `0` = nothing seen yet.
+/// `last_seen_ms`: boot-relative timestamp of the last valid 40 B frame
+/// (token, commit, heartbeat OR state — any traffic proves the worker
+/// pumps). `seen` is separate because timestamp `0` is a valid uptime.
 #[derive(Debug, Default)]
 struct DrainState {
     armed: Option<ProcessToken>,
     last_seen_ms: u64,
+    seen: bool,
     /// Parsed-frame counters: total, arm-class, commit. Let a supervisor
     /// classify a dead worker (`commits > 0` = settled at least once).
     frames: u64,
@@ -872,6 +873,7 @@ impl PipeDrain {
                     let token = ProcessToken::from_body_bytes(&body);
                     if let Ok(mut st) = s.lock() {
                         st.last_seen_ms = now_ms();
+                        st.seen = true;
                         st.frames = st.frames.saturating_add(1);
                         if token.opcode == OP_COMMIT || token.opcode == OP_HEARTBEAT {
                             if token.opcode == OP_COMMIT {
@@ -955,6 +957,7 @@ impl PipeDrain {
                 let token = ProcessToken::from_body_bytes(&body);
                 if let Ok(mut st) = state.lock() {
                     st.last_seen_ms = now_ms();
+                    st.seen = true;
                     st.frames = st.frames.saturating_add(1);
                     if token.opcode == OP_COMMIT || token.opcode == OP_HEARTBEAT {
                         if token.opcode == OP_COMMIT {
@@ -1046,7 +1049,8 @@ impl PipeDrain {
         self.done.load(Ordering::SeqCst) != 0
     }
 
-    /// Milliseconds since the last valid frame (`u64::MAX` if never).
+    /// Milliseconds since the last valid frame (`0` if no frame was ever
+    /// parsed — a silent pipe before its first frame is never expired).
     /// The supervisor turns `elapsed > lease_ms` (pipe alive, no traffic)
     /// into `DeathCause::HangTimeout`: `take_armed()` → `child.kill()`
     /// (`TerminateProcess`/SIGKILL from OUTSIDE) → `clock.restart()`.
@@ -1055,7 +1059,7 @@ impl PipeDrain {
     pub fn idle_ms(&self) -> u64 {
         match self.state.lock() {
             Ok(st) => {
-                if st.last_seen_ms == 0 {
+                if !st.seen {
                     return 0;
                 }
                 now_ms().saturating_sub(st.last_seen_ms)

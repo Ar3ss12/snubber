@@ -172,6 +172,10 @@ outlives every transaction.
   previous child's peak cannot euthanize its successor, and a reap or
   memory sample on an idle lane returns `NoWorkerAttached` instead of a
   silent zero.
+- A lane lease (`expired(lease_ms)`) is measured from a frame's boot-relative
+  timestamp; "no frame ever parsed" is tracked by a separate `seen` flag, so
+  timestamp `0` (a frame parsed at process start) is not mistaken for
+  silence. `hard < soft` clamps up, so the drain phase always exists.
 
 ---
 
@@ -215,6 +219,9 @@ cargo test --test supervisor_pool
 
 # Verify the pool storm gate (4 lanes x 8 hard kills; ignored by default)
 cargo test --test supervisor_pool_stress -- --ignored --nocapture
+
+# Verify all four reap classes in one run (armed/clean/silent/orphan; ignored)
+cargo test --test supervisor_pool_stress_mixed -- --ignored --nocapture
 
 # Verify bench hygiene (setup outside the hot loop, pure overhead only)
 cargo test --test bench_hygiene

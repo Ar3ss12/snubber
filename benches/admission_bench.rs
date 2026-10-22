@@ -1,4 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use snubber::pool::{namespace_task, task_lane, task_local, PoolConfig, WorkerPool};
 use snubber::{
     classify_stall_ceiling, gateway, ConflateSender, EpochGate, ExecutionEnvelope, IsrBridge,
     IsrSignal, PipeDrain, Priority, ProcessToken, PulseWatch, SnubberGuard, SnubberNode,
@@ -401,6 +402,92 @@ fn bench_pipe_drain(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_pool(c: &mut Criterion) {
+    use std::io::Cursor;
+
+    let mut g = c.benchmark_group("layer4_worker_pool");
+
+    // Lane namespace packing: pure shifts, no branch, no alloc.
+    g.bench_function("namespace_task_pack", |b| {
+        b.iter(|| {
+            black_box(namespace_task(
+                black_box(3),
+                black_box(0xDEAD_BEEF_0000_0001),
+            ))
+        });
+    });
+
+    // Lane + local extraction from a namespaced task id.
+    let task = namespace_task(3, 0xDEAD_BEEF_0000_0001);
+    g.bench_function("namespace_task_unpack", |b| {
+        b.iter(|| {
+            black_box(task_lane(black_box(task)));
+            black_box(task_local(black_box(task)));
+        });
+    });
+
+    // Attach + reap with an un-settled arm frame in the pipe: the rescue
+    // path (drain construction, EOF check, token take, generation bump,
+    // restart math, per-class counters).
+    let armed_wire = ProcessToken::simple(namespace_task(0, 7), 9, 1)
+        .to_bytes()
+        .to_vec();
+    let pool = WorkerPool::new(PoolConfig::new(1).with_eof_grace(0)).expect("lane");
+    let lane = pool.lane(0).expect("lane 0");
+    g.bench_function("lane_attach_reap_ambush", |b| {
+        b.iter(|| {
+            lane.attach(
+                black_box(1_001),
+                PipeDrain::drain_sync(Cursor::new(black_box(&armed_wire[..]))),
+            )
+            .expect("idle lane");
+            let _ = black_box(lane.note_death(None, 0).expect("attached child"));
+        });
+    });
+
+    // Same path when the child settled cleanly (no token to hand back).
+    let mut escaped_wire = armed_wire.clone();
+    escaped_wire.extend_from_slice(&ProcessToken::commit(namespace_task(0, 7)).to_bytes());
+    g.bench_function("lane_attach_reap_escape", |b| {
+        b.iter(|| {
+            lane.attach(
+                black_box(1_002),
+                PipeDrain::drain_sync(Cursor::new(black_box(&escaped_wire[..]))),
+            )
+            .expect("idle lane");
+            let _ = black_box(lane.note_death(Some(0), 0).expect("attached child"));
+        });
+    });
+
+    // Aggregate report: four short lane locks + totals folding.
+    let report_pool = WorkerPool::new(PoolConfig::new(4).with_eof_grace(0)).expect("four lanes");
+    for index in 0..4usize {
+        let lane = report_pool.lane(index).expect("lane");
+        lane.attach(
+            index as u32 + 1,
+            PipeDrain::drain_sync(Cursor::new(Vec::new())),
+        )
+        .expect("attach");
+        let _ = lane.note_death(Some(1), 0).expect("reap");
+    }
+    g.bench_function("report_snapshot_4_lanes", |b| {
+        b.iter(|| black_box(report_pool.report()));
+    });
+
+    // One external RSS sample through the per-lane memory watch.
+    let memory_pool =
+        WorkerPool::new(PoolConfig::new(1).with_memory(64_000, 96_000)).expect("one lane");
+    let memory_lane = memory_pool.lane(0).expect("lane 0");
+    memory_lane
+        .attach(2_001, PipeDrain::drain_sync(Cursor::new(Vec::new())))
+        .expect("attach");
+    g.bench_function("note_memory_kb", |b| {
+        b.iter(|| black_box(memory_lane.note_memory_kb(black_box(48_000))));
+    });
+
+    g.finish();
+}
+
 fn bench_contended(c: &mut Criterion) {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
@@ -595,6 +682,6 @@ fn bench_contended(c: &mut Criterion) {
 criterion_group!(
     name = benches;
     config = fast();
-    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_impedance, bench_layer4_layer5, bench_pipe_drain, bench_contended
+    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_impedance, bench_layer4_layer5, bench_pipe_drain, bench_pool, bench_contended
 );
 criterion_main!(benches);

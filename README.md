@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-309%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-317%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -67,7 +67,7 @@ let receipt = node.scoped_checked(
 Measured on AMD Ryzen 5 4600H release build
 (`cargo bench --bench admission_bench`, Criterion: 800 ms warmup,
 2 s measurement, 50 samples, isolated node per bench; re-measured
-2026-10-22 after the zero-leak settlement fix):
+2026-10-23 after the worker-pool group was added):
 
 | Operation | Architecture Layer | Average Latency | Notes |
 |---|---|---|---|
@@ -94,6 +94,11 @@ Measured on AMD Ryzen 5 4600H release build
 | `ProcessToken::from_bytes()` | Layer 4 (`core`) | **~7.3 ns** | 40-byte body parse, no allocation |
 | `state_digest.crc()` | Layer 4 (`core`) | **~266 ns** | 64-byte hardware cache line digest verification |
 | `PipeDrain::drain_sync` | Layer 4 (`std`) | **~61 ns/frame** | 256 frames: 16.5M frames/s including per-stream drain state |
+| `namespace_task` pack / unpack | Layer 4 (`std`) | **~2.1 / 1.0 ns** | `task = lane << 48 \| local`; two shifts + mask, no branch |
+| `lane.attach` + `note_death` (ambush) | Layer 4 (`std`) | **~328 ns** | Full rescue path: drain EOF, token take, generation bump, restart math, per-class counters |
+| `lane.attach` + `note_death` (escape) | Layer 4 (`std`) | **~400 ns** | Same path when the child settled (commit parsed, no token) |
+| `pool.report()` (4 lanes) | Layer 4 (`std`) | **~107 ns** | Four short lane locks + totals fold, no allocation |
+| `lane.note_memory_kb` | Layer 4 (`std`, cold) | **~12 ns** | Per-lane watch: one lock + integer compares |
 | `run_supervised_guard_with_memory` | Layer 4 (`std`) | 1 sampler call / 10 ms tick | Soft logs `MEMORY_DRAIN`; hard `kill()` without draining (`DeathCause::MemoryLimit`) |
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | Layer 2 (`std`, opt-in) | 1 `Box` + 1 clock/stage | Stage wall/CPU breakdown; default `enter*` reads no profile clock |
 | `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.13 µs** | 512-byte zero-allocation snapshot CRC32 codec |
@@ -167,7 +172,11 @@ match reap.decision { /* Restart { delay_ms } | Stop | GiveUp */ }
 
 `note_death` classifies from that lane's own pipe: **ambush** (token handed back), **escape** (commit seen), **stillborn** (neither). A pipe that does not reach EOF inside the grace window becomes a fourth honest bucket — `ReapClass::Deadlocked`; `PoolReport::healthy()` stays false until it is zero, and `ambush + escape + stillborn + deadlocks == reaps` is checked per lane and in the totals. Task ids can carry the lineage (`namespace_task`, `lane << 48 | local`), so a rescued token names its worker.
 
-Measured (`cargo test --test supervisor_pool_stress -- --ignored --nocapture`, 4 lanes × 8 hard kills, debug build): 32/32 reaps, 32/32 true ambush, 0 escape, 0 stillborn, 0 deadlocks, final generation `[9,9,9,9]` (= kills + 1 per lane), 0.31 s storm wall.
+Measured (`cargo test --test supervisor_pool_stress -- --ignored --nocapture`, 4 lanes × 8 hard kills, debug build): 32/32 reaps, 32/32 true ambush, 0 escape, 0 stillborn, 0 deadlocks, final generation `[9,9,9,9]` (= kills + 1 per lane), 0.34 s storm wall.
+
+The mixed storm cycles `armed → clean → silent → orphan` by `local % 4` inside the same run (`--mixed`, example 19): `cargo test --test supervisor_pool_stress_mixed -- --ignored --nocapture` measured 32/32 conserved reaps, **A/E/S/D = 8/8/8/8**, 8 rescued tokens, `deadlock=true` (the orphan modes hold the pipe open past the 150 ms grace) and `[9,9,9,9]` generations in 0.71 s. A deadlocked lane is reported, never guessed into another bucket.
+
+Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~328 ns (ambush) / ~400 ns (escape), a four-lane `report()` is ~107 ns, and `namespace_task` is ~2 ns — each lane locks only its own state.
 
 ---
 
@@ -204,7 +213,7 @@ Measured (`cargo test --test supervisor_pool_stress -- --ignored --nocapture`, 4
 * **[16 Streaming Checkpoint (`examples/16_streaming_checkpoint.rs`)](examples/16_streaming_checkpoint.rs):** 16 MiB body through a 64 KiB stack buffer (`tmp` → `sync_all` → `rename` → seal → successor restore); `--naive` clones the state, crosses hard and is killed mid-`write_all` with no sealed file and no ticket.
 * **[17 Impedance Bridge (`examples/17_impedance_bridge.rs`)](examples/17_impedance_bridge.rs):** One 10 000 msg/s producer through a raw stream (unbounded backlog), a one-slot conflation channel (latest wins, coalescing counted) and a paced gateway (HWM/LWM with `retry_after_ms`) at 60 FPS.
 * **[18 Impedance Calibration (`examples/18_impedance_calibration.rs`)](examples/18_impedance_calibration.rs):** `ProfileHarness` measures min/median/max/jitter/burst, derives an `ExecutionEnvelope` with headroom, then a node judges real settlements — including a deliberate no-op that lands below the floor.
-* **[19 Worker Pool (`examples/19_worker_pool.rs`)](examples/19_worker_pool.rs):** N independent lineages in one pool — one `PipeDrain`, generation clock, restart tracker and memory watch per lane; every child is killed only after its arm frame is parsed, and the JSON report gates `reaped`, `ambush`, `deadlock` and `final_generation`.
+* **[19 Worker Pool (`examples/19_worker_pool.rs`)](examples/19_worker_pool.rs):** N independent lineages in one pool — one `PipeDrain`, generation clock, restart tracker and memory watch per lane; every child is killed only after its decisive frame is parsed, and the JSON report gates `reaped`, `ambush`, `deadlock` and `final_generation`. `--mixed` cycles ambush/escape/stillborn/deadlock in one storm.
 
 ---
 

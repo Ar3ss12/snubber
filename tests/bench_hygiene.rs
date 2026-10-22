@@ -57,6 +57,7 @@ const HEAVY: &[&str] = &[
     "IsrBridge::new(",
     "TaskConduit::new(",
     "ConflateSender::<",
+    "WorkerPool::new(",
 ];
 
 /// Fixed-name benches; `bench_function(format!(...))` sites are pinned by
@@ -91,6 +92,12 @@ const COVERED: &[&str] = &[
     "static_node_enter_commit",
     "snapshot_v1_encode_crc",
     "drain_sync_256_frames",
+    "namespace_task_pack",
+    "namespace_task_unpack",
+    "lane_attach_reap_ambush",
+    "lane_attach_reap_escape",
+    "report_snapshot_4_lanes",
+    "note_memory_kb",
     "contended_node_enter_threads_",
     "contended_node_scoped_threads_",
     "contended_gateway_mpsc_threads_",

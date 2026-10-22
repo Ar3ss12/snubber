@@ -1074,12 +1074,25 @@ the aggregated `PoolReport` (ASCII card + totals). Task ids can be
 namespaced (`task = lane << 48 | local`) so a rescued token names its
 lineage: `namespace_task`, `task_lane`, `task_local`, `MAX_LANES = 2^16`.
 
+Measured costs (release, Criterion `layer4_worker_pool`): `attach +
+note_death` ~328 ns (ambush) / ~400 ns (escape), four-lane `report()`
+~107 ns, `namespace_task` ~2 ns, `note_memory_kb` ~12 ns. The storm
+gates on this machine (debug): 4 lanes × 8 armed kills = 32/32 ambush in
+0.34 s; the mixed storm produces an equal four-way split (A/E/S/D =
+8/8/8/8, 8 rescued) in 0.71 s with `deadlock=true` — the orphan mode
+keeps its pipe open past the 150 ms grace, so the deadlock bucket is
+proven, not simulated.
+
 **Reference:** `examples/19_worker_pool.rs` (supervisor and worker modes,
-JSON report), `tests/supervisor_pool.rs` (9 deterministic tests: lane
-isolation, per-lane generation, conservation, per-lane backoff/window,
-attach/reap errors, EOF-grace deadlock, task namespace, per-lane memory,
-state handoff), `tests/supervisor_pool_stress.rs` (`#[ignore]`: 4 lanes ×
-8 hard kills, gates `reaped`, `ambush`, `deadlock`, `final_generation`).
+`--mixed` four-class storm, JSON report), `tests/supervisor_pool.rs`
+(17 deterministic tests: lane isolation, per-lane generation,
+conservation, per-lane backoff/window, attach/reap errors, EOF-grace and
+zero-grace deadlock, live-pipe lease expiry, Stop/GiveUp delay contract,
+hard-limit clamp, task namespace, per-lane memory, state handoff, 4 lanes
+× 25 threaded cycles), `tests/supervisor_pool_stress.rs` (`#[ignore]`:
+4 lanes × 8 hard kills, gates `reaped`, `ambush`, `deadlock`,
+`final_generation`), `tests/supervisor_pool_stress_mixed.rs` (`#[ignore]`:
+armed/clean/silent/orphan cycle, gates the four buckets and conservation).
 
 ### 4.7 Orphan contract (Phase 6: no zombies)
 ```rust
