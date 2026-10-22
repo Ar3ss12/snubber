@@ -98,6 +98,7 @@ const COVERED: &[&str] = &[
     "lane_attach_reap_escape",
     "report_snapshot_4_lanes",
     "note_memory_kb",
+    "expired_lanes_4_lanes",
     "contended_node_enter_threads_",
     "contended_node_scoped_threads_",
     "contended_gateway_mpsc_threads_",

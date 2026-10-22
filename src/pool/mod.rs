@@ -235,6 +235,25 @@ impl WorkerPool {
         PoolReport::new(self.lanes.iter().map(|lane| lane.snapshot()).collect())
     }
 
+    /// Lanes whose pipe proved traffic once and then went silent past
+    /// `lease_ms`, as `(lane index, idle ms)`.
+    ///
+    /// One app monitor thread calls this on a tick while the lane waiters
+    /// stay blocked on `child.wait()`: every returned lane is a candidate
+    /// for the app's own `kill()` + [`PoolLane::note_death`]. A lane that
+    /// never parsed a frame is NOT returned — a child hung before its
+    /// first heartbeat is the app's spawn timeout, not a lease breach.
+    #[must_use]
+    pub fn expired_lanes(&self, lease_ms: u64) -> Vec<(usize, u64)> {
+        let mut expired = Vec::new();
+        for lane in &self.lanes {
+            if lane.expired(lease_ms) {
+                expired.push((lane.index(), lane.idle_ms()));
+            }
+        }
+        expired
+    }
+
     /// Rescued tokens summed across lanes.
     #[must_use]
     pub fn total_rescued(&self) -> u64 {

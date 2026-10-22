@@ -481,6 +481,47 @@ fn lease_expiry_sees_a_live_silent_pipe() {
 }
 
 #[test]
+fn pool_sweep_names_only_the_silent_lane() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pool = WorkerPool::new(PoolConfig::new(2).with_eof_grace(0)).expect("two lanes");
+    let silent = pool.lane(0).expect("lane 0");
+    silent
+        .attach(
+            31,
+            PipeDrain::spawn(OneFrameThenBlock {
+                frame: ProcessToken::commit(1).to_bytes().to_vec(),
+                pos: 0,
+                park: rx,
+            }),
+        )
+        .expect("attach");
+    assert!(pool.lane(1).is_some(), "lane 1 stays unattached");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while silent.counters().frames == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        pool.expired_lanes(60_000).is_empty(),
+        "a fresh frame renews the lease"
+    );
+
+    std::thread::sleep(Duration::from_millis(25));
+    let expired = pool.expired_lanes(5);
+    assert_eq!(expired.len(), 1, "only the silent, attached lane");
+    assert_eq!(expired[0].0, 0);
+    assert!(expired[0].1 >= 5, "idle={} ms", expired[0].1);
+
+    let reap = silent.note_death(None, 0).expect("reap");
+    assert!(reap.deadlock);
+    assert!(
+        pool.expired_lanes(5).is_empty(),
+        "an idle lane is not a lease breach"
+    );
+    drop(tx);
+}
+
+#[test]
 fn zero_grace_reports_deadlock_without_waiting() {
     let pool = WorkerPool::new(PoolConfig::new(1).with_eof_grace(0)).expect("one lane");
     let lane = pool.lane(0).expect("lane 0");

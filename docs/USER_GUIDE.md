@@ -1074,25 +1074,40 @@ the aggregated `PoolReport` (ASCII card + totals). Task ids can be
 namespaced (`task = lane << 48 | local`) so a rescued token names its
 lineage: `namespace_task`, `task_lane`, `task_local`, `MAX_LANES = 2^16`.
 
+A thread blocked in `child.wait()` sees only its own lane, so one app-side
+monitor calls `pool.expired_lanes(lease_ms) -> Vec<(lane, idle_ms)>` on a
+tick and kills the lanes it names itself. Only lanes that already parsed a
+frame can expire: a child that hung before its first heartbeat is the
+app's spawn timeout, not a lease breach. On Windows this is what covers a
+worker that answers once and then never exits.
+
 Measured costs (release, Criterion `layer4_worker_pool`): `attach +
 note_death` ~328 ns (ambush) / ~400 ns (escape), four-lane `report()`
-~107 ns, `namespace_task` ~2 ns, `note_memory_kb` ~12 ns. The storm
-gates on this machine (debug): 4 lanes × 8 armed kills = 32/32 ambush in
-0.34 s; the mixed storm produces an equal four-way split (A/E/S/D =
+~107 ns, four-lane `expired_lanes(5)` ~536 ns (~134 ns per lane, one
+state lock each), `namespace_task` ~2 ns, `note_memory_kb` ~12 ns. The
+storm gates on this machine (debug): 4 lanes × 8 armed kills = 32/32
+ambush in 0.34 s; the mixed storm produces an equal four-way split (A/E/S/D =
 8/8/8/8, 8 rescued) in 0.71 s with `deadlock=true` — the orphan mode
 keeps its pipe open past the 150 ms grace, so the deadlock bucket is
-proven, not simulated.
+proven, not simulated. The lease storm kills 24 workers that beat once
+and then hang (4 lanes × 6, 25 ms lease): 24/24 stillborn, `lease_kills=24`,
+0 deadlocks, 0 conservation breaks over 98,703 live `report()` samples
+from the observer thread, `[7,7,7,7]` generations, 0.42 s.
 
 **Reference:** `examples/19_worker_pool.rs` (supervisor and worker modes,
-`--mixed` four-class storm, JSON report), `tests/supervisor_pool.rs`
-(17 deterministic tests: lane isolation, per-lane generation,
-conservation, per-lane backoff/window, attach/reap errors, EOF-grace and
-zero-grace deadlock, live-pipe lease expiry, Stop/GiveUp delay contract,
-hard-limit clamp, task namespace, per-lane memory, state handoff, 4 lanes
-× 25 threaded cycles), `tests/supervisor_pool_stress.rs` (`#[ignore]`:
-4 lanes × 8 hard kills, gates `reaped`, `ambush`, `deadlock`,
-`final_generation`), `tests/supervisor_pool_stress_mixed.rs` (`#[ignore]`:
-armed/clean/silent/orphan cycle, gates the four buckets and conservation).
+`--mixed` four-class storm, `--lease-ms` euthanasia storm, JSON report),
+`tests/supervisor_pool.rs` (18 deterministic tests: lane isolation,
+per-lane generation, conservation, per-lane backoff/window, attach/reap
+errors, EOF-grace and zero-grace deadlock, live-pipe lease expiry, the
+`expired_lanes` sweep naming only the silent lane, Stop/GiveUp delay
+contract, hard-limit clamp, task namespace, per-lane memory, state
+handoff, 4 lanes × 25 threaded cycles), `tests/supervisor_pool_stress.rs`
+(`#[ignore]`: 4 lanes × 8 hard kills, gates `reaped`, `ambush`,
+`deadlock`, `final_generation`), `tests/supervisor_pool_stress_mixed.rs`
+(`#[ignore]`: armed/clean/silent/orphan cycle, gates the four buckets and
+conservation), `tests/supervisor_pool_stress_lease.rs` (`#[ignore]`:
+heartbeat-then-hang children, gates `lease_kills`, `conservation_breaks`
+and generations).
 
 ### 4.7 Orphan contract (Phase 6: no zombies)
 ```rust

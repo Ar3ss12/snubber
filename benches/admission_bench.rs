@@ -3,7 +3,7 @@ use snubber::pool::{namespace_task, task_lane, task_local, PoolConfig, WorkerPoo
 use snubber::{
     classify_stall_ceiling, gateway, ConflateSender, EpochGate, ExecutionEnvelope, IsrBridge,
     IsrSignal, PipeDrain, Priority, ProcessToken, PulseWatch, SnubberGuard, SnubberNode,
-    TaskConduit, TransactionHeader, WorkerPulse, OP_PULSE,
+    TaskConduit, TransactionHeader, WorkerPulse, OP_HEARTBEAT, OP_PULSE,
 };
 use std::time::Duration;
 
@@ -485,7 +485,66 @@ fn bench_pool(c: &mut Criterion) {
         b.iter(|| black_box(memory_lane.note_memory_kb(black_box(48_000))));
     });
 
+    // One app-side liveness sweep over four live-but-silent pipes: each
+    // lane takes its own state lock, no child is touched.
+    struct HeartbeatThenPark {
+        frame: Vec<u8>,
+        pos: usize,
+        park: std::sync::mpsc::Receiver<()>,
+    }
+    impl std::io::Read for HeartbeatThenPark {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos < self.frame.len() {
+                let take = (self.frame.len() - self.pos).min(buf.len());
+                buf[..take].copy_from_slice(&self.frame[self.pos..self.pos + take]);
+                self.pos += take;
+                return Ok(take);
+            }
+            let _ = self.park.recv();
+            Ok(0)
+        }
+    }
+
+    let lease_pool = WorkerPool::new(PoolConfig::new(4).with_eof_grace(0)).expect("four lanes");
+    let mut lease_parks = Vec::new();
+    for index in 0..4usize {
+        let (park, rx) = std::sync::mpsc::channel();
+        lease_parks.push(park);
+        lease_pool
+            .lane(index)
+            .expect("lane")
+            .attach(
+                index as u32 + 3_001,
+                PipeDrain::spawn(HeartbeatThenPark {
+                    frame: ProcessToken::simple(namespace_task(index as u16, 1), OP_HEARTBEAT, 0)
+                        .to_bytes()
+                        .to_vec(),
+                    pos: 0,
+                    park: rx,
+                }),
+            )
+            .expect("attach");
+    }
+    // Let every drain parse its heartbeat so `idle_ms` starts from a seen frame.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let parsed_all = || {
+        (0..4usize).all(|index| {
+            lease_pool
+                .lane(index)
+                .is_some_and(|lane| lane.counters().frames > 0)
+        })
+    };
+    while !parsed_all() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(parsed_all(), "every lease lane parsed its heartbeat");
+    std::thread::sleep(Duration::from_millis(50));
+    g.bench_function("expired_lanes_4_lanes", |b| {
+        b.iter(|| black_box(lease_pool.expired_lanes(black_box(5))));
+    });
+
     g.finish();
+    drop(lease_parks);
 }
 
 fn bench_contended(c: &mut Criterion) {

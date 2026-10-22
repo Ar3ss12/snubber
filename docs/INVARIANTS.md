@@ -176,6 +176,11 @@ outlives every transaction.
   timestamp; "no frame ever parsed" is tracked by a separate `seen` flag, so
   timestamp `0` (a frame parsed at process start) is not mistaken for
   silence. `hard < soft` clamps up, so the drain phase always exists.
+- `WorkerPool::expired_lanes(lease_ms)` is a read-only sweep: it names a lane
+  only when that lane's pipe is alive, was seen at least once, and has been
+  silent past the lease. It takes each lane's state lock separately, never
+  touches a child and never mutates counters, so a monitor thread can call it
+  while every lane waiter is blocked in `child.wait()`.
 
 ---
 
@@ -222,6 +227,9 @@ cargo test --test supervisor_pool_stress -- --ignored --nocapture
 
 # Verify all four reap classes in one run (armed/clean/silent/orphan; ignored)
 cargo test --test supervisor_pool_stress_mixed -- --ignored --nocapture
+
+# Verify lease euthanasia of heartbeat-then-hang workers with a live observer
+cargo test --test supervisor_pool_stress_lease -- --ignored --nocapture
 
 # Verify bench hygiene (setup outside the hot loop, pure overhead only)
 cargo test --test bench_hygiene

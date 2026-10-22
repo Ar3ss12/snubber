@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-317%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-318%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -99,6 +99,7 @@ Measured on AMD Ryzen 5 4600H release build
 | `lane.attach` + `note_death` (escape) | Layer 4 (`std`) | **~400 ns** | Same path when the child settled (commit parsed, no token) |
 | `pool.report()` (4 lanes) | Layer 4 (`std`) | **~107 ns** | Four short lane locks + totals fold, no allocation |
 | `lane.note_memory_kb` | Layer 4 (`std`, cold) | **~12 ns** | Per-lane watch: one lock + integer compares |
+| `pool.expired_lanes(lease)` (4 lanes) | Layer 4 (`std`, cold) | **~536 ns** | One sweep over four silent pipes: one state lock per lane, no child touched |
 | `run_supervised_guard_with_memory` | Layer 4 (`std`) | 1 sampler call / 10 ms tick | Soft logs `MEMORY_DRAIN`; hard `kill()` without draining (`DeathCause::MemoryLimit`) |
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | Layer 2 (`std`, opt-in) | 1 `Box` + 1 clock/stage | Stage wall/CPU breakdown; default `enter*` reads no profile clock |
 | `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.13 µs** | 512-byte zero-allocation snapshot CRC32 codec |
@@ -170,13 +171,15 @@ let reap = lane.note_death(exit_code, now_ms)?;           // waits ≤ 250 ms fo
 match reap.decision { /* Restart { delay_ms } | Stop | GiveUp */ }
 ```
 
-`note_death` classifies from that lane's own pipe: **ambush** (token handed back), **escape** (commit seen), **stillborn** (neither). A pipe that does not reach EOF inside the grace window becomes a fourth honest bucket — `ReapClass::Deadlocked`; `PoolReport::healthy()` stays false until it is zero, and `ambush + escape + stillborn + deadlocks == reaps` is checked per lane and in the totals. Task ids can carry the lineage (`namespace_task`, `lane << 48 | local`), so a rescued token names its worker.
+`note_death` classifies from that lane's own pipe: **ambush** (token handed back), **escape** (commit seen), **stillborn** (neither). A pipe that does not reach EOF inside the grace window becomes a fourth honest bucket — `ReapClass::Deadlocked`; `PoolReport::healthy()` stays false until it is zero, and `ambush + escape + stillborn + deadlocks == reaps` is checked per lane and in the totals. Task ids can carry the lineage (`namespace_task`, `lane << 48 | local`), so a rescued token names its worker. A waiter blocked in `child.wait()` cannot see a *different* lane go silent, so one app-side monitor calls `pool.expired_lanes(lease_ms)` on a tick: it names only lanes that already proved traffic once, and the monitor kills those itself.
 
 Measured (`cargo test --test supervisor_pool_stress -- --ignored --nocapture`, 4 lanes × 8 hard kills, debug build): 32/32 reaps, 32/32 true ambush, 0 escape, 0 stillborn, 0 deadlocks, final generation `[9,9,9,9]` (= kills + 1 per lane), 0.34 s storm wall.
 
 The mixed storm cycles `armed → clean → silent → orphan` by `local % 4` inside the same run (`--mixed`, example 19): `cargo test --test supervisor_pool_stress_mixed -- --ignored --nocapture` measured 32/32 conserved reaps, **A/E/S/D = 8/8/8/8**, 8 rescued tokens, `deadlock=true` (the orphan modes hold the pipe open past the 150 ms grace) and `[9,9,9,9]` generations in 0.71 s. A deadlocked lane is reported, never guessed into another bucket.
 
-Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~328 ns (ambush) / ~400 ns (escape), a four-lane `report()` is ~107 ns, and `namespace_task` is ~2 ns — each lane locks only its own state.
+The lease storm (`--lease-ms`, example 19) is the opposite case: every child emits one heartbeat and then hangs forever, so no `wait()` ever returns on its own. `cargo test --test supervisor_pool_stress_lease -- --ignored --nocapture` measured 24/24 reaps — all **stillborn** (a heartbeat is liveness, not a settlement), 0 ambush, 0 escape, 0 deadlocks, `lease_kills=24`, `conservation_breaks=0` over 98,703 live `report()` samples from the observer thread, `[7,7,7,7]` generations, 0.42 s. A child that hung before its first heartbeat is not expired — a pipe that never parsed a frame is the app's spawn timeout, not a lease breach.
+
+Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~328 ns (ambush) / ~400 ns (escape), a four-lane `report()` is ~107 ns, a four-lane lease sweep is ~536 ns, and `namespace_task` is ~2 ns — each lane locks only its own state.
 
 ---
 
@@ -213,7 +216,7 @@ Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~32
 * **[16 Streaming Checkpoint (`examples/16_streaming_checkpoint.rs`)](examples/16_streaming_checkpoint.rs):** 16 MiB body through a 64 KiB stack buffer (`tmp` → `sync_all` → `rename` → seal → successor restore); `--naive` clones the state, crosses hard and is killed mid-`write_all` with no sealed file and no ticket.
 * **[17 Impedance Bridge (`examples/17_impedance_bridge.rs`)](examples/17_impedance_bridge.rs):** One 10 000 msg/s producer through a raw stream (unbounded backlog), a one-slot conflation channel (latest wins, coalescing counted) and a paced gateway (HWM/LWM with `retry_after_ms`) at 60 FPS.
 * **[18 Impedance Calibration (`examples/18_impedance_calibration.rs`)](examples/18_impedance_calibration.rs):** `ProfileHarness` measures min/median/max/jitter/burst, derives an `ExecutionEnvelope` with headroom, then a node judges real settlements — including a deliberate no-op that lands below the floor.
-* **[19 Worker Pool (`examples/19_worker_pool.rs`)](examples/19_worker_pool.rs):** N independent lineages in one pool — one `PipeDrain`, generation clock, restart tracker and memory watch per lane; every child is killed only after its decisive frame is parsed, and the JSON report gates `reaped`, `ambush`, `deadlock` and `final_generation`. `--mixed` cycles ambush/escape/stillborn/deadlock in one storm.
+* **[19 Worker Pool (`examples/19_worker_pool.rs`)](examples/19_worker_pool.rs):** N independent lineages in one pool — one `PipeDrain`, generation clock, restart tracker and memory watch per lane; every child is killed only after its decisive frame is parsed, and the JSON report gates `reaped`, `ambush`, `deadlock` and `final_generation`. `--mixed` cycles ambush/escape/stillborn/deadlock in one storm; `--lease-ms` kills workers that beat once and then hang, using `expired_lanes` from a monitor thread.
 
 ---
 
