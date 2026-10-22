@@ -65,6 +65,9 @@ pub mod node;
 pub mod supervisor;
 
 #[cfg(feature = "std")]
+pub mod pool;
+
+#[cfg(feature = "std")]
 pub mod async_engine;
 
 #[cfg(feature = "std")]
@@ -160,6 +163,12 @@ pub use supervisor::{
     NoOrphanGuard, OrphanGuard, PipeDrain, ProcessToken, RestartDecision, RestartPolicy,
     RestartTracker, RestartWindow, StateDigest, Supervisor, TokenRollback, OP_COMMIT, OP_HEARTBEAT,
     OP_SNAPSHOT, OP_STATE, STATE_LEN,
+};
+
+#[cfg(feature = "std")]
+pub use pool::{
+    namespace_task, task_lane, task_local, LaneSnapshot, PoolConfig, PoolError, PoolLane, PoolReap,
+    PoolReport, PoolTotals, ReapClass, WorkerPool, LANE_SHIFT, MAX_LANES, TASK_LOCAL_MASK,
 };
 
 #[cfg(feature = "std")]

@@ -157,6 +157,21 @@ outlives every transaction.
   or `ps -o lstart=,comm=` (macOS). A failed read is never cached, a killed
   pid drops its cached identity, and supervisor pids are excluded, so a
   recycled pid or a stale pid file cannot redirect a kill.
+- In `WorkerPool`, every worker owns a private `PipeDrain`: a lane's
+  `take_armed()` can only return a token emitted on that lane's pipe, so no
+  rescue token crosses lanes.
+- A lane's generation is bumped exactly once per reported death
+  (`note_death` is the only bump site); no other lane's clock moves, and a
+  reap hands the successor the post-bump generation.
+- Pool conservation: `ambush + escape + stillborn + deadlocks == reaps` per
+  lane and in the totals. `deadlocks` (no EOF inside `eof_grace_ms`) is a
+  fourth honest bucket — never folded into the other three — and
+  `PoolReport::healthy()` requires it to be zero.
+- Restart math is per lane: one lane's crash storm (`GiveUp`) cannot stop,
+  restart or delay another lane. The memory watch resets on `attach`, so a
+  previous child's peak cannot euthanize its successor, and a reap or
+  memory sample on an idle lane returns `NoWorkerAttached` instead of a
+  silent zero.
 
 ---
 
@@ -194,6 +209,12 @@ cargo test --test memory_pressure
 # Verify supervisor euthanasia decisions and the real soft-drain loop
 cargo test --test supervisor_memory
 cargo test --test supervisor_memory_loop
+
+# Verify worker pool lanes (isolation, generation, conservation, deadlock grace)
+cargo test --test supervisor_pool
+
+# Verify the pool storm gate (4 lanes x 8 hard kills; ignored by default)
+cargo test --test supervisor_pool_stress -- --ignored --nocapture
 
 # Verify bench hygiene (setup outside the hot loop, pure overhead only)
 cargo test --test bench_hygiene

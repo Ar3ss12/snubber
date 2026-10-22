@@ -1,0 +1,354 @@
+//! Worker pool: N independent lineages on N private pipes.
+//!
+//! Every assertion is deterministic. Drains are fed through in-memory
+//! cursors (`PipeDrain::drain_sync`, EOF already reached) or through a
+//! reader the test controls; tracker clocks are plain `u64` values. Only
+//! the EOF-grace test waits, and it waits on purpose.
+
+use snubber::pool::{
+    namespace_task, task_lane, task_local, PoolConfig, PoolError, ReapClass, WorkerPool, MAX_LANES,
+};
+use snubber::{MemoryVerdict, PipeDrain, ProcessToken, RestartDecision, StateDigest, STATE_LEN};
+use std::io::Cursor;
+use std::time::{Duration, Instant};
+
+fn drain_of(frames: &[ProcessToken]) -> PipeDrain {
+    let mut bytes = Vec::new();
+    for frame in frames {
+        bytes.extend_from_slice(&frame.to_bytes());
+    }
+    PipeDrain::drain_sync(Cursor::new(bytes))
+}
+
+fn armed(task: u64) -> PipeDrain {
+    drain_of(&[ProcessToken::simple(task, 9, 1)])
+}
+
+fn committed(task: u64) -> PipeDrain {
+    drain_of(&[ProcessToken::simple(task, 9, 1), ProcessToken::commit(task)])
+}
+
+fn silent() -> PipeDrain {
+    drain_of(&[])
+}
+
+fn stuck() -> PipeDrain {
+    struct Stuck;
+    impl std::io::Read for Stuck {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::park();
+            Ok(0)
+        }
+    }
+    PipeDrain::spawn(Stuck)
+}
+
+#[test]
+fn lanes_do_not_share_armed_tokens() {
+    let pool = WorkerPool::new(PoolConfig::new(2)).expect("two lanes");
+    let lane_a = pool.lane(0).expect("lane 0");
+    let lane_b = pool.lane(1).expect("lane 1");
+
+    let gen_a = lane_a
+        .attach(1_001, armed(namespace_task(0, 7)))
+        .expect("attach lane 0");
+    let gen_b = lane_b
+        .attach(1_002, committed(namespace_task(1, 7)))
+        .expect("attach lane 1");
+    assert_eq!((gen_a, gen_b), (1, 1), "fresh lanes boot at generation 1");
+
+    let reap_a = lane_a.note_death(None, 1_000).expect("reap lane 0");
+    let reap_b = lane_b.note_death(Some(0), 1_000).expect("reap lane 1");
+
+    assert_eq!(reap_a.class, ReapClass::Ambush);
+    assert_eq!(reap_a.token.map(|t| t.task), Some(namespace_task(0, 7)));
+    assert_eq!(reap_a.generation, 2);
+
+    assert_eq!(reap_b.class, ReapClass::Escape);
+    assert!(reap_b.token.is_none());
+    assert_eq!(reap_b.decision, RestartDecision::Stop);
+
+    let snap_a = lane_a.snapshot();
+    let snap_b = lane_b.snapshot();
+    assert_eq!((snap_a.rescued, snap_a.ambush, snap_a.escape), (1, 1, 0));
+    assert_eq!((snap_b.rescued, snap_b.ambush, snap_b.escape), (0, 0, 1));
+
+    let report = pool.report();
+    assert_eq!(report.totals.reaps, 2);
+    assert_eq!(report.totals.rescued, 1);
+    assert!(report.conserved());
+    println!(
+        "[POOL]: tokens never crossed lanes — rescued={} ambush={} escape={}",
+        report.totals.rescued, report.totals.ambush, report.totals.escape
+    );
+}
+
+#[test]
+fn generation_bumps_only_on_the_dying_lane() {
+    let pool = WorkerPool::new(PoolConfig::new(2)).expect("two lanes");
+    let lane_a = pool.lane(0).expect("lane 0");
+    let lane_b = pool.lane(1).expect("lane 1");
+    lane_b.attach(42, silent()).expect("attach lane 1");
+
+    let mut handed_out = Vec::new();
+    for round in 0..3u64 {
+        let generation = lane_a
+            .attach(100 + round as u32, silent())
+            .expect("attach lane 0");
+        handed_out.push(generation);
+        let reap = lane_a
+            .note_death(Some(1), 1_000 + round * 10)
+            .expect("reap lane 0");
+        assert!(matches!(reap.decision, RestartDecision::Restart { .. }));
+        assert_eq!(reap.generation, generation + 1, "successor generation");
+    }
+
+    assert_eq!(handed_out, vec![1, 2, 3], "one bump per death");
+    assert_eq!(lane_a.generation(), 4);
+    assert_eq!(lane_b.generation(), 1, "idle lane keeps its generation");
+    assert_eq!(lane_a.next_epoch(), 1, "epoch resets with the generation");
+    assert_eq!(lane_b.next_epoch(), 1);
+    assert_eq!(
+        lane_b.next_epoch(),
+        2,
+        "epoch is monotonic inside a generation"
+    );
+}
+
+#[test]
+fn classification_conserves_every_reap() {
+    let pool = WorkerPool::new(PoolConfig::new(3)).expect("three lanes");
+    let lanes: Vec<_> = (0..3).map(|i| pool.lane(i).expect("lane")).collect();
+
+    lanes[0]
+        .attach(1, armed(namespace_task(0, 1)))
+        .expect("attach");
+    lanes[1]
+        .attach(2, committed(namespace_task(1, 1)))
+        .expect("attach");
+    lanes[2].attach(3, silent()).expect("attach");
+
+    let reap_0 = lanes[0].note_death(None, 0).expect("ambush");
+    let reap_1 = lanes[1].note_death(Some(0), 0).expect("escape");
+    let reap_2 = lanes[2].note_death(Some(1), 0).expect("stillborn");
+
+    assert_eq!(reap_0.class, ReapClass::Ambush);
+    assert_eq!(reap_1.class, ReapClass::Escape);
+    assert_eq!(reap_2.class, ReapClass::Stillborn);
+    assert!(reap_0.token.is_some());
+    assert!(reap_1.token.is_none() && reap_2.token.is_none());
+
+    let report = pool.report();
+    assert_eq!(report.totals.lanes, 3);
+    assert_eq!(report.totals.reaps, 3);
+    assert_eq!(report.totals.rescued, 1);
+    assert_eq!(report.totals.ambush, 1);
+    assert_eq!(report.totals.escape, 1);
+    assert_eq!(report.totals.stillborn, 1);
+    assert_eq!(report.totals.deadlocks, 0);
+    assert_eq!(report.totals.restarts, 2);
+    assert_eq!(report.totals.giveups, 0);
+    assert!(report.conserved());
+    assert!(!report.deadlocked());
+    assert!(report.healthy());
+    assert_eq!(report.final_generations(), vec![2, 2, 2]);
+
+    let text = report.to_string();
+    for needle in [
+        "lanes=3",
+        "reaps=3",
+        "rescued=1",
+        "ambush=1",
+        "escape=1",
+        "stillborn=1",
+        "deadlocks=0",
+        "conserved=true",
+        "lane=2",
+    ] {
+        assert!(
+            text.contains(needle),
+            "{needle} missing from report:\n{text}"
+        );
+    }
+    println!("\n{text}");
+}
+
+#[test]
+fn backoff_and_storm_window_are_per_lane() {
+    let pool = WorkerPool::new(PoolConfig::new(2)).expect("two lanes");
+    let lane_a = pool.lane(0).expect("lane 0");
+    let lane_b = pool.lane(1).expect("lane 1");
+
+    let mut delays = Vec::new();
+    for round in 0..3u64 {
+        lane_a.attach(10 + round as u32, silent()).expect("attach");
+        match lane_a
+            .note_death(Some(1), 1_000 + round * 100)
+            .expect("reap")
+            .decision
+        {
+            RestartDecision::Restart { delay_ms, .. } => delays.push(delay_ms),
+            other => panic!("lane 0 death {round}: {other:?}"),
+        }
+    }
+    assert_eq!(delays, vec![50, 100, 200], "exponential cooling");
+
+    lane_a.attach(90, silent()).expect("attach");
+    assert_eq!(
+        lane_a.note_death(Some(1), 1_300).expect("reap").decision,
+        RestartDecision::GiveUp {
+            deaths_in_window: 4
+        },
+        "fourth death inside 10 s parks lane 0"
+    );
+
+    lane_b.attach(91, silent()).expect("attach");
+    assert_eq!(
+        lane_b.note_death(Some(1), 1_300).expect("reap").decision,
+        RestartDecision::Restart {
+            delay_ms: 50,
+            attempt: 0
+        },
+        "lane 1 keeps its own fresh window and backoff"
+    );
+
+    assert_eq!(lane_a.snapshot().giveups, 1);
+    assert_eq!(lane_b.snapshot().giveups, 0);
+    assert_eq!(lane_a.generation(), 5, "1 boot + 4 deaths");
+    println!("\n[POOL]: per-lane backoff=50,100,200 lane0_giveups=1 lane1_giveups=0");
+}
+
+#[test]
+fn attach_and_reap_errors_are_explicit() {
+    let pool = WorkerPool::new(PoolConfig::new(1)).expect("one lane");
+    let lane = pool.lane(0).expect("lane 0");
+
+    assert_eq!(
+        lane.note_death(None, 0).unwrap_err(),
+        PoolError::NoWorkerAttached { lane: 0 }
+    );
+    assert_eq!(
+        lane.note_memory_kb(64).unwrap_err(),
+        PoolError::NoWorkerAttached { lane: 0 }
+    );
+
+    lane.attach(5, silent()).expect("attach");
+    assert_eq!(
+        lane.attach(6, silent()).unwrap_err(),
+        PoolError::LaneBusy { lane: 0 }
+    );
+
+    let reap = lane.note_death(None, 0).expect("reap");
+    assert_eq!(reap.lane, 0);
+    assert_eq!(reap.respawn_delay_ms(), Some(50));
+    assert_eq!(
+        lane.note_death(None, 1).unwrap_err(),
+        PoolError::NoWorkerAttached { lane: 0 },
+        "a double report is a caller bug, not a death"
+    );
+
+    assert_eq!(
+        WorkerPool::new(PoolConfig::new(0)).unwrap_err(),
+        PoolError::NoLanes
+    );
+    assert_eq!(
+        WorkerPool::new(PoolConfig::new(MAX_LANES + 1)).unwrap_err(),
+        PoolError::TooManyLanes {
+            requested: MAX_LANES + 1,
+            max: MAX_LANES
+        }
+    );
+    assert!(PoolError::LaneBusy { lane: 2 }
+        .to_string()
+        .contains("lane 2"));
+    assert_eq!(PoolConfig::default().lanes, 4, "default pool size");
+}
+
+#[test]
+fn eof_grace_reports_deadlock_instead_of_guessing() {
+    let pool = WorkerPool::new(PoolConfig::new(1).with_eof_grace(5)).expect("one lane");
+    let lane = pool.lane(0).expect("lane 0");
+    lane.attach(9, stuck()).expect("attach");
+
+    let started = Instant::now();
+    let reap = lane.note_death(None, 0).expect("reap");
+    assert!(
+        started.elapsed() >= Duration::from_millis(5),
+        "grace elapsed"
+    );
+    assert!(reap.deadlock);
+    assert_eq!(reap.class, ReapClass::Deadlocked);
+    assert!(reap.token.is_none(), "no token claimed from a live pipe");
+
+    let report = pool.report();
+    assert_eq!(report.totals.deadlocks, 1);
+    assert!(report.deadlocked());
+    assert!(!report.healthy(), "a deadlocked lane is not healthy");
+    assert!(report.conserved(), "deadlock is a fourth honest bucket");
+    assert!(report.to_string().contains("deadlocks=1"));
+}
+
+#[test]
+fn lane_namespaced_tasks_roundtrip() {
+    let task = namespace_task(7, 0xDEAD_BEEF);
+    assert_eq!(task_lane(task), 7);
+    assert_eq!(task_local(task), 0xDEAD_BEEF);
+    assert_eq!(namespace_task(0x1234, 1), (0x1234u64 << 48) | 1);
+    assert_eq!(namespace_task(u16::MAX, u64::MAX), u64::MAX);
+    assert_eq!(task_local(namespace_task(3, u64::MAX)), u64::MAX >> 16);
+    assert_ne!(namespace_task(1, 1), namespace_task(2, 1));
+    assert_eq!(MAX_LANES, 65_536);
+    assert_eq!(task_lane(u64::MAX >> 16), 0, "plain ids stay in lane 0");
+}
+
+#[test]
+fn memory_policy_is_per_lane_and_resets_per_child() {
+    let pool = WorkerPool::new(PoolConfig::new(2).with_memory(100, 200)).expect("two lanes");
+    let lane_a = pool.lane(0).expect("lane 0");
+    let lane_b = pool.lane(1).expect("lane 1");
+    lane_a.attach(1, silent()).expect("attach a");
+    lane_b.attach(2, silent()).expect("attach b");
+
+    assert_eq!(
+        lane_a.note_memory_kb(150).expect("sample"),
+        MemoryVerdict::Soft
+    );
+    assert_eq!(
+        lane_a.note_memory_kb(250).expect("sample"),
+        MemoryVerdict::Hard
+    );
+    assert!(lane_a.memory_verdict().is_hard());
+    assert_eq!(
+        lane_b.memory_verdict(),
+        MemoryVerdict::Ok,
+        "lane 1 saw no sample of its own"
+    );
+    assert_eq!(lane_b.snapshot().memory.peak_kb(), 0);
+
+    let reap = lane_a.note_death(None, 0).expect("reap");
+    assert!(matches!(reap.decision, RestartDecision::Restart { .. }));
+    lane_a.attach(3, silent()).expect("reattach");
+    assert_eq!(
+        lane_a.memory_verdict(),
+        MemoryVerdict::Ok,
+        "watch resets with the child"
+    );
+}
+
+#[test]
+fn state_digest_survives_the_reap() {
+    let digest = StateDigest::new([0x5A; STATE_LEN]);
+    let pool = WorkerPool::new(PoolConfig::new(1)).expect("one lane");
+    let lane = pool.lane(0).expect("lane 0");
+    lane.attach(11, drain_of(&digest.to_frames()))
+        .expect("attach");
+
+    let reap = lane.note_death(Some(1), 0).expect("reap");
+    assert_eq!(reap.state, Some(digest), "handoff payload is preserved");
+    assert_eq!(
+        reap.class,
+        ReapClass::Stillborn,
+        "state frames are not arm frames"
+    );
+    assert!(reap.token.is_none());
+}

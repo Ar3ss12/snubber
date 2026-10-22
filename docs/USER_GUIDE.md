@@ -1022,6 +1022,65 @@ bytes through a `#[global_allocator]` (streaming peak ≤ 128 KiB), and
 `tests/checkpoint_loop.rs` drives two real supervisor/worker/successor
 process chains.
 
+### 4.6d Worker pool (`WorkerPool`): N lineages, one pipe per worker
+
+One `Supervisor` is one lineage. Its `PipeDrain` keeps ONE armed slot and
+ONE `OP_STATE` scratch slot, and `take_armed()` returns a token without a
+lineage id — two workers behind one supervisor would merge rescue
+accounting, and one silent child would stall every waiter behind
+`child.wait()`. The pool keeps the wire format and the drain semantics
+intact and scales the COUNT:
+
+| Part | Single lineage | Pool |
+|---|---|---|
+| Drain | one stdout | one `PipeDrain` per lane |
+| Generation | one `GenerationClock` | one per lane, bumped once per reported death |
+| Restart | one `RestartTracker` | one per lane (own backoff and storm window) |
+| Memory | one `MemoryPolicy` | one per lane, reset on `attach` |
+| Wait | blocking `child.wait()` | one app thread per lane |
+
+```rust
+use snubber::pool::{namespace_task, PoolConfig, WorkerPool};
+use snubber::{Backoff, PipeDrain, RestartDecision, RestartPolicy, RestartWindow};
+
+let config = PoolConfig::new(4).with_restart(
+    RestartPolicy::Always,
+    Backoff::none(),
+    RestartWindow::unlimited(),
+);
+let pool = WorkerPool::new(config)?;
+let lane = pool.lane(0).unwrap().clone();                 // one Arc per app thread
+let generation = lane.attach(pid, PipeDrain::spawn(stdout))?;
+// Worker emits ProcessToken { task: namespace_task(0, seq), .. }.
+let reap = lane.note_death(exit_code, now_ms)?;
+match reap.decision {
+    RestartDecision::Restart { delay_ms, .. } => app_sleep(delay_ms),
+    RestartDecision::Stop | RestartDecision::GiveUp { .. } => app_parks(lane.index()),
+}
+```
+
+`note_death` waits up to `eof_grace_ms` (default 250 ms) for EOF and then
+classifies from THAT lane's drain only: **ambush** (un-settled arm, token
+returned for the app's rollback), **escape** (commit seen), **stillborn**
+(neither). A pipe that never reaches EOF inside the grace window is a
+fourth honest bucket — `ReapClass::Deadlocked`, no token claimed — and
+`PoolReport::healthy()` is false until `deadlocks == 0`. Conservation
+holds per lane and in the totals:
+`ambush + escape + stillborn + deadlocks == reaps`.
+
+App ownership is unchanged: the app spawns, kills, sleeps and owns pid
+files; the crate owns the classification, the per-lane restart math and
+the aggregated `PoolReport` (ASCII card + totals). Task ids can be
+namespaced (`task = lane << 48 | local`) so a rescued token names its
+lineage: `namespace_task`, `task_lane`, `task_local`, `MAX_LANES = 2^16`.
+
+**Reference:** `examples/19_worker_pool.rs` (supervisor and worker modes,
+JSON report), `tests/supervisor_pool.rs` (9 deterministic tests: lane
+isolation, per-lane generation, conservation, per-lane backoff/window,
+attach/reap errors, EOF-grace deadlock, task namespace, per-lane memory,
+state handoff), `tests/supervisor_pool_stress.rs` (`#[ignore]`: 4 lanes ×
+8 hard kills, gates `reaped`, `ambush`, `deadlock`, `final_generation`).
+
 ### 4.7 Orphan contract (Phase 6: no zombies)
 ```rust
 use snubber::{NoOrphanGuard, OrphanGuard};

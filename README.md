@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-299%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-309%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -52,7 +52,7 @@ let receipt = node.scoped_checked(
 * **Strict Determinism:** `#![forbid(unsafe_code)]`, zero external dependencies. Predictable behavior across bare-metal microcontrollers and multi-socket servers alike.
 * **Runtime-Agnostic Async:** Bounded waker queue built on `core::task::Waker` consuming **0% CPU** without depending on Tokio, async-std, or background threads.
 * **Adaptive Backpressure & Pacing:** Refusals carry physical telemetry (`retry_after_ms`, queue depth 0..255) allowing clients to pace incoming traffic instead of overwhelming dead hardware.
-* **Out-of-Process Crash Recovery:** Automated stress harness verifies resilience through 10,000 hard Windows `TerminateProcess` (`kill -9`) executions with zero pipe deadlocks and 100% token rescue. Every reap is classified as **true ambush** (armed token at death), **clean escape** (commit seen) or **stillborn** (killed during startup); a multi-lineage storm runs 4 independent supervisors in parallel with per-lane latency and handle gates.
+* **Out-of-Process Crash Recovery:** Automated stress harness verifies resilience through 10,000 hard Windows `TerminateProcess` (`kill -9`) executions with zero pipe deadlocks and 100% token rescue. Every reap is classified as **true ambush** (armed token at death), **clean escape** (commit seen) or **stillborn** (killed during startup); a multi-lineage storm runs 4 independent supervisors in parallel with per-lane latency and handle gates, and `WorkerPool` hosts N isolated lineages inside one process (one private `PipeDrain` per worker).
 * **Isolated Error Domains:** `FaultKind::is_catastrophic()` cleanly separates unrecoverable failures (Panic, Timeout, ProcessDied, ImplicitDrop) from routine capacity shedding (bulkhead limits, rate limits, stale epochs). Shedding pressure never trips circuit breakers.
 * **Monotonic Hang Clock:** Boot-relative `Instant` (`SystemClock`) — NTP sync, DST changes, and manual edits never move a deadline. Firmware brings its own `SysTick` tick via `MonotonicMs`.
 * **SPIN vs SLEEP Classification:** A hot `loop {}` settles as `SpinDetected`, a blocked syscall as `TimedOut` — identical rollback, distinct verdict, no thread ever killed. 8-byte `WorkerPulse` heartbeat strokes the hardware WDT on firmware.
@@ -151,6 +151,24 @@ powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines
 python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggressive --armed-hold
 ```
 
+### ⚡ Worker Pool (`WorkerPool`): N lineages in one process
+
+A single `Supervisor` owns one lineage: one armed slot, one `OP_STATE` scratch slot and one blocking `child.wait()`. The pool scales the count instead of merging state — every lane keeps its own `PipeDrain`, `GenerationClock`, `RestartTracker` (backoff + storm window) and `MemoryPolicy`, and one app thread waits on each child. The wire format does not change; `take_armed` still means exactly one worker's last un-settled token.
+
+```rust
+use snubber::pool::{namespace_task, PoolConfig, WorkerPool};
+
+let pool = WorkerPool::new(PoolConfig::new(4))?;          // 4 lanes, OnCrash, 50→1000 ms
+let lane = pool.lane(0).unwrap().clone();                 // one Arc per app thread
+let generation = lane.attach(pid, PipeDrain::spawn(stdout))?;
+let reap = lane.note_death(exit_code, now_ms)?;           // waits ≤ 250 ms for EOF
+match reap.decision { /* Restart { delay_ms } | Stop | GiveUp */ }
+```
+
+`note_death` classifies from that lane's own pipe: **ambush** (token handed back), **escape** (commit seen), **stillborn** (neither). A pipe that does not reach EOF inside the grace window becomes a fourth honest bucket — `ReapClass::Deadlocked`; `PoolReport::healthy()` stays false until it is zero, and `ambush + escape + stillborn + deadlocks == reaps` is checked per lane and in the totals. Task ids can carry the lineage (`namespace_task`, `lane << 48 | local`), so a rescued token names its worker.
+
+Measured (`cargo test --test supervisor_pool_stress -- --ignored --nocapture`, 4 lanes × 8 hard kills, debug build): 32/32 reaps, 32/32 true ambush, 0 escape, 0 stillborn, 0 deadlocks, final generation `[9,9,9,9]` (= kills + 1 per lane), 0.31 s storm wall.
+
 ---
 
 ## 📖 Documentation & Architecture Layers
@@ -161,7 +179,7 @@ python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggres
   * **Layer 1.5: Hang Classification:** Monotonic clock (`MonotonicMs` / `SystemClock`), CPU-spin classifier (`classify_stall`, `TimedOut` vs `SpinDetected`), 8-byte `WorkerPulse` heartbeat + `WdtSink`, ISR bridge (`IsrBridge`, 80 B SPSC ring + 32-bit trip latch, `IsrBridge::trip` bypasses `Full`), idle-park (`IdlePark` / `wfi`/`wfe` on firmware, `wfe` needs `SEVONPEND=1` at boot), pulse black-box (`pulse_stalls` + `PulseStall` anomaly, snapshot v3).
   * **Layer 2: Concurrency Bulkhead:** `SnubberNode`, presets, token buckets, sliding-window breakers, priority preemption, builder-sealed `passthrough` canary transit, external memory limits (`memory_limits` → `note_memory_kb`), and opt-in execution profiles (`enter_auto_profiled` → `commit_profiled`). Impedance bridge: one-slot conflation (`ConflateSender`), 16 B `ExecutionEnvelope` corridors (`commit_enveloped`), and the deterministic `ProfileHarness` that measures the corridor before you promise it.
   * **Layer 3: Async Waker Queue:** Runtime-agnostic async execution (`enter_async_auto`, `settle_async`, `enter_paced_async`).
-  * **Layer 4: Process Supervisor:** Out-of-process process supervisor, framed IPC tokens, `PipeDrain`, generation bumps, and memory euthanasia (`MemoryPolicy` → soft drain / hard `DeathCause::MemoryLimit`). The 64 B `StateDigest` is a ticket, not storage: a soft-limit worker must stream its checkpoint through a fixed buffer — `hard - soft` is allocator headroom, not a drain countdown.
+  * **Layer 4: Process Supervisor:** Out-of-process process supervisor, framed IPC tokens, `PipeDrain`, generation bumps, and memory euthanasia (`MemoryPolicy` → soft drain / hard `DeathCause::MemoryLimit`). The 64 B `StateDigest` is a ticket, not storage: a soft-limit worker must stream its checkpoint through a fixed buffer — `hard - soft` is allocator headroom, not a drain countdown. `WorkerPool` runs N independent lineages (one drain, clock, tracker and memory watch per lane) with per-lane rescue classification and an aggregated report.
   * **Layer 5: Diagnostics & Health:** Zero-allocation telemetry, `SnapshotV1` v4 (memory + queue gauges), anomaly detection (`MemoryGrowth`, `QueueSaturation`), `SnapshotDiff`, ASCII triage card, and CI verification gates.
 
 ---
@@ -186,6 +204,7 @@ python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggres
 * **[16 Streaming Checkpoint (`examples/16_streaming_checkpoint.rs`)](examples/16_streaming_checkpoint.rs):** 16 MiB body through a 64 KiB stack buffer (`tmp` → `sync_all` → `rename` → seal → successor restore); `--naive` clones the state, crosses hard and is killed mid-`write_all` with no sealed file and no ticket.
 * **[17 Impedance Bridge (`examples/17_impedance_bridge.rs`)](examples/17_impedance_bridge.rs):** One 10 000 msg/s producer through a raw stream (unbounded backlog), a one-slot conflation channel (latest wins, coalescing counted) and a paced gateway (HWM/LWM with `retry_after_ms`) at 60 FPS.
 * **[18 Impedance Calibration (`examples/18_impedance_calibration.rs`)](examples/18_impedance_calibration.rs):** `ProfileHarness` measures min/median/max/jitter/burst, derives an `ExecutionEnvelope` with headroom, then a node judges real settlements — including a deliberate no-op that lands below the floor.
+* **[19 Worker Pool (`examples/19_worker_pool.rs`)](examples/19_worker_pool.rs):** N independent lineages in one pool — one `PipeDrain`, generation clock, restart tracker and memory watch per lane; every child is killed only after its arm frame is parsed, and the JSON report gates `reaped`, `ambush`, `deadlock` and `final_generation`.
 
 ---
 
