@@ -37,10 +37,11 @@ use super::{
     LogLevel, Priority,
 };
 use super::{EpochGate, SnubberEvent, TransactionHeader};
+use crate::memory::{MemoryVerdict, MemoryWatch};
 #[cfg(feature = "std")]
 use std::collections::VecDeque;
 #[cfg(feature = "std")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "std")]
 use std::sync::{Arc, Mutex};
 
@@ -199,6 +200,23 @@ pub struct SnubberStats {
     /// merged into `total_started` / `admission_total` / `SnapshotV1`
     /// (the 512 B wire frame stays untouched).
     pub passthrough_admissions: u64,
+    /// Latest external memory sample, KiB (`0` = never sampled).
+    pub memory_used_kb: u64,
+    /// Worst external memory sample since boot, KiB (saturating max).
+    pub memory_peak_kb: u64,
+    /// Configured soft limit, KiB (`0` = disabled).
+    pub memory_soft_kb: u64,
+    /// Configured hard limit, KiB (`0` = disabled).
+    pub memory_hard_kb: u64,
+    /// Admissions refused because the pressure flag was set.
+    /// Own column forever — an operational refusal, never a failure streak.
+    pub memory_rejections: u64,
+    /// `true` while the last sample sat at or above the soft limit.
+    pub memory_pressure: bool,
+    /// Parked async waiters right now.
+    pub queue_depth: u64,
+    /// Configured waiter-queue ceiling (`queue_limit`).
+    pub queue_capacity: u64,
     /// Last recorded fault (any kind).
     pub last_fault: Option<FaultRecord>,
     /// Per-kind explicit-report counters, indexed by [`FaultKind::index`].
@@ -457,6 +475,8 @@ pub struct SnubberNodeBuilder {
     backpressure_policy: BackpressurePolicy,
     friction_fn: Option<FrictionFn>,
     passthrough: bool,
+    memory_soft_kb: u64,
+    memory_hard_kb: u64,
 }
 
 // [ANCHOR: BUILDER] — node builder, presets (desktop/embedded/server).
@@ -475,6 +495,8 @@ impl SnubberNodeBuilder {
             stall_ceiling_ms: 0,
             task_ttl_ms: 0,
             payload_budget_bytes: 0,
+            memory_soft_kb: 0,
+            memory_hard_kb: 0,
             rate_per_sec: 0,
             fallback: None,
             console_cap: 8,
@@ -530,6 +552,20 @@ impl SnubberNodeBuilder {
     #[must_use]
     pub fn payload_budget(mut self, bytes: usize) -> Self {
         self.payload_budget_bytes = bytes;
+        self
+    }
+
+    /// External memory limits, KiB (`0` disables either one).
+    ///
+    /// The node never samples memory itself: feed one RSS reading per
+    /// second through [`SnubberNode::note_memory_kb`]. At `soft_kb` new
+    /// admissions are refused with [`EnterError::MemoryPressure`] while
+    /// in-flight work drains; at `hard_kb` the supervisor may terminate
+    /// the process without draining. `hard < soft` clamps up to `soft`.
+    #[must_use]
+    pub fn memory_limits(mut self, soft_kb: u64, hard_kb: u64) -> Self {
+        self.memory_soft_kb = soft_kb;
+        self.memory_hard_kb = hard_kb;
         self
     }
 
@@ -802,12 +838,17 @@ impl SnubberNodeBuilder {
     /// Build the node.
     #[must_use]
     pub fn build(self) -> SnubberNode {
+        // Pressure flag: read lock-free on every admission, written ONLY
+        // by `note_memory_kb` (one owner per knob).
+        let memory_pressure = Arc::new(AtomicBool::new(false));
         SnubberNode {
             // Passthrough law sealed OUTSIDE the mutex: transit never locks.
             // `name` is Copy-mirrored for lock-free arming stamps.
             passthrough: self.passthrough,
             passthrough_name: self.name,
             passthrough_admissions: Arc::new(AtomicU64::new(0)),
+            memory_pressure: Arc::clone(&memory_pressure),
+            memory_rejections: Arc::new(AtomicU64::new(0)),
             inner: Arc::new(Mutex::new(NodeInner {
                 name: self.name,
                 max_in_flight: self.max_in_flight,
@@ -821,6 +862,8 @@ impl SnubberNodeBuilder {
                 stall_ceiling_ms: self.stall_ceiling_ms,
                 task_ttl_ms: self.task_ttl_ms,
                 payload_budget_bytes: self.payload_budget_bytes,
+                memory: MemoryWatch::new(self.memory_soft_kb, self.memory_hard_kb),
+                memory_pressure,
                 rate_per_sec: self.rate_per_sec,
                 rate_tokens: self.rate_per_sec as f64,
                 rate_last_ms: now_ms(),
@@ -853,7 +896,12 @@ impl SnubberNodeBuilder {
                 max_pulse_lag_ms: 0,
                 rate_rejected: 0,
                 auto_seq: AtomicU64::new(1),
-                stats: SnubberStats::default(),
+                stats: SnubberStats {
+                    memory_soft_kb: self.memory_soft_kb,
+                    memory_hard_kb: self.memory_hard_kb,
+                    queue_capacity: self.queue_limit as u64,
+                    ..SnubberStats::default()
+                },
             })),
         }
     }
@@ -872,6 +920,13 @@ struct NodeInner {
     stall_ceiling_ms: u64,
     task_ttl_ms: u64,
     payload_budget_bytes: usize,
+    /// External memory limits + last sample (KiB). Written only by
+    /// `note_memory_kb`, read cold (stats/snapshot) and flipped into
+    /// `memory_pressure` so admission never touches the sampler.
+    memory: MemoryWatch,
+    /// Lock-free mirror of `memory.verdict().is_pressured()`. Shared with
+    /// the node handle: admission reads it BEFORE taking this mutex.
+    memory_pressure: Arc<AtomicBool>,
     rate_per_sec: u32,
     rate_tokens: f64,
     rate_last_ms: u64,
@@ -996,13 +1051,19 @@ pub enum EnterError {
     QueueFull,
     /// Inbound payload exceeds the configured payload budget.
     PayloadBudgetExceeded(usize),
+    /// External memory sample is at/above the soft limit: the node is
+    /// draining. Refused BEFORE any lock; counted in `memory_rejections`.
+    /// Retry after 1 s — never counted as a failure streak.
+    MemoryPressure,
 }
 
 impl EnterError {
     /// Backpressure readings associated with this admission rejection.
     ///
     /// `Some` for `BulkheadFull / RateLimited / BreakerOpen` (capacity saturation);
-    /// `None` for `StaleEpoch / InvariantBreach / QueueTtlExpired / PayloadBudgetExceeded`.
+    /// `None` for `StaleEpoch / InvariantBreach / QueueTtlExpired /
+    /// PayloadBudgetExceeded / MemoryPressure` (memory pressure has no
+    /// `FaultKind`; its advisory wait is fixed at 1 s).
     #[must_use]
     pub fn backpressure(&self) -> Option<Backpressure> {
         match *self {
@@ -1018,15 +1079,21 @@ impl EnterError {
             Self::StaleEpoch
             | Self::InvariantBreach(_)
             | Self::QueueTtlExpired
-            | Self::PayloadBudgetExceeded(_) => None,
+            | Self::PayloadBudgetExceeded(_)
+            | Self::MemoryPressure => None,
         }
     }
 
     /// Advised wait before retry, ms. `0` = no pressure, retry immediately.
+    /// [`MemoryPressure`](Self::MemoryPressure) advises 1 s: the sampler
+    /// runs once per second, so a faster retry only burns CPU.
     #[inline]
     #[must_use]
     pub fn retry_after_ms(&self) -> u64 {
-        self.backpressure().map_or(0, |b| b.retry_after_ms)
+        match self {
+            Self::MemoryPressure => 1000,
+            _ => self.backpressure().map_or(0, |b| b.retry_after_ms),
+        }
     }
 }
 
@@ -1206,6 +1273,11 @@ pub struct SnubberNode {
     /// Lock-free transit counter (`Relaxed`): every dummy admission bumps
     /// it without touching the mutex. Read via `stats()` / observer.
     passthrough_admissions: Arc<AtomicU64>,
+    /// `true` while the last external memory sample was at/above soft.
+    /// Read on every admission BEFORE the mutex (same law as passthrough).
+    memory_pressure: Arc<AtomicBool>,
+    /// Admissions refused by that flag (`Relaxed`, own column).
+    memory_rejections: Arc<AtomicU64>,
 }
 
 impl SnubberNode {
@@ -1434,9 +1506,23 @@ impl SnubberNode {
     // reset_breaker, stats, take_alert, reported.
     pub fn stats(&self) -> SnubberStats {
         self.reap_timeouts();
-        let mut stats = self.lock().stats.clone();
-        // Pass-through column: lock-free read, filled outside the mutex.
+        let mut stats = {
+            let inner = self.lock();
+            let mut s = inner.stats.clone();
+            // Memory/queue gauges live in `inner` (not the counter struct):
+            // fill them here so one cached stats() is a complete picture.
+            s.memory_used_kb = inner.memory.used_kb();
+            s.memory_peak_kb = inner.memory.peak_kb();
+            s.memory_soft_kb = inner.memory.soft_kb();
+            s.memory_hard_kb = inner.memory.hard_kb();
+            s.memory_pressure = inner.memory_pressure.load(Ordering::Relaxed);
+            s.queue_depth = inner.waiters.len() as u64;
+            s.queue_capacity = inner.queue_limit as u64;
+            s
+        };
+        // Columns filled lock-free, outside the mutex.
         stats.passthrough_admissions = self.passthrough_admissions.load(Ordering::Relaxed);
+        stats.memory_rejections = self.memory_rejections.load(Ordering::Relaxed);
         stats
     }
 
@@ -1506,6 +1592,52 @@ impl SnubberNode {
         inner.max_pulse_lag_ms = inner.max_pulse_lag_ms.max(lag_ms);
         inner.stats.pulse_stalls = inner.pulse_stalls;
         inner.stats.max_pulse_lag_ms = inner.max_pulse_lag_ms;
+    }
+
+    /// Feed one external memory sample (KiB) and get its verdict.
+    ///
+    /// The crate never samples RSS (no `/proc`, no Win32, no token):
+    /// YOUR sampler (once per second is the intended cadence) passes the
+    /// resident-set size in KiB. At/above `soft` the node refuses new
+    /// admissions with [`EnterError::MemoryPressure`] until a later
+    /// sample falls back below the limit; at/above `hard` the verdict is
+    /// [`MemoryVerdict::Hard`] and the supervisor may terminate without
+    /// draining (`DeathCause::MemoryLimit`, Phase 3).
+    ///
+    /// Cold path: one short lock for integer bookkeeping, the pressure
+    /// flag is stored OUTSIDE (release) so admission never waits on the
+    /// sampler. In-flight guards are never touched — drain is cooperative.
+    pub fn note_memory_kb(&self, used_kb: u64) -> MemoryVerdict {
+        let verdict = {
+            let mut inner = self.lock();
+            let verdict = inner.memory.note(used_kb);
+            inner.stats.memory_used_kb = used_kb;
+            inner.stats.memory_peak_kb = inner.memory.peak_kb();
+            inner.stats.memory_pressure = verdict.is_pressured();
+            verdict
+        };
+        self.memory_pressure
+            .store(verdict.is_pressured(), Ordering::Release);
+        verdict
+    }
+
+    /// Verdict for the last external sample (no clock, no sampling).
+    #[must_use]
+    pub fn memory_verdict(&self) -> MemoryVerdict {
+        self.lock().memory.verdict()
+    }
+
+    /// Configured memory limits, `(soft_kb, hard_kb)` (`0` = disabled).
+    #[must_use]
+    pub fn memory_limits_kb(&self) -> (u64, u64) {
+        let inner = self.lock();
+        (inner.memory.soft_kb(), inner.memory.hard_kb())
+    }
+
+    /// Last external sample, KiB (`0` = never sampled).
+    #[must_use]
+    pub fn memory_used_kb(&self) -> u64 {
+        self.lock().memory.used_kb()
     }
 
     /// Fallback strategy value for an isolated module (`None` = no fallback armed).
@@ -2555,6 +2687,13 @@ impl SnubberNode {
         if self.passthrough {
             return Ok(self.enter_passthrough_dummy(arming, rollback));
         }
+        // Memory pressure refuses BEFORE the mutex: one relaxed flag bump,
+        // no lock contention with a watchdog that may be snapshotting.
+        // Counted in the lock-free `memory_rejections` column.
+        if self.memory_pressure.load(Ordering::Relaxed) {
+            self.memory_rejections.fetch_add(1, Ordering::Relaxed);
+            return Err(EnterError::MemoryPressure);
+        }
         let header = arming.header;
         let epoch = header.epoch;
         let task_id = header.task_id;
@@ -2992,6 +3131,12 @@ impl SnubberNode {
             };
             return core::task::Poll::Ready(Ok(self.enter_passthrough_dummy(arming, rb)));
         }
+        // Memory pressure: never park a waker behind a draining node.
+        // The rollback stays in `Option`; the future drop frees it.
+        if self.memory_pressure.load(Ordering::Relaxed) {
+            self.memory_rejections.fetch_add(1, Ordering::Relaxed);
+            return core::task::Poll::Ready(Err(EnterError::MemoryPressure));
+        }
         let now = now_ms();
         let wait_ms = now.saturating_sub(enqueued_at_ms);
         let header = TransactionHeader::new(epoch, task_id);
@@ -3316,6 +3461,14 @@ impl SnubberNode {
             // mirrored value (0 on guarded nodes, untouched on transit —
             // transit never emits hooks).
             passthrough_admissions: s.passthrough_admissions,
+            memory_used_kb: s.memory_used_kb,
+            memory_peak_kb: s.memory_peak_kb,
+            memory_soft_kb: s.memory_soft_kb,
+            memory_hard_kb: s.memory_hard_kb,
+            memory_rejections: s.memory_rejections,
+            memory_pressure: s.memory_pressure,
+            queue_depth: inner.waiters.len() as u64,
+            queue_capacity: inner.queue_limit as u64,
             last_fault: None,
             reported: s.reported,
         }

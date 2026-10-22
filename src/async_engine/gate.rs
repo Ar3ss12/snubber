@@ -117,9 +117,10 @@ pub enum GateError {
 pub fn classify(err: &EnterError) -> Refusal {
     match *err {
         EnterError::BreakerOpen => Refusal::FailFast,
-        EnterError::BulkheadFull | EnterError::RateLimited | EnterError::QueueFull => {
-            Refusal::Backoff
-        }
+        EnterError::BulkheadFull
+        | EnterError::RateLimited
+        | EnterError::QueueFull
+        | EnterError::MemoryPressure => Refusal::Backoff,
         EnterError::StaleEpoch | EnterError::QueueTtlExpired => Refusal::Ignore,
         EnterError::InvariantBreach(_) | EnterError::PayloadBudgetExceeded(_) => {
             Refusal::BadRequest

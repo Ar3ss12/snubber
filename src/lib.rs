@@ -85,6 +85,8 @@ pub mod watchdog;
 
 pub mod diagnostics;
 
+pub mod memory;
+
 pub mod protect;
 
 #[cfg(feature = "alloc")]
@@ -134,6 +136,8 @@ pub use diagnostics::{
     crc32_ieee, diagnostic_hash, find_anomalies_for_snapshot, write_diagnostic_line, write_health,
     write_triage,
 };
+
+pub use memory::{MemoryVerdict, MemoryWatch};
 
 pub use protect::Protected;
 

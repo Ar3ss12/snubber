@@ -20,10 +20,11 @@ use super::{SnubberNode, SnubberStats};
 /// Snapshot wire size: exactly 512 bytes, zero-padded, CRC32 in last 4.
 pub const SNAPSHOT_LEN: usize = 512;
 /// Snapshot format version (bytes 4..8, LE).
-/// v3: `pulse_stalls` + `max_pulse_lag_ms` (Front 4: missed WorkerPulse
-/// verdicts land in the cold frame). v2/v1 frames refuse as
-/// `BadVersion`, never half-parse.
-pub const SNAPSHOT_VERSION: u32 = 3;
+/// v4: memory bounds/sample/peak/rejections + waiter queue gauges
+/// (Phase 2 memory control). v3 added `pulse_stalls` +
+/// `max_pulse_lag_ms`; older frames refuse as `BadVersion`, never
+/// half-parse.
+pub const SNAPSHOT_VERSION: u32 = 4;
 /// Snapshot magic: `b"SNUB"` (bytes 0..4).
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SNUB";
 /// CRC covers bytes `0..508`; stored LE at `508..512`.
@@ -32,7 +33,8 @@ pub const SNAPSHOT_CRC_RANGE: usize = 508;
 // COMPILE-TIME GATES (cold-frame wire math, always compiled):
 // the 512 B frame = 508 B payload + 4 B CRC; the `reported` tail must
 // track `FaultKind::COUNT` (v2 grew 11 -> 12 for Preempted);
-// v3 appends `pulse_stalls` + `max_pulse_lag_ms` (Front 4).
+// v3 appended `pulse_stalls` + `max_pulse_lag_ms` (Front 4);
+// v4 appends memory + queue gauges (Phase 2) and still fits: 314/508 B.
 const _: () = {
     assert!(
         SNAPSHOT_LEN == 512,
@@ -92,8 +94,24 @@ pub struct SnapshotV1 {
     pub pulse_stalls: u64,
     /// Worst pulse lag observed, ms (saturating max).
     pub max_pulse_lag_ms: u64,
+    /// Latest external memory sample, KiB (0 = never sampled).
+    pub memory_used_kb: u64,
+    /// Worst external memory sample since boot, KiB.
+    pub memory_peak_kb: u64,
+    /// Soft (drain) limit, KiB (0 = disabled).
+    pub memory_soft_kb: u64,
+    /// Hard (terminate) limit, KiB (0 = disabled).
+    pub memory_hard_kb: u64,
+    /// Admissions refused by the memory pressure flag.
+    pub memory_rejections: u64,
+    /// Parked async waiters right now.
+    pub queue_depth: u64,
+    /// Configured waiter-queue ceiling.
+    pub queue_capacity: u64,
     /// Breaker position: 0 = Closed, 1 = Open, 2 = HalfOpen.
     pub breaker_state: u8,
+    /// Memory pressure: 0 = Ok, 1 = soft/hard sample in force.
+    pub memory_pressure: u8,
 }
 
 impl SnapshotV1 {
@@ -180,7 +198,15 @@ impl SnapshotV1 {
         }
         w64!(self.pulse_stalls);
         w64!(self.max_pulse_lag_ms);
+        w64!(self.memory_used_kb);
+        w64!(self.memory_peak_kb);
+        w64!(self.memory_soft_kb);
+        w64!(self.memory_hard_kb);
+        w64!(self.memory_rejections);
+        w64!(self.queue_depth);
+        w64!(self.queue_capacity);
         out[o] = self.breaker_state;
+        out[o + 1] = self.memory_pressure;
         let crc = crc32_ieee(&out[..SNAPSHOT_CRC_RANGE]);
         out[SNAPSHOT_CRC_RANGE..SNAPSHOT_LEN].copy_from_slice(&crc.to_le_bytes());
         out
@@ -244,14 +270,30 @@ impl SnapshotV1 {
             reported: [0; super::FaultKind::COUNT],
             pulse_stalls: 0,
             max_pulse_lag_ms: 0,
+            memory_used_kb: 0,
+            memory_peak_kb: 0,
+            memory_soft_kb: 0,
+            memory_hard_kb: 0,
+            memory_rejections: 0,
+            queue_depth: 0,
+            queue_capacity: 0,
             breaker_state: 0,
+            memory_pressure: 0,
         };
         for v in snap.reported.iter_mut() {
             *v = r64!();
         }
         snap.pulse_stalls = r64!();
         snap.max_pulse_lag_ms = r64!();
+        snap.memory_used_kb = r64!();
+        snap.memory_peak_kb = r64!();
+        snap.memory_soft_kb = r64!();
+        snap.memory_hard_kb = r64!();
+        snap.memory_rejections = r64!();
+        snap.queue_depth = r64!();
+        snap.queue_capacity = r64!();
         snap.breaker_state = bytes[o];
+        snap.memory_pressure = bytes[o + 1];
         Ok(snap)
     }
 
@@ -281,11 +323,19 @@ impl SnapshotV1 {
             reported: stats.reported,
             pulse_stalls: stats.pulse_stalls,
             max_pulse_lag_ms: stats.max_pulse_lag_ms,
+            memory_used_kb: stats.memory_used_kb,
+            memory_peak_kb: stats.memory_peak_kb,
+            memory_soft_kb: stats.memory_soft_kb,
+            memory_hard_kb: stats.memory_hard_kb,
+            memory_rejections: stats.memory_rejections,
+            queue_depth: stats.queue_depth,
+            queue_capacity: stats.queue_capacity,
             breaker_state: match stats.breaker_state {
                 super::BreakerState::Closed => 0,
                 super::BreakerState::Open => 1,
                 super::BreakerState::HalfOpen => 2,
             },
+            memory_pressure: u8::from(stats.memory_pressure),
         }
     }
 }
@@ -383,6 +433,13 @@ pub enum AnomalyKind {
     /// (Front 4). The engine lagged but never died — `count` = missed
     /// verdicts, `pct` carries `max_pulse_lag_ms` capped at 100.
     PulseStall,
+    /// External memory sample reached the soft limit (`memory_pressure`
+    /// set, or `used >= soft`): the node is draining. `count` = used KiB,
+    /// `pct` = used as a share of the hard limit (of soft when hard is off).
+    MemoryGrowth,
+    /// `queue_depth / queue_capacity > bottleneck_pct`: async waiters
+    /// pile up faster than admission frees slots. `count` = depth.
+    QueueSaturation,
 }
 
 impl AnomalyKind {
@@ -396,6 +453,8 @@ impl AnomalyKind {
             Self::Catastrophic => "catastrophic_fault",
             Self::PreemptStorm => "preempt_storm",
             Self::PulseStall => "pulse_stall",
+            Self::MemoryGrowth => "memory_growth",
+            Self::QueueSaturation => "queue_saturation",
         }
     }
 }
@@ -479,6 +538,16 @@ const _: () = {
     .validate();
 };
 
+/// `n / ceiling` in percent, clamped to 100 (`ceiling == 0` = no verdict).
+#[must_use]
+fn percent_of(n: u64, ceiling: u64) -> u8 {
+    if ceiling == 0 {
+        0
+    } else {
+        ((n as u128 * 100) / ceiling as u128).min(100) as u8
+    }
+}
+
 /// Cold anomaly scan over a snapshot (works from a decoded `app.snub`
 /// with no live node at hand). Pure math: `u128` percents,
 /// `total == 0` guard (no verdicts on silence), saturating everywhere.
@@ -515,6 +584,37 @@ pub fn find_anomalies_for_snapshot(
             pct: snap.max_pulse_lag_ms.min(100) as u8,
             count: snap.pulse_stalls,
         });
+    }
+    // Memory pressure ignores `min_sample` (like desync): one sample over
+    // the line is already a verdict. `memory_pressure` is authoritative;
+    // the used/soft compare is the honest fallback for hand-built frames.
+    if snap.memory_pressure != 0
+        || (snap.memory_soft_kb > 0 && snap.memory_used_kb >= snap.memory_soft_kb)
+    {
+        let ceiling = if snap.memory_hard_kb > 0 {
+            snap.memory_hard_kb
+        } else {
+            snap.memory_soft_kb
+        };
+        let pct = percent_of(snap.memory_used_kb, ceiling);
+        out.push(Anomaly {
+            kind: AnomalyKind::MemoryGrowth,
+            node,
+            pct,
+            count: snap.memory_used_kb,
+        });
+    }
+    // Waiter queue is a live gauge, not a counter: compare right now.
+    if snap.queue_capacity > 0 {
+        let pct = percent_of(snap.queue_depth, snap.queue_capacity);
+        if pct > policy.bottleneck_pct {
+            out.push(Anomaly {
+                kind: AnomalyKind::QueueSaturation,
+                node,
+                pct,
+                count: snap.queue_depth,
+            });
+        }
     }
     let total = snap.admission_total();
     if total >= policy.min_sample.max(1) {
@@ -662,6 +762,22 @@ pub struct SnapshotDiff {
     pub pulse_stalls: u64,
     /// Growth of the worst pulse lag.
     pub max_pulse_lag_ms: u64,
+    /// New admissions refused under memory pressure.
+    pub memory_rejections: u64,
+    /// Growth of the memory peak, KiB.
+    pub memory_peak_kb: u64,
+    /// Sampled memory before the window, KiB.
+    pub memory_used_kb_from: u64,
+    /// Sampled memory after the window, KiB.
+    pub memory_used_kb_to: u64,
+    /// Pressure flag before the window (0/1).
+    pub memory_pressure_from: u8,
+    /// Pressure flag after the window (0/1).
+    pub memory_pressure_to: u8,
+    /// Waiter queue depth before the window.
+    pub queue_depth_from: u64,
+    /// Waiter queue depth after the window.
+    pub queue_depth_to: u64,
     /// Breaker position before the window (0 Closed, 1 Open, 2 HalfOpen).
     pub breaker_state_from: u8,
     /// Breaker position after the window.
@@ -692,6 +808,11 @@ impl SnapshotDiff {
             && self.reported.iter().all(|&v| v == 0)
             && self.pulse_stalls == 0
             && self.max_pulse_lag_ms == 0
+            && self.memory_rejections == 0
+            && self.memory_peak_kb == 0
+            && self.memory_used_kb_from == self.memory_used_kb_to
+            && self.memory_pressure_from == self.memory_pressure_to
+            && self.queue_depth_from == self.queue_depth_to
             && self.breaker_state_from == self.breaker_state_to
     }
 
@@ -704,7 +825,7 @@ impl SnapshotDiff {
             .saturating_add(self.implicit_drops)
     }
 
-    /// Three ASCII lines into any `fmt::Write` (no allocation).
+    /// Four ASCII lines into any `fmt::Write` (no allocation).
     pub fn write_summary(&self, w: &mut impl fmt::Write) -> fmt::Result {
         writeln!(
             w,
@@ -729,6 +850,18 @@ impl SnapshotDiff {
             self.timeouts_fired,
             self.pulse_stalls,
             self.max_pulse_lag_ms
+        )?;
+        writeln!(
+            w,
+            "      memory {}->{}kb peak +{}kb reject +{} pressure {}->{} queue {}->{}",
+            self.memory_used_kb_from,
+            self.memory_used_kb_to,
+            self.memory_peak_kb,
+            self.memory_rejections,
+            pressure_name(self.memory_pressure_from),
+            pressure_name(self.memory_pressure_to),
+            self.queue_depth_from,
+            self.queue_depth_to
         )
     }
 }
@@ -769,6 +902,14 @@ impl SnapshotV1 {
             reported,
             pulse_stalls: d(self.pulse_stalls, later.pulse_stalls),
             max_pulse_lag_ms: d(self.max_pulse_lag_ms, later.max_pulse_lag_ms),
+            memory_rejections: d(self.memory_rejections, later.memory_rejections),
+            memory_peak_kb: d(self.memory_peak_kb, later.memory_peak_kb),
+            memory_used_kb_from: self.memory_used_kb,
+            memory_used_kb_to: later.memory_used_kb,
+            memory_pressure_from: self.memory_pressure,
+            memory_pressure_to: later.memory_pressure,
+            queue_depth_from: self.queue_depth,
+            queue_depth_to: later.queue_depth,
             breaker_state_from: self.breaker_state,
             breaker_state_to: later.breaker_state,
         }
@@ -782,6 +923,16 @@ fn breaker_name(code: u8) -> &'static str {
         1 => "OPEN",
         2 => "HALF",
         _ => "CLOSED",
+    }
+}
+
+/// Memory pressure code as text (`0/1` → `ok/PRESSURE`).
+#[must_use]
+fn pressure_name(code: u8) -> &'static str {
+    if code == 0 {
+        "ok"
+    } else {
+        "PRESSURE"
     }
 }
 
@@ -804,7 +955,12 @@ pub fn write_triage(w: &mut impl fmt::Write, node: &str, snap: &SnapshotV1) -> f
         .saturating_add(snap.shed_preempted());
     let verdict = if snap.catastrophic_faults() > 0 {
         "CRIT"
-    } else if shed > 0 || snap.pulse_stalls > 0 || snap.breaker_state != 0 {
+    } else if shed > 0
+        || snap.pulse_stalls > 0
+        || snap.breaker_state != 0
+        || snap.memory_pressure != 0
+        || (snap.queue_capacity > 0 && snap.queue_depth >= snap.queue_capacity)
+    {
         "WARN"
     } else {
         "OK"
@@ -837,6 +993,23 @@ pub fn write_triage(w: &mut impl fmt::Write, node: &str, snap: &SnapshotV1) -> f
         w,
         "  pulse    stalls={} lag={}ms",
         snap.pulse_stalls, snap.max_pulse_lag_ms
+    )?;
+    writeln!(
+        w,
+        "  memory   used={}kb peak={}kb soft={}kb hard={}kb pressure={} rejects={}",
+        snap.memory_used_kb,
+        snap.memory_peak_kb,
+        snap.memory_soft_kb,
+        snap.memory_hard_kb,
+        pressure_name(snap.memory_pressure),
+        snap.memory_rejections
+    )?;
+    writeln!(
+        w,
+        "  queue    depth={} cap={} ({}%)",
+        snap.queue_depth,
+        snap.queue_capacity,
+        percent_of(snap.queue_depth, snap.queue_capacity)
     )
 }
 

@@ -601,14 +601,56 @@ let node = SnubberNode::builder("task_pipeline")
 * **`queue_depth()` / `queue_capacity()`**: Live waiter-queue gauge (`waiters.len()`) and its ceiling. Synchronous nodes have no waiter queue; their pre-admission wait is reported by `TrackedGuard::queue_wait_ms()`.
 * **`payload_budget`**: Rejects oversized inputs before memory allocation (`Err(EnterError::PayloadBudgetExceeded)`).
 
-### 6. Bounded Reaper Channel (`AsyncLease` / `LeaseChannel`)
+### 6. Memory Limits (external sampler, zero measurement inside)
+The crate never reads RSS itself — `no_std` firmware, `/proc`, Win32 and a
+Tokio runtime disagree on how. YOUR sampler passes one reading per second:
+
+```rust
+use snubber::{MemoryVerdict, SnubberNode};
+
+let node = SnubberNode::builder("worker")
+    .max_in_flight(16)
+    .memory_limits(64 * 1024, 96 * 1024) // soft 64 MiB, hard 96 MiB (KiB units)
+    .build();
+
+// Sampler thread, 1 Hz (read RSS however your platform does):
+let verdict = node.note_memory_kb(rss_kb);
+match verdict {
+    MemoryVerdict::Ok => {}
+    MemoryVerdict::Soft => { /* draining: finish in-flight, then restart */ }
+    MemoryVerdict::Hard => { /* supervisor terminates WITHOUT draining */ }
+}
+```
+
+* **Soft (`used >= soft_kb`)**: new admissions fail fast with
+  `Err(EnterError::MemoryPressure)`; in-flight guards keep running and settle
+  normally (cooperative drain). A later sample below soft clears the flag.
+* **Hard (`used >= hard_kb`)**: same refusal, plus the supervisor's
+  `DeathCause::MemoryLimit` path may terminate the process immediately.
+* **Refusal is lock-free**: admissions read one `AtomicBool` BEFORE the node
+  mutex, so a pressured node never contends with the sampler or a snapshotter.
+  `retry_after_ms()` advises 1 s and `classify()` maps it to `Refusal::Backoff`.
+* **No limits (`0`, the default)**: a single relaxed load per admission; the
+  sampler still records `memory_used_kb` / `memory_peak_kb` for telemetry.
+* **Counters**: `memory_rejections` is its own column (never a failure
+  streak, never trips the breaker); `stats().memory_pressure` mirrors the flag.
+* **`MemoryWatch` / `MemoryVerdict`** are `core`-only and `Copy` (32 B), so
+  firmware can reuse the verdict math without the `std` node.
+* **Snapshot v4** carries `memory_used_kb`, `memory_peak_kb`,
+  `memory_soft_kb`, `memory_hard_kb`, `memory_rejections`, `memory_pressure`,
+  `queue_depth` and `queue_capacity`. Still 512 B (314/508 payload bytes used).
+* **Anomalies**: `AnomalyKind::MemoryGrowth` fires on any pressured sample
+  (ignores `min_sample`), `AnomalyKind::QueueSaturation` fires when
+  `queue_depth / queue_capacity > bottleneck_pct`.
+
+### 7. Bounded Reaper Channel (`AsyncLease` / `LeaseChannel`)
 When guards drop during task completion or cancellation, cleanups can be dispatched to background reaper tasks through bounded channels without blocking the worker thread:
 ```rust
 let (tx, rx) = LeaseChannel::pair(256);
 // Non-blocking try_send; channel overflow is recorded as FaultKind::BufferOverflow
 ```
 
-### 7. Zero-Sleep HTTP/gRPC Checkpoint (`AsyncGate`)
+### 8. Zero-Sleep HTTP/gRPC Checkpoint (`AsyncGate`)
 For web frameworks (Axum, Actix, Tonic) where sleeping in request handlers is forbidden:
 ```rust
 use snubber::{AsyncGate, Refusal};
@@ -844,11 +886,14 @@ diff.write_summary(&mut text)?;
 // diff: admitted +120 committed +118 aborted +2 dropped +0
 //       bulkhead +3 evicted +0 preempted +0 rate +0 stale +0
 //       breaker CLOSED->CLOSED trips +0 timeouts +0 pulse +0 lag +0ms
+//       memory 4096->6144kb peak +8192kb reject +0 pressure ok->PRESSURE queue 0->2
 ```
 
 `SnapshotDiff::catastrophic_faults()` gives the panic + timeout +
 process-died + implicit-drop delta; `breaker_state_from/to` show a
-transition inside the window. Pure `Copy` math — no wire change.
+transition inside the window; memory/queue gauges are reported as
+`from/to` pairs (`memory_peak_kb` and `memory_rejections` are monotonic,
+so they are deltas). Pure `Copy` math — no wire change.
 
 ### Triage card: one ASCII verdict per node
 
@@ -863,11 +908,14 @@ write_triage(&mut card, "click_worker", &snap)?;
 //   faults   drops=0 panics=0 timeouts=0 died=0
 //   shed     bulk=0 evict=0 rate=142 stale=0 preempt=0
 //   pulse    stalls=0 lag=0ms
+//   memory   used=4096kb peak=8192kb soft=65536kb hard=98304kb pressure=ok rejects=0
+//   queue    depth=0 cap=64 (0%)
 ```
 
 `verdict=CRIT` on any catastrophic fault, `WARN` on shedding, a missed
-pulse, or a non-closed breaker, `OK` otherwise. Pure `fmt::Write`, no
-allocation — works on firmware and in a stack buffer.
+pulse, a non-closed breaker, memory pressure, or a full waiter queue,
+`OK` otherwise. Pure `fmt::Write`, no allocation — works on firmware and
+in a stack buffer.
 
 ### Multi-node set (explicit, never a `static`)
 
@@ -953,6 +1001,8 @@ impl snubber::OrphanGuard for LinuxPdeathsigGuard {
 | `IdlePark::park` (`SpinPark`/firmware `wfi`/`wfe`) | 1 / core | 0% CPU | 0%-CPU park: `Condvar` on `std`, `wfi`/`wfe` impl on firmware (`wfe` needs `SEVONPEND=1` at boot) |
 | `WdtSink::feed` / `NoWdt` | 1 / core | no-op on std | Stroke HW WDT on firmware (same `kick()` feeds it) |
 | `node.note_pulse_stall(lag_ms)` | 2 / std | 1 atomic max | Record missed pulse into `SnapshotV1` v3 + `AnomalyKind::PulseStall` |
+| `node.note_memory_kb(used_kb)` + `memory_verdict()` | 2 / std | 1 lock + 1 atomic store | External RSS sample → `MemoryVerdict` (Ok/Soft/Hard); admissions refuse lock-free above soft |
+| `MemoryWatch` + `MemoryVerdict` | 1 / core | 32 B, `Copy` | Verdict math for firmware; `hard < soft` clamps up |
 | `node.transition(&mut s, next, rb, work)` | 2 / std | **~86.5 ns** | ONE enum state machine, no flag drift |
 | `node.transition_checked(s, rb, work)` + `LegalMove` | 2 / std | same + 0 ns | Closed graphs: illegal edges rejected at compile (E0277) |
 | `node.enter_with_priority(prio)` | 2 / std | **~73.6 ns** | Critical over Background yields cooperatively |
@@ -967,7 +1017,7 @@ impl snubber::OrphanGuard for LinuxPdeathsigGuard {
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | 2 / std | 1 `Box` at arm + 1 clock read/stage | Stage wall/CPU breakdown (opt-in; default path untouched) |
 | `enter_async_auto_profiled` | 3 / std | 1 `Box` + 2 clock reads | Profiled async admission; arms on the admitting poll |
 | `guard.profile_snapshot()` | 2 / std | 1 wall + 1 CPU read | Mid-flight profile without settling |
-| `snapshot.diff(&later)` + `write_summary` | 2 / cold | pure `Copy` math | Counter deltas since the last sample |
+| `snapshot.diff(&later)` + `write_summary` | 2 / cold | pure `Copy` math | Counter deltas + memory/queue window (`SnapshotDiff`) |
 | `write_triage(&mut out, node, &snap)` | 2 / cold | `fmt::Write`, no alloc | One ASCII verdict card per node |
 | `node_passthrough_enter` | 2 / std canary | **~86.7 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
 | `node_passthrough_scoped` | 2 / std canary | **~84.5 ns** | Same transit through `scoped()` — work runs, books stay clean |

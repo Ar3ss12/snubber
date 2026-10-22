@@ -114,6 +114,9 @@ fn cycle_torture_conservation_holds() {
                             BULKHEAD_HITS.fetch_add(1, Ordering::SeqCst);
                             break;
                         }
+                        Err(EnterError::MemoryPressure) => {
+                            unreachable!("no memory limits armed in this node");
+                        }
                     }
                 }
                 if i % 97 == 0 {
