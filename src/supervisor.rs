@@ -20,6 +20,7 @@
 //! Portable no-op included ([`NoOrphanGuard`]); OS-level implementation is application-owned.
 
 use super::{SnubberEvent, TransactionHeader};
+use crate::memory::{MemoryVerdict, MemoryWatch};
 use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,6 +84,9 @@ pub enum DeathCause {
     HangTimeout,
     /// Reaped from outside (operator, OOM-killer, parent).
     KilledOutside,
+    /// External memory sample crossed the hard limit (Phase 3):
+    /// terminated WITHOUT draining — the process was already over budget.
+    MemoryLimit,
 }
 
 impl DeathCause {
@@ -94,7 +98,72 @@ impl DeathCause {
             Self::AbortUnwind => "process died",
             Self::HangTimeout => "process hung past lease",
             Self::KilledOutside => "process reaped from outside",
+            Self::MemoryLimit => "process exceeded hard memory limit",
         }
+    }
+}
+
+/// Supervisor-side memory policy (Phase 3).
+///
+/// Pure `Copy` state over [`MemoryWatch`](crate::MemoryWatch): the
+/// supervisor samples the child (its own platform call — `/proc`,
+/// `GetProcessMemoryInfo`, cgroup) and asks this policy whether to kill.
+/// `Soft` never kills: the worker refuses admissions through
+/// [`EnterError::MemoryPressure`](crate::EnterError::MemoryPressure),
+/// drains in-flight guards, hands off a [`StateDigest`] and exits for a
+/// successor generation. Only `Hard` terminates without draining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MemoryPolicy {
+    watch: MemoryWatch,
+}
+
+impl MemoryPolicy {
+    /// `soft_kb` = drain threshold, `hard_kb` = kill threshold
+    /// (`0` disables either; `hard < soft` clamps up to `soft`).
+    #[must_use]
+    pub const fn new(soft_kb: u64, hard_kb: u64) -> Self {
+        Self {
+            watch: MemoryWatch::new(soft_kb, hard_kb),
+        }
+    }
+
+    /// Underlying watch (last sample, peak, limits).
+    #[must_use]
+    pub const fn watch(&self) -> MemoryWatch {
+        self.watch
+    }
+
+    /// Record one child sample (KiB) and return its verdict.
+    pub fn note(&mut self, used_kb: u64) -> MemoryVerdict {
+        self.watch.note(used_kb)
+    }
+
+    /// Verdict for the last sample.
+    #[must_use]
+    pub const fn verdict(&self) -> MemoryVerdict {
+        self.watch.verdict()
+    }
+
+    /// `true` only at the hard limit. Soft is a drain request, not a kill.
+    #[must_use]
+    pub const fn should_kill(&self) -> bool {
+        self.watch.verdict().is_hard()
+    }
+
+    /// `Some(MemoryLimit)` when [`should_kill`](Self::should_kill).
+    #[must_use]
+    pub const fn death_cause(&self) -> Option<DeathCause> {
+        if self.watch.verdict().is_hard() {
+            Some(DeathCause::MemoryLimit)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for MemoryPolicy {
+    fn default() -> Self {
+        Self::new(0, 0)
     }
 }
 
@@ -967,6 +1036,9 @@ impl PipeDrain {
 /// SUPERVISOR, fast + idempotent + lock-free (same as any rollback).
 pub type TokenRollback = fn(u32, [u8; 28]);
 
+/// External RSS sampler: child pid -> resident KiB (the APP's platform call).
+type MemorySampler<'a> = &'a dyn Fn(u32) -> Option<u64>;
+
 /// Turnkey process supervisor managing child process lifecycle and dead-token emergency rescue.
 ///
 /// Phase 6 orphan contract lives below ([`OrphanGuard`]).
@@ -1025,6 +1097,50 @@ impl Supervisor {
     where
         F: Fn(ProcessToken),
     {
+        Self::run_loop(worker_flag, lease_ms, None, on_dead_token)
+    }
+
+    /// Supervised loop with an external memory sampler (Phase 3).
+    ///
+    /// `sample(pid)` runs in the supervisor loop (every ~10 ms alongside the
+    /// lease check) and returns the child's resident KiB — the platform call
+    /// is the APP's (`/proc/<pid>/status`, `GetProcessMemoryInfo`, cgroup);
+    /// the crate stays `#![forbid(unsafe_code)]`.
+    ///
+    /// * `Soft` — logged once as `[SUPERVISOR:MEMORY_DRAIN]`: the worker has
+    ///   been told to refuse admissions, drain in-flight guards, hand off a
+    ///   [`StateDigest`] and exit for a successor generation. Never killed.
+    /// * `Hard` — `child.kill()` WITHOUT draining and
+    ///   [`DeathCause::MemoryLimit`] stamped via [`death_event`].
+    pub fn run_supervised_guard_with_memory<F, S>(
+        worker_flag: &'static str,
+        lease_ms: u64,
+        policy: MemoryPolicy,
+        sample: S,
+        on_dead_token: F,
+    ) -> bool
+    where
+        F: Fn(ProcessToken),
+        S: Fn(u32) -> Option<u64>,
+    {
+        Self::run_loop(
+            worker_flag,
+            lease_ms,
+            Some((policy, &sample)),
+            on_dead_token,
+        )
+    }
+
+    fn run_loop<F>(
+        worker_flag: &'static str,
+        lease_ms: u64,
+        memory: Option<(MemoryPolicy, MemorySampler<'_>)>,
+        on_dead_token: F,
+    ) -> bool
+    where
+        F: Fn(ProcessToken),
+    {
+        let mut memory = memory;
         let args: Vec<String> = std::env::args().collect();
         let is_worker = args.iter().any(|a| a == worker_flag);
         let wants_supervisor = args.iter().any(|a| a == "--supervisor");
@@ -1071,8 +1187,10 @@ impl Supervisor {
         if let Some(stdout) = child.stdout.take() {
             let drain = PipeDrain::spawn(stdout);
 
-            if lease_ms > 0 {
-                // Active watchdog loop: check if worker has exited or if silence exceeded lease_ms
+            let mut cause: Option<DeathCause> = None;
+            if lease_ms > 0 || memory.is_some() {
+                // Active watchdog loop: exit, silence past `lease_ms`,
+                // or an external memory sample crossing the hard limit.
                 loop {
                     match child.try_wait() {
                         Ok(Some(status)) => {
@@ -1080,7 +1198,7 @@ impl Supervisor {
                             break;
                         }
                         Ok(None) => {
-                            if drain.expired(lease_ms) {
+                            if lease_ms > 0 && drain.expired(lease_ms) {
                                 eprintln!(
                                     "[SUPERVISOR:HANG_TIMEOUT] child_pid={pid} idle_ms={} lease_ms={lease_ms} action=terminate_process",
                                     drain.idle_ms()
@@ -1088,7 +1206,35 @@ impl Supervisor {
                                 let _ = child.kill();
                                 let status = child.wait();
                                 println!("[SUPERVISOR:KILLED] child_pid={pid} status={status:?}");
+                                cause = Some(DeathCause::HangTimeout);
                                 break;
+                            }
+                            if let Some((policy, sample)) = memory.as_mut() {
+                                if let Some(used_kb) = sample(pid) {
+                                    let was_soft = policy.verdict() == MemoryVerdict::Soft;
+                                    let verdict = policy.note(used_kb);
+                                    let watch = policy.watch();
+                                    if verdict.is_hard() {
+                                        eprintln!(
+                                            "[SUPERVISOR:MEMORY_LIMIT] child_pid={pid} used_kb={used_kb} peak_kb={} hard_kb={} action=terminate_process_no_drain",
+                                            watch.peak_kb(),
+                                            watch.hard_kb()
+                                        );
+                                        let _ = child.kill();
+                                        let status = child.wait();
+                                        println!(
+                                            "[SUPERVISOR:KILLED] child_pid={pid} status={status:?}"
+                                        );
+                                        cause = policy.death_cause();
+                                        break;
+                                    }
+                                    if verdict == MemoryVerdict::Soft && !was_soft {
+                                        eprintln!(
+                                            "[SUPERVISOR:MEMORY_DRAIN] child_pid={pid} used_kb={used_kb} soft_kb={} action=refuse_admissions_and_handoff",
+                                            watch.soft_kb()
+                                        );
+                                    }
+                                }
                             }
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
@@ -1103,6 +1249,13 @@ impl Supervisor {
             } else {
                 let status = child.wait();
                 println!("[SUPERVISOR:TERMINATED] child_pid={pid} status={status:?}");
+            }
+
+            if let Some(cause) = cause {
+                println!(
+                    "[SUPERVISOR:DEATH_CAUSE] child_pid={pid} cause=\"{}\"",
+                    cause.reason()
+                );
             }
 
             for _ in 0..50 {

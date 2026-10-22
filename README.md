@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-261%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-266%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -87,6 +87,7 @@ Measured on AMD Ryzen 5 4600H release build
 | `node.note_memory_kb(used)` | Layer 2 (`std`, cold) | 1 lock + 1 atomic store | External memory sample → soft/hard verdict; admissions refuse lock-free above soft |
 | `process_token.to_bytes()` | Layer 4 (`core`) | **~7.5 ns** | 44-byte framed wire serialization (`to_le_bytes`) |
 | `state_digest.crc()` | Layer 4 (`core`) | **~261 ns** | 64-byte hardware cache line digest verification |
+| `run_supervised_guard_with_memory` | Layer 4 (`std`) | 1 sampler call / 10 ms tick | Soft logs `MEMORY_DRAIN`; hard `kill()` without draining (`DeathCause::MemoryLimit`) |
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | Layer 2 (`std`, opt-in) | 1 `Box` + 1 clock/stage | Stage wall/CPU breakdown; default `enter*` reads no profile clock |
 | `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.1 µs** | 512-byte zero-allocation snapshot CRC32 codec |
 | `snapshot_v1()` + `find_anomalies()` | Layer 5 (cold) | **512 B, CRC32** | Zero-allocation telemetry; `assert_no_anomalies!()` CI gate |
@@ -113,7 +114,7 @@ Measured with half of available hardware cores active (6 concurrent threads unde
   * **Layer 1.5: Hang Classification:** Monotonic clock (`MonotonicMs` / `SystemClock`), CPU-spin classifier (`classify_stall`, `TimedOut` vs `SpinDetected`), 8-byte `WorkerPulse` heartbeat + `WdtSink`, ISR bridge (`IsrBridge`, 80 B SPSC ring + 32-bit trip latch, `IsrBridge::trip` bypasses `Full`), idle-park (`IdlePark` / `wfi`/`wfe` on firmware, `wfe` needs `SEVONPEND=1` at boot), pulse black-box (`pulse_stalls` + `PulseStall` anomaly, snapshot v3).
   * **Layer 2: Concurrency Bulkhead:** `SnubberNode`, presets, token buckets, sliding-window breakers, priority preemption, builder-sealed `passthrough` canary transit, external memory limits (`memory_limits` → `note_memory_kb`), and opt-in execution profiles (`enter_auto_profiled` → `commit_profiled`).
   * **Layer 3: Async Waker Queue:** Runtime-agnostic async execution (`enter_async_auto`, `settle_async`, `enter_paced_async`).
-  * **Layer 4: Process Supervisor:** Out-of-process process supervisor, framed IPC tokens, `PipeDrain`, and generation bumps.
+  * **Layer 4: Process Supervisor:** Out-of-process process supervisor, framed IPC tokens, `PipeDrain`, generation bumps, and memory euthanasia (`MemoryPolicy` → soft drain / hard `DeathCause::MemoryLimit`).
   * **Layer 5: Diagnostics & Health:** Zero-allocation telemetry, `SnapshotV1` v4 (memory + queue gauges), anomaly detection (`MemoryGrowth`, `QueueSaturation`), `SnapshotDiff`, ASCII triage card, and CI verification gates.
 
 ---
@@ -133,6 +134,7 @@ Measured with half of available hardware cores active (6 concurrent threads unde
 * **[11 Hang Classifier (`examples/11_hang_classifier.rs`)](examples/11_hang_classifier.rs):** App-side CPU clock backend; hot `loop {}` settles as `SpinDetected`, blocked sleep as `TimedOut` — no thread is ever killed.
 * **[12 ISR Bridge (`examples/12_isr_bridge.rs`)](examples/12_isr_bridge.rs):** Hardware interrupt to guard abort via lock-free SPSC ring (80 B, ~2 bus cycles per push) — timer pulse feeds `WorkerPulse`, overcurrent trip latches a bit that bypasses a full ring.
 * **[13 Canary Differential (`examples/13_canary_differential.rs`)](examples/13_canary_differential.rs):** Naked `passthrough(true)` leaks vs guarded rescue on a virtual driver — comparative proof stand, zero real hardware moves.
+* **[14 Memory Recycle (`examples/14_memory_recycle.rs`)](examples/14_memory_recycle.rs):** Soft limit → drain → `StateDigest` handoff to a successor generation; hard limit → `MemoryPolicy` kill verdict.
 
 ---
 

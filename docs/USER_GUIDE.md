@@ -804,6 +804,34 @@ if let Some(digest) = snubber::take_stdin_digest() {
 }
 ```
 
+### 4.6b Memory euthanasia (`MemoryPolicy`, Phase 3)
+Same external-sample law as §6, supervisor side: the APP's sampler reads the
+child's RSS, `MemoryPolicy` only does integer compares and names the verdict.
+
+```rust
+use snubber::{DeathCause, MemoryPolicy, Supervisor};
+
+let policy = MemoryPolicy::new(64 * 1024, 96 * 1024); // soft drain, hard kill
+// Sampler: pid -> resident KiB (the APP's platform call: /proc, Win32, cgroup).
+let sample = |pid: u32| read_rss_kb(pid);
+Supervisor::run_supervised_guard_with_memory(
+    "--worker", 5_000, policy, sample, on_dead_token,
+);
+```
+
+* **Soft** — logged once as `[SUPERVISOR:MEMORY_DRAIN]`; the worker refuses
+  admissions, drains in-flight guards, emits a `StateDigest` (§4.6) and exits
+  for a successor generation. The supervisor never kills at soft.
+* **Hard** — `child.kill()` WITHOUT draining; the death is stamped
+  `DeathCause::MemoryLimit` (`"process exceeded hard memory limit"`, never
+  confused with `HangTimeout`).
+* **`hard < soft`** clamps up to soft, so a drain phase always exists;
+  `0` disables a threshold; both zero keeps the plain lease loop.
+* `policy.watch()` exposes `used_kb()` / `peak_kb()` / limits for the
+  postmortem; `policy.death_cause()` is `Some(MemoryLimit)` only at hard.
+* The whole chain — soft → refuse → digest → generation bump → successor
+  admits — runs in `examples/14_memory_recycle.rs`.
+
 ### 4.7 Orphan contract (Phase 6: no zombies)
 ```rust
 use snubber::{NoOrphanGuard, OrphanGuard};
@@ -1003,6 +1031,8 @@ impl snubber::OrphanGuard for LinuxPdeathsigGuard {
 | `node.note_pulse_stall(lag_ms)` | 2 / std | 1 atomic max | Record missed pulse into `SnapshotV1` v3 + `AnomalyKind::PulseStall` |
 | `node.note_memory_kb(used_kb)` + `memory_verdict()` | 2 / std | 1 lock + 1 atomic store | External RSS sample → `MemoryVerdict` (Ok/Soft/Hard); admissions refuse lock-free above soft |
 | `MemoryWatch` + `MemoryVerdict` | 1 / core | 32 B, `Copy` | Verdict math for firmware; `hard < soft` clamps up |
+| `MemoryPolicy::new(soft, hard)` + `note(used)` | 2 / std | pure integer compares | Supervisor verdict: soft drains, hard kills; `death_cause()` names `MemoryLimit` |
+| `Supervisor::run_supervised_guard_with_memory(..)` | 2 / std | 1 sampler call / 10 ms tick | Lease + RSS watchdog; soft logs `MEMORY_DRAIN`, hard `kill()` without draining |
 | `node.transition(&mut s, next, rb, work)` | 2 / std | **~86.5 ns** | ONE enum state machine, no flag drift |
 | `node.transition_checked(s, rb, work)` + `LegalMove` | 2 / std | same + 0 ns | Closed graphs: illegal edges rejected at compile (E0277) |
 | `node.enter_with_priority(prio)` | 2 / std | **~73.6 ns** | Critical over Background yields cooperatively |
