@@ -642,6 +642,9 @@ match verdict {
 * **Anomalies**: `AnomalyKind::MemoryGrowth` fires on any pressured sample
   (ignores `min_sample`), `AnomalyKind::QueueSaturation` fires when
   `queue_depth / queue_capacity > bottleneck_pct`.
+* **Checkpointing under pressure**: `soft` is a level, not a deadline —
+  see §4.6c for the 64 B ticket layout, the fixed-buffer streaming recipe
+  and the cgroup v2 page-cache trap before you serialize any state.
 
 ### 7. Bounded Reaper Channel (`AsyncLease` / `LeaseChannel`)
 When guards drop during task completion or cancellation, cleanups can be dispatched to background reaper tasks through bounded channels without blocking the worker thread:
@@ -833,6 +836,160 @@ Supervisor::run_supervised_guard_with_memory(
   admits — runs in `examples/14_memory_recycle.rs`; the real two-process
   loop (supervisor + worker, drain mode vs `--no-drain`) runs in
   `examples/15_supervised_memory.rs`.
+
+### 4.6c Checkpoint physics: 64 B is a ticket, not storage
+
+`StateDigest` is exactly 64 bytes (`STATE_LEN`, compile-time gate
+`STATE_LEN == 64`). The crate treats the bytes as opaque: it computes one
+CRC32 over all 64 bytes (`StateDigest::crc`), splits them into three
+`OP_STATE` frames (24 + 24 + 16 B), reassembles them in `PipeDrain` and
+silently drops any torn or mismatched set. The field layout below is the
+recommended worker-to-successor protocol; the crate does not parse it.
+
+> **Level Budget, Not Time Budget**
+> `hard_kb - soft_kb` is not a reserve of seconds. It is the allocator's
+> headroom. A process that normally holds 64 MiB with `hard_kb = 96 MiB`
+> has 32 MiB of one-shot headroom; a single allocation above that is
+> killed on the next sampler tick (10 ms), before it can flush state.
+
+> **The Ticket Law**
+> `StateDigest` stores nothing. It certifies that a file was already
+> written, synced and sealed by `rename`. A process killed mid-write has
+> no sealed file, so no ticket is emitted, and the successor must roll
+> back to the previous sealed checkpoint.
+
+#### Fixed layout (64 B, explicit little-endian)
+
+| Offset | Size | Field | Encoding |
+|---|---|---|---|
+| `[0..4]` | 4 | Magic | `b"SNBK"` (Snubber ChecKpoint) |
+| `[4..6]` | 2 | Version | `u16`, `0x0001` |
+| `[6..8]` | 2 | Flags | `u16`: bit 0 `COMPRESSED`, bit 1 `ENCRYPTED`, bit 2 `DIRTY_RESUME` |
+| `[8..16]` | 8 | Generation | `u64` from `GenerationClock` / `SNUBBER_GEN` |
+| `[16..24]` | 8 | Sequence | `u64`, last committed batch/transaction |
+| `[24..32]` | 8 | Total bytes | `u64`, exact size of the sealed file |
+| `[32..36]` | 4 | CRC32 | `u32` over the file body as written |
+| `[36..40]` | 4 | Reserved | `u32`, zero |
+| `[40..64]` | 24 | Payload | app slot: file UUID, offset, hash — or zeros |
+
+Every field is written with `copy_from_slice(&value.to_le_bytes())`;
+reserved and unused payload bytes stay `0x00`. No padding, no
+`transmute`, no uninitialized memory reaches the pipe.
+
+```rust
+fn seal(gen: u64, seq: u64, total: u64, crc: u32, file_id: &[u8; 16]) -> StateDigest {
+    let mut d = [0u8; STATE_LEN];
+    d[0..4].copy_from_slice(b"SNBK");
+    d[4..6].copy_from_slice(&1u16.to_le_bytes());
+    d[6..8].copy_from_slice(&0u16.to_le_bytes()); // flags
+    d[8..16].copy_from_slice(&gen.to_le_bytes());
+    d[16..24].copy_from_slice(&seq.to_le_bytes());
+    d[24..32].copy_from_slice(&total.to_le_bytes());
+    d[32..36].copy_from_slice(&crc.to_le_bytes());
+    d[36..40].copy_from_slice(&0u32.to_le_bytes()); // reserved = 0
+    d[40..56].copy_from_slice(file_id);
+    // [56..64] stays zero
+    StateDigest::new(d)
+}
+```
+
+Successor validation is all-or-nothing: a wrong magic, unknown version,
+size mismatch or file CRC mismatch makes the ticket dead. Note the split:
+the 3-frame pipe path (`emit_if_supervised` -> `PipeDrain`) verifies the
+digest CRC and drops torn sets, but `take_stdin_digest` is a plain 64 B
+`read_exact` (a short read yields `None`) — it does not re-verify the CRC.
+Treat magic/version/body CRC as the successor's own gate.
+
+```rust
+fn restore(digest: &StateDigest, path: &Path) -> std::io::Result<Vec<u8>> {
+    let d = &digest.bytes;
+    if &d[0..4] != b"SNBK" || u16::from_le_bytes([d[4], d[5]]) != 1 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "dead ticket"));
+    }
+    let total = u64::from_le_bytes(d[24..32].try_into().unwrap());
+    let want = u32::from_le_bytes(d[32..36].try_into().unwrap());
+    let body = std::fs::read(path)?;
+    if body.len() as u64 != total || crc32(0, &body) != want {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "torn checkpoint"));
+    }
+    Ok(body)
+}
+```
+
+#### Why a naive serialization dies (50 MB state)
+
+`serde_json::to_vec(&state)` — or a plain `state.clone()` — allocates a
+second copy of the state. A worker at 64 MiB resident that crosses soft
+and then builds a 50 MiB copy reaches 114 MiB, above `hard_kb = 96 MiB`.
+The supervisor's 10 ms sampler sees the crossing and calls `child.kill()`
+before the first `write_all` reaches the disk. Writing 50 MB at 500 MB/s
+takes ~100 ms plus `sync_all`; the level crossing is not a countdown.
+
+#### Streaming recipe (bounded heap)
+
+```rust
+const BUF: usize = 64 * 1024;
+
+fn write_checkpoint(path: &Path, state: &[u8]) -> std::io::Result<u32> {
+    let tmp = path.with_extension("tmp");
+    use std::io::Write;
+    let mut file = std::fs::File::create(&tmp)?;
+    let mut buf = [0u8; BUF]; // stack, reused for every chunk
+    let mut crc = 0u32;
+    for chunk in state.chunks(BUF) {
+        buf[..chunk.len()].copy_from_slice(chunk);
+        crc = crc32(crc, &buf[..chunk.len()]);
+        file.write_all(&buf[..chunk.len()])?;
+    }
+    file.sync_all()?;          // durability before the seal
+    drop(file);
+    std::fs::rename(&tmp, path)?; // atomic on POSIX and NTFS
+    Ok(crc)
+}
+```
+
+Peak heap delta is the 64 KiB stack buffer, independent of state size.
+Emit the ticket only after `rename` returns:
+
+```rust
+let crc = write_checkpoint(&path, state)?;
+seal(gen, seq, state.len() as u64, crc, &file_id).emit_if_supervised();
+std::process::exit(0);
+```
+
+#### cgroup v2: page cache counts against the limit
+
+* Linux container limits are enforced on `memory.current`.
+* It includes anonymous memory **and** the page cache of written files.
+* A 50 MB `write()` leaves 50 MB of cached pages in the kernel. The heap
+  did not grow, but the cgroup counter did.
+* With a 150 MB container, a worker at 110 MB that writes a 50 MB
+  checkpoint reaches ~160 MB: the kernel OOM-killer terminates the process
+  inside `write_all`, before any supervisor logic runs.
+
+Close it in the app: after `sync_all()`, drop the pages with
+`posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)` on Linux. Dirty pages must
+be synced first — `fadvise` cannot evict them. On Windows,
+`GetProcessMemoryInfo` reports the process Working Set and does not
+account file cache; `sync_all` (`FlushFileBuffers`) is still required for
+durability. A cgroup-aware sampler should read the `anon` field of
+`memory.stat` for heap pressure, or budget the checkpoint size into
+`hard_kb`.
+
+#### Ownership split
+
+| Guarantee | Owner |
+|---|---|
+| 64 B ticket, CRC over all 64 B, 3-frame transport, torn frames dropped | crate |
+| Threshold verdicts (`MemoryVerdict`), hard-kill decision, 10 ms sampling | crate |
+| Serialization, 64 KiB buffer, `.tmp` + `sync_all` + `rename`, `fadvise`, file CRC | app |
+| `soft`/`hard` values such that `hard - soft` covers the checkpoint peak | app |
+
+If the process is killed mid-stream, no complete digest reaches the drain
+(`PipeDrain::last_state` keeps the previous one) and the `.tmp` file is
+never renamed. The successor reads stdin via `spawn_with_digest` /
+`take_stdin_digest`, revalidates magic, version, size and CRC, and on any
+mismatch rolls back to the previous sealed checkpoint.
 
 ### 4.7 Orphan contract (Phase 6: no zombies)
 ```rust

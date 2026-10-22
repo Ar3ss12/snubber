@@ -81,6 +81,16 @@ only move a `Copy` verdict; the crate never measures memory itself.
   and is stamped `DeathCause::MemoryLimit`; soft crossings never kill.
 - `hard < soft` is clamped up to `soft`, so no configuration can skip the
   drain phase.
+- `soft` is a level, not a deadline: `hard - soft` is the allocator's
+  headroom, and the hard kill fires on the first sampler tick (10 ms) at or
+  above `hard`. A checkpoint that allocates a second copy of the state does
+  not get time to flush; it dies inside the allocation.
+- `StateDigest` is a 64 B ticket, not storage. The crate guarantees one
+  CRC32 over the 64 bytes and a 3-frame (24/24/16 B) transport where torn
+  or mismatched frames are dropped; serialization, the fixed 64 KiB buffer,
+  tmp + `sync_all` + `rename`, page-cache eviction (`posix_fadvise`) and
+  validation of the file body are app-owned. A kill mid-write leaves no
+  sealed file, hence no valid ticket.
 
 ---
 
