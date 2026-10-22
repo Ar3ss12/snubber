@@ -92,6 +92,29 @@ only move a `Copy` verdict; the crate never measures memory itself.
   validation of the file body are app-owned. A kill mid-write leaves no
   sealed file, hence no valid ticket.
 
+### Invariant 9: Impedance Is Explicit (One Slot, Two Walls)
+Mismatched producer/consumer rates are handled by named primitives, never
+by an accidental unbounded queue.
+- `ConflateSender` retains at most ONE unsampled value. A publish into an
+  occupied slot replaces it and increments `conflated`; `publish` returns
+  that fact. Over any window
+  `published == taken + conflated + occupied`, where `occupied` is 0 or 1.
+  The counter is a monotonic relaxed load, the payload carries no `Clone`
+  bound, and a producer never blocks on the consumer.
+- `ExecutionEnvelope` is a 16 B `Copy` header: min/max wall µs and min/max
+  payload bytes. `0` disables one bound; `max < min` raises the ceiling to
+  the floor; bounds are inclusive. The wall half is judged only for
+  profiled guards (`work_wall_us`); the payload half is exact for any
+  guard from the caller's byte count.
+- A floor or ceiling miss ticks `envelope_underflows` /
+  `envelope_overflows` and nothing else: it never feeds the breaker, never
+  changes `SnubberEvent`, never enters the 512 B `SnapshotV1` frame, and
+  never turns a committed transaction into a failure.
+- The harness is deterministic: the same seed produces the same payload
+  sequence, and an injected clock produces exact microseconds. A burst is
+  a non-overlapping run of `burst_len` consecutive samples strictly above
+  the median.
+
 ---
 
 ## 2. Verification Protocol
@@ -131,13 +154,22 @@ cargo test --test supervisor_memory_loop
 
 # Verify bench hygiene (setup outside the hot loop, pure overhead only)
 cargo test --test bench_hygiene
+
+# Verify one-slot conflation (latest wins, exact coalescing, payload drops)
+cargo test --test conflation
+
+# Verify envelope laws (zero disables, clamp, underflow/overflow own columns)
+cargo test --test execution_envelope
+
+# Verify harness determinism (scripted clock matrix, payload range, PRNG)
+cargo test --test harness
 ```
 
 ---
 
 ## 3. Reporting a Discrepancy
 
-If you identify a scenario where any of the eight invariants above fails using purely Safe Rust:
+If you identify a scenario where any of the nine invariants above fails using purely Safe Rust:
 
 1. **Minimal Reproduction:** Construct an isolated integration test demonstrating the violation (failing an explicit `assert!`).
 2. **Deterministic Trigger:** The test must run and fail within 30 seconds without requiring external infrastructure.

@@ -1010,6 +1010,93 @@ let guard = NoOrphanGuard; // honest no-op; real Win32 Job Objects implemented i
 assert!(!guard.arm(child_pid));
 ```
 
+### 4.8 Impedance bridge (Phase 4): conflation, envelope, harness
+
+A 10 000 msg/s producer feeding a 60 FPS consumer is a 166:1 mismatch. There
+are three honest answers; pick by what a stale value is worth:
+
+| Topology | Queue length | Stale data | API |
+|---|---|---|---|
+| Raw stream | unbounded | delivered late, forever | app-owned `mpsc` |
+| **Conflation** | **0 or 1** | dropped, counted | `ConflateSender` / `ConflateReceiver` |
+| Pacing | bounded | refused with an advised wait | `gateway` HWM 75% / LWM 50% |
+
+**Conflation.** One slot, latest wins. A publish into an occupied slot
+replaces the unsampled value and increments `conflated`:
+
+```rust
+use snubber::ConflateSender;
+let (tx, rx) = ConflateSender::<u64>::pair();
+assert!(!tx.publish(1));   // empty slot: plain publish
+assert!(tx.publish(2));    // occupied: coalesced
+assert_eq!(rx.take_latest(), Some(2));
+assert_eq!(rx.take_latest(), None);
+assert_eq!(rx.conflated(), 1);
+```
+
+Counter law: `published == taken + conflated + occupied`, where `occupied`
+is 0 or 1. `publish` returns the replacement flag, so a producer can count
+coalescing without a second read. The channel is the `TaskConduit` draft
+table (`TaskConduit::publish_draft` returns the same flag,
+`conflated_drafts()` mirrors the counter on both ends), so it carries no
+`Clone` bound on the payload and never blocks on the consumer. The consumer
+samples at its own cadence; `None` means "no publish since the last take",
+never "lagging".
+
+**Execution envelope.** A 16-byte `Copy` corridor declared on the node,
+judged once per settlement:
+
+```rust
+use snubber::{ExecutionEnvelope, SnubberNode};
+let env = ExecutionEnvelope::new(100, 1_000, 64, 8_192); // µs, bytes
+let node = SnubberNode::builder("quotes").execution_envelope(env).build();
+
+let guard = node.enter_auto_profiled(|| {}).expect("admit");
+// ... work ...
+let (_event, profile, verdict) = guard.commit_enveloped(payload_bytes);
+```
+
+* `0` disables an individual bound; all four zero disables judgement.
+* `max < min` raises the ceiling to the floor (the floor is the stronger
+  promise). Bounds are inclusive.
+* The wall half is judged only for profiled entries
+  (`enter_profiled*` / `enter_auto_profiled`) from
+  `ExecutionProfile::work_wall_us`; a plain guard has no clock evidence and
+  gets `TimeVerdict::Inside`. The payload half is exact for any guard.
+* Floor misses tick `SnubberStats::envelope_underflows`, ceiling misses tick
+  `envelope_overflows`. Neither feeds the breaker, neither changes
+  `SnubberEvent`, neither enters `SnapshotV1` (the 512 B frame stays v4).
+* An underflow is the silent-skip signal: work returned faster or smaller
+  than promised, so the cache was stale or the loop never ran.
+
+**Harness.** Measure first, promise second:
+
+```rust
+use snubber::ProfileHarness;
+let report = ProfileHarness::new(64, 4, 3)
+    .payload_range(4_000, 12_000)
+    .run(0x5EED, |bytes| { /* workload */ let _ = bytes; });
+println!("{}", report.summary());
+let envelope = report.envelope(50); // floor -50%, ceiling +50%
+```
+
+The matrix is **min / median / max**, **jitter** (`max - min`) and
+**bursts** — non-overlapping runs of `burst_len` consecutive samples
+strictly above the median. `FastPrng` (xorshift32) makes the payload
+sequence reproducible from the seed; `run_with_clock` accepts an injected
+nanosecond clock, so tests assert exact microseconds.
+`run_boundary_harness(samples, seed, work)` is the one-shot default plan
+(64 samples, 4 warm-up, burst 3, payload 0).
+
+**Reference:** `examples/17_impedance_bridge.rs` runs one producer through
+the raw stream, the conflation slot and the paced gateway side by side;
+`examples/18_impedance_calibration.rs` measures a workload, derives an
+envelope and judges real settlements, including a deliberate no-op
+underflow. Tests: `tests/conflation.rs` (1M publishers, exact coalescing,
+payload drop accounting, non-`Clone` payload), `tests/execution_envelope.rs`
+(scripted clocks: inside / under / over / zero-disabled / clamp),
+`tests/harness.rs` (scripted clock matrix and payload range).
+
 ---
 
 ## Layer 5: Diagnostics & Health (Catastrophic Faults vs Capacity Shedding + `app.snub`)
@@ -1218,6 +1305,9 @@ impl snubber::OrphanGuard for LinuxPdeathsigGuard {
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | 2 / std | 1 `Box` at arm + 1 clock read/stage | Stage wall/CPU breakdown (opt-in; default path untouched) |
 | `enter_async_auto_profiled` | 3 / std | 1 `Box` + 2 clock reads | Profiled async admission; arms on the admitting poll |
 | `guard.profile_snapshot()` | 2 / std | 1 wall + 1 CPU read | Mid-flight profile without settling |
+| `ConflateSender::pair()` + `publish` / `take_latest` | 2 / std | 1 slot mutex + 1 relaxed counter | Latest-value channel (queue 0 or 1), coalescing counted, no `Clone` bound on payload |
+| `ExecutionEnvelope::new(..)` + `execution_envelope(env)` + `commit_enveloped(bytes)` | 2 / std | 16 B `Copy` header, judge at settle | Corridor catches too slow/too big and too fast/too small; underflow/overflow in own stats columns, breaker untouched |
+| `ProfileHarness` + `HarnessReport` / `run_boundary_harness` | 2 / std | one `Vec` of samples + sort | Deterministic PRNG, min/median/max/jitter/burst matrix, `report.envelope(headroom)` |
 | `snapshot.diff(&later)` + `write_summary` | 2 / cold | pure `Copy` math | Counter deltas + memory/queue window (`SnapshotDiff`) |
 | `write_triage(&mut out, node, &snap)` | 2 / cold | `fmt::Write`, no alloc | One ASCII verdict card per node |
 | `node_passthrough_enter` | 2 / std canary | **~86.7 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |

@@ -37,6 +37,7 @@ use super::{
     LogLevel, Priority,
 };
 use super::{EpochGate, SnubberEvent, TransactionHeader};
+use crate::envelope::{EnvelopeVerdict, ExecutionEnvelope, TimeVerdict};
 use crate::memory::{MemoryVerdict, MemoryWatch};
 #[cfg(feature = "std")]
 use std::collections::VecDeque;
@@ -190,6 +191,13 @@ pub struct SnubberStats {
     pub window_outcomes: u64,
     /// Sliding-window position: failures in the open window.
     pub window_failures: u64,
+    /// Settlements that fell below the execution-envelope floor
+    /// (time or payload). Own column forever: a floor miss is a signal,
+    /// never a failure streak — the breaker never sees it.
+    pub envelope_underflows: u64,
+    /// Settlements that exceeded an envelope ceiling. Counted, never
+    /// merged with `timeouts_fired` / `bulkhead_rejections`.
+    pub envelope_overflows: u64,
     /// How many times an poisoned mutex was recovered via `into_inner`.
     /// ZERO-PANIC design goal is 0 here: phases A/C hold no allocation,
     /// so the mutex is physically unpoisonable. Non-zero means foreign
@@ -464,6 +472,7 @@ pub struct SnubberNodeBuilder {
     stall_ceiling_ms: u64,
     task_ttl_ms: u64,
     payload_budget_bytes: usize,
+    envelope: ExecutionEnvelope,
     rate_per_sec: u32,
     fallback: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     console_cap: usize,
@@ -495,6 +504,7 @@ impl SnubberNodeBuilder {
             stall_ceiling_ms: 0,
             task_ttl_ms: 0,
             payload_budget_bytes: 0,
+            envelope: ExecutionEnvelope::off(),
             memory_soft_kb: 0,
             memory_hard_kb: 0,
             rate_per_sec: 0,
@@ -552,6 +562,19 @@ impl SnubberNodeBuilder {
     #[must_use]
     pub fn payload_budget(mut self, bytes: usize) -> Self {
         self.payload_budget_bytes = bytes;
+        self
+    }
+
+    /// Declared execution corridor for every profiled settlement.
+    ///
+    /// Judged in [`TrackedGuard::commit_enveloped`] against
+    /// `ExecutionProfile::work_wall_us` and the caller-supplied payload
+    /// byte count. Floors and ceilings are counted in their own stats
+    /// columns; neither feeds the breaker. [`ExecutionEnvelope::off`]
+    /// (default) disables the judgement.
+    #[must_use]
+    pub fn execution_envelope(mut self, envelope: ExecutionEnvelope) -> Self {
+        self.envelope = envelope;
         self
     }
 
@@ -862,6 +885,7 @@ impl SnubberNodeBuilder {
                 stall_ceiling_ms: self.stall_ceiling_ms,
                 task_ttl_ms: self.task_ttl_ms,
                 payload_budget_bytes: self.payload_budget_bytes,
+                envelope: self.envelope,
                 memory: MemoryWatch::new(self.memory_soft_kb, self.memory_hard_kb),
                 memory_pressure,
                 rate_per_sec: self.rate_per_sec,
@@ -920,6 +944,8 @@ struct NodeInner {
     stall_ceiling_ms: u64,
     task_ttl_ms: u64,
     payload_budget_bytes: usize,
+    /// Declared corridor judged by `commit_enveloped` (`off` by default).
+    envelope: ExecutionEnvelope,
     /// External memory limits + last sample (KiB). Written only by
     /// `note_memory_kb`, read cold (stats/snapshot) and flipped into
     /// `memory_pressure` so admission never touches the sampler.
@@ -2988,6 +3014,7 @@ impl SnubberNode {
         let deadline = inner.timeout_ms;
         let cpu_budget = inner.cpu_budget_ms;
         let stall_ceiling = inner.stall_ceiling_ms;
+        let envelope = inner.envelope;
         drop(inner);
 
         Ok(TrackedGuard {
@@ -3010,6 +3037,7 @@ impl SnubberNode {
             queue_wait_ms: parked_ms,
             retry_count: 0,
             profile: None,
+            envelope,
         })
     }
 
@@ -3044,6 +3072,7 @@ impl SnubberNode {
             queue_wait_ms: 0,
             retry_count: 0,
             profile: None,
+            envelope: ExecutionEnvelope::off(),
         }
     }
 
@@ -3339,6 +3368,7 @@ impl SnubberNode {
         let deadline_ms = inner.timeout_ms;
         let cpu_budget_ms = inner.cpu_budget_ms;
         let stall_ceiling_ms = inner.stall_ceiling_ms;
+        let envelope = inner.envelope;
         let node_arc = self.inner.clone();
         let node_name = inner.name;
         drop(inner);
@@ -3378,6 +3408,7 @@ impl SnubberNode {
             queue_wait_ms: wait_ms,
             retry_count: 0,
             profile: None,
+            envelope,
         }))
     }
 
@@ -3455,6 +3486,8 @@ impl SnubberNode {
             rate_rejected: s.rate_rejected,
             window_outcomes: s.window_outcomes,
             window_failures: s.window_failures,
+            envelope_underflows: s.envelope_underflows,
+            envelope_overflows: s.envelope_overflows,
             poison_recoveries: s.poison_recoveries,
             // Pass-through column lives outside the mutex (lock-free atomic);
             // `stats()` fills it after the lock. Internal snapshots copy the
@@ -4150,6 +4183,8 @@ pub struct TrackedGuard<F: FnOnce()> {
     /// Opt-in execution profile state. `None` on every default entry path:
     /// no clock is read and the guard carries one pointer-sized field.
     profile: Option<Box<ProfileState>>,
+    /// Execution corridor copied from the node at admission (16 B, `Copy`).
+    envelope: ExecutionEnvelope,
 }
 
 /// Watchdog outcome for [`TrackedGuard::check_timeout`].
@@ -4296,6 +4331,58 @@ impl<F: FnOnce()> TrackedGuard<F> {
         let event = self.commit();
         profile.settle_us = to_us(wall().saturating_sub(settle_start));
         (event, profile)
+    }
+
+    /// Commit and judge the settlement against the node's
+    /// [`ExecutionEnvelope`].
+    ///
+    /// Same profile accounting as [`commit_profiled`](Self::commit_profiled):
+    /// `work_wall_us` stops at the commit call. The wall half is judged only
+    /// when the guard was armed by a profiled entry (`enter_profiled*` /
+    /// `enter_auto_profiled`) — a plain guard has no clock evidence and gets
+    /// [`TimeVerdict::Inside`]. The payload half is exact for any guard: it
+    /// uses the caller's byte count for the value being committed.
+    ///
+    /// Underflow and overflow tick their own stats columns
+    /// ([`SnubberStats::envelope_underflows`] /
+    /// [`SnubberStats::envelope_overflows`]); neither feeds the breaker —
+    /// an envelope miss is telemetry, not a transaction failure.
+    #[must_use = "the verdict is the point: an underflow is a silent wrong answer, not a success"]
+    pub fn commit_enveloped(
+        self,
+        payload_bytes: u64,
+    ) -> (SnubberEvent<()>, ExecutionProfile, EnvelopeVerdict) {
+        let profiled = self.profile.is_some();
+        let envelope = self.envelope;
+        let node = self.node.clone();
+        let (event, profile) = self.commit_profiled();
+        if envelope.is_off() {
+            return (event, profile, EnvelopeVerdict::inside());
+        }
+        let time = if profiled {
+            envelope.time_verdict(u64::from(profile.work_wall_us))
+        } else {
+            TimeVerdict::Inside
+        };
+        let verdict = EnvelopeVerdict {
+            time,
+            payload: envelope.payload_verdict(payload_bytes),
+        };
+        if verdict.has_underflow() || verdict.has_overflow() {
+            let mut inner = node.lock().unwrap_or_else(|p| {
+                let mut g = p.into_inner();
+                g.stats.poison_recoveries = g.stats.poison_recoveries.saturating_add(1);
+                hard_clamp_slots(&mut g);
+                g
+            });
+            if verdict.has_underflow() {
+                inner.stats.envelope_underflows = inner.stats.envelope_underflows.saturating_add(1);
+            }
+            if verdict.has_overflow() {
+                inner.stats.envelope_overflows = inner.stats.envelope_overflows.saturating_add(1);
+            }
+        }
+        (event, profile, verdict)
     }
 
     /// Milliseconds spent waiting in the queue before admission (0 for sync enter).

@@ -71,7 +71,13 @@ pub mod async_engine;
 pub mod conduit;
 
 #[cfg(feature = "std")]
+pub mod conflate;
+
+#[cfg(feature = "std")]
 pub mod channel;
+
+#[cfg(feature = "std")]
+pub mod harness;
 
 pub mod clock;
 
@@ -80,6 +86,8 @@ pub mod isr;
 pub mod policy;
 
 pub mod contract;
+
+pub mod envelope;
 
 pub mod watchdog;
 
@@ -101,6 +109,8 @@ pub use clock::{
     classify_stall, classify_stall_ceiling, CpuClock, IdlePark, MonotonicMs, NoWdt, PulseWatch,
     SpinPark, StallKind, WdtSink, WorkerPulse,
 };
+
+pub use envelope::{EnvelopeVerdict, ExecutionEnvelope, PayloadVerdict, TimeVerdict};
 
 pub use isr::{
     IsrBridge, IsrPushError, IsrSignal, ISR_RING_CAP, ISR_RING_MASK, OP_EMERGENCY_TRIP, OP_PAUSE,
@@ -162,9 +172,15 @@ pub use async_engine::{
 pub use conduit::{Directive, ResumeFuture, TaskConduit, TaskHandle};
 
 #[cfg(feature = "std")]
+pub use conflate::{ConflateReceiver, ConflateSender};
+
+#[cfg(feature = "std")]
 pub use channel::{
     gateway, GatewayHost, GatewayRecvError, GatewaySendError, GatewaySender, GatewayStats,
 };
+
+#[cfg(feature = "std")]
+pub use harness::{run_boundary_harness, FastPrng, HarnessReport, ProfileHarness};
 
 use core::fmt;
 use core::mem;

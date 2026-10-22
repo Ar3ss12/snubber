@@ -11,7 +11,7 @@
 
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
@@ -62,6 +62,7 @@ struct IntercomInner<S, D> {
     cancel_reason: Mutex<Option<&'static str>>,
     state: RwLock<S>,
     draft: Mutex<Option<D>>,
+    conflated: AtomicU64,
     condvar: Condvar,
     wakers: Mutex<Vec<Waker>>,
 }
@@ -91,6 +92,7 @@ impl<S, D> TaskConduit<S, D> {
             cancel_reason: Mutex::new(None),
             state: RwLock::new(initial_state),
             draft: Mutex::new(None),
+            conflated: AtomicU64::new(0),
             condvar: Condvar::new(),
             wakers: Mutex::new(Vec::new()),
         });
@@ -207,15 +209,35 @@ impl<S, D> TaskConduit<S, D> {
     }
 
     /// Publish an intermediate draft artifact onto the shared table.
-    pub fn publish_draft(&self, draft: D) {
+    ///
+    /// The table is a **single slot**: a newer draft overwrites an
+    /// unsampled older one. Returns `true` when that happened, so a
+    /// producer can report coalescing without a second counter read.
+    pub fn publish_draft(&self, draft: D) -> bool {
         if let Ok(mut lock) = self.inner.draft.lock() {
+            let replaced = lock.is_some();
+            if replaced {
+                self.inner.conflated.fetch_add(1, Ordering::Relaxed);
+            }
             *lock = Some(draft);
+            return replaced;
         }
+        false
     }
 
     /// Take the draft artifact from the shared table (if any).
     pub fn take_draft(&self) -> Option<D> {
         self.inner.draft.lock().ok().and_then(|mut d| d.take())
+    }
+
+    /// Drafts overwritten before the caller sampled them.
+    ///
+    /// `published - taken == conflated` holds for single-slot traffic:
+    /// every publish that did not land in an empty slot coalesced an
+    /// unsampled draft. Monotonic, relaxed, never blocks.
+    #[must_use]
+    pub fn conflated_drafts(&self) -> u64 {
+        self.inner.conflated.load(Ordering::Relaxed)
     }
 }
 
@@ -299,6 +321,13 @@ impl<S, D> TaskHandle<S, D> {
     /// Take the draft artifact from the shared table.
     pub fn take_draft(&self) -> Option<D> {
         self.inner.draft.lock().ok().and_then(|mut d| d.take())
+    }
+
+    /// Drafts overwritten before the caller sampled them (mirror of
+    /// [`TaskConduit::conflated_drafts`]).
+    #[must_use]
+    pub fn conflated_drafts(&self) -> u64 {
+        self.inner.conflated.load(Ordering::Relaxed)
     }
 
     fn wake_async(&self) {
