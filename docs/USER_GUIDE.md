@@ -835,7 +835,9 @@ Supervisor::run_supervised_guard_with_memory(
 * The whole chain — soft → refuse → digest → generation bump → successor
   admits — runs in `examples/14_memory_recycle.rs`; the real two-process
   loop (supervisor + worker, drain mode vs `--no-drain`) runs in
-  `examples/15_supervised_memory.rs`.
+  `examples/15_supervised_memory.rs`; the bounded-heap checkpoint itself
+  (64 KiB streaming vs `--naive` clone) runs in
+  `examples/16_streaming_checkpoint.rs`.
 
 ### 4.6c Checkpoint physics: 64 B is a ticket, not storage
 
@@ -990,6 +992,16 @@ If the process is killed mid-stream, no complete digest reaches the drain
 never renamed. The successor reads stdin via `spawn_with_digest` /
 `take_stdin_digest`, revalidates magic, version, size and CRC, and on any
 mismatch rolls back to the previous sealed checkpoint.
+
+**Reference:** `examples/16_streaming_checkpoint.rs` runs both paths
+end-to-end — streaming seals 16 MiB and the successor reports
+`restored_bytes=16777216`; `--naive` clones the state, crosses `hard_kb`
+and is killed mid-`write_all`, leaving `state.tmp` and no ticket.
+`tests/checkpoint_ticket.rs` covers the dead-ticket matrix (magic,
+version, size, CRC, torn write), `tests/checkpoint_budget.rs` counts heap
+bytes through a `#[global_allocator]` (streaming peak ≤ 128 KiB), and
+`tests/checkpoint_loop.rs` drives two real supervisor/worker/successor
+process chains.
 
 ### 4.7 Orphan contract (Phase 6: no zombies)
 ```rust
