@@ -80,10 +80,11 @@ examples and gate teeth). Details: USER_GUIDE "Fixed in 0.6.8".
   checks no longer degrade to platform skips. A skipped check still fails
   the verdict, so the macOS lane is judged on executed checks.
 - Two timing-sensitive tests no longer race the clock:
-  `spurious_repolls_do_not_reset_the_ttl_clock` ignores Miri and waits
-  adaptively instead of assuming 30 ms sleeps fit inside the TTL, and
-  `spawn_guarded_binds_thread_guard_leash` synchronises through an mpsc
-  handshake instead of a 20 ms sleep.
+  `spurious_repolls_do_not_reset_the_ttl_clock` ignores Miri and stops
+  predicting the poll result from wall-clock time (it accepts either park
+  or expiry at the 1 ms-clock boundary and asserts `queue_wait_ms` spans
+  from the first park), and `spawn_guarded_binds_thread_guard_leash`
+  synchronises through an mpsc handshake instead of a 20 ms sleep.
 
 ## 0.6.7 — 2026-10-23
 
