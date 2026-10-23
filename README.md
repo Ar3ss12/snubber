@@ -215,6 +215,8 @@ The mixed storm cycles `armed → clean → silent → orphan` by `local % 4` in
 
 The lease storm (`--lease-ms`, example 19) is the opposite case: every child emits one heartbeat and then hangs forever, so no `wait()` ever returns on its own. `cargo test --test supervisor_pool_stress_lease -- --ignored --nocapture` measured 24/24 reaps — all **stillborn** (a heartbeat is liveness, not a settlement), 0 ambush, 0 escape, 0 deadlocks, `lease_kills=24`, `conservation_breaks=0` over ~90k live `report()` samples from the observer thread, `[7,7,7,7]` generations, `wall_ms=220`. A child that hung before its first heartbeat is not expired — a pipe that never parsed a frame is the app's spawn timeout, not a lease breach.
 
+All three storms plus `stress_breaker_churn` run in the `pool-gates` job of `.github/workflows/stress.yml` on every push and pull request (4 lanes × 8 / 6 / 8 kills and 8 threads × 1500 churn ops, ~2 s of test time); the heavier supervisor and multi-lineage harnesses stay scheduled or dispatch-only.
+
 Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~220 ns (ambush) / ~177 ns (escape), a four-lane `report()` is ~112 ns, a four-lane lease sweep is ~539 ns, and `namespace_task` is ~2 ns — each lane locks only its own state.
 
 ---

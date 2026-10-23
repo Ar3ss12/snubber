@@ -18,6 +18,14 @@ examples and gate teeth). Details: USER_GUIDE "Fixed in 0.6.8".
   into `bulkhead_rejections`.
 - Depth gauge subtracts `explicit_aborts` and `implicit_drops`, so a
   settled transaction never shows as in flight.
+- Rate shedding has its own `FaultKind::RateLimited` (index 12,
+  `FaultKind::COUNT` 13): a `BulkheadFull` TripBreaker override can no
+  longer fire on a paced refusal, hooks and health see the honest event,
+  and `rate_rejected` is booked once. `SnapshotV1` bumps to v5 and grows
+  the reported tail 12 → 13 (322/508 bytes).
+- Admission stamps and fault details are built in PHASE B: every
+  rejection arm drops the state lock before `arming.clone()`/`format!`,
+  and the rate counter uses `saturating_add` like every other bump.
 - Async admission probe state is cleared on every terminal `Ready`
   (spurious re-polls no longer leave `half_open_probe` wedged, and a
   Ready future retires any queue entry it still owns by identity).
@@ -67,6 +75,12 @@ examples and gate teeth). Details: USER_GUIDE "Fixed in 0.6.8".
   or empty; harnesses fail on zero samples; deadlock literals removed
   from termination reports.
 - Miri runs with `-Zmiri-strict-provenance` in both CI lanes.
+- The benchmark exporter publishes only `.../new/estimates.json` (a real
+  ns latency): it also published `change/` entries, i.e. a relative delta
+  printed as "nanoseconds". CI now runs one bench and greps the exported
+  table instead of only compiling benches. The ignored pool storms and
+  `stress_breaker_churn` run on every push and PR (`pool-gates`); only
+  the supervisor and multi-lineage harnesses stay scheduled.
 - Docs: README saturation claim is measured (~1.1M admissions/sec on six
   contending threads), `WorkerPulse` footprint is arch-conditional,
   pool numbers re-measured (attach/reap ~220/~177 ns with the drain built

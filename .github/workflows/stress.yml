@@ -85,6 +85,46 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # Cheap pool gates: the `#[ignore]` pool storms spawn real children but
+  # finish in well under a second each (32/24/32 reaps + breaker churn),
+  # so they gate every push and PR. These are the ONLY coverage for lane
+  # lease euthanasia, mixed-class reaping and the EvictOldest ceiling —
+  # leaving them scheduled-only would let a PR break them unnoticed.
+  # The heavyweight process-storm harnesses below stay scheduled-only.
+  pool-gates:
+    name: Pool stress gates (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Pool storms + breaker churn (ignored gates)
+        run: |
+          cargo test --release --locked \
+            --test supervisor_pool_stress \
+            --test supervisor_pool_stress_lease \
+            --test supervisor_pool_stress_mixed \
+            --test stress_breaker_churn \
+            -- --ignored
+
+      - name: Upload Pool Gate Artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pool-gates
+          path: |
+            target/pool_stress_report.json
+            target/pool_lease_stress_report.json
+            target/pool_mixed_stress_report.json
+          if-no-files-found: warn
+          retention-days: 14
+
   # Single-process harness: launches ONE supervisor, kills its workers
   # through the pid-file handshake and checks the JSON report (kills,
   # reaps, generation, leak gates). Scheduled/manual only -- it hammers
@@ -163,8 +203,11 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  ignored-stress-gates:
-    name: Ignored stress gates (cargo test -- --ignored)
+  # The pool storms and breaker churn moved to `pool-gates` (per push/PR).
+  # What remains here spawns a background supervisor plus a killer thread
+  # and is scheduled/manual only.
+  termination-gate:
+    name: Termination storm (cargo test -- --ignored)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -177,12 +220,8 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
-      - name: Run all #[ignore] stress gates
+      - name: Run the #[ignore] termination stress gate
         run: |
           cargo test --release --locked \
-            --test supervisor_pool_stress \
-            --test supervisor_pool_stress_lease \
-            --test supervisor_pool_stress_mixed \
             --test supervisor_termination \
-            --test stress_breaker_churn \
             -- --ignored
