@@ -146,8 +146,10 @@ outlives every transaction.
 - The multi-lineage harness gates per-lane handle growth
   (`-MaxHandleGrowth` / `--max-handle-growth`, default 16) alongside private
   growth; first, peak and last samples are reported so a one-off warm-up
-  delta is visible. Handle sampling is Linux-only (`/proc/<pid>/fd`); macOS
-  reports that gate as n/a and keeps the RSS gate.
+  delta is visible. Descriptor sampling reads `/proc/<pid>/fd` on Linux and
+  `lsof -nP -p <pid> -F f` on macOS, so the gate applies on both runners.
+  Where neither source exists the check is reported as a skip, and a skip
+  fails the verdict: reduced coverage is never a pass.
 - Every reap is classified: **true ambush** (armed token left at death),
   **clean escape** (a commit was seen), or **stillborn** (no commit and no
   armed token). `-ArmedHold` / `--armed-hold` publishes the worker pid only

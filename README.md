@@ -173,7 +173,7 @@ The same gates run in CI (`.github/workflows/stress.yml`, `--aggressive`, dispat
 | macos-latest (arm64) | armed-hold | 1,000 | 7.19 s | 139.1 | 100% | 0 | 0 | 22–24 / 344–554 µs |
 | macos-latest (arm64) | free-running | 2,000 | 31.82 s | 62.9 | 61.9% | 38.1% | 0 | 13–14 / 57–84 µs |
 
-Per-lane RSS growth ≤ 0.45 MB on both runners; Linux handle growth 0…+1. The macOS rate is lower because identity verification spawns `ps` for every new pid and process spawn is slower, so free-running kills mostly land after the commit (escape) instead of during startup (stillborn).
+Per-lane RSS growth ≤ 0.45 MB on both runners; Linux handle growth 0…+1 (macOS now samples descriptors with `lsof -p` and gates the same limit). The macOS rate is lower because identity verification spawns `ps` for every new pid and process spawn is slower, so free-running kills mostly land after the commit (escape) instead of during startup (stillborn).
 
 ```powershell
 # Single-lineage release gate (10,000 kills)

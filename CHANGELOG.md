@@ -74,6 +74,16 @@ examples and gate teeth). Details: USER_GUIDE "Fixed in 0.6.8".
   ~112 ns, lease sweep ~539 ns), storm timings re-measured, and the API table
   gains `PoolReap` / `LaneSnapshot` / `PoolTotals` / `expired_lanes` /
   `DEFAULT_EOF_GRACE_MS` / argv-twin rows.
+- The POSIX storm harness gates descriptor growth on macOS too: it counts
+  `/proc/<pid>/fd` on Linux and parses `lsof -nP -p <pid> -F f` on macOS
+  (1 Hz, since `lsof` walks every descriptor), so the four per-lane handle
+  checks no longer degrade to platform skips. A skipped check still fails
+  the verdict, so the macOS lane is judged on executed checks.
+- Two timing-sensitive tests no longer race the clock:
+  `spurious_repolls_do_not_reset_the_ttl_clock` ignores Miri and waits
+  adaptively instead of assuming 30 ms sleeps fit inside the TTL, and
+  `spawn_guarded_binds_thread_guard_leash` synchronises through an mpsc
+  handshake instead of a 20 ms sleep.
 
 ## 0.6.7 — 2026-10-23
 

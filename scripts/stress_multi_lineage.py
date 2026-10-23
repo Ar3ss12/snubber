@@ -10,7 +10,8 @@ The single-lineage release gate stays frozen in ``stress_harness.ps1`` (Windows)
 and ``stress_multi_lineage.ps1`` (Windows, raw Win32 kill). This script is the
 POSIX equivalent of the latter: SIGKILL instead of TerminateProcess, process
 identity from ``/proc/<pid>/stat`` starttime (Linux) or ``ps -o lstart``
-(macOS), so a recycled pid is never mistaken for the live worker.
+(macOS), so a recycled pid is never mistaken for the live worker. Descriptor
+growth is sampled from ``/proc/<pid>/fd`` on Linux and ``lsof -p`` on macOS.
 
 Every reap is classified from the supervisor report: true ambush (armed token
 at death), clean escape (commit seen) or stillborn (neither). ``--armed-hold``
@@ -35,6 +36,14 @@ import time
 from pathlib import Path
 
 IS_LINUX = sys.platform.startswith("linux")
+
+# Descriptor sampling: /proc on Linux, `lsof -p` on macOS. Probe once so a
+# platform without either still reports an explicit SKIP instead of silently
+# zero samples.
+LSOF = shutil.which("lsof") or (
+    "/usr/sbin/lsof" if Path("/usr/sbin/lsof").exists() else None
+)
+FD_SAMPLING = IS_LINUX or LSOF is not None
 
 
 def resolve(repo: Path, value: str) -> Path:
@@ -113,12 +122,26 @@ def proc_rss_mb(pid: int) -> float | None:
 
 
 def proc_fds(pid: int) -> int | None:
-    if not IS_LINUX:
+    if IS_LINUX:
+        try:
+            return len(os.listdir(f"/proc/{pid}/fd"))
+        except OSError:
+            return None
+    if LSOF is None:
         return None
+    # -nP skip host/port lookups; -F f emits one "f<fd>" line per descriptor.
     try:
-        return len(os.listdir(f"/proc/{pid}/fd"))
-    except OSError:
+        out = subprocess.run(
+            [LSOF, "-nP", "-p", str(pid), "-F", "f"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
+    if out.returncode != 0 or not out.stdout:
+        return None
+    return sum(1 for line in out.stdout.splitlines() if line.startswith("f"))
 
 
 class Sample:
@@ -269,15 +292,23 @@ def monitor(args: argparse.Namespace, lanes: list[Lane], supervisors: set[int], 
     started = time.monotonic()
     last_line = 0.0
     last_sample = 0.0
+    last_fd_sample = 0.0
+    # lsof enumerates every descriptor; at 10 Hz per lane it would cost more
+    # than the storm it measures. One sample per second still spans the run.
+    fd_interval = 0.1 if IS_LINUX else 1.0
     while not stop.is_set():
         now = time.monotonic()
         # RSS reads spawn `ps` on macOS; sample resources at 10 Hz, print at 2 Hz.
+        fd_due = now - last_fd_sample >= fd_interval
+        if fd_due:
+            last_fd_sample = now
         if now - last_sample >= 0.1:
             last_sample = now
             for lane in lanes:
                 if lane.sup and lane.sup.poll() is None:
                     lane.sup_rss.note(proc_rss_mb(lane.sup.pid))
-                    lane.sup_fds.note(proc_fds(lane.sup.pid))
+                    if fd_due:
+                        lane.sup_fds.note(proc_fds(lane.sup.pid))
                 worker = read_pid(lane.dir / "target" / "supervised_worker.pid")
                 if worker and worker not in supervisors:
                     # Same identity gate as the killer: a recycled pid must
@@ -517,7 +548,7 @@ def run(args: argparse.Namespace, repo: Path) -> int:
             else "0 samples (leak gate cannot pass on no data)"
         )
         checks.append((f"{tag} rss growth <= {args.max_growth_mb} MB", rss_ok, rss_detail))
-        if IS_LINUX:
+        if FD_SAMPLING:
             fds_ok = lane.sup_fds.count > 0 and lane.sup_fds.growth() <= args.max_handle_growth
             fds_detail = (
                 f"{lane.sup_fds.growth():.0f}"
@@ -528,7 +559,7 @@ def run(args: argparse.Namespace, repo: Path) -> int:
         else:
             # Explicit SKIP accounting: a platform-unavailable check must
             # not masquerade as a PASS in the gate table.
-            checks.append((f"{tag} handle growth", None, "SKIP: fd sampling is Linux-only"))
+            checks.append((f"{tag} handle growth", None, "SKIP: no /proc and no lsof"))
 
     checks.append(("aggregate killed == expected", total_killed == expected, f"{total_killed}/{expected}"))
     checks.append(("aggregate reaped == expected", total_reaped == expected, f"{total_reaped}/{expected}"))
@@ -590,7 +621,7 @@ def run(args: argparse.Namespace, repo: Path) -> int:
         "armed_hold": args.armed_hold,
         "min_ambush_pct": min_ambush,
         "max_growth_mb": args.max_growth_mb,
-        "max_handle_growth": args.max_handle_growth if IS_LINUX else None,
+        "max_handle_growth": args.max_handle_growth if FD_SAMPLING else None,
         "lines": [
             {
                 "lane": lane.index,
@@ -612,7 +643,7 @@ def run(args: argparse.Namespace, repo: Path) -> int:
                 },
                 "resources": {
                     "rss_mb": lane.sup_rss.as_dict(),
-                    "handles": lane.sup_fds.as_dict() if IS_LINUX else None,
+                    "handles": lane.sup_fds.as_dict() if FD_SAMPLING else None,
                     "worker_rss_mb_peak": round(lane.worker_rss.peak, 3),
                 },
                 "stale": lane.stale,
