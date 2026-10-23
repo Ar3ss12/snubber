@@ -107,7 +107,7 @@ impl<S, D> TaskConduit<S, D> {
 
     /// Update the live telemetry state via a mutating closure.
     ///
-    /// Poison-recovering (same discipline as [`Self::inspect`]): a panicked
+    /// Poison-recovering (same discipline as `TaskHandle::inspect`): a panicked
     /// state closure must not freeze all future state publishing — the
     /// poison is absorbed and the closure still runs on the recovered guard.
     pub fn update_state<F: FnOnce(&mut S)>(&self, f: F) {

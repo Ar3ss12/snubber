@@ -1,7 +1,7 @@
 //! Worker pool: N independent supervised lineages, one pipe per worker.
 //!
 //! [`Supervisor`](crate::Supervisor) owns exactly ONE lineage: one armed
-//! slot in its [`PipeDrain`], one generation clock, one blocking
+//! slot in its `PipeDrain`, one generation clock, one blocking
 //! `child.wait()`. Putting eight workers behind one supervisor would merge
 //! their accounting — a rescue token from lane 3 would be indistinguishable
 //! from lane 5, and one silent worker would freeze every other lane.
@@ -12,7 +12,7 @@
 //!
 //! * lane `i` = one [`GenerationClock`](crate::GenerationClock), one
 //!   [`RestartTracker`](crate::RestartTracker) (+ backoff + storm window),
-//!   one [`MemoryPolicy`], one [`PipeDrain`], one pid — see [`PoolLane`];
+//!   one `MemoryPolicy`, one `PipeDrain`, one pid — see [`PoolLane`];
 //! * `N` app threads, each blocking on its own child and draining its own
 //!   pipe; a lane guards only its own state, so lanes never contend;
 //! * the APP still owns `spawn`, `kill`, `sleep` and pid files; this module

@@ -1110,7 +1110,7 @@ fn hard_clamp_slots(inner: &mut NodeInner) {
     }
 }
 
-/// Monotonic millisecond clock (`std` backend for [`MonotonicMs`]).
+/// Monotonic millisecond clock (`std` backend for [`MonotonicMs`](crate::MonotonicMs)).
 ///
 /// Boot-relative `Instant`: never jumps on NTP sync, DST change, or
 /// manual edits — unlike `SystemTime`. Zero-size, `Copy`; safe to hold
@@ -2237,7 +2237,7 @@ impl SnubberNode {
     /// Arm a guard with an execution profile, auto sequence IDs, `std` clock.
     ///
     /// Same admission pipeline as [`enter_auto`](Self::enter_auto); the
-    /// returned guard carries a boxed [`ProfileState`] so
+    /// returned guard carries a boxed `ProfileState` so
     /// [`TrackedGuard::checkpoint_timed`] and
     /// [`TrackedGuard::commit_profiled`] can attribute wall/CPU time.
     /// Plain `enter_auto` reads no clock and allocates nothing.
@@ -2421,7 +2421,7 @@ impl SnubberNode {
     /// Execute fallible work within a protected scope guarded by semantic parameter validation.
     ///
     /// Validates `params` via `invariant` BEFORE allocating a slot or arming the guard:
-    /// - If validation fails, returns [`SnubberError::Admission(EnterError::InvariantBreach)`]. Neither
+    /// - If validation fails, returns `SnubberError::Admission(EnterError::InvariantBreach)`. Neither
     ///   `rollback()` nor `work()` are executed.
     /// - If validation passes, executes `work(params)`. Commits on `Ok(T)` and rolls back on `Err(E)`.
     ///
@@ -2475,7 +2475,7 @@ impl SnubberNode {
     /// is restored (caller passes `&mut`, we write back only success)
     /// and the guard rolls back. No half-moved enums, ever.
     ///
-    /// For COMPILE-TIME legal edges see [`transition_checked`]: declare
+    /// For COMPILE-TIME legal edges see [`transition_checked`](Self::transition_checked): declare
     /// `impl LegalMove<Next> for State` per allowed rib and the compiler
     /// rejects `Terminated -> Running` before a byte is generated.
     /// This method stays permissive on purpose (dynamic topologies,

@@ -4,8 +4,8 @@
 //! nanoseconds — the Tokio scheduler never notices). This module is the
 //! documented bridge: refuse-fast here, sleep in YOUR runtime there.
 //!
-//! * [`AsyncGate`] — thin wrapper over [`SnubberNode`](crate::SnubberNode):
-//!   admission only, always [`BackpressurePolicy::AdviseOnly`], never
+//! * [`AsyncGate`] — thin wrapper over [`SnubberNode`]:
+//!   admission only, always `BackpressurePolicy::AdviseOnly`, never
 //!   parks a thread. Every refusal carries `retry_after_ms` + `depth`.
 //! * Rule: `BlockCaller` / `AdaptiveBlock` are FORBIDDEN behind this gate
 //!   (they `std::thread::sleep` the worker — see F14). Cancellation is

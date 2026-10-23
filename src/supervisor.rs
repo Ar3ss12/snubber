@@ -106,7 +106,7 @@ impl DeathCause {
 
 /// Supervisor-side memory policy (Phase 3).
 ///
-/// Pure `Copy` state over [`MemoryWatch`](crate::MemoryWatch): the
+/// Pure `Copy` state over [`MemoryWatch`]: the
 /// supervisor samples the child (its own platform call — `/proc`,
 /// `GetProcessMemoryInfo`, cgroup) and asks this policy whether to kill.
 /// `Soft` never kills: the worker refuses admissions through
@@ -1408,7 +1408,7 @@ impl Supervisor {
     ///   the operator, NOT a control message — the pipe is one-way
     ///   (child → out), the supervisor never signals the worker. The child
     ///   is expected to sample its own memory (`SnubberNode` soft limit →
-    ///   [`EnterError::MemoryPressure`]) and drain itself. Never killed.
+    ///   `crate::EnterError::MemoryPressure`) and drain itself. Never killed.
     /// * `Hard` — `child.kill()` WITHOUT draining and
     ///   [`DeathCause::MemoryLimit`] stamped via [`death_event`].
     pub fn run_supervised_guard_with_memory<F, S>(

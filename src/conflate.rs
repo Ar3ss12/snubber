@@ -8,7 +8,7 @@
 //! dashboards and progress views: stale snapshots are not data, they are
 //! work the consumer would do for nothing.
 //!
-//! Backed by the [`TaskConduit`](crate::TaskConduit) draft table, so the
+//! Backed by the [`TaskConduit`] draft table, so the
 //! coalescing counter needs no extra allocation and no `Clone` bound on `T`.
 //! Non-blocking on both ends: the consumer polls at its own cadence
 //! (typically the display refresh), the producer only ever contends for the

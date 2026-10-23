@@ -7,7 +7,7 @@
 //!   alloc), CRC helpers. No `std`, no `alloc`, no threads, no files.
 //! * `std`-only: [`find_anomalies`] (pure over a `stats()` snapshot),
 //!   [`NodeSet`] (explicit `&Node` list, never a `static`),
-//!   [`print_health`], [`diagnostic_line`], [`assert_no_anomalies`].
+//!   [`print_health`], [`diagnostic_line`], `assert_no_anomalies!`.
 //!
 //! The crate gives bytes and math; the APP gives threads, paths and
 //! network. `SnapshotV1::encode` + your own 10-second flusher is the whole "cold layer".
