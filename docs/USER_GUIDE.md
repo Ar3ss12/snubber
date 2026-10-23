@@ -1585,6 +1585,24 @@ transient `max + 1` admission; `note_death(Some(code), ..)` examples match
 the API; INVARIANTS.md states the EvictOldest `C + 1` exception to
 Invariant 2; README measures `commit` at ~5.4 ns without an allocation.
 
+## Fixed in 0.6.4: post-release audit strike
+
+Fourth pass found one core-concurrency hole and a decorative CI gate; both closed with teeth.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| `EvictOldest` ceiling | Every saturated call re-booked: with `max + 2` live guards `hard_clamp_slots` erased the surplus from `in_flight` while `lane_in_flight` kept counting — the Critical-over-Background preemption precondition (`lane_in_flight[0] == in_flight`) could never hold again, silently disabling preemption | Overbooking is capped at exactly one slot (ceiling `max + 1`); a caller arriving beyond it is refused with `BulkheadFull` like any other shed | `tests/bulkhead_capacity.rs::evict_oldest_overbooking_caps_at_max_plus_one` |
+| Panicking erased rollback | In `enter_erased` / `enter_supervised_erased` the probe settle lived in the same hook AFTER the user rollback: a panicking rollback unwound past it, `ErasedGuard::drop`'s `catch_unwind` swallowed the panic, and the breaker stayed welded (stale `half_open_probe`) until a manual reset | The settle runs BEFORE the panic resumes (`catch_unwind` around the rollback, settle, `resume_unwind`): the books are always honest, the panic still reaches the caller of `abort()` / `commit()` | `tests/erased.rs::panicking_rollback_still_settles_the_erased_probe` |
+| Async eviction telemetry | The async `EvictOldest` arm bumped only the raw `stats.evicted` counter: no `record_locked`, no `FaultRecord`, no per-kind policy — a user's `.policy(EvictedOldest, ..)` never fired on the async path | Full sync-arm parity: `record_locked` (bump 4) + `publish_fault` + `emit`, so the per-kind policy and hooks fire and the counter is counted exactly once | `tests/async_primitives.rs::async_eviction_reports_evicted_oldest_telemetry` |
+| Gate 6 in CI (decorative) | `cargo-semver-checks` never ran: CI checkout had no tags (`SKIP`), the tool was never installed, and both SKIPs still printed "All invariant gates PASSED" with exit 0 | `ci.yml` fetches full history + tags, installs `cargo-semver-checks`; under `$CI` a SKIP is a FAIL (`.sh` gate), and the repo is tagged per release (`v0.6.3` baseline) | `scripts/check_compile_gates.sh` CI mode |
+| Harness kill identity (.sh) | `stress_harness.sh` followed the pid file / `pgrep` fallback straight to `kill -9`: a recycled pid, or any process whose argv merely CONTAINS the target path (a `tail -f` on the log, an editor), could be killed | Identity gate before every kill: `/proc/<pid>/exe` image name + monotonic starttime vs the last victim (Linux), image-name match on macOS/BSD — parity with the `.ps1` / `.py` killers | `scripts/stress_harness.sh::target_is_worker` |
+
+Documentation-only: `README.md` now attributes the correct verdict names
+to `classify_stall` (`CpuSpin` / `SleepBlocked` / `DeadlockStall` — the
+settle verdicts `SpinDetected` / `DeadlockSuspected` belong to
+`guard.check_timeout()`); INVARIANTS.md states the enforced $C+1$
+refusal.
+
 ## API & Cost Quick Reference
 
 | Operation | Layer | Latency / Footprint | When to Use |

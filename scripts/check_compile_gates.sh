@@ -7,6 +7,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# CI mode: GitHub Actions sets CI=true. A controlled environment has no
+# excuse for a SKIP — the bare-metal target and the semver tool must be
+# provisioned by the workflow, and the tag baseline by the release process.
+# A SKIP here is a hole in the audit, not a pass.
+in_ci() { [ -n "${CI:-}" ]; }
+
 echo "=== Snubber Architectural Invariant Audit ==="
 FAILURES=0
 
@@ -70,7 +76,12 @@ if ! grep -q '^#!\[cfg_attr(not(feature = "std"), no_std)\]' "${REPO_ROOT}/src/l
     echo "FAIL (missing #![cfg_attr(not(feature = \"std\"), no_std)] in src/lib.rs)"
     FAILURES=$((FAILURES + 1))
 elif ! rustup target list --installed 2>/dev/null | grep -qx "thumbv7em-none-eabihf"; then
-    echo "SKIP (target not installed: rustup target add thumbv7em-none-eabihf)"
+    if in_ci; then
+        echo "FAIL (CI: bare-metal target missing — workflow must run: rustup target add thumbv7em-none-eabihf)"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "SKIP (target not installed: rustup target add thumbv7em-none-eabihf)"
+    fi
 else
     BARE_METAL_TARGET="thumbv7em-none-eabihf"
     if (cd "${REPO_ROOT}" && cargo check --quiet --no-default-features --target "${BARE_METAL_TARGET}") \
@@ -86,7 +97,12 @@ fi
 echo -n "[6/6] Auditing public API against the last release... "
 API_BASELINE="$(git -C "${REPO_ROOT}" describe --tags --abbrev=0 2>/dev/null || true)"
 if [ -z "${API_BASELINE}" ]; then
-    echo "SKIP (no git tag baseline)"
+    if in_ci; then
+        echo "FAIL (CI: no git tag baseline — checkout must fetch tags and the repo must be tagged per release)"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "SKIP (no git tag baseline)"
+    fi
 elif command -v cargo-semver-checks > /dev/null 2>&1     || (cd "${REPO_ROOT}" && cargo semver-checks --version > /dev/null 2>&1); then
     if (cd "${REPO_ROOT}" && bash "${SCRIPT_DIR}/check_api_diff.sh" "${API_BASELINE}" > /dev/null); then
         echo "OK (no breaking change vs ${API_BASELINE})"
@@ -95,7 +111,12 @@ elif command -v cargo-semver-checks > /dev/null 2>&1     || (cd "${REPO_ROOT}" &
         FAILURES=$((FAILURES + 1))
     fi
 else
-    echo "SKIP (cargo-semver-checks not installed)"
+    if in_ci; then
+        echo "FAIL (CI: cargo-semver-checks missing — workflow must install it)"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "SKIP (cargo-semver-checks not installed)"
+    fi
 fi
 
 echo "---------------------------------------------"

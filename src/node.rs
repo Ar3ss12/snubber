@@ -2179,8 +2179,17 @@ impl SnubberNode {
         let node2 = self.clone();
         Ok(crate::ErasedGuard::with_commit_hook(
             move || {
-                rollback();
+                // The probe settle must run even if the user's rollback
+                // panics: the guard's own catch_unwind would otherwise
+                // swallow the panic AFTER the hook unwound past the settle,
+                // leaving `half_open_probe` set and the breaker welded shut
+                // until a manual reset. The panic still reaches the caller
+                // — only the books are guaranteed first.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
                 node.settle_erased_probe(was_probe, false);
+                if let Err(payload) = outcome {
+                    std::panic::resume_unwind(payload);
+                }
             },
             move || {
                 node2.settle_erased_probe(was_probe, true);
@@ -2682,8 +2691,13 @@ impl SnubberNode {
         let node2 = self.clone();
         Ok(crate::ErasedGuard::with_commit_hook(
             move || {
-                rollback();
+                // Same panic-boundary as `enter_erased`: settle the probe
+                // before any rollback panic resumes.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
                 node.settle_erased_probe(was_probe, false);
+                if let Err(payload) = outcome {
+                    std::panic::resume_unwind(payload);
+                }
                 crate::ProcessToken::commit(seq).emit_if_supervised();
             },
             move || {
@@ -3114,6 +3128,29 @@ impl SnubberNode {
                     }
                 }
                 OverflowPolicy::EvictOldest => {
+                    // Overbooking is capped at exactly ONE extra slot: the
+                    // legal ceiling is `max + 1` (see `hard_clamp_slots`).
+                    // If that slot is taken too, the caller is refused — a
+                    // second overbook would be erased by the clamp while
+                    // the extra live guard kept its real slot, eroding
+                    // `in_flight` accounting and desynchronizing
+                    // `lane_in_flight` from it (which silently disables
+                    // Critical-over-Background preemption forever).
+                    if inner.in_flight >= inner.max_in_flight.saturating_add(1) {
+                        if inner.breaker == BreakerState::HalfOpen {
+                            inner.half_open_probe = false;
+                        }
+                        let record = FaultRecord {
+                            kind: FaultKind::BulkheadFull,
+                            ..arming.clone()
+                        };
+                        let mut outcome =
+                            Self::record_locked(&mut inner, FaultKind::BulkheadFull, 3, 0);
+                        drop(inner);
+                        self.publish_fault(&mut outcome, &record);
+                        Self::emit(outcome, record);
+                        return Err(EnterError::BulkheadFull);
+                    }
                     let record = FaultRecord {
                         kind: FaultKind::EvictedOldest,
                         ..arming.clone()
@@ -3540,7 +3577,9 @@ impl SnubberNode {
                             old.evicted.store(true, Ordering::Release);
                             evicted_waker = Some(old.waker);
                         }
-                        inner.stats.evicted = inner.stats.evicted.saturating_add(1);
+                        // `stats.evicted` is bumped by `record_locked` below
+                        // (bump kind 4, parity with the sync arm) — do not
+                        // double-count here.
                     }
                 }
             }
@@ -3550,7 +3589,31 @@ impl SnubberNode {
                 waker: waker.clone(),
                 evicted: flag,
             });
+            // Telemetry parity with the sync EvictOldest arm: the eviction
+            // goes through `record_locked` + the per-kind policy, so a
+            // user's `.policy(EvictedOldest, ..)` fires on the async path
+            // too and `reported` agrees with `stats.evicted`.
+            let evicted_record = evicted_waker.as_ref().map(|_| FaultRecord {
+                kind: FaultKind::EvictedOldest,
+                node: inner.name.clone(),
+                file: loc.file(),
+                line: loc.line(),
+                header,
+                detail: Some(FaultDetail::Static("oldest async waiter evicted")),
+                stage: 0,
+                stage_label: None,
+                queue_wait_ms: wait_ms,
+                elapsed_ms: 0,
+                retry_count: 0,
+            });
+            let evicted_outcome = evicted_record
+                .as_ref()
+                .map(|_| Self::record_locked(&mut inner, FaultKind::EvictedOldest, 4, 0));
             drop(inner);
+            if let (Some(record), Some(mut outcome)) = (evicted_record, evicted_outcome) {
+                self.publish_fault(&mut outcome, &record);
+                Self::emit(outcome, record);
+            }
             if let Some(w) = evicted_waker {
                 w.wake();
             }

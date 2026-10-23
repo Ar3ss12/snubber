@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-367%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-370%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -92,7 +92,7 @@ Measured on AMD Ryzen 5 4600H release build
 |---|---|---|---|
 | `SnubberGuard::new` + `commit` | Layer 1 (`core`) | **~5.4 ns** | Stack move + owned-field drop, zero heap allocation |
 | `EpochGate::observe` | Layer 1 (`core`) | **~2.6 ns** | 2-D generation + monotonic epoch filter |
-| `classify_stall` / `classify_stall_ceiling` | Layer 1 (`core`) | **~2.1 ns** (const math) | `SpinDetected` / `SleepBlocked` / `DeadlockSuspected` from one sample pair |
+| `classify_stall` / `classify_stall_ceiling` | Layer 1 (`core`) | **~2.1 ns** (const math) | `CpuSpin` / `SleepBlocked` / `DeadlockStall` from one sample pair (the settle verdicts `SpinDetected` / `DeadlockSuspected` come from `guard.check_timeout`) |
 | `node.enter + commit` | Layer 2 (`std`) | **~121 ns** | Full bulkhead, circuit breaker, auto-commit |
 | `node.enter_auto + commit` | Layer 2 (`std`) | **~134 ns** | + atomic sequence minting |
 | `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~119 ns** | Priority lane: −2 ns vs plain enter |
@@ -217,7 +217,7 @@ Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~32
 * 📘 **[Invariants & Verification Protocol (`docs/INVARIANTS.md`)](docs/INVARIANTS.md)** — Formal mathematical guarantees, admission conservation, zero slot leak proofs.
 * 📘 **[User Guide (`docs/USER_GUIDE.md`)](docs/USER_GUIDE.md)** — Comprehensive architecture manual:
   * **Layer 1: Core RAII Guard:** Stack rollback, `EpochGate`, and universal ergonomics (`scoped`, `scoped_checked`, `snub_check!`).
-  * **Layer 1.5: Hang Classification:** Monotonic clock (`MonotonicMs` / `SystemClock`), CPU-spin classifier (`classify_stall`, `TimedOut` vs `SpinDetected`), 8-byte `WorkerPulse` heartbeat + `WdtSink`, ISR bridge (`IsrBridge`, 80 B SPSC ring + 32-bit trip latch, `IsrBridge::trip` bypasses `Full`), idle-park (`IdlePark` / `wfi`/`wfe` on firmware, `wfe` needs `SEVONPEND=1` at boot), pulse black-box (`pulse_stalls` + `PulseStall` anomaly, snapshot v3).
+  * **Layer 1.5: Hang Classification:** Monotonic clock (`MonotonicMs` / `SystemClock`), CPU-spin classifier (`classify_stall` → `CpuSpin` / `DeadlockStall`; `guard.check_timeout()` → `SpinDetected` / `TimedOut`), 8-byte `WorkerPulse` heartbeat + `WdtSink`, ISR bridge (`IsrBridge`, 80 B SPSC ring + 32-bit trip latch, `IsrBridge::trip` bypasses `Full`), idle-park (`IdlePark` / `wfi`/`wfe` on firmware, `wfe` needs `SEVONPEND=1` at boot), pulse black-box (`pulse_stalls` + `PulseStall` anomaly, snapshot v3).
   * **Layer 2: Concurrency Bulkhead:** `SnubberNode`, presets, token buckets, sliding-window breakers, priority preemption, builder-sealed `passthrough` canary transit, external memory limits (`memory_limits` → `note_memory_kb`), and opt-in execution profiles (`enter_auto_profiled` → `commit_profiled`). Impedance bridge: one-slot conflation (`ConflateSender`), 16 B `ExecutionEnvelope` corridors (`commit_enveloped`), and the deterministic `ProfileHarness` that measures the corridor before you promise it.
   * **Layer 3: Async Waker Queue:** Runtime-agnostic async execution (`enter_async_auto`, `settle_async`, `enter_paced_async`).
   * **Layer 4: Process Supervisor:** Out-of-process process supervisor, framed IPC tokens, `PipeDrain`, generation bumps, and memory euthanasia (`MemoryPolicy` → soft drain / hard `DeathCause::MemoryLimit`). `PipeDrain` has three drivers over one parser — `spawn` (reader thread), `drain_sync` (blocking `Read`), and `feed` + `finish` (caller-pushed chunks) — plus an injectable `ClockFn` for lease timing and `write_to` sinks for non-stdout transports. The 64 B `StateDigest` is a ticket, not storage: a soft-limit worker must stream its checkpoint through a fixed buffer — `hard - soft` is allocator headroom, not a drain countdown. `WorkerPool` runs N independent lineages (one drain, clock, tracker and memory watch per lane) with per-lane rescue classification and an aggregated report.

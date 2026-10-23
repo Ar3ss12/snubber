@@ -55,6 +55,33 @@ now_ms() {
 rss_kb() { awk '/^VmRSS:/ {print $2; exit}' "/proc/$1/status" 2>/dev/null; }
 threads_n() { awk '/^Threads:/ {print $2; exit}' "/proc/$1/status" 2>/dev/null; }
 fds_n() { ls "/proc/$1/fd" 2>/dev/null | wc -l | tr -d ' '; }
+
+LAST_KILLED_START_S=0
+TARGET_START_S=0
+# Identity gate before SIGKILL (parity with the .ps1 image+creation-time
+# and .py /proc-starttime killers): the victim must BE the worker image,
+# not an unrelated process whose argv merely CONTAINS the target path
+# (a `tail -f` on the supervisor log, an editor, an ancestor shell).
+# Linux: /proc/<pid>/exe image name + monotonic starttime vs the last
+# kill (a stale recycled pid or a not-yet-rewritten pid file is skipped).
+# macOS/BSD: no /proc — image-name match only.
+target_is_worker() {
+    TARGET_START_S=0
+    pid="$1"
+    exe=$(basename "$(readlink "/proc/$pid/exe" 2>/dev/null)" 2>/dev/null)
+    if [ -n "$exe" ]; then
+        [ "$exe" = "$TARGET_PROCESS" ] || return 1
+        start_ticks=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+        case "$start_ticks" in ''|*[!0-9]*) return 1 ;; esac
+        clk=$(getconf CLK_TCK 2>/dev/null)
+        [ -n "$clk" ] || clk=100
+        TARGET_START_S=$((start_ticks / clk))
+        [ "$TARGET_START_S" -gt "$LAST_KILLED_START_S" ] || return 1
+        return 0
+    fi
+    comm_line=$(ps -o comm= -p "$pid" 2>/dev/null | tail -n 1)
+    [ "$(basename "$comm_line")" = "$TARGET_PROCESS" ]
+}
 cpu_ticks() { sed 's/^[^)]*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $12+$13}'; }
 
 SUP_PID=""
@@ -180,11 +207,19 @@ while [ "$EXECUTED" -lt "$KILLS" ]; do
         fi
     fi
 
+    # Identity gate: never SIGKILL a process that is not the worker image.
+    # A foreign candidate (or a stale recycled start) is skipped; if no
+    # genuine worker ever appears, the STALL watchdog breaks the loop.
+    if [ "$TARGET_PID" -ne 0 ] && ! target_is_worker "$TARGET_PID"; then
+        TARGET_PID=0
+    fi
+
     if [ "$TARGET_PID" -ne 0 ]; then
         START_NS=""
         [ "$HAVE_NS" = 1 ] && START_NS=$(date +%s%N)
         sample_worker "$TARGET_PID"
         if kill -9 "$TARGET_PID" 2>/dev/null; then
+            LAST_KILLED_START_S=$TARGET_START_S
             if [ "$HAVE_NS" = 1 ]; then
                 END_NS=$(date +%s%N)
                 awk -v a="$START_NS" -v b="$END_NS" 'BEGIN { printf "%.3f\n", (b-a)/1000000 }' >> "$LAT_FILE"

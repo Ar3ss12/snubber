@@ -9,8 +9,8 @@
 #![cfg(feature = "alloc")]
 
 use snubber::{
-    ClosurePolicy, EnterError, ErasedGuard, FaultAction, FaultDetail, FaultKind, FaultPolicy,
-    LogLevel, SnubberNode,
+    BreakerState, ClosurePolicy, EnterError, ErasedGuard, FaultAction, FaultDetail, FaultKind,
+    FaultPolicy, LogLevel, SnubberNode,
 };
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -238,9 +238,67 @@ fn erased_drop_reopens_breaker_like_a_failed_probe() {
         "failed erased probe must re-open the breaker"
     );
     assert!(matches!(
-        node.enter(3, 3, || {}),
+        node.enter(11, 11, || {}),
         Err(EnterError::BreakerOpen)
     ));
     node.reset_breaker();
     node.enter(4, 4, || {}).expect("recovers").commit();
+}
+
+// Regression (0.6.4): a panicking user rollback in the erased Drop path
+// used to unwind past `settle_erased_probe` — `ErasedGuard::drop`'s
+// catch_unwind swallowed the panic with the probe flag still set, and the
+// breaker stayed welded until a manual reset (every admission rejected as
+// BreakerOpen, nothing recorded). The settle now runs BEFORE the panic
+// resumes, so the books are always honest.
+#[test]
+fn panicking_rollback_still_settles_the_erased_probe() {
+    let node = SnubberNode::builder("erased/panic-rollback")
+        .trip_after_failures(1)
+        .build();
+    node.report(FaultKind::Panic, 1, 1); // Closed -> HalfOpen
+    assert_eq!(
+        node.stats().breaker_state,
+        BreakerState::HalfOpen,
+        "one catastrophic report trips the streak breaker"
+    );
+
+    // Probe armed via the erased path; the user rollback panics on Drop.
+    let guard = node
+        .enter_erased(10, 10, || panic!("rollback explodes"))
+        .expect("probe admitted");
+    drop(guard); // panic swallowed by the guard's catch_unwind; settle must run
+
+    // Honest failed-probe state (Open), NOT welded: a report re-arms the
+    // probe from Open and the next admission is that probe. Pre-fix the
+    // stale `half_open_probe` flag rejected it forever.
+    assert_eq!(
+        node.stats().breaker_state,
+        BreakerState::Open,
+        "failed probe must re-open the breaker, not wedge HalfOpen"
+    );
+    node.report(FaultKind::Panic, 2, 2);
+    assert_eq!(node.stats().breaker_state, BreakerState::HalfOpen);
+    node.enter(11, 11, || {})
+        .expect("probe must be re-admitted after the panicking rollback")
+        .commit();
+    assert_eq!(node.stats().breaker_state, BreakerState::Closed);
+
+    // Explicit abort with a panicking rollback: the panic surfaces to the
+    // caller (abort is an explicit call), the probe still settles.
+    node.report(FaultKind::Panic, 4, 4);
+    let guard = node
+        .enter_erased(12, 12, || panic!("rollback explodes again"))
+        .expect("probe admitted");
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || guard.abort("boom")));
+    assert!(
+        result.is_err(),
+        "abort must surface the user rollback panic"
+    );
+    assert_eq!(
+        node.stats().breaker_state,
+        BreakerState::Open,
+        "aborted probe settled honestly despite the panic"
+    );
 }

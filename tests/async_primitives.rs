@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
 static WOKEN: AtomicBool = AtomicBool::new(false);
+static EVICT_HOOK_HITS: AtomicU64 = AtomicU64::new(0);
 
 fn create_tracked_waker() -> Waker {
     unsafe fn clone(_: *const ()) -> RawWaker {
@@ -43,18 +44,37 @@ fn block_on<F: std::future::Future>(mut fut: F) -> F::Output {
 
 #[test]
 fn waker_queue_sleeps_and_wakes_on_commit() {
-    WOKEN.store(false, Ordering::SeqCst);
+    // Private wake flag: the shared `WOKEN` static is written by other
+    // tests' wakers running in parallel threads, which made the negative
+    // assert below race (spurious PASS/FAIL depending on scheduling).
+    static WOKEN_WQ: AtomicBool = AtomicBool::new(false);
+    fn waker_wq() -> Waker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VT_WQ)
+        }
+        unsafe fn wake(_: *const ()) {
+            WOKEN_WQ.store(true, Ordering::SeqCst);
+        }
+        unsafe fn wake_by_ref(_: *const ()) {
+            WOKEN_WQ.store(true, Ordering::SeqCst);
+        }
+        unsafe fn drop(_: *const ()) {}
+        static VT_WQ: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT_WQ)) }
+    }
+
+    WOKEN_WQ.store(false, Ordering::SeqCst);
     let node = SnubberNode::builder("async/waker").max_in_flight(1).build();
     let gate = node.enter(1, 1, || {}).expect("slot 1");
 
     let mut fut = node.enter_async(2, 2, || {});
 
     // Poll with our tracked waker:
-    let waker = create_tracked_waker();
+    let waker = waker_wq();
     let mut cx = std::task::Context::from_waker(&waker);
     assert!(core::pin::Pin::new(&mut fut).poll(&mut cx).is_pending());
     assert!(
-        !WOKEN.load(Ordering::SeqCst),
+        !WOKEN_WQ.load(Ordering::SeqCst),
         "must not be woken while slot held"
     );
     assert_eq!(node.waiter_len(), 1, "waker parked in the queue");
@@ -62,7 +82,7 @@ fn waker_queue_sleeps_and_wakes_on_commit() {
     // Release slot: node MUST explicitly invoke waker.wake()
     drop(gate);
     assert!(
-        WOKEN.load(Ordering::SeqCst),
+        WOKEN_WQ.load(Ordering::SeqCst),
         "node MUST explicitly invoke waker.wake() on slot release"
     );
 
@@ -393,4 +413,46 @@ fn admitted_on_spurious_repoll_leaves_no_ghost_waiter() {
     }
 
     guard.commit();
+}
+
+// Regression (0.6.4): async EvictOldest evictions now go through the same
+// `record_locked` + per-kind policy path as the sync arm — `reported`
+// agrees with `stats.evicted` (pre-fix the async arm bumped only the raw
+// `evicted` counter, so a user's `.policy(EvictedOldest, ..)` never fired
+// and the telemetry columns disagreed).
+#[test]
+fn async_eviction_reports_evicted_oldest_telemetry() {
+    WOKEN_A.store(false, Ordering::SeqCst);
+    WOKEN_B.store(false, Ordering::SeqCst);
+    EVICT_HOOK_HITS.store(0, Ordering::SeqCst);
+    let node = SnubberNode::builder("async/evict-telemetry")
+        .max_in_flight(1)
+        .queue_limit(1)
+        .overflow(OverflowPolicy::EvictOldest)
+        .on_fault(|record, _, _| {
+            if record.kind == FaultKind::EvictedOldest {
+                EVICT_HOOK_HITS.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .build();
+    let _slot = node.enter(1, 1, || {}).expect("occupy the only slot");
+
+    let mut fut_a = node.enter_async(2, 2, || {});
+    let wa = waker_a();
+    let cx_a = &mut std::task::Context::from_waker(&wa);
+    assert!(core::pin::Pin::new(&mut fut_a).poll(cx_a).is_pending());
+
+    let mut fut_b = node.enter_async(3, 3, || {});
+    let wb = waker_b();
+    let cx_b = &mut std::task::Context::from_waker(&wb);
+    assert!(core::pin::Pin::new(&mut fut_b).poll(cx_b).is_pending());
+    assert!(WOKEN_A.load(Ordering::SeqCst), "eviction fired");
+
+    let s = node.stats();
+    assert_eq!(s.evicted, 1, "exactly one eviction, no double counting");
+    assert_eq!(
+        EVICT_HOOK_HITS.load(Ordering::SeqCst),
+        1,
+        "the async eviction must fire the per-kind policy path (sync-arm parity)"
+    );
 }

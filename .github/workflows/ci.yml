@@ -17,12 +17,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags: Gate 6 diffs the public API against the
+          # last release tag via `git describe`; a depth-1 checkout makes
+          # the semver gate silently SKIP.
+          fetch-depth: 0
 
       - name: Install Stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
           targets: thumbv7em-none-eabihf
+
+      - name: Install cargo-semver-checks (Gate 6)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2

@@ -187,3 +187,76 @@ fn bulkhead_rejection_leaves_the_epoch_free_for_retry() {
         .expect("same epoch must stay fresh after BulkheadFull")
         .commit();
 }
+
+// Regression (0.6.4): the EvictOldest overbooking is capped at exactly ONE
+// extra slot (legal ceiling `max + 1`). Before the fix every saturated
+// call re-booked, `hard_clamp_slots` erased the surplus from `in_flight`
+// while the live guards kept their real slots, and `lane_in_flight`
+// diverged from `in_flight` — which silently disabled Critical-over-
+// Background preemption forever (its precondition
+// `lane_in_flight[0] == in_flight` could never hold again).
+#[test]
+fn evict_oldest_overbooking_caps_at_max_plus_one() {
+    let node = SnubberNode::builder("wall/evict-ceiling")
+        .max_in_flight(2)
+        .shed_policy(OverflowPolicy::EvictOldest)
+        .trip_after_failures(0)
+        .build();
+
+    let g1 = node.enter(1, 1, || {}).expect("first admission");
+    let g2 = node.enter(2, 2, || {}).expect("second admission");
+    let g3 = node
+        .enter(3, 3, || {})
+        .expect("the single legal overbook fills max + 1");
+    assert!(!node.bulkhead_has_room(), "at the legal ceiling");
+
+    // Beyond the ceiling: refused, and the refusal must not erode the books.
+    match node.enter(4, 4, || {}) {
+        Err(EnterError::BulkheadFull) => {}
+        Ok(_) => panic!("third concurrent caller must be refused at max + 1"),
+        Err(e) => panic!("expected BulkheadFull, got {e:?}"),
+    }
+    assert!(matches!(
+        node.enter(5, 5, || {}),
+        Err(EnterError::BulkheadFull)
+    ));
+
+    assert_eq!(
+        node.lane_in_flight(),
+        [0, 3, 0],
+        "lane accounting must still equal live guards (max + 1), not diverge"
+    );
+
+    let s = node.stats();
+    assert_eq!(
+        s.evicted, 1,
+        "exactly one overbook, not one per refused caller"
+    );
+    assert_eq!(
+        s.bulkhead_rejections, 2,
+        "refusals counted as bulkhead shedding"
+    );
+
+    drop(g1);
+    drop(g2);
+    assert!(node.bulkhead_has_room(), "slots freed below the ceiling");
+    let g6 = node.enter(6, 6, || {}).expect("re-admission after drain");
+    let g7 = node
+        .enter(7, 7, || {})
+        .expect("the overbook is available again at saturation");
+    assert!(matches!(
+        node.enter(8, 8, || {}),
+        Err(EnterError::BulkheadFull)
+    ));
+
+    drop(g3);
+    drop(g6);
+    drop(g7);
+    let s = node.stats();
+    assert_eq!(
+        s.total_started,
+        s.committed + s.implicit_drops + s.explicit_aborts,
+        "every admission settled exactly once"
+    );
+    assert_eq!(node.lane_in_flight(), [0, 0, 0], "clean drain");
+}
