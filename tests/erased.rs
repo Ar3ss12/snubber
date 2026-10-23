@@ -217,7 +217,9 @@ fn erased_admission_does_not_close_half_open_breaker() {
         snubber::BreakerState::Closed,
         "erased commit settles the probe: breaker closes"
     );
-    node.enter(4, 4, || {}).expect("admits after recovery").commit();
+    node.enter(4, 4, || {})
+        .expect("admits after recovery")
+        .commit();
 }
 
 #[test]
@@ -235,7 +237,10 @@ fn erased_drop_reopens_breaker_like_a_failed_probe() {
         snubber::BreakerState::Open,
         "failed erased probe must re-open the breaker"
     );
-    assert!(matches!(node.enter(3, 3, || {}), Err(EnterError::BreakerOpen)));
+    assert!(matches!(
+        node.enter(3, 3, || {}),
+        Err(EnterError::BreakerOpen)
+    ));
     node.reset_breaker();
     node.enter(4, 4, || {}).expect("recovers").commit();
 }

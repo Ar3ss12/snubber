@@ -168,7 +168,10 @@ fn custom_pressure_advisory_is_capped_by_the_node_ceiling() {
         .backpressure(BackpressurePolicy::Custom(reactor))
         .build();
     let _held = node.enter(1, 1, || {}).expect("first slot");
-    assert!(matches!(node.enter(2, 2, || {}), Err(EnterError::BulkheadFull)));
+    assert!(matches!(
+        node.enter(2, 2, || {}),
+        Err(EnterError::BulkheadFull)
+    ));
     assert_eq!(
         SEEN.load(Ordering::SeqCst),
         1000,

@@ -312,9 +312,7 @@ impl<S, D> TaskHandle<S, D> {
                 if let Ok(slot) = reason_lock.as_deref_mut() {
                     *slot = Some(reason);
                 }
-                self.inner
-                    .directive
-                    .store(DIR_PREEMPTED, Ordering::Release);
+                self.inner.directive.store(DIR_PREEMPTED, Ordering::Release);
                 self.inner.condvar.notify_all();
                 drop(reason_lock);
                 self.wake_async();

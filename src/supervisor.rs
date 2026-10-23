@@ -1519,8 +1519,7 @@ impl Supervisor {
             // CLEAN while the child's last words are still in flight.
             let eof_started = drain.now_ms();
             while !drain.eof()
-                && drain.now_ms().saturating_sub(eof_started)
-                    <= crate::pool::DEFAULT_EOF_GRACE_MS
+                && drain.now_ms().saturating_sub(eof_started) <= crate::pool::DEFAULT_EOF_GRACE_MS
             {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
