@@ -88,7 +88,7 @@ if ($FnBody.Count -eq 0 -or ($FnBody[0] -notmatch 'fn record_locked\(')) {
 
 # Gate 4: Zero-metaphor scan across codebase (AGENTS.md Section 14)
 Write-Host "[4/6] Auditing forbidden metaphors..." -NoNewline
-# Scope: src + benches + examples + tests — public examples are as
+# Scope: src + benches + examples + tests -- public examples are as
 # user-visible as the docs the rule protects (parity with the .sh gate).
 # Excludes binary header magic terminology ("magic bytes / magic number") which is technical standard.
 $ForbiddenPatterns = @(
@@ -126,7 +126,7 @@ if ($LibContent -cnotmatch '(?m)^#!\[cfg_attr\(not\(feature = "std"\), no_std\)\
     $Failures++
 } elseif (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
     if ($InCi) {
-        Write-Host " FAIL (CI: rustup missing — workflow must install the toolchain)" -ForegroundColor Red
+        Write-Host " FAIL (CI: rustup missing -- workflow must install the toolchain)" -ForegroundColor Red
         $Failures++
     } else {
         Write-Host " SKIP (rustup not installed)" -ForegroundColor Yellow
@@ -134,7 +134,7 @@ if ($LibContent -cnotmatch '(?m)^#!\[cfg_attr\(not\(feature = "std"\), no_std\)\
     }
 } elseif (-not ((rustup target list --installed) -contains $BareMetalTarget)) {
     if ($InCi) {
-        Write-Host " FAIL (CI: bare-metal target missing — workflow must run: rustup target add $BareMetalTarget)" -ForegroundColor Red
+        Write-Host " FAIL (CI: bare-metal target missing -- workflow must run: rustup target add $BareMetalTarget)" -ForegroundColor Red
         $Failures++
     } else {
         Write-Host " SKIP (target not installed: rustup target add $BareMetalTarget)" -ForegroundColor Yellow
@@ -170,7 +170,7 @@ $GitExit = $LASTEXITCODE
 $ErrorActionPreference = $PrevEap
 if ($GitExit -ne 0 -or -not $ApiBaseline) {
     if ($InCi) {
-        Write-Host " FAIL (CI: no git tag baseline — checkout must fetch tags and the repo must be tagged per release)" -ForegroundColor Red
+        Write-Host " FAIL (CI: no git tag baseline -- checkout must fetch tags and the repo must be tagged per release)" -ForegroundColor Red
         $Failures++
     } else {
         Write-Host " SKIP (no git tag baseline)" -ForegroundColor Yellow
@@ -191,7 +191,7 @@ if ($GitExit -ne 0 -or -not $ApiBaseline) {
     $ErrorActionPreference = $PrevEap
     if (-not $SemverInstalled) {
         if ($InCi) {
-            Write-Host " FAIL (CI: cargo-semver-checks missing — workflow must install it)" -ForegroundColor Red
+            Write-Host " FAIL (CI: cargo-semver-checks missing -- workflow must install it)" -ForegroundColor Red
             $Failures++
         } else {
             Write-Host " SKIP (cargo-semver-checks not installed)" -ForegroundColor Yellow
@@ -222,7 +222,7 @@ Write-Host "---------------------------------------------"
 if ($Skips -gt 0) {
     # Never a PASS-looking summary over a reduced audit: the skip count
     # is on its own line, next to the verdict.
-    Write-Host "$Skips gate(s) SKIPPED — the audit ran at reduced coverage." -ForegroundColor Yellow
+    Write-Host "$Skips gate(s) SKIPPED -- the audit ran at reduced coverage." -ForegroundColor Yellow
 }
 if ($Failures -eq 0) {
     Write-Host "All invariant gates PASSED." -ForegroundColor Green

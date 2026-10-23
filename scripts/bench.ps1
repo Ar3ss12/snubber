@@ -1,4 +1,4 @@
-# SNUBBER BENCH HARNESS — run Criterion benchmarks and export a
+# SNUBBER BENCH HARNESS -- run Criterion benchmarks and export a
 # float-free telemetry snapshot (ns/op, mean point estimate) into
 # target/bench/snapshot.md.
 #
@@ -104,7 +104,7 @@ foreach ($est in $estimates) {
 if ($rows.Count -le 2) {
     # Header-only snapshot means the export saw no estimates: publishing it
     # would zero out the README table with a green CI. Fail instead.
-    Write-Error "No bench estimates found under $criterionDir — refusing to write an empty snapshot."
+    Write-Error "No bench estimates found under $criterionDir -- refusing to write an empty snapshot."
     exit 1
 }
 

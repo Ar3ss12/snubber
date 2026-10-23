@@ -24,7 +24,7 @@ if (-not $Baseline) {
 Write-Host "[API] semver diff" -NoNewline
 if (-not $Baseline) {
     if (Test-Path "$RepoRoot\.git\shallow") {
-        Write-Host " SKIP (no git tag baseline; shallow clone — run: git fetch --tags --unshallow)"
+        Write-Host " SKIP (no git tag baseline; shallow clone -- run: git fetch --tags --unshallow)"
     } else {
         Write-Host " SKIP (no git tag baseline)"
     }
