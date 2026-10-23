@@ -22,6 +22,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: thumbv7em-none-eabihf
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
@@ -34,6 +35,11 @@ jobs:
 
       - name: Pure Bare-Metal Layer 1 Check (no-default-features)
         run: cargo check --no-default-features
+
+      - name: TRUE no_std Gate (bare-metal target, core + alloc)
+        run: |
+          cargo check --no-default-features --target thumbv7em-none-eabihf
+          cargo check --no-default-features --features alloc --target thumbv7em-none-eabihf
 
       - name: Architectural Invariant & Compile Gates Audit
         run: bash scripts/check_compile_gates.sh

@@ -5,7 +5,7 @@
 //! they now describe one worker instead of a merged crowd.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::memory::MemoryVerdict;
 use crate::supervisor::{
@@ -244,9 +244,15 @@ impl PoolLane {
 
         let mut deadlock = false;
         if self.eof_grace_ms > 0 {
-            let deadline = Instant::now() + Duration::from_millis(self.eof_grace_ms);
+            // Grace runs on the drain's own clock: the default is the
+            // process monotonic ms, tests inject a counter, firmware pushes
+            // chunks and calls `finish()` from its own task.
+            // Strictly greater: millisecond clocks truncate, so `>=` can
+            // declare the grace over up to 1 ms early. `>` costs one poll
+            // and guarantees the caller actually got the full window.
+            let started = drain.now_ms();
             while !drain.eof() {
-                if Instant::now() >= deadline {
+                if drain.now_ms().saturating_sub(started) > self.eof_grace_ms {
                     deadlock = true;
                     break;
                 }

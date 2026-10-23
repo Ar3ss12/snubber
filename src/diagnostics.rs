@@ -14,6 +14,9 @@
 
 use core::fmt;
 
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
+
 #[cfg(feature = "std")]
 use super::{SnubberNode, SnubberStats};
 
@@ -551,16 +554,19 @@ fn percent_of(n: u64, ceiling: u64) -> u8 {
 /// Cold anomaly scan over a snapshot (works from a decoded `app.snub`
 /// with no live node at hand). Pure math: `u128` percents,
 /// `total == 0` guard (no verdicts on silence), saturating everywhere.
-#[must_use]
-pub fn find_anomalies_for_snapshot(
+///
+/// `core`-only: verdicts go to `sink` one by one, so firmware pays only
+/// for the anomalies it actually sees. [`find_anomalies_for_snapshot`]
+/// is the `alloc` convenience wrapper.
+pub fn scan_anomalies_for_snapshot<F: FnMut(Anomaly)>(
     node: &'static str,
     snap: &SnapshotV1,
     policy: &AnomalyPolicy,
-) -> Vec<Anomaly> {
-    let mut out = Vec::new();
+    mut sink: F,
+) {
     let catastrophic = snap.catastrophic_faults();
     if catastrophic > 0 {
-        out.push(Anomaly {
+        sink(Anomaly {
             kind: AnomalyKind::Catastrophic,
             node,
             pct: 100,
@@ -568,7 +574,7 @@ pub fn find_anomalies_for_snapshot(
         });
     }
     if snap.shed_stale() > 0 {
-        out.push(Anomaly {
+        sink(Anomaly {
             kind: AnomalyKind::Desync,
             node,
             pct: 1,
@@ -578,7 +584,7 @@ pub fn find_anomalies_for_snapshot(
     // Front 4: missed heartbeats ignore `min_sample` (like desync) — a
     // single frozen pulse on an idle node is still a lag verdict.
     if snap.pulse_stalls > 0 {
-        out.push(Anomaly {
+        sink(Anomaly {
             kind: AnomalyKind::PulseStall,
             node,
             pct: snap.max_pulse_lag_ms.min(100) as u8,
@@ -597,7 +603,7 @@ pub fn find_anomalies_for_snapshot(
             snap.memory_soft_kb
         };
         let pct = percent_of(snap.memory_used_kb, ceiling);
-        out.push(Anomaly {
+        sink(Anomaly {
             kind: AnomalyKind::MemoryGrowth,
             node,
             pct,
@@ -608,7 +614,7 @@ pub fn find_anomalies_for_snapshot(
     if snap.queue_capacity > 0 {
         let pct = percent_of(snap.queue_depth, snap.queue_capacity);
         if pct > policy.bottleneck_pct {
-            out.push(Anomaly {
+            sink(Anomaly {
                 kind: AnomalyKind::QueueSaturation,
                 node,
                 pct,
@@ -621,7 +627,7 @@ pub fn find_anomalies_for_snapshot(
         let pct_of = |n: u64| ((n as u128 * 100) / (total as u128).max(1)).min(100) as u8;
         let bulk = snap.shed_bulkhead();
         if bulk > 0 && pct_of(bulk) > policy.bottleneck_pct {
-            out.push(Anomaly {
+            sink(Anomaly {
                 kind: AnomalyKind::Bottleneck,
                 node,
                 pct: pct_of(bulk),
@@ -630,7 +636,7 @@ pub fn find_anomalies_for_snapshot(
         }
         let rate = snap.shed_rate();
         if rate > 0 && pct_of(rate) > policy.flood_pct {
-            out.push(Anomaly {
+            sink(Anomaly {
                 kind: AnomalyKind::Flood,
                 node,
                 pct: pct_of(rate),
@@ -639,7 +645,7 @@ pub fn find_anomalies_for_snapshot(
         }
         let preempted = snap.shed_preempted();
         if preempted > 0 && pct_of(preempted) > policy.flood_pct {
-            out.push(Anomaly {
+            sink(Anomaly {
                 kind: AnomalyKind::PreemptStorm,
                 node,
                 pct: pct_of(preempted),
@@ -647,6 +653,18 @@ pub fn find_anomalies_for_snapshot(
             });
         }
     }
+}
+
+/// Cold anomaly scan collected into a `Vec` (`alloc` convenience).
+#[cfg(feature = "alloc")]
+#[must_use]
+pub fn find_anomalies_for_snapshot(
+    node: &'static str,
+    snap: &SnapshotV1,
+    policy: &AnomalyPolicy,
+) -> Vec<Anomaly> {
+    let mut out = Vec::new();
+    scan_anomalies_for_snapshot(node, snap, policy, |anomaly| out.push(anomaly));
     out
 }
 

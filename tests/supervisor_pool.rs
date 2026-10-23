@@ -13,6 +13,7 @@ use snubber::{
     StateDigest, STATE_LEN,
 };
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -290,6 +291,53 @@ fn eof_grace_reports_deadlock_instead_of_guessing() {
     assert!(!report.healthy(), "a deadlocked lane is not healthy");
     assert!(report.conserved(), "deadlock is a fourth honest bucket");
     assert!(report.to_string().contains("deadlocks=1"));
+}
+
+static GRACE_TICKS: AtomicU64 = AtomicU64::new(0);
+
+fn ticking_clock() -> u64 {
+    GRACE_TICKS.fetch_add(1, Ordering::SeqCst)
+}
+
+#[test]
+fn eof_grace_follows_the_drain_clock_not_wall_time() {
+    let pool = WorkerPool::new(PoolConfig::new(1).with_eof_grace(5)).expect("one lane");
+    let lane = pool.lane(0).expect("lane 0");
+    let drain = PipeDrain::manual_with_clock(ticking_clock);
+    drain.feed(&ProcessToken::simple(1, 9, 1).to_bytes());
+    lane.attach(9, drain).expect("attach");
+
+    let started = Instant::now();
+    let reap = lane.note_death(None, 0).expect("reap");
+    // Five 1 ms polls move the injected clock past the grace; the verdict
+    // comes from the clock value, not from elapsed wall time.
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(reap.deadlock);
+    assert_eq!(reap.class, ReapClass::Deadlocked);
+    assert_eq!(reap.token, None, "a deadlocked drain claims nothing");
+}
+
+#[test]
+fn manually_fed_drain_reaps_as_ambush_after_finish() {
+    let pool = WorkerPool::new(PoolConfig::new(1).with_eof_grace(5)).expect("one lane");
+    let lane = pool.lane(0).expect("lane 0");
+    let drain = PipeDrain::manual();
+    let frame = ProcessToken::simple(namespace_task(0, 11), 9, 1).to_bytes();
+    // Split the frame across two pushes, then declare EOF from the app.
+    let (head, tail) = frame.split_at(20);
+    assert_eq!(drain.feed(head), 0);
+    assert_eq!(drain.feed(tail), 1);
+    drain.finish();
+    lane.attach(10, drain).expect("attach");
+
+    let reap = lane.note_death(None, 0).expect("reap");
+    assert!(!reap.deadlock);
+    assert_eq!(reap.class, ReapClass::Ambush);
+    assert_eq!(
+        reap.token.map(|token| token.task),
+        Some(namespace_task(0, 11))
+    );
+    assert_eq!(lane.generation(), 2);
 }
 
 #[test]

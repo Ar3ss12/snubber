@@ -13,7 +13,19 @@
 //! * Application: provides the `unsafe` backends. The crate never
 //!   touches `unsafe` or OS handles — see `contract.rs` boundary.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_has_atomic = "64"))]
+use core::sync::atomic::AtomicU32;
+#[cfg(target_has_atomic = "64")]
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::Ordering;
+
+#[cfg(target_has_atomic = "64")]
+type PulseTick = AtomicU64;
+/// Targets without 64-bit CAS (Cortex-M0..M7) keep a wrapping 32-bit
+/// generation: the watcher only compares for equality, so a wrap is
+/// invisible unless two observations are exactly 2^32 kicks apart.
+#[cfg(not(target_has_atomic = "64"))]
+type PulseTick = AtomicU32;
 
 /// Millisecond tick source. Monotonic (never moves backwards).
 ///
@@ -124,7 +136,7 @@ pub const fn classify_stall_ceiling(
 /// worker settles itself at its next `check_timeout` checkpoint.
 #[derive(Debug)]
 pub struct WorkerPulse {
-    tick: AtomicU64,
+    tick: PulseTick,
 }
 
 impl WorkerPulse {
@@ -133,7 +145,7 @@ impl WorkerPulse {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            tick: AtomicU64::new(0),
+            tick: PulseTick::new(0),
         }
     }
 
@@ -143,10 +155,20 @@ impl WorkerPulse {
         self.tick.fetch_add(1, Ordering::Release);
     }
 
-    /// Current tick (for the watcher side).
+    /// Current tick (for the watcher side). 64-bit monotonic counter;
+    /// targets without 64-bit atomics wrap at `2^32`.
+    #[cfg(target_has_atomic = "64")]
     #[inline]
     pub fn tick(&self) -> u64 {
         self.tick.load(Ordering::Acquire)
+    }
+
+    /// Current tick (for the watcher side). Wraps at `2^32` on targets
+    /// without 64-bit atomics.
+    #[cfg(not(target_has_atomic = "64"))]
+    #[inline]
+    pub fn tick(&self) -> u64 {
+        u64::from(self.tick.load(Ordering::Acquire))
     }
 }
 
@@ -259,10 +281,18 @@ impl IdlePark for SpinPark {
     }
 }
 
+#[cfg(target_has_atomic = "64")]
 const _: () = {
     assert!(
         core::mem::size_of::<WorkerPulse>() == 8,
         "WorkerPulse must stay one AtomicU64 (8 bytes)"
+    );
+};
+#[cfg(not(target_has_atomic = "64"))]
+const _: () = {
+    assert!(
+        core::mem::size_of::<WorkerPulse>() == 4,
+        "WorkerPulse must stay one AtomicU32 (4 bytes) without 64-bit CAS"
     );
 };
 

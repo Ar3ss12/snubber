@@ -3,7 +3,7 @@ use snubber::pool::{namespace_task, task_lane, task_local, PoolConfig, WorkerPoo
 use snubber::{
     classify_stall_ceiling, gateway, ConflateSender, EpochGate, ExecutionEnvelope, IsrBridge,
     IsrSignal, PipeDrain, Priority, ProcessToken, PulseWatch, SnubberGuard, SnubberNode,
-    TaskConduit, TransactionHeader, WorkerPulse, OP_HEARTBEAT, OP_PULSE,
+    StateDigest, TaskConduit, TransactionHeader, WorkerPulse, OP_HEARTBEAT, OP_PULSE,
 };
 use std::time::Duration;
 
@@ -402,6 +402,43 @@ fn bench_pipe_drain(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_drain_feed(c: &mut Criterion) {
+    // One frame per call: the full scanner state machine (magic window,
+    // body assembly, dispatch) with no reader, no thread, no syscall.
+    let frame = ProcessToken::simple(7, OP_HEARTBEAT, 0).to_bytes();
+    let mut g = c.benchmark_group("layer4_drain_feed");
+    let single = PipeDrain::manual();
+    g.bench_function("drain_feed_frame", |b| {
+        b.iter(|| black_box(single.feed(black_box(&frame))));
+    });
+
+    // 256 frames in one chunk: amortizes the per-call lock and branch.
+    const FRAMES: usize = 256;
+    let mut wire = Vec::with_capacity(FRAMES * 44);
+    for i in 0..FRAMES as u64 {
+        wire.extend_from_slice(&ProcessToken::commit(i).to_bytes());
+    }
+    let bulk = PipeDrain::manual();
+    g.bench_function("drain_feed_256_frames", |b| {
+        b.iter(|| black_box(bulk.feed(black_box(&wire))));
+    });
+    g.finish();
+
+    // Transport-agnostic token sink: 44 bytes into a discarding writer.
+    let mut g = c.benchmark_group("layer4_token_sink");
+    let token = ProcessToken::simple(1, 9, 7);
+    let digest = StateDigest::new([7u8; 64]);
+    g.bench_function("token_write_to", |b| {
+        let mut sink = std::io::sink();
+        b.iter(|| black_box(token.write_to(&mut sink)));
+    });
+    g.bench_function("state_digest_write_to", |b| {
+        let mut sink = std::io::sink();
+        b.iter(|| black_box(digest.write_to(&mut sink)));
+    });
+    g.finish();
+}
+
 fn bench_pool(c: &mut Criterion) {
     use std::io::Cursor;
 
@@ -741,6 +778,6 @@ fn bench_contended(c: &mut Criterion) {
 criterion_group!(
     name = benches;
     config = fast();
-    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_impedance, bench_layer4_layer5, bench_pipe_drain, bench_pool, bench_contended
+    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_impedance, bench_layer4_layer5, bench_pipe_drain, bench_drain_feed, bench_pool, bench_contended
 );
 criterion_main!(benches);

@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-318%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-337%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -45,6 +45,22 @@ let receipt = node.scoped_checked(
 
 ---
 
+## 🔌 Embedded & `no_std`
+
+`std` and `alloc` are additive features. Without `std` the crate is `core`-only (`#![cfg_attr(not(feature = "std"), no_std)]`); CI builds **both** `core` and `core + alloc` for `thumbv7em-none-eabihf`, and `WorkerPulse` drops to a 32-bit atomic on targets without 64-bit CAS. Layers 1–3 and the diagnostics core are fully `no_std`; the supervisor and pool stay `std` because they own OS pipes and reader threads.
+
+The supervisor parser does not require a reader thread or stdout. Push bytes from a UART/DMA task and declare EOF yourself:
+
+```rust
+let drain = PipeDrain::manual_with_clock(app_tick_ms); // injectable clock
+let frames = drain.feed(uart_chunk);                   // any chunking, any size
+drain.finish();                                        // EOF → rescue classification
+```
+
+`ProcessToken::write_to(&mut sink)` and `StateDigest::write_to(&mut sink)` replace `emit_if_supervised` when the transport is not stdout: no environment lookup, no global lock, errors returned.
+
+---
+
 ## 🛡️ Architecture & Guarantees
 
 * **Zero-Boilerplate RAII Rollback:** No manual token tracking. Scoped executions auto-commit on success and guarantee resource release via `Drop` on panics, errors, or early returns.
@@ -67,7 +83,7 @@ let receipt = node.scoped_checked(
 Measured on AMD Ryzen 5 4600H release build
 (`cargo bench --bench admission_bench`, Criterion: 800 ms warmup,
 2 s measurement, 50 samples, isolated node per bench; re-measured
-2026-10-23 after the worker-pool group was added):
+2026-10-23 after the drain-feed and token-sink groups were added):
 
 | Operation | Architecture Layer | Average Latency | Notes |
 |---|---|---|---|
@@ -94,6 +110,10 @@ Measured on AMD Ryzen 5 4600H release build
 | `ProcessToken::from_bytes()` | Layer 4 (`core`) | **~7.3 ns** | 40-byte body parse, no allocation |
 | `state_digest.crc()` | Layer 4 (`core`) | **~266 ns** | 64-byte hardware cache line digest verification |
 | `PipeDrain::drain_sync` | Layer 4 (`std`) | **~61 ns/frame** | 256 frames: 16.5M frames/s including per-stream drain state |
+| `PipeDrain::feed` (one 44 B frame) | Layer 4 (`std`) | **~97 ns** | Caller-pushed chunk: scanner + lock + dispatch, no reader thread |
+| `PipeDrain::feed` (256 frames/chunk) | Layer 4 (`std`) | **~21.2 µs** (82.7 ns/frame) | Same scanner, one lock per chunk |
+| `ProcessToken::write_to(&mut sink)` | Layer 4 (`std`) | **~0.5 ns** | 44 B `write_all` into any `Write`: no env, no stdout lock |
+| `StateDigest::write_to(&mut sink)` | Layer 4 (`std`) | **~616 ns** | Three `OP_STATE` frames + CRC32 seals |
 | `namespace_task` pack / unpack | Layer 4 (`std`) | **~2.1 / 1.0 ns** | `task = lane << 48 \| local`; two shifts + mask, no branch |
 | `lane.attach` + `note_death` (ambush) | Layer 4 (`std`) | **~328 ns** | Full rescue path: drain EOF, token take, generation bump, restart math, per-class counters |
 | `lane.attach` + `note_death` (escape) | Layer 4 (`std`) | **~400 ns** | Same path when the child settled (commit parsed, no token) |
@@ -191,7 +211,7 @@ Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~32
   * **Layer 1.5: Hang Classification:** Monotonic clock (`MonotonicMs` / `SystemClock`), CPU-spin classifier (`classify_stall`, `TimedOut` vs `SpinDetected`), 8-byte `WorkerPulse` heartbeat + `WdtSink`, ISR bridge (`IsrBridge`, 80 B SPSC ring + 32-bit trip latch, `IsrBridge::trip` bypasses `Full`), idle-park (`IdlePark` / `wfi`/`wfe` on firmware, `wfe` needs `SEVONPEND=1` at boot), pulse black-box (`pulse_stalls` + `PulseStall` anomaly, snapshot v3).
   * **Layer 2: Concurrency Bulkhead:** `SnubberNode`, presets, token buckets, sliding-window breakers, priority preemption, builder-sealed `passthrough` canary transit, external memory limits (`memory_limits` → `note_memory_kb`), and opt-in execution profiles (`enter_auto_profiled` → `commit_profiled`). Impedance bridge: one-slot conflation (`ConflateSender`), 16 B `ExecutionEnvelope` corridors (`commit_enveloped`), and the deterministic `ProfileHarness` that measures the corridor before you promise it.
   * **Layer 3: Async Waker Queue:** Runtime-agnostic async execution (`enter_async_auto`, `settle_async`, `enter_paced_async`).
-  * **Layer 4: Process Supervisor:** Out-of-process process supervisor, framed IPC tokens, `PipeDrain`, generation bumps, and memory euthanasia (`MemoryPolicy` → soft drain / hard `DeathCause::MemoryLimit`). The 64 B `StateDigest` is a ticket, not storage: a soft-limit worker must stream its checkpoint through a fixed buffer — `hard - soft` is allocator headroom, not a drain countdown. `WorkerPool` runs N independent lineages (one drain, clock, tracker and memory watch per lane) with per-lane rescue classification and an aggregated report.
+  * **Layer 4: Process Supervisor:** Out-of-process process supervisor, framed IPC tokens, `PipeDrain`, generation bumps, and memory euthanasia (`MemoryPolicy` → soft drain / hard `DeathCause::MemoryLimit`). `PipeDrain` has three drivers over one parser — `spawn` (reader thread), `drain_sync` (blocking `Read`), and `feed` + `finish` (caller-pushed chunks) — plus an injectable `ClockFn` for lease timing and `write_to` sinks for non-stdout transports. The 64 B `StateDigest` is a ticket, not storage: a soft-limit worker must stream its checkpoint through a fixed buffer — `hard - soft` is allocator headroom, not a drain countdown. `WorkerPool` runs N independent lineages (one drain, clock, tracker and memory watch per lane) with per-lane rescue classification and an aggregated report.
   * **Layer 5: Diagnostics & Health:** Zero-allocation telemetry, `SnapshotV1` v4 (memory + queue gauges), anomaly detection (`MemoryGrowth`, `QueueSaturation`), `SnapshotDiff`, ASCII triage card, and CI verification gates.
 
 ---

@@ -559,14 +559,27 @@ impl ProcessToken {
 
     /// Emit framed token to stdout if running under a supervisor (`SNUBBER_SUPERVISED` env var is set).
     /// Token is preceded by the 4-byte `SNUB` sync magic, making it immune to stray text in stdout.
+    ///
+    /// Stdout + env are only the DEFAULT transport: apps that own a socket,
+    /// UART or pipe call [`ProcessToken::write_to`] directly.
     pub fn emit_if_supervised(&self) {
         if Self::is_supervised() {
             use std::io::Write;
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
-            let _ = lock.write_all(&self.to_bytes());
+            let _ = self.write_to(&mut lock);
             let _ = lock.flush();
         }
+    }
+
+    /// Write the 44 wire bytes to any sink — pipe, socket, UART bridge or
+    /// in-memory buffer. No env lookup, no stdout coupling; errors are
+    /// returned instead of swallowed.
+    ///
+    /// # Errors
+    /// Whatever `out` returns.
+    pub fn write_to<W: std::io::Write>(self, out: &mut W) -> std::io::Result<()> {
+        out.write_all(&self.to_bytes())
     }
 
     /// Serialize to 44 wire bytes with "SNUB" sync magic (little-endian, no alloc).
@@ -761,6 +774,17 @@ impl StateDigest {
         frames
     }
 
+    /// Write the three `OP_STATE` frames to any sink (no env, no stdout).
+    ///
+    /// # Errors
+    /// Whatever `out` returns.
+    pub fn write_to<W: std::io::Write>(self, out: &mut W) -> std::io::Result<()> {
+        for frame in self.to_frames() {
+            frame.write_to(out)?;
+        }
+        Ok(())
+    }
+
     /// Publish to stdout under a supervisor (child process side).
     /// No-op when unsupervised. Flushes — drain reads in real time.
     pub fn emit_if_supervised(&self) {
@@ -768,9 +792,7 @@ impl StateDigest {
             use std::io::Write;
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
-            for f in self.to_frames() {
-                let _ = lock.write_all(&f.to_bytes());
-            }
+            let _ = self.write_to(&mut lock);
             let _ = lock.flush();
         }
     }
@@ -811,12 +833,21 @@ struct DrainState {
     scratch_full_crc: u32,
 }
 
+/// Monotonic millisecond clock supplied to a drain.
+///
+/// The default is [`now_ms`]; tests pass a counter and firmware passes its
+/// `SysTick` read, so lease sweeps are driven by the same clock the app
+/// already owns instead of a hidden `Instant`.
+pub type ClockFn = fn() -> u64;
+
 /// Monotonic millisecond clock (supervisor side, `std` backend).
 ///
 /// Delegates to the node-side boot-relative `Instant` source so both
-/// halves of Layer 4 share one origin. Never `SystemTime`.
+/// halves of Layer 4 share one origin. Never `SystemTime`. This is the
+/// default [`ClockFn`]; callers that own a cheaper tick source can inject
+/// their own via [`PipeDrain::manual_with_clock`].
 #[inline]
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     super::node::now_ms()
 }
 
@@ -835,194 +866,229 @@ pub struct DrainCounters {
     pub commits: u64,
 }
 
+/// Incremental `SNUB` frame scanner: survives arbitrary chunk boundaries.
+#[derive(Debug)]
+struct IngestState {
+    window: [u8; 4],
+    body: [u8; 40],
+    body_len: usize,
+    in_body: bool,
+}
+
+impl Default for IngestState {
+    fn default() -> Self {
+        Self {
+            window: [0u8; 4],
+            body: [0u8; 40],
+            body_len: 0,
+            in_body: false,
+        }
+    }
+}
+
+impl IngestState {
+    /// Consume a chunk, calling `on_token` for every complete frame.
+    /// Returns the number of frames delivered. A partial frame stays in
+    /// the scanner until the next chunk (or is dropped at `finish`).
+    fn push<F: FnMut(ProcessToken)>(&mut self, mut chunk: &[u8], mut on_token: F) -> usize {
+        let mut frames = 0;
+        while !chunk.is_empty() {
+            if self.in_body {
+                let take = (40 - self.body_len).min(chunk.len());
+                self.body[self.body_len..self.body_len + take].copy_from_slice(&chunk[..take]);
+                self.body_len += take;
+                chunk = &chunk[take..];
+                if self.body_len == 40 {
+                    on_token(ProcessToken::from_body_bytes(&self.body));
+                    self.reset();
+                    frames += 1;
+                }
+            } else {
+                self.window[0] = self.window[1];
+                self.window[1] = self.window[2];
+                self.window[2] = self.window[3];
+                self.window[3] = chunk[0];
+                chunk = &chunk[1..];
+                if self.window == TOKEN_MAGIC {
+                    self.in_body = true;
+                    self.body_len = 0;
+                }
+            }
+        }
+        frames
+    }
+
+    /// Drop any partial frame and re-arm the magic scan.
+    fn reset(&mut self) {
+        self.window = [0u8; 4];
+        self.body = [0u8; 40];
+        self.body_len = 0;
+        self.in_body = false;
+    }
+}
+
+#[derive(Debug)]
+struct DrainInner {
+    state: Mutex<DrainState>,
+    ingest: Mutex<IngestState>,
+}
+
 /// Pipe drain: background reader keeping the kernel buffer empty.
 ///
 /// Robust framing: scans for `TOKEN_MAGIC` ("SNUB"). Any non-token output
 /// (e.g. `println!` logs) in stdout is transparently skipped without losing
 /// frame alignment or crashing.
-#[derive(Debug)]
+///
+/// Three drivers share one parser:
+/// * [`PipeDrain::spawn`] — OS reader thread (default `std` flow);
+/// * [`PipeDrain::drain_sync`] — blocking read to EOF (buffers, fuzzing);
+/// * [`PipeDrain::feed`] — caller-pushed chunks (embedded UART, async
+///   runtimes, tests). Call [`PipeDrain::finish`] when the stream ends.
+///
+/// Cloning is a cheap handle: every clone observes the same drain.
+#[derive(Debug, Clone)]
 pub struct PipeDrain {
-    state: Arc<Mutex<DrainState>>,
+    inner: Arc<DrainInner>,
     done: Arc<AtomicU64>,
+    clock: ClockFn,
 }
 
 impl PipeDrain {
+    /// Empty drain driven only by [`PipeDrain::feed`] (no reader thread).
+    #[must_use]
+    pub fn manual() -> Self {
+        Self::manual_with_clock(now_ms)
+    }
+
+    /// Empty `feed`-driven drain with an injected clock.
+    ///
+    /// The clock stamps `last_seen` and answers [`PipeDrain::idle_ms`], so
+    /// lease sweeps are deterministic in tests and follow the firmware tick
+    /// on embedded targets instead of a hidden `Instant`.
+    #[must_use]
+    pub fn manual_with_clock(clock: ClockFn) -> Self {
+        Self {
+            inner: Arc::new(DrainInner {
+                state: Mutex::new(DrainState::default()),
+                ingest: Mutex::new(IngestState::default()),
+            }),
+            done: Arc::new(AtomicU64::new(0)),
+            clock,
+        }
+    }
+
     /// Spawn the drain on `reader`. Returns immediately, thread owns it.
     #[must_use]
     pub fn spawn<R: Read + Send + 'static>(reader: R) -> Self {
-        let state = Arc::new(Mutex::new(DrainState::default()));
-        let done = Arc::new(AtomicU64::new(0));
-        let s = Arc::clone(&state);
-        let d = Arc::clone(&done);
+        Self::spawn_with_clock(reader, now_ms)
+    }
+
+    /// [`PipeDrain::spawn`] with an injected clock.
+    #[must_use]
+    pub fn spawn_with_clock<R: Read + Send + 'static>(reader: R, clock: ClockFn) -> Self {
+        let drain = Self::manual_with_clock(clock);
+        let worker = drain.clone();
         std::thread::spawn(move || {
             let mut reader = std::io::BufReader::with_capacity(4096, reader);
-            let mut window = [0u8; 4];
-            let mut one = [0u8; 1];
-
-            while let Ok(()) = reader.read_exact(&mut one) {
-                window[0] = window[1];
-                window[1] = window[2];
-                window[2] = window[3];
-                window[3] = one[0];
-
-                if window == TOKEN_MAGIC {
-                    let mut body = [0u8; 40];
-                    if reader.read_exact(&mut body).is_err() {
-                        break;
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        worker.feed(&buf[..n]);
                     }
-                    let token = ProcessToken::from_body_bytes(&body);
-                    if let Ok(mut st) = s.lock() {
-                        st.last_seen_ms = now_ms();
-                        st.seen = true;
-                        st.frames = st.frames.saturating_add(1);
-                        if token.opcode == OP_COMMIT || token.opcode == OP_HEARTBEAT {
-                            if token.opcode == OP_COMMIT {
-                                st.commits = st.commits.saturating_add(1);
-                                st.armed = None;
-                            }
-                        } else if token.opcode == OP_STATE {
-                            // Hot handoff chunk: seq = task (0/1/2).
-                            // Layout: payload[0..take] = data (24/24/16).
-                            // Frame 2 carries authoritative full-digest CRC at payload[16..20].
-                            // Frame CRC at payload[24..28].
-                            let seq = (token.task.min(2)) as usize;
-                            let take = if seq < 2 { 24 } else { 16 };
-                            let mut want = [0u8; 4];
-                            want.copy_from_slice(&token.payload[24..28]);
-                            let want = u32::from_le_bytes(want);
-
-                            let valid_chunk = if seq == 2 {
-                                state_crc(&token.payload[0..20]) == want
-                            } else {
-                                state_crc(&token.payload[0..take]) == want
-                            };
-
-                            if valid_chunk {
-                                st.scratch[seq][0..take].copy_from_slice(&token.payload[0..take]);
-                                if seq == 2 {
-                                    let mut fcrc = [0u8; 4];
-                                    fcrc.copy_from_slice(&token.payload[16..20]);
-                                    st.scratch_full_crc = u32::from_le_bytes(fcrc);
-                                }
-                                st.scratch_got |= 1 << seq;
-                                if st.scratch_got == 0b111 {
-                                    let mut bytes = [0u8; STATE_LEN];
-                                    bytes[0..24].copy_from_slice(&st.scratch[0][0..24]);
-                                    bytes[24..48].copy_from_slice(&st.scratch[1][0..24]);
-                                    bytes[48..64].copy_from_slice(&st.scratch[2][0..16]);
-                                    let candidate = StateDigest::new(bytes);
-                                    if candidate.crc() == st.scratch_full_crc {
-                                        st.state = Some(candidate);
-                                    }
-                                    // Reset mask so subsequent digests reassemble cleanly
-                                    st.scratch_got = 0;
-                                }
-                            }
-                            // Corrupt or mismatched frame: dropped silently,
-                            // replacement process gets the last verified whole state.
-                        } else {
-                            st.arms = st.arms.saturating_add(1);
-                            st.armed = Some(token);
-                        }
-                    }
-                    window = [0u8; 4];
+                    Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
             }
-            d.store(1, Ordering::SeqCst);
+            worker.finish();
         });
-        Self { state, done }
+        drain
     }
 
     /// Synchronously process a reader to EOF without spawning a background OS thread.
     /// Ideal for in-memory byte buffers, fuzzing sweeps, and synchronous parsers.
     #[must_use]
     pub fn drain_sync<R: Read>(reader: R) -> Self {
-        let state = Arc::new(Mutex::new(DrainState::default()));
-        let done = Arc::new(AtomicU64::new(0));
-        let mut reader = std::io::BufReader::with_capacity(4096, reader);
-        let mut window = [0u8; 4];
-        let mut one = [0u8; 1];
+        Self::drain_sync_with_clock(reader, now_ms)
+    }
 
-        while let Ok(()) = reader.read_exact(&mut one) {
-            window[0] = window[1];
-            window[1] = window[2];
-            window[2] = window[3];
-            window[3] = one[0];
-
-            if window == TOKEN_MAGIC {
-                let mut body = [0u8; 40];
-                if reader.read_exact(&mut body).is_err() {
-                    break;
+    /// [`PipeDrain::drain_sync`] with an injected clock.
+    #[must_use]
+    pub fn drain_sync_with_clock<R: Read>(mut reader: R, clock: ClockFn) -> Self {
+        let drain = Self::manual_with_clock(clock);
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    drain.feed(&buf[..n]);
                 }
-                let token = ProcessToken::from_body_bytes(&body);
-                if let Ok(mut st) = state.lock() {
-                    st.last_seen_ms = now_ms();
-                    st.seen = true;
-                    st.frames = st.frames.saturating_add(1);
-                    if token.opcode == OP_COMMIT || token.opcode == OP_HEARTBEAT {
-                        if token.opcode == OP_COMMIT {
-                            st.commits = st.commits.saturating_add(1);
-                            st.armed = None;
-                        }
-                    } else if token.opcode == OP_STATE {
-                        let seq = (token.task.min(2)) as usize;
-                        let take = if seq < 2 { 24 } else { 16 };
-                        let mut want = [0u8; 4];
-                        want.copy_from_slice(&token.payload[24..28]);
-                        let want = u32::from_le_bytes(want);
-
-                        let valid_chunk = if seq == 2 {
-                            state_crc(&token.payload[0..20]) == want
-                        } else {
-                            state_crc(&token.payload[0..take]) == want
-                        };
-
-                        if valid_chunk {
-                            st.scratch[seq][0..take].copy_from_slice(&token.payload[0..take]);
-                            if seq == 2 {
-                                let mut fcrc = [0u8; 4];
-                                fcrc.copy_from_slice(&token.payload[16..20]);
-                                st.scratch_full_crc = u32::from_le_bytes(fcrc);
-                            }
-                            st.scratch_got |= 1 << seq;
-                            if st.scratch_got == 0b111 {
-                                let mut bytes = [0u8; STATE_LEN];
-                                bytes[0..24].copy_from_slice(&st.scratch[0][0..24]);
-                                bytes[24..48].copy_from_slice(&st.scratch[1][0..24]);
-                                bytes[48..64].copy_from_slice(&st.scratch[2][0..16]);
-                                let candidate = StateDigest::new(bytes);
-                                if candidate.crc() == st.scratch_full_crc {
-                                    st.state = Some(candidate);
-                                }
-                                st.scratch_got = 0;
-                            }
-                        }
-                    } else {
-                        st.arms = st.arms.saturating_add(1);
-                        st.armed = Some(token);
-                    }
-                }
-                window = [0u8; 4];
+                Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
             }
         }
-        done.store(1, Ordering::SeqCst);
-        Self { state, done }
+        drain.finish();
+        drain
+    }
+
+    /// Push bytes through the incremental `SNUB` scanner.
+    ///
+    /// Accepts any chunking: one byte at a time, several frames per chunk,
+    /// garbage prefixes, torn tails. Returns the number of complete frames
+    /// delivered by THIS call; a partial frame is retained for the next one.
+    /// A finished drain accepts nothing and returns `0`.
+    pub fn feed(&self, bytes: &[u8]) -> usize {
+        if self.eof() {
+            return 0;
+        }
+        let mut ingest = match self.inner.ingest.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        ingest.push(bytes, |token| self.apply_token(token))
+    }
+
+    /// Mark the stream finished (`EOF`). Idempotent, thread-safe; a torn
+    /// partial frame is discarded, exactly like a reader that hit `EOF`.
+    pub fn finish(&self) {
+        self.done.store(1, Ordering::SeqCst);
+    }
+
+    /// Apply one parsed token under one short lock.
+    fn apply_token(&self, token: ProcessToken) {
+        let now = (self.clock)();
+        let mut state = match self.inner.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        apply_token(&mut state, token, now);
+    }
+
+    /// Current reading of this drain's clock, ms.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        (self.clock)()
     }
 
     /// Take the last un-settled token, if any (call AFTER `EOF`/reap).
     #[must_use]
     pub fn take_armed(&self) -> Option<ProcessToken> {
-        self.state.lock().ok().and_then(|mut st| st.armed.take())
+        self.inner
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.armed.take())
     }
 
     /// Parsed-frame counters (cheap snapshot under one short lock).
     #[must_use]
     pub fn counters(&self) -> DrainCounters {
-        match self.state.lock() {
-            Ok(st) => DrainCounters {
-                frames: st.frames,
-                arms: st.arms,
-                commits: st.commits,
+        match self.inner.state.lock() {
+            Ok(state) => DrainCounters {
+                frames: state.frames,
+                arms: state.arms,
+                commits: state.commits,
             },
             Err(_) => DrainCounters::default(),
         }
@@ -1034,16 +1100,16 @@ impl PipeDrain {
     /// out under one short lock — no alloc, never panics.
     #[must_use]
     pub fn take_state(&self) -> Option<StateDigest> {
-        self.state.lock().ok().and_then(|st| st.state)
+        self.inner.state.lock().ok().and_then(|state| state.state)
     }
 
     /// Peek without taking (supervisor polls before spawning replacement process).
     #[must_use]
     pub fn last_state(&self) -> Option<StateDigest> {
-        self.state.lock().ok().and_then(|st| st.state)
+        self.inner.state.lock().ok().and_then(|state| state.state)
     }
 
-    /// `true` once the reader hit `EOF`/error.
+    /// `true` once the reader hit `EOF`/error or [`PipeDrain::finish`] ran.
     #[must_use]
     pub fn eof(&self) -> bool {
         self.done.load(Ordering::SeqCst) != 0
@@ -1057,12 +1123,12 @@ impl PipeDrain {
     /// A reaped-then-hung PID is abandoned — the generation already moved.
     #[must_use]
     pub fn idle_ms(&self) -> u64 {
-        match self.state.lock() {
-            Ok(st) => {
-                if !st.seen {
+        match self.inner.state.lock() {
+            Ok(state) => {
+                if !state.seen {
                     return 0;
                 }
-                now_ms().saturating_sub(st.last_seen_ms)
+                (self.clock)().saturating_sub(state.last_seen_ms)
             }
             Err(_) => 0,
         }
@@ -1072,6 +1138,62 @@ impl PipeDrain {
     #[must_use]
     pub fn expired(&self, lease_ms: u64) -> bool {
         !self.eof() && self.idle_ms() > lease_ms
+    }
+}
+
+/// Apply one parsed token to drain state under the caller's lock.
+fn apply_token(state: &mut DrainState, token: ProcessToken, now_ms: u64) {
+    state.last_seen_ms = now_ms;
+    state.seen = true;
+    state.frames = state.frames.saturating_add(1);
+    if token.opcode == OP_COMMIT || token.opcode == OP_HEARTBEAT {
+        if token.opcode == OP_COMMIT {
+            state.commits = state.commits.saturating_add(1);
+            state.armed = None;
+        }
+    } else if token.opcode == OP_STATE {
+        // Hot handoff chunk: seq = task (0/1/2).
+        // Layout: payload[0..take] = data (24/24/16).
+        // Frame 2 carries the authoritative full-digest CRC at payload[16..20].
+        // Frame CRC at payload[24..28].
+        let seq = (token.task.min(2)) as usize;
+        let take = if seq < 2 { 24 } else { 16 };
+        let mut want = [0u8; 4];
+        want.copy_from_slice(&token.payload[24..28]);
+        let want = u32::from_le_bytes(want);
+
+        let valid_chunk = if seq == 2 {
+            state_crc(&token.payload[0..20]) == want
+        } else {
+            state_crc(&token.payload[0..take]) == want
+        };
+
+        if valid_chunk {
+            state.scratch[seq][0..take].copy_from_slice(&token.payload[0..take]);
+            if seq == 2 {
+                let mut full = [0u8; 4];
+                full.copy_from_slice(&token.payload[16..20]);
+                state.scratch_full_crc = u32::from_le_bytes(full);
+            }
+            state.scratch_got |= 1 << seq;
+            if state.scratch_got == 0b111 {
+                let mut bytes = [0u8; STATE_LEN];
+                bytes[0..24].copy_from_slice(&state.scratch[0][0..24]);
+                bytes[24..48].copy_from_slice(&state.scratch[1][0..24]);
+                bytes[48..64].copy_from_slice(&state.scratch[2][0..16]);
+                let candidate = StateDigest::new(bytes);
+                if candidate.crc() == state.scratch_full_crc {
+                    state.state = Some(candidate);
+                }
+                // Reset the mask so subsequent digests reassemble cleanly.
+                state.scratch_got = 0;
+            }
+        }
+        // Corrupt or mismatched frame: dropped silently, the replacement
+        // process gets the last verified whole state.
+    } else {
+        state.arms = state.arms.saturating_add(1);
+        state.armed = Some(token);
     }
 }
 

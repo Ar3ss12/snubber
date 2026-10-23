@@ -182,6 +182,28 @@ outlives every transaction.
   touches a child and never mutates counters, so a monitor thread can call it
   while every lane waiter is blocked in `child.wait()`.
 
+### Invariant 11: Chunking-Independent Parsing (Feed Equivalence)
+`PipeDrain::feed` is the same scanner as the reader-thread path, so frame
+delivery cannot depend on how the transport sliced the stream:
+
+- For any partition of the same byte stream, `feed` delivers the same
+  sequence of `ProcessToken`s and the same `frames` / `arms` / `commits`
+  counters as `drain_sync` over the whole stream.
+- A partial frame is retained across calls: bytes are neither dropped nor
+  duplicated at a chunk boundary. Bytes inside a 40-byte body are opaque
+  (inserting garbage mutates that token, never starts a nested frame); the
+  next `SNUB` magic re-synchronizes.
+- `feed` returns exactly the number of frames completed by that call.
+- `finish()` is the only EOF source for a manual drain: idempotent,
+  thread-safe, discards a torn tail, and makes every later `feed` return
+  zero without mutating state.
+- The injected `ClockFn` is the only time source of a drain: `idle_ms`,
+  `expired` and the pool EOF grace read the same counter, so a fake clock
+  reproduces lease and deadlock verdicts without wall time.
+- `ProcessToken::write_to` / `StateDigest::write_to` emit the identical
+  bytes as `to_bytes()` / `to_frames()`, so a sink round-trip through
+  `feed` yields the same counters and rescue classification as stdout.
+
 ---
 
 ## 2. Verification Protocol
@@ -231,6 +253,9 @@ cargo test --test supervisor_pool_stress_mixed -- --ignored --nocapture
 # Verify lease euthanasia of heartbeat-then-hang workers with a live observer
 cargo test --test supervisor_pool_stress_lease -- --ignored --nocapture
 
+# Verify chunked parsing equivalence, injected clocks and token sinks (invariant 11)
+cargo test --test drain_feed
+
 # Verify bench hygiene (setup outside the hot loop, pure overhead only)
 cargo test --test bench_hygiene
 
@@ -261,7 +286,7 @@ python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggres
 
 ## 3. Reporting a Discrepancy
 
-If you identify a scenario where any of the ten invariants above fails using purely Safe Rust:
+If you identify a scenario where any of the eleven invariants above fails using purely Safe Rust:
 
 1. **Minimal Reproduction:** Construct an isolated integration test demonstrating the violation (failing an explicit `assert!`).
 2. **Deterministic Trigger:** The test must run and fail within 30 seconds without requiring external infrastructure.

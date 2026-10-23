@@ -9,7 +9,7 @@ Write-Host "=== Snubber Architectural Invariant Audit ===" -ForegroundColor Cyan
 $Failures = 0
 
 # Gate 1: Check #![forbid(unsafe_code)] in src/lib.rs
-Write-Host "[1/4] Auditing unsafe code veto..." -NoNewline
+Write-Host "[1/5] Auditing unsafe code veto..." -NoNewline
 $LibContent = Get-Content "$RepoRoot\src\lib.rs" -Raw
 if ($LibContent -match '#!\[forbid\(unsafe_code\)\]') {
     Write-Host " OK (forbid(unsafe_code) active)" -ForegroundColor Green
@@ -27,7 +27,7 @@ if ($UnsafeMatches) {
 }
 
 # Gate 2: Saturating arithmetic on counters in src/node.rs
-Write-Host "[2/4] Auditing saturating counters in src/node.rs..." -NoNewline
+Write-Host "[2/5] Auditing saturating counters in src/node.rs..." -NoNewline
 # Counter increment check: flag direct `+= 1` on known counter fields
 $CounterViolations = Select-String -Path "$RepoRoot\src\node.rs" -Pattern "\b(in_flight|total_started|committed|bulkhead_rejections|poison_recoveries|stale_epochs_rejected)\s*\+="
 if ($CounterViolations) {
@@ -39,7 +39,7 @@ if ($CounterViolations) {
 }
 
 # Gate 3: Lock-hygiene audit in Phase A/C (no foreign calls / formatting under lock)
-Write-Host "[3/4] Auditing zero-panic mutex discipline in src/node.rs..." -NoNewline
+Write-Host "[3/5] Auditing zero-panic mutex discipline in src/node.rs..." -NoNewline
 # Search for format! or println! inside record_locked or enter_inner lock sections
 $FormatUnderLock = Select-String -Path "$RepoRoot\src\node.rs" -Pattern "fn record_locked[\s\S]*?format!"
 if ($FormatUnderLock) {
@@ -50,7 +50,7 @@ if ($FormatUnderLock) {
 }
 
 # Gate 4: Zero-metaphor scan across codebase (AGENTS.md Section 14)
-Write-Host "[4/4] Auditing forbidden metaphors..." -NoNewline
+Write-Host "[4/5] Auditing forbidden metaphors..." -NoNewline
 # Excludes binary header magic terminology ("magic bytes / magic number") which is technical standard.
 $ForbiddenPatterns = @(
     "\bwizard\b",
@@ -70,6 +70,32 @@ if ($MetaphorMatches.Count -gt 0) {
     $Failures++
 } else {
     Write-Host " OK (technical language strictly adhered)" -ForegroundColor Green
+}
+
+# Gate 5: TRUE no_std - crate attribute + bare-metal target compile
+Write-Host "[5/5] Auditing true no_std on bare metal..." -NoNewline
+$BareMetalTarget = "thumbv7em-none-eabihf"
+if ($LibContent -notmatch '#!\[cfg_attr\(not\(feature = "std"\), no_std\)\]') {
+    Write-Host " FAIL (missing #![cfg_attr(not(feature = `"std`"), no_std)] in src/lib.rs)" -ForegroundColor Red
+    $Failures++
+} elseif (-not ((rustup target list --installed) -contains $BareMetalTarget)) {
+    Write-Host " SKIP (target not installed: rustup target add $BareMetalTarget)" -ForegroundColor Yellow
+} else {
+    Push-Location $RepoRoot
+    try {
+        cargo check --quiet --no-default-features --target $BareMetalTarget
+        if ($LASTEXITCODE -eq 0) {
+            cargo check --quiet --no-default-features --features alloc --target $BareMetalTarget
+        }
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host " OK (core and alloc build for $BareMetalTarget)" -ForegroundColor Green
+        } else {
+            Write-Host " FAIL (no_std build failed for $BareMetalTarget)" -ForegroundColor Red
+            $Failures++
+        }
+    } finally {
+        Pop-Location
+    }
 }
 
 Write-Host "---------------------------------------------"

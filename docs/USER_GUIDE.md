@@ -722,7 +722,7 @@ When a process is vaporized instantly (`kill -9`, `Stop-Process -Force`, `std::p
 
 1. **Generation Clock (`GenerationClock`):** The supervisor starts workers with `gen=N`. If the worker dies, the supervisor increments to `gen=N+1`. Any delayed zombie packets from the dead worker are cut off at the gate.
 2. **Framed Pipe Intercom (`ProcessToken`):** The worker emits framed 44-byte packets (`b"SNUB"` sync magic + 40 bytes payload).
-3. **PipeDrain:** The supervisor drains the stream continuously in a background reader with sliding-window sync, filtering out arbitrary `println!` noise.
+3. **PipeDrain:** The supervisor drains the stream continuously in a background reader with sliding-window sync, filtering out arbitrary `println!` noise. The same parser is reachable without a reader thread — `drain_sync` (blocking `Read`) and `feed` + `finish` (caller-pushed chunks) — and the liveness clock is injectable (`ClockFn`).
 4. **Emergency Rescue on EOF:** If the worker is killed mid-transaction while holding an armed token, the pipe closes (`EOF`), and the supervisor immediately executes the registered emergency hardware release outside the dead process.
 
 ### Single-Line Supervised Wire-Up:
@@ -733,6 +733,40 @@ let guard = node.enter_supervised_erased(
     move || { hardware::release_relay(relay_id); }
 )?;
 ```
+
+### Transport and clock injection (`feed`, `write_to`, `ClockFn`)
+The wire format is transport-agnostic; only the default helpers assume stdout
+and an OS reader thread. Three drivers share ONE incremental scanner:
+
+| Driver | Signature | Use |
+|---|---|---|
+| `PipeDrain::spawn` | `spawn<R: Read + Send + 'static>(reader)` | Child stdout / OS pipe, own thread |
+| `PipeDrain::drain_sync` | `drain_sync<R: Read>(reader)` | In-memory buffers, fuzz sweeps, tests |
+| `PipeDrain::feed` | `feed(&self, bytes: &[u8]) -> usize` | UART/DMA chunks, async runtimes, manual pumps |
+
+`feed` accepts any chunking — a byte at a time, several frames per chunk, a
+garbage prefix, a torn tail — and returns the number of complete frames
+delivered by that call. Call `finish()` when the stream ends: the drain reaches
+`EOF`, classifies the rescue and accepts no further bytes.
+
+```rust
+use snubber::PipeDrain;
+
+let drain = PipeDrain::manual_with_clock(app_tick_ms); // app-owned ms counter
+let frames = drain.feed(&uart_chunk);                  // 0..=N complete frames
+let idle = drain.idle_ms();                            // measured on app_tick_ms
+drain.finish();                                        // EOF, idempotent
+```
+
+The injected `ClockFn` (`fn() -> u64`) stamps every parsed frame and answers
+`idle_ms` / `expired`. The default is the process monotonic clock; a fake
+counter makes lease tests deterministic and a firmware `SysTick` read removes
+the hidden `Instant`.
+
+On the worker side, `ProcessToken::write_to(&mut sink)` and
+`StateDigest::write_to(&mut sink)` write the 44-byte frames to any
+`std::io::Write` (socket, UART bridge, buffer). `emit_if_supervised` is only a
+stdout wrapper over `write_to` plus the `SNUBBER_SUPERVISED` check.
 
 ### Out-of-Process Hard Termination Harness (10,000 OS Kills):
 The architecture has been verified against **10,000 real Windows `TerminateProcess` executions** without a single pipe deadlock or lost token. Every reap is classified: **true ambush** (an armed token was still pending at death), **clean escape** (at least one commit was observed) or **stillborn** (no commit and no armed token, typically a kill during process startup). The three counters sum to `reaped` on every run.

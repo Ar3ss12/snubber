@@ -131,6 +131,22 @@ fn anomalies_pin_each_verdict() {
 }
 
 #[test]
+fn streaming_anomaly_scan_matches_the_vec_wrapper() {
+    let node = SnubberNode::builder("stream").build();
+    node.report(FaultKind::Panic, 1, 1);
+    let snap = node.snapshot_v1();
+    let policy = AnomalyPolicy::default();
+
+    let collected = find_anomalies_for_snapshot("stream", &snap, &policy);
+    let mut streamed = Vec::new();
+    snubber::scan_anomalies_for_snapshot("stream", &snap, &policy, |anomaly| {
+        streamed.push(anomaly);
+    });
+    assert!(!collected.is_empty(), "the panic must produce a verdict");
+    assert_eq!(streamed, collected);
+}
+
+#[test]
 fn diagnostic_line_and_health_render() {
     let node = SnubberNode::builder("click_worker").build();
     node.report(FaultKind::Panic, 1, 1);

@@ -17,6 +17,17 @@
 //! Core stays dependency-free and `unsafe`-free; the node adds only
 //! `std::sync` (shared recorder), no runtimes, no HTTP, no async.
 //!
+//! # Feature gates
+//!
+//! `std` and `alloc` are additive. Without `std` the crate is
+//! `#![no_std]` (`core` only) and builds for bare-metal targets; `alloc`
+//! adds `String`-backed fault details, `ErasedGuard` and `Vec` helpers.
+//! The supervisor and pool modules require `std` (OS pipes and reader
+//! threads); [`PipeDrain::feed`](crate::PipeDrain::feed) lets embedded
+//! and async callers drive the same parser by pushing chunks, and
+//! [`ProcessToken::write_to`](crate::ProcessToken::write_to) targets any
+//! `Write` sink instead of stdout.
+//!
 //! # Minimal example
 //!
 //! ```rust
@@ -31,8 +42,15 @@
 //! assert!(committed.is_terminal());
 //! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+#[cfg(test)]
+extern crate std;
 
 /// Universal invariant assertion macro for semantic admission boundary gates.
 ///
@@ -146,9 +164,12 @@ pub use diagnostics::{
 };
 
 pub use diagnostics::{
-    crc32_ieee, diagnostic_hash, find_anomalies_for_snapshot, write_diagnostic_line, write_health,
+    crc32_ieee, diagnostic_hash, scan_anomalies_for_snapshot, write_diagnostic_line, write_health,
     write_triage,
 };
+
+#[cfg(feature = "alloc")]
+pub use diagnostics::find_anomalies_for_snapshot;
 
 pub use memory::{MemoryVerdict, MemoryWatch};
 
@@ -159,10 +180,10 @@ pub use protect::SafeLockExt;
 
 #[cfg(feature = "std")]
 pub use supervisor::{
-    take_stdin_digest, Backoff, DeathCause, DrainCounters, GenerationClock, MemoryPolicy,
-    NoOrphanGuard, OrphanGuard, PipeDrain, ProcessToken, RestartDecision, RestartPolicy,
-    RestartTracker, RestartWindow, StateDigest, Supervisor, TokenRollback, OP_COMMIT, OP_HEARTBEAT,
-    OP_SNAPSHOT, OP_STATE, STATE_LEN,
+    now_ms, take_stdin_digest, Backoff, ClockFn, DeathCause, DrainCounters, GenerationClock,
+    MemoryPolicy, NoOrphanGuard, OrphanGuard, PipeDrain, ProcessToken, RestartDecision,
+    RestartPolicy, RestartTracker, RestartWindow, StateDigest, Supervisor, TokenRollback,
+    OP_COMMIT, OP_HEARTBEAT, OP_SNAPSHOT, OP_STATE, STATE_LEN,
 };
 
 #[cfg(feature = "std")]
