@@ -377,11 +377,17 @@ fn spawn_guarded_binds_thread_guard_leash() {
         .max_in_flight(1)
         .trip_after_failures(0)
         .build();
+    let (published_tx, published_rx) = std::sync::mpsc::channel();
     let (join, handle) = node.spawn_guarded(
         || {},
         0u64,
-        |conduit: TaskConduit<u64, ()>| {
+        move |conduit: TaskConduit<u64, ()>| {
             conduit.update_state(|s| *s = 1);
+            // Signal AFTER the publish. A panicking worker drops the
+            // sender, so the wait below fails with `Err` instead of racing
+            // a fixed sleep (Miri needs far longer than 20 ms to reach
+            // this point, and its clock/sleep do not agree).
+            let _ = published_tx.send(());
             loop {
                 match conduit.check_directive() {
                     Directive::Cancel(_) | Directive::Preempted(_) => break,
@@ -393,8 +399,11 @@ fn spawn_guarded_binds_thread_guard_leash() {
             }
         },
     );
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    assert_eq!(handle.inspect(), 1, "worker published via conduit");
+    // Blocking recv, not a timed poll: Miri schedules the worker while the
+    // main thread blocks; a dead worker closes the channel and surfaces
+    // here as `Err` rather than hanging on a sleep budget.
+    published_rx.recv().expect("worker published via conduit");
+    assert_eq!(handle.inspect(), 1, "state visible through the handle");
     handle.send_directive(Directive::Cancel("stop"));
     let res = join.join().expect("worker joined");
     assert!(res.is_ok(), "clean commit, got {res:?}");

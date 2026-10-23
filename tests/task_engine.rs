@@ -268,15 +268,17 @@ fn futures_lite_fake_waker_id(id: usize) -> core::task::Waker {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "wall-clock TTL margins; run natively")]
 fn spurious_repolls_do_not_reset_the_ttl_clock() {
     // Regression: the dedup re-park path re-stamped `enqueued_at_ms`, so a
     // future parked in the queue never accumulated queue-wait — an
     // executor spinning re-polls starved `task_ttl` forever. The TTL
     // origin must stay at the FIRST park.
+    let ttl = Duration::from_millis(100);
     let node = SnubberNode::builder("test_ttl_restamp")
         .max_in_flight(1)
         .queue_capacity(4)
-        .task_ttl(Duration::from_millis(100))
+        .task_ttl(ttl)
         .build();
     let g1 = node.enter(1, 1, || {}).expect("first enters bulkhead");
 
@@ -286,15 +288,27 @@ fn spurious_repolls_do_not_reset_the_ttl_clock() {
 
     // First park stamps the origin (t = 0).
     assert!(fut.as_mut().poll(&mut cx).is_pending());
+    let parked_at = std::time::Instant::now();
     // Spurious re-polls with the same waker hit the dedup path; each must
-    // leave the origin untouched (t stays ~60 ms after the two sleeps).
-    std::thread::sleep(Duration::from_millis(30));
-    assert!(fut.as_mut().poll(&mut cx).is_pending());
-    std::thread::sleep(Duration::from_millis(30));
-    assert!(fut.as_mut().poll(&mut cx).is_pending());
+    // leave the origin untouched (t stays well below TTL after the sleeps).
+    for _ in 0..2 {
+        std::thread::sleep(Duration::from_millis(30));
+        if parked_at.elapsed() >= ttl {
+            // A stalled host overslept past the TTL: expiry is then the
+            // honest verdict (measured from the first park), so the
+            // pending window cannot be observed on this run.
+            match fut.as_mut().poll(&mut cx) {
+                core::task::Poll::Ready(Err(EnterError::QueueTtlExpired)) => return,
+                _ => panic!("expired TTL must surface as QueueTtlExpired"),
+            }
+        }
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+    }
     // Now t >= 110 ms > TTL = 100 ms: the next poll must expire, measured
     // from the FIRST park — not from the last spurious re-poll.
-    std::thread::sleep(Duration::from_millis(50));
+    while parked_at.elapsed() < Duration::from_millis(110) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     drop(g1);
     match fut.as_mut().poll(&mut cx) {
         core::task::Poll::Ready(Err(EnterError::QueueTtlExpired)) => {}
@@ -302,7 +316,7 @@ fn spurious_repolls_do_not_reset_the_ttl_clock() {
     }
     let fault = node.stats().last_fault.expect("ttl fault recorded");
     assert!(
-        fault.queue_wait_ms >= 100,
+        fault.queue_wait_ms >= ttl.as_millis() as u64,
         "queue_wait_ms must span the whole parked time, got {}",
         fault.queue_wait_ms
     );
