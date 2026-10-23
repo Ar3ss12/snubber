@@ -154,9 +154,9 @@ if [ "$LAUNCH" = 1 ]; then
     if [ "$BUILD" = 1 ] || [ ! -x "$EXE" ]; then
         echo "[BUILD] cargo build --example $TARGET_PROCESS ($PROFILE)..."
         if [ "$PROFILE" = "release" ]; then
-            cargo build --release --example "$TARGET_PROCESS" || { echo "[FAIL] cargo build"; exit 1; }
+            cargo build --locked --release --example "$TARGET_PROCESS" || { echo "[FAIL] cargo build"; exit 1; }
         else
-            cargo build --example "$TARGET_PROCESS" || { echo "[FAIL] cargo build"; exit 1; }
+            cargo build --locked --example "$TARGET_PROCESS" || { echo "[FAIL] cargo build"; exit 1; }
         fi
     fi
     [ -x "$EXE" ] || { echo "[FAIL] supervisor binary missing: $EXE (use --build)"; exit 1; }
@@ -295,8 +295,9 @@ TOKENS=$(read_json_int tokens_rescued)
 CLEAN=$(read_json_int clean_settles)
 FINAL_GEN=$(read_json_int final_generation)
 ELAPSED_MS=$(read_json_int elapsed_ms)
-# -E: portable ERE — BSD sed (macOS) does not support GNU BRE alternation \|.
-DEADLOCK=$(sed -nE 's/.*"deadlock": *(true|false).*/\1/p' "$REPORT" 2>/dev/null | head -1)
+AMBUSH=$(read_json_int ambush_kills)
+ESCAPE=$(read_json_int escape_kills)
+STILLBORN=$(read_json_int stillborn_kills)
 
 CHECKS_FAILED=0
 CHECK_LINES=""
@@ -311,8 +312,12 @@ add_check() {
 if [ -n "$REAPED" ]; then
     [ "$REAPED" -eq "$EXECUTED" ] && add_check 1 "reaped == kills" || add_check 0 "reaped == kills"
     [ $((TOKENS + CLEAN)) -eq "$REAPED" ] && add_check 1 "rescue + clean == reaped" || add_check 0 "rescue + clean == reaped"
+    [ $((AMBUSH + ESCAPE + STILLBORN)) -eq "$REAPED" ] && add_check 1 "class buckets sum to reaped" || add_check 0 "class buckets sum to reaped"
     [ "$FINAL_GEN" -eq $((EXECUTED + 1)) ] && add_check 1 "final_generation == kills + 1" || add_check 0 "final_generation == kills + 1"
-    [ "$DEADLOCK" = "false" ] && add_check 1 "deadlock == false" || add_check 0 "deadlock == false"
+else
+    # A missing or unparsable report proves nothing: the four checks
+    # above never ran, so the run must fail instead of "passing harness-only".
+    add_check 0 "report present and parsable ($REPORT)"
 fi
 if [ -n "$SUP_PID" ]; then
     [ "$SUP_EXIT" = "0" ] && add_check 1 "supervisor exit == 0" || add_check 0 "supervisor exit == 0"
@@ -333,13 +338,8 @@ elif [ "$LAUNCH" = "1" ]; then
 fi
 
 VERDICT="FAIL"
-if [ "$EXECUTED" -eq "$KILLS" ] && [ "$CHECKS_FAILED" -eq 0 ]; then
-    if [ -n "$REAPED" ]; then
-        VERDICT="PASS"
-    elif [ -z "$SUP_PID" ]; then
-        # Pending pass only in external mode; a launched supervisor owes a report.
-        VERDICT="PASS (harness only, report pending)"
-    fi
+if [ "$EXECUTED" -eq "$KILLS" ] && [ "$CHECKS_FAILED" -eq 0 ] && [ -n "$REAPED" ]; then
+    VERDICT="PASS"
 fi
 
 RATE=$(awk -v n="$EXECUTED" -v ms="$DUR_MS" 'BEGIN { printf "%.1f", ms > 0 ? 1000*n/ms : n }')
@@ -458,7 +458,6 @@ cat > "$STATS" <<EOF
     "clean_settles": ${CLEAN:-null},
     "final_generation": ${FINAL_GEN:-null},
     "elapsed_ms": ${ELAPSED_MS:-null},
-    "deadlock": ${DEADLOCK:-null},
     "exit": ${SUP_EXIT:-null}
   },
   "resources": {

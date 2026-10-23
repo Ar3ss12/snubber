@@ -64,14 +64,14 @@ drain.finish();                                        // EOF → rescue classif
 ## 🛡️ Architecture & Guarantees
 
 * **Zero-Boilerplate RAII Rollback:** No manual token tracking. Scoped executions auto-commit on success and guarantee resource release via `Drop` on panics, errors, or early returns.
-* **Single-Digit-Nanosecond Overhead:** Base stack guard costs **~5.4 ns**; commit takes the rollback and forgets an allocation-free `Copy` shell (no heap, no extra wire bytes). Concurrency-limited nodes process over **8.2M ops/sec** (`core`-only / `std`).
+* **Single-Digit-Nanosecond Overhead:** Base stack guard costs **~5.4 ns**; commit takes the rollback and forgets an allocation-free `Copy` shell (no heap, no extra wire bytes). A saturated node admits **~1.1M admissions/sec** under 6-thread contention (uncontended admission is several times faster; see the latency table).
 * **Strict Determinism:** `#![forbid(unsafe_code)]`, zero external dependencies. Predictable behavior across bare-metal microcontrollers and multi-socket servers alike.
 * **Runtime-Agnostic Async:** Bounded waker queue built on `core::task::Waker` consuming **0% CPU** without depending on Tokio, async-std, or background threads.
 * **Adaptive Backpressure & Pacing:** Refusals carry physical telemetry (`retry_after_ms`, queue depth 0..255) allowing clients to pace incoming traffic instead of overwhelming dead hardware.
 * **Out-of-Process Crash Recovery:** Automated stress harness verifies resilience through 10,000 hard Windows `TerminateProcess` (`kill -9`) executions with zero pipe deadlocks and 100% token rescue. Every reap is classified as **true ambush** (armed token at death), **clean escape** (commit seen) or **stillborn** (killed during startup); a multi-lineage storm runs 4 independent supervisors in parallel with per-lane latency and handle gates, and `WorkerPool` hosts N isolated lineages inside one process (one private `PipeDrain` per worker).
 * **Isolated Error Domains:** `FaultKind::is_catastrophic()` cleanly separates unrecoverable failures (Panic, Timeout, ProcessDied, ImplicitDrop) from routine capacity shedding (bulkhead limits, rate limits, stale epochs). Shedding pressure never trips circuit breakers.
 * **Monotonic Hang Clock:** Boot-relative `Instant` (`SystemClock`) — NTP sync, DST changes, and manual edits never move a deadline. Firmware brings its own `SysTick` tick via `MonotonicMs`.
-* **SPIN vs SLEEP Classification:** A hot `loop {}` settles as `SpinDetected`, a blocked syscall as `TimedOut` — identical rollback, distinct verdict, no thread ever killed. 8-byte `WorkerPulse` heartbeat strokes the hardware WDT on firmware.
+* **SPIN vs SLEEP Classification:** A hot `loop {}` settles as `SpinDetected`, a blocked syscall as `TimedOut` — identical rollback, distinct verdict, no thread ever killed. A one-atomic-word `WorkerPulse` heartbeat (8 B on 64-bit, 4 B on 32-bit targets) strokes the hardware WDT on firmware.
 * **Zero-Allocation Telemetry:** 512-byte diagnostic snapshots with CRC32 integrity, zero heap allocations on the hot path, and CI validation via `assert_no_anomalies!()`.
 * **Selective Pass-Through (Canary Law):** Builder-sealed `passthrough(true)` runs open-doors transit for differential proof — naked leaks counted lock-free, guarded rescues; wire frame stays 512 B.
 * **Extensible by Contract:** Public error/classification enums are `#[non_exhaustive]` (0.6.0), so new verdicts are additive — downstream matches must keep a `_` arm, and the crate's own internal matches stay exhaustive. `friction_fn` / `pressure_fn` accept capturing closures stored in `Arc<dyn Fn>` and run outside the node lock; `snub_check_map!` maps invariant breaches into your error type; `NodeName::{Static, Owned}` names nodes at runtime without touching the `Copy` telemetry frames (owned-name nodes export the marker `<owned>` in metric/anomaly rows; read `FaultRecord::node` or `node.name()` for the exact label); supervisor entry points have explicit `_argv` variants (`run_supervised_guard_argv`, `run_supervised_guard_with_lease_argv`, `run_supervised_guard_with_memory_argv`) so embedders that don't own `std::env::args` can pass their own argument vector; format ceilings (3 priority lanes, 4 profile stages, 16 ISR slots, 28 B token payload, 512 B snapshot, 250 ms EOF grace) are published constants.
@@ -103,7 +103,7 @@ Measured on AMD Ryzen 5 4600H release build
 | `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~99.6 ns** | Same transit through `scoped()` — work runs, books stay clean |
 | `ConflateSender::publish + take_latest` | Layer 2 (`std`) | **~22.5 ns** | One-slot latest wins, no allocation, no `Clone` bound |
 | `ConflateSender::publish` (occupied slot) | Layer 2 (`std`) | **~16.3 ns** | Replaced value counted, never queued |
-| `guard.commit_enveloped(64)` | Layer 2 (`std`) | **~152 ns** | Payload corridor exact; wall corridor only for profiled guards |
+| `guard.commit_enveloped(64)` | Layer 2 (`std`) | **~148 ns** | Payload corridor exact; wall corridor only for profiled guards |
 | `enter_async_auto` | Layer 3 (`std`) | **0% CPU** | Pure `core::task::Waker` parking, no runtime deps |
 | `enter_async_auto_profiled` | Layer 3 (`std`, opt-in) | structural: 1 `Box` + 2 clock reads | Same waker parking, profile arms on the admitting poll |
 | `enter_async_auto` (ready poll) | Layer 3 (`std`) | **~202 ns** | Full admission through the future; the ready path allocates nothing |
@@ -116,15 +116,15 @@ Measured on AMD Ryzen 5 4600H release build
 | `state_digest.crc()` | Layer 4 (`core`) | **~266 ns** | 64-byte hardware cache line digest verification |
 | `PipeDrain::drain_sync` | Layer 4 (`std`) | **~61 ns/frame** | 256 frames: 16.5M frames/s including per-stream drain state |
 | `PipeDrain::feed` (one 44 B frame) | Layer 4 (`std`) | **~97 ns** | Caller-pushed chunk: scanner + lock + dispatch, no reader thread |
-| `PipeDrain::feed` (256 frames/chunk) | Layer 4 (`std`) | **~21.2 µs** (82.7 ns/frame) | Same scanner, one lock per chunk |
+| `PipeDrain::feed` (256 frames/chunk) | Layer 4 (`std`) | **~21.2 µs** (82.7 ns/frame) | Same scanner: one ingest lock per chunk + one short state lock per token |
 | `ProcessToken::write_to(&mut sink)` | Layer 4 (`std`) | **~0.5 ns** | 44 B `write_all` into any `Write`: no env, no stdout lock |
 | `StateDigest::write_to(&mut sink)` | Layer 4 (`std`) | **~616 ns** | Three `OP_STATE` frames + CRC32 seals |
 | `namespace_task` pack / unpack | Layer 4 (`std`) | **~2.1 / 1.0 ns** | `task = lane << 48 \| local`; two shifts + mask, no branch |
-| `lane.attach` + `note_death` (ambush) | Layer 4 (`std`) | **~328 ns** | Full rescue path: drain EOF, token take, generation bump, restart math, per-class counters |
-| `lane.attach` + `note_death` (escape) | Layer 4 (`std`) | **~400 ns** | Same path when the child settled (commit parsed, no token) |
-| `pool.report()` (4 lanes) | Layer 4 (`std`) | **~107 ns** | Four short lane locks + totals fold, no allocation |
+| `lane.attach` + `note_death` (ambush) | Layer 4 (`std`) | **~338 ns** | Full rescue path: drain EOF, token take, generation bump, restart math, per-class counters |
+| `lane.attach` + `note_death` (escape) | Layer 4 (`std`) | **~407 ns** | Same path when the child settled (commit parsed, no token) |
+| `pool.report()` (4 lanes) | Layer 4 (`std`) | **~112 ns** | Four short lane locks + totals fold, no allocation |
 | `lane.note_memory_kb` | Layer 4 (`std`, cold) | **~12 ns** | Per-lane watch: one lock + integer compares |
-| `pool.expired_lanes(lease)` (4 lanes) | Layer 4 (`std`, cold) | **~536 ns** | One sweep over four silent pipes: one state lock per lane, no child touched |
+| `pool.expired_lanes(lease)` (4 lanes) | Layer 4 (`std`, cold) | **~539 ns** | One sweep over four silent pipes: one state lock per lane, no child touched |
 | `run_supervised_guard_with_memory` | Layer 4 (`std`) | structural: 1 sampler call / 10 ms tick | Soft logs `MEMORY_DRAIN`; hard `kill()` without draining (`DeathCause::MemoryLimit`) |
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | Layer 2 (`std`, opt-in) | structural: 1 `Box` + 1 clock/stage | Stage wall/CPU breakdown; default `enter*` reads no profile clock |
 | `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.13 µs** | 512-byte zero-allocation snapshot CRC32 codec |
@@ -136,15 +136,15 @@ Measured on AMD Ryzen 5 4600H release build
 | `before.diff(&after)` + `write_triage` | Layer 5 (cold) | structural: pure `Copy` math + `fmt::Write` | Counter deltas since last sample; one ASCII verdict card |
 | `memory_limits(soft, hard)` + admission | Layer 2 (`std`) | structural: 1 relaxed load | Over soft → `EnterError::MemoryPressure` without taking the mutex |
 
-### ⚡ Contended Multi-Threaded Latencies (Real Cross-Core Saturation)
+### ⚡ Contended Multi-Threaded Latencies (Real Thread Saturation)
 Measured with half of available hardware cores active (6 concurrent threads under contention, AMD Ryzen 5 4600H):
 
 | Contended Operation | Concurrency | Measured Latency | Physical Phenomenon |
 |---|---|---|---|
-| `contended_node_enter` | 6 threads | **~893 ns** | L1 cache-line bouncing across physical cores on node mutex |
-| `contended_node_scoped` | 6 threads | **~874 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
-| `contended_gateway_mpsc` | 6 threads | **~151 ns** | Bounded multi-producer channel write under parallel core flood |
-| `cross_thread_isr_bridge` | 2 threads (inter-core) | **~35.3 ns** | Lock-free SPSC ring across physical core boundaries (bus latency) |
+| `contended_node_enter` | 6 threads | **~915 ns** | Mutex contention: cache-line transfer between threads |
+| `contended_node_scoped` | 6 threads | **~871 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
+| `contended_gateway_mpsc` | 6 threads | **~172 ns** | Bounded multi-producer channel write under parallel thread load |
+| `cross_thread_isr_bridge` | 2 threads | **~37.2 ns** | Lock-free SPSC ring: cache-line handoff between threads |
 
 ### ⚡ Multi-Lineage Termination Storm
 
@@ -208,7 +208,7 @@ The mixed storm cycles `armed → clean → silent → orphan` by `local % 4` in
 
 The lease storm (`--lease-ms`, example 19) is the opposite case: every child emits one heartbeat and then hangs forever, so no `wait()` ever returns on its own. `cargo test --test supervisor_pool_stress_lease -- --ignored --nocapture` measured 24/24 reaps — all **stillborn** (a heartbeat is liveness, not a settlement), 0 ambush, 0 escape, 0 deadlocks, `lease_kills=24`, `conservation_breaks=0` over 98,703 live `report()` samples from the observer thread, `[7,7,7,7]` generations, 0.42 s. A child that hung before its first heartbeat is not expired — a pipe that never parsed a frame is the app's spawn timeout, not a lease breach.
 
-Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~328 ns (ambush) / ~400 ns (escape), a four-lane `report()` is ~107 ns, a four-lane lease sweep is ~536 ns, and `namespace_task` is ~2 ns — each lane locks only its own state.
+Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~338 ns (ambush) / ~407 ns (escape), a four-lane `report()` is ~112 ns, a four-lane lease sweep is ~539 ns, and `namespace_task` is ~2 ns — each lane locks only its own state.
 
 ---
 
@@ -217,7 +217,7 @@ Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~32
 * 📘 **[Invariants & Verification Protocol (`docs/INVARIANTS.md`)](docs/INVARIANTS.md)** — Formal mathematical guarantees, admission conservation, zero slot leak proofs.
 * 📘 **[User Guide (`docs/USER_GUIDE.md`)](docs/USER_GUIDE.md)** — Comprehensive architecture manual:
   * **Layer 1: Core RAII Guard:** Stack rollback, `EpochGate`, and universal ergonomics (`scoped`, `scoped_checked`, `snub_check!`).
-  * **Layer 1.5: Hang Classification:** Monotonic clock (`MonotonicMs` / `SystemClock`), CPU-spin classifier (`classify_stall` → `CpuSpin` / `DeadlockStall`; `guard.check_timeout()` → `SpinDetected` / `TimedOut`), 8-byte `WorkerPulse` heartbeat + `WdtSink`, ISR bridge (`IsrBridge`, 80 B SPSC ring + 32-bit trip latch, `IsrBridge::trip` bypasses `Full`), idle-park (`IdlePark` / `wfi`/`wfe` on firmware, `wfe` needs `SEVONPEND=1` at boot), pulse black-box (`pulse_stalls` + `PulseStall` anomaly, snapshot v3).
+  * **Layer 1.5: Hang Classification:** Monotonic clock (`MonotonicMs` / `SystemClock`), CPU-spin classifier (`classify_stall` → `CpuSpin` / `DeadlockStall`; `guard.check_timeout()` → `SpinDetected` / `TimedOut`), one-word `WorkerPulse` heartbeat + `WdtSink`, ISR bridge (`IsrBridge`, 80 B SPSC ring + 32-bit trip latch, `IsrBridge::trip` bypasses `Full`), idle-park (`IdlePark` / `wfi`/`wfe` on firmware, `wfe` needs `SEVONPEND=1` at boot), pulse black-box (`pulse_stalls` + `PulseStall` anomaly, snapshot v3).
   * **Layer 2: Concurrency Bulkhead:** `SnubberNode`, presets, token buckets, sliding-window breakers, priority preemption, builder-sealed `passthrough` canary transit, external memory limits (`memory_limits` → `note_memory_kb`), and opt-in execution profiles (`enter_auto_profiled` → `commit_profiled`). Impedance bridge: one-slot conflation (`ConflateSender`), 16 B `ExecutionEnvelope` corridors (`commit_enveloped`), and the deterministic `ProfileHarness` that measures the corridor before you promise it.
   * **Layer 3: Async Waker Queue:** Runtime-agnostic async execution (`enter_async_auto`, `settle_async`, `enter_paced_async`).
   * **Layer 4: Process Supervisor:** Out-of-process process supervisor, framed IPC tokens, `PipeDrain`, generation bumps, and memory euthanasia (`MemoryPolicy` → soft drain / hard `DeathCause::MemoryLimit`). `PipeDrain` has three drivers over one parser — `spawn` (reader thread), `drain_sync` (blocking `Read`), and `feed` + `finish` (caller-pushed chunks) — plus an injectable `ClockFn` for lease timing and `write_to` sinks for non-stdout transports. The 64 B `StateDigest` is a ticket, not storage: a soft-limit worker must stream its checkpoint through a fixed buffer — `hard - soft` is allocator headroom, not a drain countdown. `WorkerPool` runs N independent lineages (one drain, clock, tracker and memory watch per lane) with per-lane rescue classification and an aggregated report.

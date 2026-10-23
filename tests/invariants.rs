@@ -180,14 +180,22 @@ fn verify_slot_containment_and_single_shot_rollback() {
         let ab = Arc::clone(&abort_counter);
 
         handles.push(thread::spawn(move || {
+            let mut accepted = 0u64;
+            let mut refused = 0u64;
             for i in 0..ATTEMPTS_PER_THREAD {
                 let rb_local = Arc::clone(&rb);
                 let guard = match n.enter_erased_auto(move || {
                     rb_local.fetch_add(1, Ordering::SeqCst);
                 }) {
-                    Ok(g) => g,
+                    Ok(g) => {
+                        accepted += 1;
+                        g
+                    }
                     Err(_) => {
-                        // Rejection is a valid capacity shedding state; no slots leaked
+                        // Rejection is a valid capacity-shedding state: the
+                        // slot was never taken, but the refusal MUST be
+                        // counted so the conservation law below can see it.
+                        refused += 1;
                         continue;
                     }
                 };
@@ -200,12 +208,36 @@ fn verify_slot_containment_and_single_shot_rollback() {
                     guard.abort("simulated_failure");
                 }
             }
+            (accepted, refused)
         }));
     }
 
+    let mut accepted = 0u64;
+    let mut refused = 0u64;
     for h in handles {
-        h.join().unwrap();
+        let (a, r) = h.join().unwrap();
+        accepted += a;
+        refused += r;
     }
+
+    // Invariant 1: every attempt is either admitted or shed — no silent
+    // third outcome. The node's own books must agree with the harness.
+    assert_eq!(
+        accepted + refused,
+        (THREADS * ATTEMPTS_PER_THREAD) as u64,
+        "every attempt must be either admitted or counted as shed"
+    );
+    let s = node.stats();
+    assert_eq!(
+        s.total_started, accepted,
+        "node books must match admissions"
+    );
+    assert_eq!(s.shed_total(), refused, "node books must match shed count");
+    assert_eq!(
+        s.admission_total(),
+        s.total_started + s.shed_total(),
+        "conservation law: admission_total == total_started + shed_total"
+    );
 
     // Invariant 2: Quiescent state must have zero slots in flight
     assert_eq!(

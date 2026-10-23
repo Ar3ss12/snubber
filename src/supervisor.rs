@@ -433,7 +433,7 @@ impl RestartTracker {
                 self.deaths_ms.pop_front();
             }
             self.deaths_ms.push_back(now_ms);
-            while self.deaths_ms.len() > self.window.max_restarts as usize + 1 {
+            while self.deaths_ms.len() > (self.window.max_restarts as usize).saturating_add(1) {
                 self.deaths_ms.pop_front();
             }
             if self.deaths_ms.len() > self.window.max_restarts as usize {
@@ -885,25 +885,35 @@ impl PipeDrain {
     /// delivered by THIS call; a partial frame is retained for the next one.
     /// A finished drain accepts nothing and returns `0`.
     pub fn feed(&self, bytes: &[u8]) -> usize {
-        if self.eof() {
-            return 0;
-        }
+        // Take the ingest lock BEFORE the EOF check: `finish` also takes it,
+        // so a concurrent close either fully precedes this chunk or fully
+        // follows it — a finished drain truly accepts nothing.
         let mut ingest = match self.inner.ingest.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        ingest.push(bytes, |token| self.apply_token(token))
+        if self.eof() {
+            return 0;
+        }
+        // One clock read per chunk, taken OUTSIDE the state lock. The
+        // ClockFn is caller code; it must never run under a drain mutex.
+        let now = (self.clock)();
+        ingest.push(bytes, |token| self.apply_token_at(token, now))
     }
 
     /// Mark the stream finished (`EOF`). Idempotent, thread-safe; a torn
     /// partial frame is discarded, exactly like a reader that hit `EOF`.
     pub fn finish(&self) {
+        // Serialize with `feed` through the ingest lock (see `feed`).
+        let _ingest = match self.inner.ingest.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         self.done.store(1, Ordering::SeqCst);
     }
 
-    /// Apply one parsed token under one short lock.
-    fn apply_token(&self, token: ProcessToken) {
-        let now = (self.clock)();
+    /// Apply one parsed token under one short state lock.
+    fn apply_token_at(&self, token: ProcessToken, now: u64) {
         let mut state = match self.inner.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -936,13 +946,16 @@ impl PipeDrain {
     /// Parsed-frame counters (cheap snapshot under one short lock).
     #[must_use]
     pub fn counters(&self) -> DrainCounters {
-        match self.inner.state.lock() {
-            Ok(state) => DrainCounters {
-                frames: state.frames,
-                arms: state.arms,
-                commits: state.commits,
-            },
-            Err(_) => DrainCounters::default(),
+        // Recover a poisoned lock: the counters are plain integers, so the
+        // recovered value is exactly as trustworthy as before the panic.
+        let state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        DrainCounters {
+            frames: state.frames,
+            arms: state.arms,
+            commits: state.commits,
         }
     }
 
@@ -966,7 +979,11 @@ impl PipeDrain {
     /// Peek without taking (supervisor polls before spawning replacement process).
     #[must_use]
     pub fn last_state(&self) -> Option<StateDigest> {
-        self.inner.state.lock().ok().and_then(|state| state.state)
+        let state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.state
     }
 
     /// `true` once the reader hit `EOF`/error or [`PipeDrain::finish`] ran.
@@ -983,15 +1000,18 @@ impl PipeDrain {
     /// A reaped-then-hung PID is abandoned — the generation already moved.
     #[must_use]
     pub fn idle_ms(&self) -> u64 {
-        match self.inner.state.lock() {
-            Ok(state) => {
-                if !state.seen {
-                    return 0;
-                }
-                (self.clock)().saturating_sub(state.last_seen_ms)
-            }
-            Err(_) => 0,
+        // Read the clock BEFORE the lock: ClockFn is caller code and must
+        // not run while the drain state mutex is held. A poisoned state
+        // still holds a valid timestamp — recover, do not report 0.
+        let now = (self.clock)();
+        let state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !state.seen {
+            return 0;
         }
+        now.saturating_sub(state.last_seen_ms)
     }
 
     /// `true` if the pipe is alive but silent past `lease_ms`.

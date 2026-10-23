@@ -151,16 +151,23 @@ fn process_kill_stress_test() {
 
     println!("[TEST RUNNER] Report received:\n{}", report_content);
 
-    // Verify properties
-    assert!(
-        report_content.contains("\"deadlock\": false"),
-        "Supervisor reported deadlock!"
-    );
+    // Verify properties. `reaped` must be partitioned across the three
+    // termination classes — a silent unclassified death would break the sum.
     assert_eq!(
         json_num(&report_content, "total_reaped"),
         kills,
         "Total reaped count mismatch!"
     );
+    let settled =
+        json_num(&report_content, "clean_settles") + json_num(&report_content, "ambush_kills");
+    assert_eq!(
+        settled, kills,
+        "every reaped process must be classified (clean + ambush)"
+    );
+    let classes = json_num(&report_content, "ambush_kills")
+        + json_num(&report_content, "escape_kills")
+        + json_num(&report_content, "stillborn_kills");
+    assert_eq!(classes, kills, "class buckets must sum to reaped");
     assert_eq!(
         json_num(&report_content, "final_generation"),
         kills + 1,

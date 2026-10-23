@@ -234,20 +234,26 @@ impl<S, D> TaskConduit<S, D> {
     /// unsampled older one. Returns `true` when that happened, so a
     /// producer can report coalescing without a second counter read.
     pub fn publish_draft(&self, draft: D) -> bool {
-        if let Ok(mut lock) = self.inner.draft.lock() {
-            let replaced = lock.is_some();
-            if replaced {
-                self.inner.conflated.fetch_add(1, Ordering::Relaxed);
-            }
-            *lock = Some(draft);
-            return replaced;
+        let mut lock = match self.inner.draft.lock() {
+            Ok(l) => l,
+            // A poisoned draft table still holds a valid slot: recover it
+            // instead of silently dropping the publish.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let replaced = lock.is_some();
+        if replaced {
+            self.inner.conflated.fetch_add(1, Ordering::Relaxed);
         }
-        false
+        *lock = Some(draft);
+        replaced
     }
 
     /// Take the draft artifact from the shared table (if any).
     pub fn take_draft(&self) -> Option<D> {
-        self.inner.draft.lock().ok().and_then(|mut d| d.take())
+        match self.inner.draft.lock() {
+            Ok(mut d) => d.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
     }
 
     /// Drafts overwritten before the caller sampled them.
@@ -353,7 +359,13 @@ impl<S, D> TaskHandle<S, D> {
     /// in the gap before the waiter actually parks — the classic lost
     /// wakeup, leaving the worker asleep forever on a resumed conduit.
     fn notify_sync(inner: &IntercomInner<S, D>) {
-        let _guard = inner.cancel_reason.lock().ok();
+        // Recover a poisoned mutex: `.ok()` would drop the guard and issue
+        // the notify UNLOCKED, re-opening the exact lost-wakeup window this
+        // function exists to close.
+        let _guard = match inner.cancel_reason.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         inner.condvar.notify_all();
     }
 
@@ -436,6 +448,9 @@ impl<S, D> Future for ResumeFuture<S, D> {
         // release of wakers lock and the directive load, leaving Case A
         // open: controller could drain (empty list) before poller pushed,
         // and poller would park forever.
+        // Clone before the lock: `Waker::clone` runs foreign vtable code
+        // and may allocate; no executor code under the wakers mutex.
+        let waker = cx.waker().clone();
         let mut wakers = match this.inner.wakers.lock() {
             Ok(w) => w,
             Err(poisoned) => poisoned.into_inner(),
@@ -447,14 +462,14 @@ impl<S, D> Future for ResumeFuture<S, D> {
                 // own entry (matched by the minted flag), never a sibling's.
                 if let Some(flag) = this.identity.as_ref() {
                     if let Some(slot) = wakers.iter_mut().find(|q| Arc::ptr_eq(&q.identity, flag)) {
-                        slot.waker = cx.waker().clone();
+                        slot.waker = waker;
                         return Poll::Pending;
                     }
                 }
                 let flag = Arc::new(AtomicBool::new(false));
                 this.identity = Some(Arc::clone(&flag));
                 wakers.push(ParkedResumeWaker {
-                    waker: cx.waker().clone(),
+                    waker,
                     identity: flag,
                 });
                 // Remember the pushed entry so Drop can retire it.
@@ -462,13 +477,13 @@ impl<S, D> Future for ResumeFuture<S, D> {
             }
             DIR_CANCEL | DIR_PREEMPTED => {
                 // The entry is about to resolve; nothing is parked anymore.
-                let reason = this
-                    .inner
-                    .cancel_reason
-                    .lock()
-                    .ok()
-                    .and_then(|r| *r)
-                    .unwrap_or("cancelled");
+                let reason = {
+                    let r = match this.inner.cancel_reason.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    (*r).unwrap_or("cancelled")
+                };
                 Poll::Ready(Err(reason))
             }
             _ => Poll::Ready(Ok(())),

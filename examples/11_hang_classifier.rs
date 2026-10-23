@@ -9,11 +9,14 @@
 //! Run: `cargo run --example 11_hang_classifier`
 
 use snubber::{SnubberNode, TimeoutCheck};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Simulated OS thread-CPU counter (stand-in for `GetThreadTimes` on
 /// Windows / `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` on Linux).
 static SIM_CPU_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Simulated hardware state: the rollback closure must really drop it.
+static IRON_ENERGIZED: AtomicBool = AtomicBool::new(false);
 
 /// App-side sampler: plain `fn() -> u64`, no closure, no lock.
 fn thread_cpu_ms() -> u64 {
@@ -34,8 +37,10 @@ fn main() {
         .timeout_ms(1)
         .cpu_budget_ms(50)
         .build();
+    IRON_ENERGIZED.store(true, Ordering::SeqCst);
     let guard = node
         .enter(1, 1, || {
+            IRON_ENERGIZED.store(false, Ordering::SeqCst);
             println!("[Guard] spin rollback: iron de-energized")
         })
         .expect("admit")
@@ -53,6 +58,10 @@ fn main() {
         Err(_) => panic!("spin must settle as SpinDetected"),
         Ok(_) => panic!("spin must not stay within budget"),
     }
+    assert!(
+        !IRON_ENERGIZED.load(Ordering::SeqCst),
+        "the timeout settlement must have run the spin rollback"
+    );
 
     // Scenario B: blocked sleep — wall grows, CPU stands still.
     println!("\nScenario B: blocked sleep (wall grows, CPU frozen)");
@@ -62,8 +71,10 @@ fn main() {
         .timeout_ms(1)
         .cpu_budget_ms(50)
         .build();
+    IRON_ENERGIZED.store(true, Ordering::SeqCst);
     let guard = node
         .enter(2, 2, || {
+            IRON_ENERGIZED.store(false, Ordering::SeqCst);
             println!("[Guard] sleep rollback: iron de-energized")
         })
         .expect("admit")
@@ -76,6 +87,10 @@ fn main() {
         Err(_) => panic!("sleep must settle as TimedOut, not SpinDetected"),
         Ok(_) => panic!("sleep must not stay within budget"),
     }
+    assert!(
+        !IRON_ENERGIZED.load(Ordering::SeqCst),
+        "the timeout settlement must have run the sleep rollback"
+    );
 
     println!("\nVerification: SPIN vs SLEEP classified without killing any thread.");
 }

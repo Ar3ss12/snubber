@@ -133,18 +133,23 @@ fn hard_clamp_slots_guarantees_ceiling_under_evict_oldest_stress() {
     for thread_id in 0..8usize {
         let n = Arc::clone(&node);
         handles.push(std::thread::spawn(move || {
+            let mut refused = 0u64;
             for i in 0..200u64 {
                 let task_id = thread_id as u64 * 1000 + i;
                 if let Ok(guard) = n.enter(task_id, task_id, || {}) {
                     std::thread::yield_now();
                     guard.commit();
+                } else {
+                    refused += 1;
                 }
             }
+            refused
         }));
     }
 
+    let mut refused = 0u64;
     for h in handles {
-        h.join().expect("thread join");
+        refused += h.join().expect("thread join");
     }
 
     assert_eq!(
@@ -163,6 +168,12 @@ fn hard_clamp_slots_guarantees_ceiling_under_evict_oldest_stress() {
         s.committed + s.implicit_drops + s.explicit_aborts,
         "every admitted transaction must settle exactly once"
     );
+    assert_eq!(
+        1600,
+        s.total_started + refused,
+        "every attempt is either admitted or shed"
+    );
+    assert_eq!(s.shed_total(), refused, "node books must match shed count");
 }
 
 // Regression (0.6.2, bug 14): a BulkheadFull rejection must not burn the

@@ -17,6 +17,16 @@ echo "=== Snubber Architectural Invariant Audit ==="
 FAILURES=0
 SKIPS=0
 
+# Precondition: every scanned path must exist. A missing file makes grep
+# exit 2, which used to be indistinguishable from "no match" and let a
+# gate print OK over an empty scan.
+for need in src/lib.rs src/node.rs src benches examples tests; do
+    if [ ! -e "${REPO_ROOT}/${need}" ]; then
+        echo "FAIL: required path ${need} is missing — gate scan would be empty."
+        exit 1
+    fi
+done
+
 # Gate 1: Check #![forbid(unsafe_code)] in src/lib.rs
 echo -n "[1/6] Auditing unsafe code veto... "
 if grep -q '^#!\[forbid(unsafe_code)\]' "${REPO_ROOT}/src/lib.rs"; then
@@ -26,22 +36,42 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-if grep -rEIn '(^|[^_[:alnum:]])unsafe[[:space:]]*(\{|fn)' --include='*.rs' "${REPO_ROOT}/src" > /dev/null 2>&1; then
+if UNSAFE_HITS="$(grep -rEIn '(^|[^_[:alnum:]])unsafe[[:space:]]*(\{|fn)' --include='*.rs' "${REPO_ROOT}/src" 2>&1)"; then
     echo "FAIL: Found raw unsafe keyword in src/:"
-    grep -rEIn '(^|[^_[:alnum:]])unsafe[[:space:]]*(\{|fn)' --include='*.rs' "${REPO_ROOT}/src"
+    printf '%s\n' "${UNSAFE_HITS}"
     FAILURES=$((FAILURES + 1))
+else
+    rc=$?
+    if [ "$rc" -ne 1 ]; then
+        echo "FAIL: unsafe scan could not run (grep exit ${rc}) — treating as a hole:"
+        printf '%s\n' "${UNSAFE_HITS}"
+        FAILURES=$((FAILURES + 1))
+    fi
 fi
 
 # Gate 2: Saturating arithmetic on counters in src/node.rs
 # (scoped to node.rs on purpose: the fields are private to it — tests,
 # benches, and examples define their own unrelated `in_flight`s.)
 echo -n "[2/6] Auditing saturating counters in src/node.rs... "
-if grep -En '(^|[^_[:alnum:]])(in_flight|total_started|committed|bulkhead_rejections|poison_recoveries|stale_epochs_rejected)[[:space:]]*\+=' "${REPO_ROOT}/src/node.rs" > /dev/null 2>&1; then
-    echo "FAIL: Direct += found on counter:"
-    grep -En '(^|[^_[:alnum:]])(in_flight|total_started|committed|bulkhead_rejections|poison_recoveries|stale_epochs_rejected)[[:space:]]*\+=' "${REPO_ROOT}/src/node.rs"
-    FAILURES=$((FAILURES + 1))
-else
+PLUS_EQ_HITS="$(grep -En '(^|[^_[:alnum:]])(in_flight|total_started|committed|bulkhead_rejections|poison_recoveries|stale_epochs_rejected)[[:space:]]*\+=' "${REPO_ROOT}/src/node.rs" 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+    # Doc/comment lines are not code: `committed += 1` in a contract
+    # comment must not trip a scan for direct counter writes.
+    CODE_HITS="$(printf '%s\n' "${PLUS_EQ_HITS}" | grep -vE '^[0-9]+:[[:space:]]*//' || true)"
+    if [ -n "${CODE_HITS}" ]; then
+        echo "FAIL: Direct += found on counter:"
+        printf '%s\n' "${CODE_HITS}"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "OK (saturating math preserved)"
+    fi
+elif [ "$rc" -eq 1 ]; then
     echo "OK (saturating math preserved)"
+else
+    echo "FAIL: saturating-counter scan could not run (grep exit ${rc}):"
+    printf '%s\n' "${PLUS_EQ_HITS}"
+    FAILURES=$((FAILURES + 1))
 fi
 
 # Gate 3: Lock-hygiene audit in Phase A/C
@@ -77,12 +107,19 @@ fi
 # works on both.
 echo -n "[4/6] Auditing forbidden metaphors... "
 FORBIDDEN_METAPHORS='(^|[^_[:alnum:]])(wizard|spaceship|bulletproof|panacea)([^_[:alnum:]]|$)|(^|[^_[:alnum:]])silver[[:space:]]+bullet([^_[:alnum:]]|$)'
-if grep -rEIn "${FORBIDDEN_METAPHORS}" --include='*.rs' "${REPO_ROOT}/src" "${REPO_ROOT}/benches" "${REPO_ROOT}/examples" "${REPO_ROOT}/tests" > /dev/null 2>&1; then
+if METAPHOR_HITS="$(grep -rEIn "${FORBIDDEN_METAPHORS}" --include='*.rs' "${REPO_ROOT}/src" "${REPO_ROOT}/benches" "${REPO_ROOT}/examples" "${REPO_ROOT}/tests" 2>&1)"; then
     echo "FAIL: Found informal metaphors in src/ benches/ examples/ tests/:"
-    grep -rEIn "${FORBIDDEN_METAPHORS}" --include='*.rs' "${REPO_ROOT}/src" "${REPO_ROOT}/benches" "${REPO_ROOT}/examples" "${REPO_ROOT}/tests"
+    printf '%s\n' "${METAPHOR_HITS}"
     FAILURES=$((FAILURES + 1))
 else
-    echo "OK (technical language strictly adhered)"
+    rc=$?
+    if [ "$rc" -eq 1 ]; then
+        echo "OK (technical language strictly adhered)"
+    else
+        echo "FAIL: metaphor scan could not run (grep exit ${rc}):"
+        printf '%s\n' "${METAPHOR_HITS}"
+        FAILURES=$((FAILURES + 1))
+    fi
 fi
 
 # Gate 5: TRUE no_std — crate attribute + bare-metal target compile
@@ -100,8 +137,8 @@ elif ! rustup target list --installed 2>/dev/null | grep -qx "thumbv7em-none-eab
     fi
 else
     BARE_METAL_TARGET="thumbv7em-none-eabihf"
-    if (cd "${REPO_ROOT}" && cargo check --quiet --no-default-features --target "${BARE_METAL_TARGET}") \
-        && (cd "${REPO_ROOT}" && cargo check --quiet --no-default-features --features alloc --target "${BARE_METAL_TARGET}"); then
+    if (cd "${REPO_ROOT}" && cargo check --locked --quiet --no-default-features --target "${BARE_METAL_TARGET}") \
+        && (cd "${REPO_ROOT}" && cargo check --locked --quiet --no-default-features --features alloc --target "${BARE_METAL_TARGET}"); then
         echo "OK (core and alloc build for ${BARE_METAL_TARGET})"
     else
         echo "FAIL (no_std build failed for ${BARE_METAL_TARGET})"
@@ -141,9 +178,10 @@ fi
 
 echo "---------------------------------------------"
 if [ "$SKIPS" -gt 0 ]; then
-    # Never a PASS-looking summary over a reduced audit: the skip count
-    # is on its own line, next to the verdict.
-    echo "$SKIPS gate(s) SKIPPED — the audit ran at reduced coverage."
+    # A skip is a hole, not a pass: reduced coverage must fail the gate.
+    echo "$SKIPS gate(s) SKIPPED — coverage reduced, audit NOT complete."
+    echo "Re-run with the missing tool available (CI provisions every tool)."
+    exit 1
 fi
 if [ "$FAILURES" -eq 0 ]; then
     echo "All invariant gates PASSED."

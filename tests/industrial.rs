@@ -76,10 +76,12 @@ fn token_bucket_caps_admissions_per_second() {
     assert_eq!(s.total_started, 1);
     assert_eq!(s.committed, 1);
     assert_eq!(s.rate_rejected, 1);
-    // The rate refusal is ALSO mirrored into `bulkhead_rejections` by
-    // contract (`record_locked` bump 6): rate limiting is part of the
-    // saturation family, and the mirror keeps backpressure gauges whole.
-    assert_eq!(s.bulkhead_rejections, 1);
+    // A rate refusal is shed exactly once: no mirror into the other
+    // rejection buckets, so the conservation law stays arithmetically
+    // true (`attempts == started + shed`).
+    assert_eq!(s.bulkhead_rejections, 0);
+    assert_eq!(s.shed_total(), 1);
+    assert_eq!(s.admission_total(), 2);
 }
 
 #[test]

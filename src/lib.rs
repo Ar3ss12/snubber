@@ -15,7 +15,10 @@
 //!   `interval=359999640000`; no Clone-on-write semantics by design).
 //!
 //! Core stays dependency-free and `unsafe`-free; the node adds only
-//! `std::sync` (shared recorder), no runtimes, no HTTP, no async.
+//! `std::sync` (shared recorder) — no runtimes, no HTTP, no executor.
+//! Async entry is opt-in: [`SnubberNode::enter_async`] parks one waker
+//! and settles it from the node itself, so it runs on any executor
+//! (including a hand-rolled one) without pulling in a runtime crate.
 //!
 //! # Feature gates
 //!

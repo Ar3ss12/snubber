@@ -78,6 +78,7 @@ trap 'rm -f "${TMP_OUT}"' EXIT
 
 "$PY" - << 'EOF' > "${TMP_OUT}"
 import os
+import sys
 import json
 import glob
 
@@ -132,8 +133,11 @@ for path in estimate_files:
                     latency = f"{mean_ns / 1000.0:.2f} us"
                     
                 print(f"| `{label}` | **{latency}** | {group} bench |")
-        except Exception:
-            continue
+        except Exception as exc:
+            # A corrupt or half-written estimate must fail the export: the
+            # old `continue` silently dropped rows and still published.
+            print(f"[bench] FAIL: cannot parse {path}: {exc}", file=sys.stderr)
+            sys.exit(1)
 EOF
 
 if [ ! -s "${TMP_OUT}" ] || [ "$(grep -c '^| `' "${TMP_OUT}" 2>/dev/null)" = "0" ]; then

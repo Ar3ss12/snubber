@@ -60,8 +60,8 @@ jobs:
 
       - name: TRUE no_std Gate (bare-metal target, core + alloc)
         run: |
-          cargo check --no-default-features --target thumbv7em-none-eabihf
-          cargo check --no-default-features --features alloc --target thumbv7em-none-eabihf
+          cargo check --locked --no-default-features --target thumbv7em-none-eabihf
+          cargo check --locked --no-default-features --features alloc --target thumbv7em-none-eabihf
 
       - name: Architectural Invariant & Compile Gates Audit
         run: bash scripts/check_compile_gates.sh
@@ -79,7 +79,7 @@ jobs:
         run: cargo metadata --locked --format-version 1 > /dev/null
 
       - name: Package Integrity (dry-run publish)
-        run: cargo publish --dry-run
+        run: cargo publish --dry-run --locked
 
   # 2. CROSS-PLATFORM TEST SUITE: Linux, Windows, macOS
   test-matrix:
@@ -157,7 +157,7 @@ jobs:
 
       - name: Run Miri on Core Suites
         env:
-          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks"
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks -Zmiri-strict-provenance"
         run: |
           cargo miri test --locked --test guard
           cargo miri test --locked --test scoped_transactions
@@ -193,7 +193,7 @@ jobs:
 
       - name: Run Miri on Concurrency Suites
         env:
-          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks"
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks -Zmiri-strict-provenance"
         run: |
           cargo miri test --locked --test backpressure
           cargo miri test --locked --test fault_classification

@@ -308,8 +308,10 @@ def kill_lane_worker(lane: "Lane", supervisors: set[int], target: str) -> None:
         return
     try:
         os.kill(worker, signal.SIGKILL)
-    except OSError:
+    except ProcessLookupError:
         pass
+    except OSError as exc:
+        print(f"[WARN] lane {lane.index} kill(pid={worker}) failed: {exc}", file=sys.stderr)
 
 
 def cleanup(lanes: list[Lane], supervisors: set[int], target: str) -> None:
@@ -321,7 +323,7 @@ def cleanup(lanes: list[Lane], supervisors: set[int], target: str) -> None:
             try:
                 lane.sup.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                pass
+                print(f"[WARN] lane {lane.index} supervisor {lane.sup.pid} ignored SIGKILL for 5 s", file=sys.stderr)
     for lane in lanes:
         kill_lane_worker(lane, supervisors, target)
 
@@ -333,7 +335,7 @@ def run(args: argparse.Namespace, repo: Path) -> int:
 
     exe = repo / "target" / args.profile / "examples" / args.target
     if args.build or not exe.exists():
-        cmd = ["cargo", "build", "--example", args.target]
+        cmd = ["cargo", "build", "--locked", "--example", args.target]
         if args.profile == "release":
             cmd.insert(2, "--release")
         print(f"[BUILD] {' '.join(cmd)}", flush=True)
@@ -494,7 +496,13 @@ def run(args: argparse.Namespace, repo: Path) -> int:
         checks.append(
             (f"{tag} final gen == kills+1", int(report.get("final_generation", 0)) == args.kills_per_line + 1, "")
         )
-        checks.append((f"{tag} no pipe deadlock", not bool(report.get("deadlock", True)), ""))
+        checks.append(
+            (
+                f"{tag} rescued+clean == reaped",
+                int(report.get("tokens_rescued", 0)) + int(report.get("clean_settles", 0)) == reaped,
+                f"{report.get('tokens_rescued', 0)}+{report.get('clean_settles', 0)}",
+            )
+        )
         checks.append((f"{tag} supervisor exit 0", lane.sup_exit == 0, str(lane.sup_exit)))
         checks.append(
             (f"{tag} killer no error/stall", lane.error is None and not lane.stalled, lane.error or "")
@@ -502,21 +510,21 @@ def run(args: argparse.Namespace, repo: Path) -> int:
         checks.append(
             (f"{tag} ambush >= {min_ambush:.0f}%", ambush_pct + 1e-9 >= min_ambush, f"{ambush_pct:.1f}%")
         )
-        checks.append(
-            (
-                f"{tag} rss growth <= {args.max_growth_mb} MB",
-                lane.sup_rss.growth() <= args.max_growth_mb,
-                f"{lane.sup_rss.growth():.2f} MB",
-            )
+        rss_ok = lane.sup_rss.count > 0 and lane.sup_rss.growth() <= args.max_growth_mb
+        rss_detail = (
+            f"{lane.sup_rss.growth():.2f} MB"
+            if lane.sup_rss.count > 0
+            else "0 samples (leak gate cannot pass on no data)"
         )
+        checks.append((f"{tag} rss growth <= {args.max_growth_mb} MB", rss_ok, rss_detail))
         if IS_LINUX:
-            checks.append(
-                (
-                    f"{tag} handle growth <= {args.max_handle_growth}",
-                    lane.sup_fds.growth() <= args.max_handle_growth,
-                    f"{lane.sup_fds.growth():.0f}",
-                )
+            fds_ok = lane.sup_fds.count > 0 and lane.sup_fds.growth() <= args.max_handle_growth
+            fds_detail = (
+                f"{lane.sup_fds.growth():.0f}"
+                if lane.sup_fds.count > 0
+                else "0 samples (leak gate cannot pass on no data)"
             )
+            checks.append((f"{tag} handle growth <= {args.max_handle_growth}", fds_ok, fds_detail))
         else:
             # Explicit SKIP accounting: a platform-unavailable check must
             # not masquerade as a PASS in the gate table.
@@ -572,7 +580,8 @@ def run(args: argparse.Namespace, repo: Path) -> int:
         print(f"  {label}  {name}" + (f"  ({detail})" if detail else ""))
     if skipped:
         print(f"  [skip accounting] {len(skipped)} check(s) skipped: platform-gated", flush=True)
-    verdict = "PASS" if not failed else "FAIL"
+    # A skipped check is a hole, not a pass: reduced coverage fails the run.
+    verdict = "PASS" if not failed and not skipped else "FAIL"
     print(f"[VERDICT] {verdict}", flush=True)
 
     stats = {

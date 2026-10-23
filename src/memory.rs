@@ -8,8 +8,10 @@
 //! `AtomicBool`, never a sampler, never a lock held by foreign code.
 //!
 //! Limits are KiB. `0` disables a limit: soft-only nodes drain and let the
-//! supervisor restart them, hard-only nodes keep admitting until the OS
-//! kills them, both-zero nodes behave exactly as before (zero cost).
+//! supervisor restart them, hard-only nodes refuse new admissions at the
+//! hard limit and signal `MemoryVerdict::Hard` so the supervisor can
+//! terminate without draining, both-zero nodes behave exactly as before
+//! (zero cost).
 
 /// Verdict for one external memory sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

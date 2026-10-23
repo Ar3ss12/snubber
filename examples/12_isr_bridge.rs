@@ -14,6 +14,9 @@
 //! side), or with `SEV` at the end of each ISR. Otherwise an ISR
 //! between `is_empty()` and `wfe` loses the wakeup.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use snubber::{
     IsrBridge, IsrSignal, PulseWatch, SnubberNode, WorkerPulse, OP_EMERGENCY_TRIP, OP_PAUSE,
     OP_PULSE,
@@ -68,30 +71,54 @@ fn main() {
     println!("=== Pattern 12: ISR bridge (interrupt to guard) ===");
 
     let node = SnubberNode::builder("isr/laser").max_in_flight(1).build();
+    // Simulated laser hardware: the rollback must actually switch it off.
+    let laser_on = Arc::new(AtomicBool::new(false));
     let pulse = WorkerPulse::new();
     let mut watch = PulseWatch::new(1000);
 
     // Cycle 1: timer ticks feed the pulse, guard commits clean.
     println!("\nCycle 1: timer pulse, clean commit");
     timer_isr(1);
+    laser_on.store(true, Ordering::SeqCst);
     let guard = node
-        .enter(1, 1, || println!("[Guard] laser off"))
+        .enter(1, 1, {
+            let laser = Arc::clone(&laser_on);
+            move || {
+                laser.store(false, Ordering::SeqCst);
+                println!("[Guard] laser off")
+            }
+        })
         .expect("admit");
     assert!(poll_hardware(true), "pulse tick pending");
     assert!(!drain_bridge(&pulse), "no trip latched");
     assert!(watch.observe(pulse.tick(), 100));
     guard.commit();
+    assert!(
+        laser_on.load(Ordering::SeqCst),
+        "a committed cycle keeps the laser energized"
+    );
     println!("[Main] committed: pulse alive, iron energized");
 
     // Cycle 2: overcurrent ISR trips mid-work, guard aborts.
     println!("\nCycle 2: overcurrent trip, abort");
+    laser_on.store(true, Ordering::SeqCst);
     let guard = node
-        .enter(2, 2, || println!("[Guard] laser off"))
+        .enter(2, 2, {
+            let laser = Arc::clone(&laser_on);
+            move || {
+                laser.store(false, Ordering::SeqCst);
+                println!("[Guard] laser off")
+            }
+        })
         .expect("admit");
     overcurrent_isr(7);
     assert!(poll_hardware(true), "trip latched");
     assert!(drain_bridge(&pulse), "trip must abort the guard");
     guard.abort("hardware_isr_trip");
+    assert!(
+        !laser_on.load(Ordering::SeqCst),
+        "the abort must have run the laser-off rollback"
+    );
     node.note_pulse_stall(watch.idle_ms(5000));
     assert_eq!(node.stats().pulse_stalls, 1);
 
@@ -105,8 +132,15 @@ fn main() {
     let shed_before = BRIDGE.shed_count();
     assert!(shed_before >= 1, "full ring sheds telemetry");
     overcurrent_isr(4);
+    laser_on.store(true, Ordering::SeqCst);
     let guard = node
-        .enter(3, 3, || println!("[Guard] laser off"))
+        .enter(3, 3, {
+            let laser = Arc::clone(&laser_on);
+            move || {
+                laser.store(false, Ordering::SeqCst);
+                println!("[Guard] laser off")
+            }
+        })
         .expect("admit");
     assert!(
         drain_bridge(&pulse),

@@ -96,15 +96,19 @@ impl<T, F: FnOnce()> Protected<T, F> {
     /// Preserves the authentic transaction header from the underlying guard.
     #[inline]
     pub fn abort(mut self, reason: &'static str) -> super::SnubberEvent<()> {
-        self.resource.take();
-        if let Some(guard) = self.guard.take() {
+        // Rollback FIRST, resource second — same order as `Drop`. A rollback
+        // closure is allowed to read the protected resource; taking it
+        // before the guard ran handed the closure a freed value.
+        let event = if let Some(guard) = self.guard.take() {
             guard.abort(reason)
         } else {
             super::SnubberEvent::Aborted {
                 header: super::TransactionHeader::new(0, 0),
                 reason,
             }
-        }
+        };
+        self.resource.take();
+        event
     }
 }
 

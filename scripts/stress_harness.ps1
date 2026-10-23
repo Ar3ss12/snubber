@@ -238,8 +238,8 @@ try {
     if ($Launch) {
         if ($Build -or -not (Test-Path $exe)) {
             Write-Host "[BUILD] cargo build --example $TargetProcess ($Profile)..." -ForegroundColor Yellow
-            $cargoArgs = @("build", "--example", $TargetProcess)
-            if ($Profile -eq "release") { $cargoArgs = @("build", "--release", "--example", $TargetProcess) }
+            $cargoArgs = @("build", "--locked", "--example", $TargetProcess)
+            if ($Profile -eq "release") { $cargoArgs = @("build", "--locked", "--release", "--example", $TargetProcess) }
             & cargo @cargoArgs
             if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
         }
@@ -473,9 +473,9 @@ if ($wSamples -gt 0) {
 
 $checks = New-Object 'System.Collections.Generic.List[object]'
 $ambush = 0; $escape = 0; $stillborn = 0
-# Launch mode without a report is a failure, not a pending pass: the
-# supervisor was ours, it owed us termination_report.json.
-$checks.Add([pscustomobject]@{ Name = "report present"; Ok = ($report -or -not $Launch) })
+# A missing or unparsable report proves nothing: the report checks below
+# would never run, so the run must fail in every mode.
+$checks.Add([pscustomobject]@{ Name = "report present and parsable"; Ok = [bool]$report })
 if ($report) {
     if ($report.PSObject.Properties['ambush_kills']) {
         $ambush = [int]$report.ambush_kills
@@ -497,8 +497,6 @@ if ($report) {
         $checks.Add([pscustomobject]@{ Name = ("true ambush rate {0:N1}% >= {1}%" -f $ambushPct, $minAmbush); Ok = ($ambushPct -ge $minAmbush) })
     }
     $checks.Add([pscustomobject]@{ Name = "final_generation == kills + 1"; Ok = ([int]$report.final_generation -eq $completed + 1) })
-    # A missing key must fail, not pass ([bool]$null is $false).
-    $checks.Add([pscustomobject]@{ Name = "deadlock == false"; Ok = ($report.PSObject.Properties['deadlock'] -and -not [bool]$report.deadlock) })
 }
 if ($Launch) {
     # Kept outside the report block: a wedged supervisor must fail the run
@@ -524,11 +522,7 @@ if ($supSamples -gt 0) {
 }
 
 $failedChecks = @($checks | Where-Object { -not $_.Ok })
-# Pending pass only makes sense in external mode (we never owned the
-# supervisor, so no report contract exists); launch mode owes a report.
-$verdict = if ($completed -eq $Kills -and $failedChecks.Count -eq 0) {
-    if ($report) { "PASS" } elseif (-not $Launch) { "PASS (harness only, report pending)" } else { "FAIL" }
-} else { "FAIL" }
+$verdict = if ($completed -eq $Kills -and $failedChecks.Count -eq 0 -and $report) { "PASS" } else { "FAIL" }
 
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "   STRESS RESULTS" -ForegroundColor Cyan

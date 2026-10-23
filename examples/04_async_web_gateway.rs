@@ -8,9 +8,7 @@
 //! `tokio::time::sleep(...).await`.
 
 use snubber::{AsyncGate, Refusal, SnubberNode};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SLEPT_MS: AtomicU64 = AtomicU64::new(0);
+use std::time::{Duration, Instant};
 
 fn main() {
     let node = SnubberNode::builder("async/demo")
@@ -20,22 +18,24 @@ fn main() {
     let gate = AsyncGate::new(node).expect("AdviseOnly passes");
     // Slot 1: admitted.
     let held = gate.admit(1, 1, || {}).expect("first in");
-    // Slot 2: wall pushes back — classify, record the wait OUTSIDE.
+    // Slot 2: wall pushes back — classify, then honour the advised wait
+    // with a real (blocking here; `tokio::time::sleep` in an executor)
+    // sleep OUTSIDE any node lock.
     match gate.admit(2, 2, || {}) {
         Ok(_) => panic!("wall must push back"),
         Err(e) => {
             assert_eq!(snubber::classify(&e), Refusal::Backoff);
             let wait = snubber::retry_after_ms(&e).clamp(1, 50);
-            // In Tokio: `tokio::time::sleep(Duration::from_millis(wait)).await`.
-            // Here (no runtime): record that the sleep would happen outside.
-            SLEPT_MS.fetch_add(wait, Ordering::SeqCst);
+            let started = Instant::now();
+            std::thread::sleep(Duration::from_millis(wait));
+            let slept = started.elapsed();
+            assert!(
+                slept >= Duration::from_millis(wait),
+                "advised wait {wait} ms must actually elapse outside the node, saw {slept:?}"
+            );
             println!("ASYNC_GATE: refused fast, advised wait={wait}ms, slept outside");
         }
     }
     drop(held);
-    assert!(
-        SLEPT_MS.load(Ordering::SeqCst) > 0,
-        "sleep happened outside"
-    );
-    println!("ASYNC_GATE: no runtime inside, no thread parked");
+    println!("ASYNC_GATE: no runtime inside, no node lock held across the wait");
 }

@@ -72,8 +72,8 @@ $totalTarget = $Lines * $KillsPerLine
 
 if ($Build -or -not (Test-Path $exe)) {
     Write-Host "[BUILD] cargo build --example $TargetProcess ($Profile)..." -ForegroundColor Yellow
-    $cargoArgs = @("build", "--example", $TargetProcess)
-    if ($Profile -eq "release") { $cargoArgs = @("build", "--release", "--example", $TargetProcess) }
+    $cargoArgs = @("build", "--locked", "--example", $TargetProcess)
+    if ($Profile -eq "release") { $cargoArgs = @("build", "--locked", "--release", "--example", $TargetProcess) }
     & cargo @cargoArgs
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
 }
@@ -493,8 +493,6 @@ foreach ($lane in $lanes) {
             $checks.Add([pscustomobject]@{ Name = ("$tag true ambush rate {0:N1}% >= {1}%" -f $lane.AmbushPct, $minAmbush); Ok = ($lane.AmbushPct -ge $minAmbush) })
         }
         $checks.Add([pscustomobject]@{ Name = "$tag final_generation == kills + 1"; Ok = ([int]$lane.ReportObj.final_generation -eq $KillsPerLine + 1) })
-        # A missing key must fail, not pass ([bool]$null is $false).
-        $checks.Add([pscustomobject]@{ Name = "$tag deadlock == false"; Ok = ($lane.ReportObj.PSObject.Properties['deadlock'] -and -not [bool]$lane.ReportObj.deadlock) })
     } else {
         $checks.Add([pscustomobject]@{ Name = "$tag report present"; Ok = $false })
     }

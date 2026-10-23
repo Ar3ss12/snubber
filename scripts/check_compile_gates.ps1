@@ -11,7 +11,16 @@ $Skips = 0
 
 # CI mode: GitHub Actions sets CI=true. A SKIP in a controlled
 # environment is a hole in the audit, not a pass (parity with the .sh).
-$InCi = [bool]$env:CI
+# Compare the VALUE: [bool]"false" is true for any non-empty string.
+$InCi = ($env:CI -ne $null -and $env:CI -ne "" -and $env:CI -notin @("false", "0"))
+
+# Precondition: a missing scanned path must fail, never yield an empty scan.
+foreach ($Need in @("src\lib.rs", "src\node.rs", "src", "benches", "examples", "tests")) {
+    if (-not (Test-Path (Join-Path $RepoRoot $Need))) {
+        Write-Host "FAIL: required path $Need is missing -- gate scan would be empty." -ForegroundColor Red
+        exit 1
+    }
+}
 
 # Gate 1: Check #![forbid(unsafe_code)] in src/lib.rs
 Write-Host "[1/6] Auditing unsafe code veto..." -NoNewline
@@ -38,7 +47,8 @@ if ($UnsafeMatches) {
 # Gate 2: Saturating arithmetic on counters in src/node.rs
 Write-Host "[2/6] Auditing saturating counters in src/node.rs..." -NoNewline
 # Counter increment check: flag direct `+= 1` on known counter fields
-$CounterViolations = Select-String -Path "$RepoRoot\src\node.rs" -CaseSensitive -Pattern "\b(in_flight|total_started|committed|bulkhead_rejections|poison_recoveries|stale_epochs_rejected)\s*\+="
+$CounterViolations = Select-String -Path "$RepoRoot\src\node.rs" -CaseSensitive -Pattern "\b(in_flight|total_started|committed|bulkhead_rejections|poison_recoveries|stale_epochs_rejected)\s*\+=" |
+    Where-Object { $_.Line -notmatch '^\s*//' }
 if ($CounterViolations) {
     Write-Host " FAIL: Direct += found on counter:" -ForegroundColor Red
     $CounterViolations | ForEach-Object { Write-Host "   $($_.Filename):$($_.LineNumber): $($_.Line.Trim())" }
@@ -143,9 +153,9 @@ if ($LibContent -cnotmatch '(?m)^#!\[cfg_attr\(not\(feature = "std"\), no_std\)\
 } else {
     Push-Location $RepoRoot
     try {
-        cargo check --quiet --no-default-features --target $BareMetalTarget
+        cargo check --locked --quiet --no-default-features --target $BareMetalTarget
         if ($LASTEXITCODE -eq 0) {
-            cargo check --quiet --no-default-features --features alloc --target $BareMetalTarget
+            cargo check --locked --quiet --no-default-features --features alloc --target $BareMetalTarget
         }
         if ($LASTEXITCODE -eq 0) {
             Write-Host " OK (core and alloc build for $BareMetalTarget)" -ForegroundColor Green
@@ -182,7 +192,8 @@ if ($GitExit -ne 0 -or -not $ApiBaseline) {
     $HeadRev = & git -C "$RepoRoot" rev-parse HEAD 2>$null
     $TagRev = & git -C "$RepoRoot" rev-parse "$ApiBaseline^{}" 2>$null
     if ($HeadRev -and $TagRev -and $HeadRev -eq $TagRev) {
-        Write-Host " WARN (baseline $ApiBaseline == HEAD; committed-but-untagged API changes are invisible)" -ForegroundColor Yellow
+        Write-Host " FAIL (baseline $ApiBaseline == HEAD; committed-but-untagged API changes are invisible -- tag the release or pass an older baseline)" -ForegroundColor Red
+        $Failures++
     }
     $PrevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
@@ -203,13 +214,14 @@ if ($GitExit -ne 0 -or -not $ApiBaseline) {
         try {
             $PrevEap = $ErrorActionPreference
             $ErrorActionPreference = "Continue"
-            & cargo semver-checks check-release --baseline-rev $ApiBaseline --package $Crate *> $null
+            $SemverOut = & cargo semver-checks check-release --baseline-rev $ApiBaseline --package $Crate 2>&1
             $SemverExit = $LASTEXITCODE
             $ErrorActionPreference = $PrevEap
             if ($SemverExit -eq 0) {
                 Write-Host " OK (no breaking change vs $ApiBaseline)" -ForegroundColor Green
             } else {
                 Write-Host " FAIL (breaking API change vs ${ApiBaseline}: run scripts/check_api_diff.ps1)" -ForegroundColor Red
+                $SemverOut | ForEach-Object { Write-Host "   $_" }
                 $Failures++
             }
         } finally {
@@ -220,9 +232,10 @@ if ($GitExit -ne 0 -or -not $ApiBaseline) {
 
 Write-Host "---------------------------------------------"
 if ($Skips -gt 0) {
-    # Never a PASS-looking summary over a reduced audit: the skip count
-    # is on its own line, next to the verdict.
-    Write-Host "$Skips gate(s) SKIPPED -- the audit ran at reduced coverage." -ForegroundColor Yellow
+    # A skip is a hole, not a pass: reduced coverage must fail the gate.
+    Write-Host "$Skips gate(s) SKIPPED -- coverage reduced, audit NOT complete." -ForegroundColor Yellow
+    Write-Host "Re-run with the missing tool available (CI provisions every tool)." -ForegroundColor Yellow
+    exit 1
 }
 if ($Failures -eq 0) {
     Write-Host "All invariant gates PASSED." -ForegroundColor Green

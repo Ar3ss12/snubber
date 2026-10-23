@@ -47,7 +47,8 @@ fi
 # A baseline pointing at HEAD diffs an empty range: the gate would PASS
 # trivially unless the worktree is dirty. Say so instead of passing silently.
 if [ "$(git -C "${REPO_ROOT}" rev-parse "${BASELINE}^{commit}" 2>/dev/null || true)" = "$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || true)" ]; then
-    echo " WARN (baseline ${BASELINE} is HEAD: committed-but-untagged API changes are invisible to this gate)"
+    echo " FAIL (baseline ${BASELINE} is HEAD: committed-but-untagged API changes are invisible to this gate -- tag the release or pass an older baseline)"
+    exit 1
 fi
 
 CRATE="$(sed -n 's/^name *= *\"\([^\"]*\)\".*/\1/p' "${REPO_ROOT}/Cargo.toml" | head -1)"

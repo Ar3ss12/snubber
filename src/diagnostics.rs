@@ -144,10 +144,25 @@ impl SnapshotV1 {
             .saturating_add(self.implicit_drops)
     }
 
-    /// Capacity shedding: bulkhead + evicted (worker capacity saturated).
+    /// Capacity shedding: bulkhead rejections only (parity with
+    /// [`crate::SnubberStats::shed_bulkhead`]). `evicted` is a side-event
+    /// of an admission already counted in `total_started`; adding it here
+    /// made the snapshot and the live stats disagree.
     #[must_use]
     pub fn shed_bulkhead(&self) -> u64 {
-        self.bulkhead_rejections.saturating_add(self.evicted)
+        self.bulkhead_rejections
+    }
+
+    /// Admission first-pass shed: every refusal kind exactly once.
+    /// `admission_total() == total_started + shed_total()`.
+    #[must_use]
+    pub fn shed_total(&self) -> u64 {
+        self.bulkhead_rejections
+            .saturating_add(self.stale_epochs_rejected)
+            .saturating_add(self.rate_rejected)
+            .saturating_add(self.breaker_rejections)
+            .saturating_add(self.poisoned_rejected)
+            .saturating_add(self.memory_rejections)
     }
 
     /// Operational shedding: cooperative preemptions (own column, never merged).
@@ -169,19 +184,13 @@ impl SnapshotV1 {
     }
 
     /// Total admission attempts observed. Parity with
-    /// [`crate::SnubberStats::admission_total`]: `evicted` is excluded —
-    /// a sync `EvictOldest` overbooking is already counted in
-    /// `total_started` (adding it would double-count), while an async
-    /// evicted victim's own attempt is the one admission the crate
-    /// reports as started in its place.
+    /// [`crate::SnubberStats::admission_total`]:
+    /// `admission_total() == total_started + shed_total()`. `evicted` is
+    /// excluded — an `EvictOldest` overbooking is already counted in
+    /// `total_started` (adding it would double-count).
     #[must_use]
     pub fn admission_total(&self) -> u64 {
-        self.total_started
-            .saturating_add(self.bulkhead_rejections)
-            .saturating_add(self.stale_epochs_rejected)
-            .saturating_add(self.breaker_rejections)
-            .saturating_add(self.rate_rejected)
-            .saturating_add(self.poisoned_rejected)
+        self.total_started.saturating_add(self.shed_total())
     }
 
     /// Encode to exactly 512 bytes: magic + version + LE fields, zero

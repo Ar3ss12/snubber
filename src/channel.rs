@@ -116,6 +116,18 @@ struct GatewayBooks {
     throttled: u64,
 }
 
+impl GatewayBooks {
+    /// Poison-tolerant counter update: a panicked peer does not corrupt
+    /// `u64` counters, so recover the guard instead of dropping the tick.
+    fn update(books: &Mutex<GatewayBooks>, f: impl FnOnce(&mut Self)) {
+        let mut b = match books.lock() {
+            Ok(b) => b,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        f(&mut b);
+    }
+}
+
 /// Shared throttle state: atomics only, no lock on the hot path.
 #[derive(Debug)]
 struct ThrottleState {
@@ -170,7 +182,9 @@ fn watermarks(capacity: usize) -> (usize, usize) {
     if capacity < THROTTLE_MIN_CAP {
         return (capacity + 1, 0);
     }
-    (capacity * HWM_NUM / WM_DEN, capacity / 2)
+    // 75% without overflow: `c - c/4` == `3c/4` for every `usize` and
+    // saturates instead of wrapping for absurd capacities.
+    (capacity - capacity / 4, capacity / 2)
 }
 
 /// Cap a raw depth estimate to the `u8` telemetry range.
@@ -281,11 +295,13 @@ impl<T> GatewaySender<T> {
     ///   advised wait instead of retry-spinning. Releases only after
     ///   the queue drains to the 50% low watermark (hysteresis latch).
     pub fn send(&self, cmd: T) -> Result<(), GatewaySendError> {
-        let depth = self.throttle.depth.load(Ordering::Relaxed).max(0) as usize;
+        // Acquire, not Relaxed: this depth gates a refusal decision, so it
+        // must not be a stale value that bypasses an armed throttle.
+        let depth = self.throttle.depth.load(Ordering::Acquire).max(0) as usize;
         if self.throttle.throttled.load(Ordering::Acquire) && depth > self.throttle.lwm {
-            if let Ok(mut b) = self.books.lock() {
+            GatewayBooks::update(&self.books, |b| {
                 b.throttled = b.throttled.saturating_add(1);
-            }
+            });
             return Err(GatewaySendError::Throttled {
                 retry_after_ms: self.throttle.retry_after_ms(depth),
                 depth: depth_u8(depth),
@@ -307,15 +323,15 @@ impl<T> GatewaySender<T> {
                 if depth >= self.throttle.hwm as isize {
                     self.throttle.throttled.store(true, Ordering::Release);
                 }
-                if let Ok(mut b) = self.books.lock() {
+                GatewayBooks::update(&self.books, |b| {
                     b.sent = b.sent.saturating_add(1);
-                }
+                });
                 Ok(())
             }
             Err(TrySendError::Full(_)) => {
-                if let Ok(mut b) = self.books.lock() {
+                GatewayBooks::update(&self.books, |b| {
                     b.shed = b.shed.saturating_add(1);
-                }
+                });
                 Err(GatewaySendError::Full)
             }
             Err(TrySendError::Disconnected(_)) => Err(GatewaySendError::Disconnected),
@@ -331,20 +347,24 @@ impl<T> GatewaySender<T> {
     /// Estimated queue depth (sender-side counter, saturating at 0).
     #[must_use]
     pub fn depth(&self) -> usize {
-        self.throttle.depth.load(Ordering::Relaxed).max(0) as usize
+        self.throttle.depth.load(Ordering::Acquire).max(0) as usize
     }
 
     /// Snapshot the counters (`Copy` out, poison-safe default).
     #[must_use]
     pub fn stats(&self) -> GatewayStats {
-        self.books
-            .lock()
-            .map_or(GatewayStats::default(), |b| GatewayStats {
-                sent: b.sent,
-                admitted: b.admitted,
-                shed: b.shed,
-                throttled: b.throttled,
-            })
+        let b = match self.books.lock() {
+            Ok(b) => b,
+            // Poisoned books still hold valid counters — report them
+            // instead of silently zeroing the whole gateway.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        GatewayStats {
+            sent: b.sent,
+            admitted: b.admitted,
+            shed: b.shed,
+            throttled: b.throttled,
+        }
     }
 }
 
@@ -366,9 +386,9 @@ impl<T> GatewayHost<T> {
         match self.rx.recv() {
             Ok(cmd) => {
                 self.on_take();
-                if let Ok(mut b) = self.books.lock() {
+                GatewayBooks::update(&self.books, |b| {
                     b.admitted = b.admitted.saturating_add(1);
-                }
+                });
                 Ok(cmd)
             }
             Err(_) => Err(GatewayRecvError::Disconnected),
@@ -381,9 +401,9 @@ impl<T> GatewayHost<T> {
         match self.rx.try_recv() {
             Ok(cmd) => {
                 self.on_take();
-                if let Ok(mut b) = self.books.lock() {
+                GatewayBooks::update(&self.books, |b| {
                     b.admitted = b.admitted.saturating_add(1);
-                }
+                });
                 Some(cmd)
             }
             Err(_) => None,
@@ -407,7 +427,7 @@ impl<T> GatewayHost<T> {
     /// Estimated queue depth (receiver-side counter, saturating at 0).
     #[must_use]
     pub fn depth(&self) -> usize {
-        self.throttle.depth.load(Ordering::Relaxed).max(0) as usize
+        self.throttle.depth.load(Ordering::Acquire).max(0) as usize
     }
 
     fn on_take(&self) {
@@ -418,7 +438,7 @@ impl<T> GatewayHost<T> {
         // the latch clears whenever the post-decrement depth is at/below
         // the low watermark, which a negative prev trivially satisfies.
         let prev = self.throttle.depth.fetch_sub(1, Ordering::Relaxed);
-        if prev - 1 <= self.throttle.lwm as isize {
+        if prev.saturating_sub(1) <= self.throttle.lwm as isize {
             self.throttle.throttled.store(false, Ordering::Release);
         }
     }
@@ -426,13 +446,17 @@ impl<T> GatewayHost<T> {
     /// Snapshot the counters.
     #[must_use]
     pub fn stats(&self) -> GatewayStats {
-        self.books
-            .lock()
-            .map_or(GatewayStats::default(), |b| GatewayStats {
-                sent: b.sent,
-                admitted: b.admitted,
-                shed: b.shed,
-                throttled: b.throttled,
-            })
+        let b = match self.books.lock() {
+            Ok(b) => b,
+            // Poisoned books still hold valid counters — report them
+            // instead of silently zeroing the whole gateway.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        GatewayStats {
+            sent: b.sent,
+            admitted: b.admitted,
+            shed: b.shed,
+            throttled: b.throttled,
+        }
     }
 }

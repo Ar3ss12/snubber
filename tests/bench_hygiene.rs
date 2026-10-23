@@ -56,8 +56,20 @@ const HEAVY: &[&str] = &[
     "SnubberNode::builder(",
     "IsrBridge::new(",
     "TaskConduit::new(",
+    "TaskConduit::pair(",
     "ConflateSender::<",
     "WorkerPool::new(",
+    "PipeDrain::drain_sync(",
+];
+
+/// Constructors that ARE the measured API: `drain_sync` performs the
+/// whole scan in its constructor, and `lane.attach` takes ownership of a
+/// drain, so per-sample construction is the honest cost there. Every such
+/// site must be declared here; any undeclared constructor is still a bug.
+const PER_SAMPLE: &[(&str, &str)] = &[
+    ("drain_sync_256_frames", "PipeDrain::drain_sync("),
+    ("lane_attach_reap_ambush", "PipeDrain::drain_sync("),
+    ("lane_attach_reap_escape", "PipeDrain::drain_sync("),
 ];
 
 /// Fixed-name benches; `bench_function(format!(...))` sites are pinned by
@@ -217,7 +229,11 @@ fn bench_setup_outside_hot_loop() {
         assert!(
             timed.contains("b.iter(") || timed.contains("b.iter_custom(") || name.ends_with('_')
         );
+        let name_s: &str = name;
         for ctor in HEAVY {
+            if PER_SAMPLE.iter().any(|(n, c)| *n == name_s && *c == *ctor) {
+                continue;
+            }
             assert!(
                 !timed.contains(ctor),
                 "bench '{name}' builds '{ctor}' inside timer"

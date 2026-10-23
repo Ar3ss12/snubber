@@ -10,12 +10,13 @@
 //! resolves to `Err(EnterError::QueueFull)` instead of hanging forever;
 //! dropping a parked future deregisters exactly its own queue entry.
 //!
-//! Known window (accepted, self-healing): a settle pops its winner under
-//! the lock and wakes it AFTER unlocking. If the winner's task is dropped
-//! in that gap, the wake is a no-op and the freed slot is handed off only
-//! on the NEXT settle — one waiter waits one extra settle, bounded by
-//! traffic. A dead waker cannot be detected portably, so the alternative
-//! is waking two waiters per settle (wake storm) — not taken.
+//! Cancellation handoff: a settle pops ONE winner and wakes it after
+//! unlocking. If that task is dropped in the gap, `Drop for EnterFuture`
+//! observes a free slot in `deregister_waiter` and wakes the next waiter,
+//! so a quiescent node cannot strand the queue (no "next settle" needed).
+//! `EnterFuture::poll` retires its own queue entry on every terminal
+//! `Ready`, so an early refusal (memory/TTL/breaker/stale/queue-full/rate)
+//! never leaves a ghost entry squatting `queue_limit`.
 //!
 //! Works with Tokio, async-std, smol, embassy — anything polling `Future`.
 //! Queue is capped (1024, oldest evicted); atomic admission reserves the slot
@@ -92,6 +93,9 @@ impl<F: FnOnce() + Unpin> Future for EnterFuture<F> {
             .as_ref()
             .is_some_and(|f| f.load(Ordering::Acquire))
         {
+            // The evictor already popped our entry; the flag is the verdict,
+            // not a live slot. Clear it so Drop does not wake an extra waiter.
+            this.evicted = None;
             return Poll::Ready(Err(EnterError::QueueFull));
         }
         let mut evicted_slot: Option<Arc<AtomicBool>> = None;
@@ -119,6 +123,19 @@ impl<F: FnOnce() + Unpin> Future for EnterFuture<F> {
                 }
             }
             this.evicted = new_flag;
+            return attempt;
+        }
+        match &attempt {
+            // Ready, but a spurious re-poll may have admitted us while our
+            // own queue entry is still parked: retire whatever entry this
+            // future still owns (identity-matched, no-op when the settle
+            // path already popped it).
+            Poll::Ready(Ok(_)) | Poll::Ready(Err(_)) => {
+                if let Some(old) = this.evicted.take() {
+                    this.node.deregister_waiter(&old);
+                }
+            }
+            Poll::Pending => {}
         }
         attempt
     }

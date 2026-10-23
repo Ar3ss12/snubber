@@ -12,7 +12,7 @@ $RepoRoot = Resolve-Path "$ScriptDir\.."
 # CI mode: GitHub Actions sets CI=true. A SKIP in a controlled
 # environment means the workflow is misconfigured (missing tags or
 # tooling) -- that must fail the run, not silently skip the gate.
-$InCi = [bool]$env:CI
+$InCi = ($env:CI -ne $null -and $env:CI -ne "" -and $env:CI -notin @("false", "0"))
 
 if (-not $Baseline) {
     # PS 5.1 wraps native stderr in ErrorRecords: under Stop, a
@@ -69,7 +69,8 @@ $BaselineCommit = & git -C "$RepoRoot" rev-parse "${Baseline}^{commit}" 2>$null
 $HeadCommit = & git -C "$RepoRoot" rev-parse HEAD 2>$null
 $ErrorActionPreference = $PrevEap
 if ($BaselineCommit -and $BaselineCommit -eq $HeadCommit) {
-    Write-Host " WARN (baseline $Baseline is HEAD: committed-but-untagged API changes are invisible to this gate)"
+    Write-Host " FAIL (baseline $Baseline is HEAD: committed-but-untagged API changes are invisible to this gate -- tag the release or pass an older baseline)" -ForegroundColor Red
+    exit 1
 }
 
 $Crate = (Select-String -Path "$RepoRoot\Cargo.toml" -Pattern '^name\s*=\s*"(.+)"' |

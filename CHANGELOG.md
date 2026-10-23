@@ -4,6 +4,67 @@ All notable changes to `snubber`. Benchmarks live in [README.md](README.md);
 the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 ("Fixed in …" sections) and [docs/INVARIANTS.md](docs/INVARIANTS.md).
 
+## 0.6.8 — 2026-10-23
+
+Seventh-audit batch (core accounting, async liveness, erased slots, honest
+examples and gate teeth). Details: USER_GUIDE "Fixed in 0.6.8".
+
+- Conservation is now an API-level invariant:
+  `admission_total() == total_started + shed_total()`. `shed_total()`
+  counts every first-pass refusal exactly once (capacity, stale, rate,
+  breaker, poisoned lock, memory); `evicted` and `preempted` are
+  side-events of an admission already in `total_started`, so they no
+  longer inflate the shed side. `rate_rejected` is no longer mirrored
+  into `bulkhead_rejections`.
+- Depth gauge subtracts `explicit_aborts` and `implicit_drops`, so a
+  settled transaction never shows as in flight.
+- Async admission probe state is cleared on every terminal `Ready`
+  (spurious re-polls no longer leave `half_open_probe` wedged, and a
+  Ready future retires any queue entry it still owns by identity).
+  `Drop for EnterFuture` hands the freed slot to the next waiter in
+  `deregister_waiter`, so a cancelled task cannot strand a quiescent
+  queue; an evictor's verdict clears the flag without waking a phantom.
+- `enter_erased` / `enter_supervised_erased` book the success when the
+  erased guard's `commit()` runs, never at admission: `committed += 1`,
+  one window outcome, streak reset; a guard that never commits cannot
+  inflate `success_rate_per_mille`. Rollback still re-opens a HalfOpen
+  probe.
+- Poison recovery: gateway books, conduit drafts and the cancel-reason
+  guard recover `into_inner` instead of silently dropping the update
+  (`.ok()` issued the notify unlocked, re-opening a lost-wakeup window).
+- `Protect` runs the rollback BEFORE taking the resource (same order as
+  `Drop`): the closure can still read the protected value.
+- `PipeDrain::feed` takes the ingest lock before the EOF check (a
+  concurrent close is fully ordered, not half-applied), and the
+  injectable clock is read once per chunk OUTSIDE the state lock
+  (`apply_token_at`).
+- Channel: HWM is computed as `c - c/4` (no overflow at absurd
+  capacities) and the throttle depth is loaded with `Acquire` so a
+  refusal cannot act on a stale depth.
+- Overflow and clamp fixes: `task_ttl` converts `as_millis` with
+  `try_from` (saturates, never wraps), restart-window reserve uses
+  `saturating_add`, lane histograms are clamped to the aggregate
+  `in_flight` after lock recovery, and profile stage slices are clamped
+  to `stage_count`.
+- Tests, examples, benches: conservation asserted in the invariants,
+  bulkhead-ceiling and industrial suites; rollback effects are observable
+  state (DB handles, iron energization, laser latch, real advised sleep)
+  instead of counters that can be faked; fake wakers use
+  `Waker::from(Arc<dyn Wake>)` (Miri strict provenance); bench hygiene
+  covers `TaskConduit::pair` and `PipeDrain::drain_sync`.
+- Scripts/CI: a grep error (rc=2), a missing report, a skipped check
+  (missing tool or thumb target) and a baseline equal to `HEAD` all FAIL;
+  `--locked` on every cargo invocation (thumb gates, publish dry-run);
+  harnesses fail on zero samples; deadlock literals removed from
+  termination reports.
+- Miri runs with `-Zmiri-strict-provenance` in both CI lanes.
+- Docs: README saturation claim is measured (~1.1M admissions/sec on six
+  contending threads), `WorkerPulse` footprint is arch-conditional,
+  pool numbers re-measured (attach/reap ~338/~407 ns, report ~112 ns,
+  lease sweep ~539 ns), storm timings re-measured, and the API table
+  gains `PoolReap` / `LaneSnapshot` / `PoolTotals` / `expired_lanes` /
+  `DEFAULT_EOF_GRACE_MS` / argv-twin rows.
+
 ## 0.6.7 — 2026-10-23
 
 Sixth-audit batch: conduit waker identity, core-exposed drain, honest

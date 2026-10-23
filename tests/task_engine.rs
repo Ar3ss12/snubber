@@ -253,19 +253,18 @@ fn futures_lite_fake_waker() -> core::task::Waker {
 }
 
 fn futures_lite_fake_waker_id(id: usize) -> core::task::Waker {
-    use core::task::{RawWaker, RawWakerVTable};
-    // Data must be real addresses (Miri warns on `id as *const ()`),
-    // but distinct per id so the wakers stay distinguishable by identity.
-    static WAKER_SLOTS: [u8; 8] = [0; 8];
-    unsafe fn clone(data: *const ()) -> RawWaker {
-        RawWaker::new(data, &VTABLE)
+    use std::sync::Arc;
+    use std::task::Wake;
+
+    /// Each `Arc::new` is a distinct allocation, so the waker data
+    /// pointer (which `will_wake` compares) is unique per id — no raw
+    /// vtable, no provenance tricks, valid under `-Zmiri-strict-provenance`.
+    struct FakeWake(#[allow(dead_code)] usize);
+    impl Wake for FakeWake {
+        fn wake(self: Arc<Self>) {}
+        fn wake_by_ref(self: &Arc<Self>) {}
     }
-    unsafe fn wake(_: *const ()) {}
-    unsafe fn wake_by_ref(_: *const ()) {}
-    unsafe fn drop(_: *const ()) {}
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-    let data = &WAKER_SLOTS[id % WAKER_SLOTS.len()] as *const u8 as *const ();
-    unsafe { core::task::Waker::from_raw(RawWaker::new(data, &VTABLE)) }
+    core::task::Waker::from(Arc::new(FakeWake(id)))
 }
 
 #[test]

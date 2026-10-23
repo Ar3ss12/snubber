@@ -27,14 +27,18 @@ if (-not $SkipRun) {
         $PrevEap = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
-            cargo bench --locked --bench admission_bench 2>&1 | ForEach-Object { Write-Host $_ }
+            $CargoOut = @(& cargo bench --locked --bench admission_bench 2>&1)
             $CargoExit = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $PrevEap
         }
         if ($CargoExit -ne 0) {
+            # Diagnostics belong on stderr, prefixed: folding them into
+            # Write-Host made cargo failures look like ordinary output.
+            $CargoOut | ForEach-Object { [Console]::Error.WriteLine($_) }
             throw "cargo bench failed with exit code $CargoExit"
         }
+        $CargoOut | ForEach-Object { Write-Host $_ }
     } finally {
         Pop-Location
     }

@@ -10,7 +10,7 @@
 >
 > Hang layer (v0.5): monotonic `Instant` clock (no `SystemTime` jumps),
 > CPU-spin classifier (`TimedOut` vs `SpinDetected` vs `DeadlockSuspected`,
-> silence ceiling optional), 8-byte `WorkerPulse`
+> silence ceiling optional), `WorkerPulse` (8 B, 4 B without 64-bit CAS)
 > heartbeat. See [Layer 1.5](#layer-15-hang-classification-spin-vs-sleep-vs-deadlock--pulse).
 >
 > Extensibility (v0.6.0): `#[non_exhaustive]` verdict enums,
@@ -149,7 +149,7 @@ match guard.check_timeout() {
 no lock); the arming sample is captured at attach time so deltas are
 measured from arming, not from boot.
 
-### Heartbeat: `WorkerPulse` (8 bytes) + `PulseWatch`
+### Heartbeat: `WorkerPulse` (8 B, 4 B without 64-bit CAS) + `PulseWatch`
 
 ```rust
 use snubber::{PulseWatch, WorkerPulse};
@@ -1152,16 +1152,16 @@ app's spawn timeout, not a lease breach. On Windows this is what covers a
 worker that answers once and then never exits.
 
 Measured costs (release, Criterion `layer4_worker_pool`): `attach +
-note_death` ~328 ns (ambush) / ~400 ns (escape), four-lane `report()`
-~107 ns, four-lane `expired_lanes(5)` ~536 ns (~134 ns per lane, one
+note_death` ~338 ns (ambush) / ~407 ns (escape), four-lane `report()`
+~112 ns, four-lane `expired_lanes(5)` ~539 ns (~135 ns per lane, one
 state lock each), `namespace_task` ~2 ns, `note_memory_kb` ~12 ns. The
 storm gates on this machine (debug): 4 lanes × 8 armed kills = 32/32
 ambush in 0.34 s; the mixed storm produces an equal four-way split (A/E/S/D =
-8/8/8/8, 8 rescued) in 0.71 s with `deadlock=true` — the orphan mode
+8/8/8/8, 8 rescued) in 0.82 s with `deadlock=true` — the orphan mode
 keeps its pipe open past the 150 ms grace, so the deadlock bucket is
 proven, not simulated. The lease storm kills 24 workers that beat once
 and then hang (4 lanes × 6, 25 ms lease): 24/24 stillborn, `lease_kills=24`,
-0 deadlocks, 0 conservation breaks over 98,703 live `report()` samples
+0 deadlocks, 0 conservation breaks over 99,392 live `report()` samples
 from the observer thread, `[7,7,7,7]` generations, 0.42 s.
 
 **Reference:** `examples/19_worker_pool.rs` (supervisor and worker modes,
@@ -1652,6 +1652,37 @@ reservation); the README lists the real `no_std` surface; `PulseTick` is
 documented as internal; the Layer 5 helper exports got a quick-reference
 row.
 
+## Fixed in 0.6.8: seventh-audit batch
+
+Accounting conservation, async liveness, erased booking, honest examples,
+gate teeth.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| Admission conservation | `admission_total` summed `total_started`, the refusal columns AND `evicted`; a sync `EvictOldest` overbook made the identity impossible to hold | `shed_total()` counts every first-pass refusal exactly once; `evicted` / `preempted` are side-events of an admission already in `total_started`; `admission_total() == total_started + shed_total()` | `tests/invariants.rs`, `tests/bulkhead_capacity.rs`, `tests/industrial.rs` |
+| Rate mirror | A `RateLimited` refusal incremented both `rate_rejected` and `bulkhead_rejections` (one shed counted twice) | `rate_rejected` only | `tests/invariants.rs` |
+| Depth gauge | `in_flight` proxy was `total_started - committed`, so aborted and implicitly dropped transactions looked in flight forever | Subtracts `explicit_aborts` and `implicit_drops` too | `tests/node_stats.rs` |
+| Async terminal `Ready` | An early refusal left the queue entry parked (ghost squatting `queue_limit`); a spurious re-poll could leave `half_open_probe` set | Every terminal `Ready` retires the entry this future still owns (identity-matched) and clears probe state | `tests/async_primitives.rs::admitted_on_spurious_repoll_leaves_no_ghost_waiter` |
+| Cancellation handoff | A task dropped between settle-pop and wake left the slot idle until the NEXT settle | `Drop for EnterFuture` observes the free slot in `deregister_waiter` and wakes the next waiter | `tests/async_primitives.rs` |
+| Erased admission booking | A throwaway `commit()` at admission wrote `committed += 1` and a clean breaker outcome before any work ran | Admission settles the slot only; the erased guard's real `commit()` books `committed`, one window outcome and the streak reset | `tests/supervisor.rs`, `tests/erased.rs` |
+| Poisoned locks on cold paths | Gateway books, conduit drafts and the cancel-reason guard used `if let Ok` / `.ok()`: the update was dropped, and the notify fired unlocked | `into_inner` recovery; the cancel notify stays under the guard | `tests/conduit.rs`, `tests/channel.rs` |
+| `Protect` order | `abort()` took the resource before running the rollback, so the closure saw a freed value | Rollback first, resource second (same order as `Drop`) | `tests/protect.rs` |
+| Drain ordering | `feed` checked EOF before taking the ingest lock (a concurrent close could interleave); the `ClockFn` ran under the state lock | Ingest lock taken before the EOF check; one clock read per chunk outside the state lock (`apply_token_at`) | `tests/drain_feed.rs` |
+| Channel HWM / throttle | `capacity * 3 / 4` could overflow at absurd capacities; depth loaded `Relaxed` could bypass an armed throttle | `capacity - capacity / 4`; `Acquire` depth load | `tests/channel.rs` |
+| Overflow / clamp | `ttl.as_millis() as u64` truncated on 128-bit `as_millis`; restart reserve could overflow; recovered lane histograms could exceed `in_flight`; `slowest_stage` indexed past `stage_count` | `try_from` saturating cast; `saturating_add`; lane clamp to the aggregate after recovery; clamped stage slice | `tests/profiling.rs`, `tests/node_stats.rs` |
+| Example honesty | Examples 03/11/12 "proved" rollbacks with counters they incremented themselves; 04 slept without checking | Observable state (open DB handles, iron energization, laser latch) and a real timed sleep with an elapsed assertion | `examples/03_*.rs`, `examples/04_*.rs`, `examples/11_*.rs`, `examples/12_*.rs` |
+| Bench hygiene | `TaskConduit::pair` / `PipeDrain::drain_sync` allocations escaped the HEAVY allowlist | Added, with per-sample allowlist for the two named setups | `tests/bench_hygiene.rs` |
+| Script/CI teeth | grep rc=2 read as "no match"; missing reports and tool/target SKIPs passed; a baseline tag equal to `HEAD` compared the crate to itself | All four are FAILs; `--locked` everywhere; zero-sample leak gates fail | `scripts/*`, `.github/workflows/ci.yml` |
+| Miri provenance | Fake wakers built via `transmute`-style tricks tripped strict provenance | `Waker::from(Arc<dyn Wake>)`; `-Zmiri-strict-provenance` in both CI lanes | `tests/task_engine.rs`, CI |
+
+Documentation-only: README saturation figure restated as measured
+(~1.1M admissions/sec on six contending threads), `WorkerPulse`
+footprint arch-conditional (8 B / 4 B), pool and contention numbers
+re-measured on this machine, storm timings re-measured (mixed storm
+0.82 s, 99,392 lease samples), and the API table gains `PoolReap`,
+`LaneSnapshot`, `PoolTotals`, `expired_lanes`, `DEFAULT_EOF_GRACE_MS`
+and the argv-twin rows.
+
 ## Fixed in 0.6.7: sixth-audit batch
 
 Conduit waker identity, core-exposed drain, honest bookkeeping, CI teeth.
@@ -1706,7 +1737,7 @@ cites the TTL regression test.
 | `Protected::new(res, guard)` + `commit()` | 1 / core | 0 ns (generics) | Resource burns with guard unless committed |
 | `node.scoped_sealed(rb, work)` + `ScopeToken` | 2 / std | same as `scoped` | `!Send` seal: thread-leak fails at compile |
 | `StaticNode::<I, Q>::build(name)` | 2 / std | same as builder | Capacities validated FIRST in `build()` |
-| `gateway::<T>(cap)` + `host.recv()` | 2 / std | **~46 ns** send+receive roundtrip | Multiple senders, one receiver channel; HWM/LWM throttle paces at 75%/50% with integer `retry_after_ms`, `send_critical` bypasses |
+| `gateway::<T>(cap)` + `host.recv()` | 2 / std | **~46 ns** send+receive roundtrip (the row measures BOTH halves; a bare `try_send` is cheaper and not what this number claims) | Multiple senders, one receiver channel; HWM/LWM throttle paces at 75%/50% with integer `retry_after_ms`, `send_critical` bypasses |
 | `RestartTracker::note_death(code, now)` | 2 / std | pure math | Process respawn backoff tracker, caller sleeps |
 | `StateDigest` + `take_state()` | 2 / std | 64 B, ~1 ns | Hot handoff: memory survives death |
 | `NoOrphanGuard` / `OrphanGuard` | 2 / std | trait only | Parent death = child processes reaped (app impl) |
@@ -1715,16 +1746,16 @@ cites the TTL regression test.
 | `enter_async_auto_profiled` | 3 / std | 1 `Box` + 2 clock reads | Profiled async admission; arms on the admitting poll |
 | `guard.profile_snapshot()` | 2 / std | 1 wall + 1 CPU read | Mid-flight profile without settling |
 | `ConflateSender::pair()` + `publish` / `take_latest` | 2 / std | **~22.5 ns** pair; ~16.3 ns replace | Latest-value channel (queue 0 or 1), coalescing counted, no `Clone` bound on payload |
-| `ExecutionEnvelope::new(..)` + `execution_envelope(env)` + `commit_enveloped(bytes)` | 2 / std | 16 B `Copy` header; **~152 ns** settle with payload judge | Corridor catches too slow/too big and too fast/too small; underflow/overflow in own stats columns, breaker untouched |
+| `ExecutionEnvelope::new(..)` + `execution_envelope(env)` + `commit_enveloped(bytes)` | 2 / std | 16 B `Copy` header; **~148 ns** settle with payload judge | Corridor catches too slow/too big and too fast/too small; underflow/overflow in own stats columns, breaker untouched |
 | `ProfileHarness` + `HarnessReport` / `run_boundary_harness` | 2 / std | one `Vec` of samples + sort | Deterministic PRNG, min/median/max/jitter/burst matrix, `report.envelope(headroom)` |
 | `snapshot.diff(&later)` + `write_summary` | 2 / cold | pure `Copy` math | Counter deltas + memory/queue window (`SnapshotDiff`) |
 | `write_triage(&mut out, node, &snap)` | 2 / cold | `fmt::Write`, no alloc | One ASCII verdict card per node |
 | `node_passthrough_enter` | 2 / std canary | **~98.4 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
 | `node_passthrough_scoped` | 2 / std canary | **~99.6 ns** | Same transit through `scoped()` — work runs, books stay clean |
-| `contended_node_enter` (6 threads, shared `enter_auto` allocator) | 2 / std contended | **~893 ns** | MESI cache-line bouncing on node mutex; StaleEpoch losers bounded-retry (cap 64 + yield), same contract as `concurrency_stress` |
-| `contended_node_scoped` (6 threads) | 2 / std contended | **~874 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
-| `contended_gateway_mpsc` (6 producers + drain) | 2 / std contended | **~151 ns** | Bounded multi-producer write under parallel core flood |
-| `cross_thread_isr_bridge` (push core + pop core) | 1 / core inter-core | **~35.3 ns** | Lock-free SPSC ring across physical cores (honest inter-core bus latency, not L1-hot loop) |
+| `contended_node_enter` (6 threads, shared `enter_auto` allocator) | 2 / std contended | **~915 ns** | MESI cache-line bouncing on node mutex; StaleEpoch losers bounded-retry (cap 64 + yield), same contract as `concurrency_stress` |
+| `contended_node_scoped` (6 threads) | 2 / std contended | **~871 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
+| `contended_gateway_mpsc` (6 producers + drain) | 2 / std contended | **~172 ns** | Bounded multi-producer write under parallel core flood |
+| `cross_thread_isr_bridge` (push core + pop core) | 1 / core inter-core | **~37.2 ns** | Lock-free SPSC ring across physical cores (honest inter-core bus latency, not L1-hot loop) |
 | `node.enter_async_auto` | 2 / std | 0% CPU waker park | Async admission under bounded concurrency |
 | `guard.settle_async(fut)` | 2 / std | zero lock during await | Commit across `.await` points |
 | `TaskConduit` / `TaskHandle` | 2 / std | lock-free atomics | 2-way live steering, pause/resume waker, drafts |
@@ -1743,3 +1774,9 @@ cites the TTL regression test.
 | `LeaseEvent { task_id, stage, kind }` | 3 / std | `Copy` event | Reaper mailbox payload fired by `AsyncLease` drop; overflow accounting goes through `LeaseChannel::fire` |
 | `run_supervised_guard_with_grace(worker_flag, lease_ms, eof_grace_ms, on_dead_token)` | 3 / std | one reaped child process | Supervised guard with a configurable terminal EOF grace: a slow-flushing child (big buffered stdout) gets more than the default grace before death classification, so an in-flight rescue token is never misreported CLEAN |
 | `ProcessToken` / `SnubScanner` (core `drain` module) | 1 / core | 44-byte wire frame; zero allocation | Token parser reachable without `std`: `to_bytes` / `from_bytes` / `from_body_bytes` and the streaming `SnubScanner::push` work on bare metal; `feed`/`write_to` drive it without a reader thread |
+| `pool.attach(..)` / `pool.note_death(..)` → `PoolReap` | 3 / std | **~338 ns** ambush / **~407 ns** escape (one lane lock each) | One reap: `class` (`Ambush`/`Escape`/`Stillborn`/`Deadlocked`), rescued `token`, next `generation`, last `StateDigest`, per-lane `RestartDecision`; the app owns sleep + spawn |
+| `pool.report()` / `PoolTotals::of(&lanes)` | 3 / std | **~112 ns** four lanes | Aggregated row per lineage (`LaneSnapshot`) plus pool-wide sums; no allocation in `report()` |
+| `pool.expired_lanes(lease_ms)` | 3 / std | **~539 ns** four lanes (~135 ns per lane) | Lease sweep: names only lanes whose parsed heartbeat froze past the lease; the app kills them itself |
+| `LaneSnapshot` / `PoolTotals` | 3 / std | `Clone` row / `Copy` totals | Rows carry `conserved()` (`ambush+escape+stillborn+deadlocks == reaps`); totals fold the same four honest buckets, never a guessed fifth |
+| `DEFAULT_EOF_GRACE_MS` (250 ms) | 3 / std | published const, compile-asserted | Default terminal EOF grace; `run_supervised_guard_with_grace` and the pool builder override it per call/site |
+| `Supervisor::run_supervised_guard_with_lease_argv(..)` / `..._with_memory_argv(..)` | 3 / std | explicit `&[String]` argv | Argv twins of the lease/RSS watchdogs for tests, embedded launchers and shells that parsed their own command line (index 0 is the program name) |

@@ -173,7 +173,8 @@ pub struct SnubberStats {
     pub preempted: u64,
     /// Breaker fast-rejections while OPEN.
     pub breaker_rejections: u64,
-    /// Breaker trips (Closed -> Open transitions).
+    /// Breaker trips (Closed -> HalfOpen transitions; the probe then
+    /// decides Closed on success or Open on failure).
     pub breaker_trips: u64,
     /// Current breaker position.
     pub breaker_state: BreakerState,
@@ -201,9 +202,13 @@ pub struct SnubberStats {
     /// merged with `timeouts_fired` / `bulkhead_rejections`.
     pub envelope_overflows: u64,
     /// How many times an poisoned mutex was recovered via `into_inner`.
-    /// ZERO-PANIC design goal is 0 here: phases A/C hold no allocation,
-    /// so the mutex is physically unpoisonable. Non-zero means foreign
-    /// code panicked under the lock — investigate.
+    /// ZERO-PANIC design goal is 0 here. The lock guards no user code,
+    /// but it is NOT allocation-free: the async queue grows a
+    /// `VecDeque`, stores a freshly `Arc::new`-ed eviction flag, and the
+    /// cold `stats()` snapshot clones `last_fault` (an owned detail can
+    /// allocate). A non-zero value therefore means an allocation failure
+    /// (abort, not poison) or a panic from crate code under the lock —
+    /// investigate either way.
     pub poison_recoveries: u64,
     /// Pass-through transit admissions (builder-sealed canary law).
     /// Own column forever: counted lock-free on the transit path, never
@@ -275,6 +280,11 @@ impl SnubberStats {
     /// NOTE: `preempted` is NOT an attempt — it is a side-event of one
     /// `BulkheadFull` knock (Critical over pure-Background). Adding it
     /// here would double-count; it lives in its own column.
+    ///
+    /// INVARIANT: `admission_total() == total_started + shed_total()`.
+    /// Every refusal kind appears exactly once on the shed side; a
+    /// `RateLimited` attempt is counted in `rate_rejected` ONLY (the
+    /// token bucket never mirrors into `bulkhead_rejections`).
     #[must_use]
     pub fn admission_total(&self) -> u64 {
         self.total_started
@@ -283,6 +293,7 @@ impl SnubberStats {
             .saturating_add(self.breaker_rejections)
             .saturating_add(self.rate_rejected)
             .saturating_add(self.poisoned_rejected)
+            .saturating_add(self.memory_rejections)
     }
 
     /// Operational shedding: cooperative preemptions (own column, never merged).
@@ -292,16 +303,20 @@ impl SnubberStats {
         self.preempted
     }
 
-    /// Admission first-pass shed: capacity, token, stale and breaker
-    /// drops at the perimeter (`preempted` excluded — its own column).
-    /// The complement of `started` in the admission sum.
+    /// Admission first-pass shed: capacity, token, stale, breaker,
+    /// poisoned-lock and memory-pressure drops at the perimeter.
+    ///
+    /// `evicted` and `preempted` are NOT here — both are side-events of
+    /// an admission that already appears in `total_started`; adding them
+    /// would break `admission_total() == total_started + shed_total()`.
     #[must_use]
     pub fn shed_total(&self) -> u64 {
         self.bulkhead_rejections
             .saturating_add(self.stale_epochs_rejected)
             .saturating_add(self.rate_rejected)
-            .saturating_add(self.evicted)
             .saturating_add(self.breaker_rejections)
+            .saturating_add(self.poisoned_rejected)
+            .saturating_add(self.memory_rejections)
     }
 
     /// Success ratio per-mille (0..1000), float-free telemetry:
@@ -320,7 +335,12 @@ impl SnubberStats {
     #[must_use]
     pub fn depth_at(&self, max_in_flight: usize) -> u8 {
         let max = max_in_flight.max(1) as u64;
-        ((self.total_started.saturating_sub(self.committed) * 255 / max).min(255)) as u8
+        let pending = self
+            .total_started
+            .saturating_sub(self.committed)
+            .saturating_sub(self.explicit_aborts)
+            .saturating_sub(self.implicit_drops);
+        (pending.saturating_mul(255) / max).min(255) as u8
     }
 
     /// Snapshot-local depth gauge (committed vs started proxy).
@@ -557,7 +577,7 @@ impl SnubberNodeBuilder {
     /// Tasks waiting longer than this fail fast with [`EnterError::QueueTtlExpired`].
     #[must_use]
     pub fn task_ttl(mut self, ttl: core::time::Duration) -> Self {
-        self.task_ttl_ms = ttl.as_millis() as u64;
+        self.task_ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
         self
     }
 
@@ -1112,6 +1132,16 @@ fn hard_clamp_slots(inner: &mut NodeInner) {
         .saturating_add(1);
     if inner.queued > q_ceiling {
         inner.queued = q_ceiling;
+    }
+    // Lane histogram must never exceed the aggregate: `lane_in_flight[0] >
+    // in_flight` permanently disables the Critical-over-Background
+    // preemption precondition, so the clamp gives lanes first claim on the
+    // repaired `in_flight` budget and drops the overflow.
+    let mut budget = inner.in_flight;
+    for slot in inner.lane_in_flight.iter_mut() {
+        let kept = (*slot).min(budget);
+        *slot = kept;
+        budget -= kept;
     }
 }
 
@@ -2144,24 +2174,25 @@ impl SnubberNode {
     /// struct fields (`struct App { hold: Option<ErasedGuard> }`).
     ///
     /// How it works: the slot + epoch are reserved through the REAL
-    /// pipeline; the probe guard is committed immediately (clean books),
-    /// and the returned erased guard owns ONLY the user's rollback.
-    /// Consequences (honest, not hidden):
-    /// * `commit()` on the erased guard disarms the rollback — the node
-    ///   books already counted this admission as committed via the probe.
+    /// pipeline; the admission guard releases its slot WITHOUT booking a
+    /// success, and the returned erased guard owns ONLY the user's
+    /// rollback. Consequences (honest, not hidden):
+    /// * `commit()` on the erased guard disarms the rollback and books
+    ///   the outcome THEN: `committed += 1`, one window outcome, failure
+    ///   streak reset. Nothing is booked at admission, so a guard that
+    ///   never commits cannot inflate the success rate.
     /// * `Drop` without `commit` runs the user's rollback — the hardware
-    ///   is still protected; the node book-keeping stays on the probe's
-    ///   clean path (no phantom implicit-drop).
+    ///   is still protected; the slot was already released at admission,
+    ///   and the node books no phantom implicit-drop.
     /// * If the admission landed while the breaker was HalfOpen, the
-    ///   probe settles with the ERASED guard's outcome, not the
-    ///   throwaway commit: `commit()` → Closed, drop/abort → Open
-    ///   (a failed probe re-opens — the downstream was NOT healthy).
-    /// * The bulkhead ceiling applies at ADMISSION only: the probe's
-    ///   instant commit releases the slot, so LIVE erased guards are not
-    ///   bounded by `max_in_flight` and `committed` counts before the
-    ///   work runs. A daemon holding many erased guards must enforce its
-    ///   own in-flight ceiling (semaphore / owned counter) — the node
-    ///   cannot see the guards it no longer tracks.
+    ///   probe settles with the ERASED guard's outcome: `commit()` →
+    ///   Closed, drop/abort → Open (a failed probe re-opens — the
+    ///   downstream was NOT healthy).
+    /// * The bulkhead ceiling applies at ADMISSION only: the slot is
+    ///   released there, so LIVE erased guards are not bounded by
+    ///   `max_in_flight`. A daemon holding many erased guards must
+    ///   enforce its own in-flight ceiling (semaphore / owned counter) —
+    ///   the node cannot see the guards it no longer tracks.
     ///
     /// Use `enter` when you need typed per-guard settle accounting; use
     /// `enter_erased` when the guard must LIVE in a struct.
@@ -2198,7 +2229,11 @@ impl SnubberNode {
             let mut g = probed;
             let was_probe = g.is_probe;
             g.is_probe = false;
-            g.commit();
+            // Admission only: release the slot WITHOUT booking a success.
+            // A throwaway `commit()` used to write `committed += 1` and a
+            // clean breaker outcome before any work ran, inflating
+            // `success_rate_per_mille` and resetting the failure streak.
+            g.settle_admission_only();
             was_probe
         };
         let node = self.clone();
@@ -2212,13 +2247,13 @@ impl SnubberNode {
                 // until a manual reset. The panic still reaches the caller
                 // — only the books are guaranteed first.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
-                node.settle_erased_probe(was_probe, false);
+                node.settle_erased_probe(was_probe);
                 if let Err(payload) = outcome {
                     std::panic::resume_unwind(payload);
                 }
             },
             move || {
-                node2.settle_erased_probe(was_probe, true);
+                node2.settle_erased_commit(was_probe);
             },
         ))
     }
@@ -2714,7 +2749,7 @@ impl SnubberNode {
             let mut g = probed;
             let was_probe = g.is_probe;
             g.is_probe = false;
-            g.commit();
+            g.settle_admission_only();
             was_probe
         };
         let node = self.clone();
@@ -2724,14 +2759,14 @@ impl SnubberNode {
                 // Same panic-boundary as `enter_erased`: settle the probe
                 // before any rollback panic resumes.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
-                node.settle_erased_probe(was_probe, false);
+                node.settle_erased_probe(was_probe);
                 if let Err(payload) = outcome {
                     std::panic::resume_unwind(payload);
                 }
                 crate::ProcessToken::commit(seq).emit_if_supervised();
             },
             move || {
-                node2.settle_erased_probe(was_probe, true);
+                node2.settle_erased_commit(was_probe);
                 crate::ProcessToken::commit(seq).emit_if_supervised();
             },
         ))
@@ -3278,7 +3313,7 @@ impl SnubberNode {
         }
         inner.stats.total_started = inner.stats.total_started.saturating_add(1);
         hard_clamp_slots(&mut inner);
-        let was_half_open = inner.breaker == BreakerState::HalfOpen;
+        let was_half_open = inner.breaker == BreakerState::HalfOpen && inner.half_open_probe;
         let deadline = inner.timeout_ms;
         let cpu_budget = inner.cpu_budget_ms;
         let stall_ceiling = inner.stall_ceiling_ms;
@@ -3351,28 +3386,38 @@ impl SnubberNode {
         inner.stats.breaker_state = BreakerState::Closed;
     }
 
-    /// Deferred probe settlement for the erased admissions
+    /// Success settlement for the erased admissions
     /// ([`Self::enter_erased`] / [`Self::enter_supervised_erased`]):
-    /// the admission-time probe commit does not settle a HalfOpen
-    /// breaker (the real transaction's outcome is still unknown), so
-    /// the erased guard's own outcome does. `ok` mirrors the guard's
-    /// settle paths: commit → Closed + streak reset; rollback
-    /// (drop/abort) → Open, the cooling window restarts.
+    /// booked when the ERASED guard's `commit()` runs, never at
+    /// admission. Mirrors the sync commit: `committed += 1`, one window
+    /// outcome, failure streak reset, and a HalfOpen probe closes.
     #[cfg(feature = "alloc")]
-    fn settle_erased_probe(&self, was_probe: bool, ok: bool) {
+    fn settle_erased_commit(&self, was_probe: bool) {
+        let mut inner = self.lock();
+        inner.stats.committed = inner.stats.committed.saturating_add(1);
+        note_outcome(&mut inner, false);
+        inner.stats.window_outcomes = inner.window_outcomes;
+        inner.stats.window_failures = inner.window_failures;
+        if was_probe {
+            inner.half_open_probe = false;
+            inner.breaker = BreakerState::Closed;
+            inner.stats.breaker_state = BreakerState::Closed;
+        }
+    }
+
+    /// Failure settlement for the erased admissions: a rollback (drop or
+    /// panic) re-opens a HalfOpen probe — the downstream was NOT healthy.
+    /// Planned aborts do not feed the failure streak, matching the sync
+    /// `abort()` path.
+    #[cfg(feature = "alloc")]
+    fn settle_erased_probe(&self, was_probe: bool) {
         if !was_probe {
             return;
         }
         let mut inner = self.lock();
         inner.half_open_probe = false;
-        if ok {
-            inner.breaker = BreakerState::Closed;
-            inner.consecutive_failures = 0;
-            inner.stats.breaker_state = BreakerState::Closed;
-        } else {
-            inner.breaker = BreakerState::Open;
-            inner.stats.breaker_state = BreakerState::Open;
-        }
+        inner.breaker = BreakerState::Open;
+        inner.stats.breaker_state = BreakerState::Open;
     }
 
     /// Compile-time error budget: bake `MAX_ERRORS` into the call site.
@@ -3468,6 +3513,10 @@ impl SnubberNode {
         // queue" must mean it really queued.
         let wait_ms = now.saturating_sub(enqueued_at_ms.unwrap_or(now));
         let header = TransactionHeader::new(epoch, task_id);
+        // Clone the waker BEFORE the lock: `Waker::clone` invokes foreign
+        // vtable code (and may allocate). The parked entry then owns a
+        // plain value, so no executor code runs under the node mutex.
+        let waker = waker.clone();
         let mut inner = self.lock();
 
         // 0. Task TTL check: if task waited longer than task_ttl_ms, fail fast.
@@ -3587,7 +3636,7 @@ impl SnubberNode {
                     .iter_mut()
                     .find(|w| Arc::ptr_eq(&w.evicted, prev))
                 {
-                    slot.waker = waker.clone();
+                    slot.waker = waker;
                     *evicted_out = Some(Arc::clone(prev));
                     // TTL origin stays at the FIRST park: `enqueued_at_ms`
                     // was stamped when this entry was pushed. Re-stamping
@@ -3641,7 +3690,7 @@ impl SnubberNode {
             *evicted_out = Some(Arc::clone(&flag));
             *enqueued_at_ms = Some(now);
             inner.waiters.push_back(ParkedWaiter {
-                waker: waker.clone(),
+                waker,
                 evicted: flag,
             });
             // Telemetry parity with the sync EvictOldest arm: the eviction
@@ -3711,15 +3760,44 @@ impl SnubberNode {
             inner.stats.rate_rejected = inner.rate_rejected;
         }
 
-        // 5. Commit slot:
-        inner.gate.observe(&header);
+        // 5. Commit slot. The epoch is adopted only here so a queue
+        // rejection above never burns the caller's coordinates; a header
+        // that lost the race to a higher epoch is shed as stale, exactly
+        // like the sync path (never silently admitted).
+        if !inner.gate.observe(&header) {
+            if inner.breaker == BreakerState::HalfOpen {
+                inner.half_open_probe = false;
+            }
+            let record = FaultRecord {
+                kind: FaultKind::StaleEpoch,
+                node: inner.name.clone(),
+                file: loc.file(),
+                line: loc.line(),
+                header,
+                detail: None,
+                stage: 0,
+                stage_label: None,
+                queue_wait_ms: wait_ms,
+                elapsed_ms: 0,
+                retry_count: 0,
+            };
+            let mut outcome = Self::record_locked(&mut inner, FaultKind::StaleEpoch, 2, 0);
+            drop(inner);
+            self.publish_fault(&mut outcome, &record);
+            Self::emit(outcome, record);
+            return core::task::Poll::Ready(Err(EnterError::StaleEpoch));
+        }
         inner.in_flight = inner.in_flight.saturating_add(1);
         inner.queued = inner.queued.saturating_add(1);
         inner.lane_in_flight[1] = inner.lane_in_flight[1].saturating_add(1);
         inner.stats.total_started = inner.stats.total_started.saturating_add(1);
         hard_clamp_slots(&mut inner);
 
-        let is_probe = inner.breaker == BreakerState::HalfOpen;
+        // The probe ROLE, not just the breaker position: `half_open_probe`
+        // is released whenever this attempt parks or is shed, so a later
+        // admission must not inherit it merely because the breaker is
+        // still HalfOpen.
+        let is_probe = inner.breaker == BreakerState::HalfOpen && inner.half_open_probe;
         let deadline_ms = inner.timeout_ms;
         let cpu_budget_ms = inner.cpu_budget_ms;
         let stall_ceiling_ms = inner.stall_ceiling_ms;
@@ -3771,10 +3849,24 @@ impl SnubberNode {
     /// Called from `Drop for EnterFuture` when a parked future is dropped:
     /// without this its queue entry squats a slot forever and later
     /// admissions starve behind a waker nobody will wake.
+    /// Cancellation also HANDS OFF: a settle pops one winner and wakes it
+    /// outside the lock; if that task is dropped before polling, its queue
+    /// entry is already gone and nobody would wake the next waiter on a
+    /// quiescent node. Waking one waiter whenever a slot is genuinely free
+    /// closes that hole (a loser simply re-parks).
     pub(crate) fn deregister_waiter(&self, evicted: &Arc<AtomicBool>) {
-        self.lock()
-            .waiters
-            .retain(|w| !Arc::ptr_eq(&w.evicted, evicted));
+        let waker = {
+            let mut inner = self.lock();
+            inner.waiters.retain(|w| !Arc::ptr_eq(&w.evicted, evicted));
+            if inner.in_flight < inner.max_in_flight {
+                inner.waiters.pop_front()
+            } else {
+                None
+            }
+        };
+        if let Some(w) = waker {
+            w.waker.wake();
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, NodeInner> {
@@ -3920,8 +4012,9 @@ impl SnubberNode {
     /// state) so the signature itself cannot smuggle a panicking call
     /// under the lock: 0 = none, 1 = breaker_rejections,
     /// 2 = stale_epochs_rejected, 3 = bulkhead_rejections, 4 = evicted,
-    /// 5 = poisoned_rejected (+reported), 6 = rate mirror
-    /// (`extra` = rate_rejected value), 7 = preempted (+reported).
+    /// 5 = poisoned_rejected (+reported), 6 = rate_rejected
+    /// (write-through, `extra` = the new value), 7 = preempted
+    /// (+reported).
     fn record_locked(
         inner: &mut NodeInner,
         record_kind: FaultKind,
@@ -3949,7 +4042,10 @@ impl SnubberNode {
                     inner.stats.reported[record_kind.index()].saturating_add(1);
             }
             6 => {
-                inner.stats.bulkhead_rejections = inner.stats.bulkhead_rejections.saturating_add(1);
+                // Token bucket is its OWN column forever. Mirroring it into
+                // `bulkhead_rejections` made `admission_total()` count one
+                // RateLimited attempt twice and contaminated
+                // `shed_bulkhead()` with rate pressure.
                 inner.stats.rate_rejected = extra;
             }
             7 => {
@@ -4353,10 +4449,14 @@ impl ExecutionProfile {
     /// Longest recorded stage (`None` when no timed checkpoint ran).
     #[must_use]
     pub fn slowest_stage(&self) -> Option<StageSpan> {
-        self.stages[..self.stage_count as usize]
-            .iter()
-            .copied()
-            .max_by_key(|s| s.wall_us)
+        self.stage_slice().iter().copied().max_by_key(|s| s.wall_us)
+    }
+
+    /// Recorded stages; `stage_count` is caller-settable, so it is
+    /// clamped to the fixed array to keep slicing panic-free.
+    fn stage_slice(&self) -> &[StageSpan] {
+        let n = (self.stage_count as usize).min(self.stages.len());
+        &self.stages[..n]
     }
 
     /// ASCII profile line + one line per stage (`fmt::Write`, no allocation).
@@ -4378,7 +4478,7 @@ impl ExecutionProfile {
                 ""
             },
         )?;
-        for span in &self.stages[..self.stage_count as usize] {
+        for span in self.stage_slice() {
             writeln!(
                 out,
                 "  {} {} {}us",
@@ -4610,6 +4710,37 @@ pub enum TimeoutCheck {
     /// RAN exactly like `TimedOut`; the variant names the silence for
     /// the post-mortem dump.
     DeadlockSuspected,
+}
+
+/// Feed BOTH breaker modes from one settled outcome: reset the
+/// consecutive streak on success, advance it + the windowed batch
+/// on failure, trip by whichever mode fires first.
+fn note_outcome(inner: &mut NodeInner, failed: bool) {
+    // Windowed batch always observes (when armed).
+    if inner.failure_window > 0 {
+        inner.window_outcomes = inner.window_outcomes.saturating_add(1);
+        if failed {
+            inner.window_failures = inner.window_failures.saturating_add(1);
+        }
+        if inner.window_outcomes >= inner.failure_window as u64 {
+            let pct = inner.window_failures.saturating_mul(100) / inner.window_outcomes.max(1);
+            if pct >= inner.failure_threshold_percent as u64
+                && inner.breaker == BreakerState::Closed
+            {
+                inner.breaker = BreakerState::HalfOpen;
+                inner.half_open_probe = false;
+                inner.stats.breaker_trips = inner.stats.breaker_trips.saturating_add(1);
+                inner.stats.breaker_state = BreakerState::HalfOpen;
+            }
+            inner.window_outcomes = 0;
+            inner.window_failures = 0;
+        }
+    }
+    if failed {
+        inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
+    } else {
+        inner.consecutive_failures = 0;
+    }
 }
 
 impl<F: FnOnce()> TrackedGuard<F> {
@@ -4928,6 +5059,38 @@ impl<F: FnOnce()> TrackedGuard<F> {
         }
     }
 
+    /// Admission-only settle used by the erased handoff: releases the
+    /// slot and wakes ONE parked waiter, but books NO success.
+    ///
+    /// The erased guard owns the real outcome; a throwaway `commit()` here
+    /// would fabricate `committed + 1` and a clean breaker outcome before
+    /// the work ran. The inner rollback is the erased path's `|| {}`, so
+    /// dropping it has no hardware effect.
+    pub(crate) fn settle_admission_only(mut self) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        let lane = self.priority.code().min(2) as usize;
+        if let Some(g) = self.guard.take() {
+            drop(g); // `|| {}` — no hardware effect
+        }
+        self.release_profile();
+        let waker = {
+            let mut inner = self.node.lock().unwrap_or_else(|p| {
+                let mut g = p.into_inner();
+                g.stats.poison_recoveries = g.stats.poison_recoveries.saturating_add(1);
+                hard_clamp_slots(&mut g);
+                g
+            });
+            release_slot_inner(&mut inner, lane);
+            inner.waiters.pop_front()
+        };
+        if let Some(w) = waker {
+            w.waker.wake();
+        }
+    }
+
     /// Success path: hardware rollback disarmed, books settled.
     /// Wakes ONE parked `enter_async` waiter (outside the lock, PHASE B).
     /// Pass-through dummy: no-op — mark settled, return Committed, touch nothing.
@@ -4955,7 +5118,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
                 g
             });
             inner.stats.committed = inner.stats.committed.saturating_add(1);
-            Self::note_outcome(&mut inner, false);
+            note_outcome(&mut inner, false);
             inner.stats.window_outcomes = inner.window_outcomes;
             inner.stats.window_failures = inner.window_failures;
             if is_probe {
@@ -5043,7 +5206,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             inner.deadlock_suspected = inner.deadlock_suspected.saturating_add(1);
             inner.stats.deadlock_suspected = inner.deadlock_suspected;
         }
-        Self::note_outcome(&mut inner, true);
+        note_outcome(&mut inner, true);
         // Watchdog timeouts feed the streak: a hung task IS a failure
         // (the doc says "streak fed" — the trip was missing). A probe
         // is skipped here: its failure already re-opened the breaker
@@ -5090,37 +5253,6 @@ impl<F: FnOnce()> TrackedGuard<F> {
         } else {
             TimeoutCheck::TimedOut
         })
-    }
-
-    /// Feed BOTH breaker modes from one settled outcome: reset the
-    /// consecutive streak on success, advance it + the windowed batch
-    /// on failure, trip by whichever mode fires first.
-    fn note_outcome(inner: &mut NodeInner, failed: bool) {
-        // Windowed batch always observes (when armed).
-        if inner.failure_window > 0 {
-            inner.window_outcomes = inner.window_outcomes.saturating_add(1);
-            if failed {
-                inner.window_failures = inner.window_failures.saturating_add(1);
-            }
-            if inner.window_outcomes >= inner.failure_window as u64 {
-                let pct = inner.window_failures * 100 / inner.window_outcomes.max(1);
-                if pct >= inner.failure_threshold_percent as u64
-                    && inner.breaker == BreakerState::Closed
-                {
-                    inner.breaker = BreakerState::HalfOpen;
-                    inner.half_open_probe = false;
-                    inner.stats.breaker_trips = inner.stats.breaker_trips.saturating_add(1);
-                    inner.stats.breaker_state = BreakerState::HalfOpen;
-                }
-                inner.window_outcomes = 0;
-                inner.window_failures = 0;
-            }
-        }
-        if failed {
-            inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
-        } else {
-            inner.consecutive_failures = 0;
-        }
     }
 
     /// Windowed-batch position for dashboards: `(outcomes, failures)` in
@@ -5205,7 +5337,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         });
         release_slot_inner(&mut inner, lane);
         inner.stats.implicit_drops = inner.stats.implicit_drops.saturating_add(1);
-        Self::note_outcome(&mut inner, true);
+        note_outcome(&mut inner, true);
         inner.stats.window_outcomes = inner.window_outcomes;
         inner.stats.window_failures = inner.window_failures;
         streak_trip_locked(&mut inner);

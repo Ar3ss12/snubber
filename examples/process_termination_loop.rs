@@ -207,7 +207,6 @@ fn main() {
   "armed_hold": {},
   "age_us": {{ "min": {}, "mean": {}, "max": {} }},
   "final_generation": {},
-  "deadlock": false,
   "elapsed_ms": {}
 }}"#,
         target_kills,
