@@ -114,30 +114,34 @@ estimate_files = sorted(glob.glob(pattern, recursive=True))
 for path in estimate_files:
     norm = os.path.normpath(path).replace("\\", "/")
     parts = norm.split("/")
-    
-    # Filter only primary runs: <group>/<function>/estimates.json
-    # Ignore new/base subdirectories
-    if len(parts) >= 3 and parts[-2] not in ("new", "base"):
-        key = parts[-2]
-        group = parts[-3] if len(parts) >= 4 else "benchmark"
-        label = labels.get(key, key)
-        
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                mean_ns = float(data["mean"]["point_estimate"])
-                
-                if mean_ns < 1000.0:
-                    latency = f"{mean_ns:.1f} ns"
-                else:
-                    latency = f"{mean_ns / 1000.0:.2f} us"
-                    
-                print(f"| `{label}` | **{latency}** | {group} bench |")
-        except Exception as exc:
-            # A corrupt or half-written estimate must fail the export: the
-            # old `continue` silently dropped rows and still published.
-            print(f"[bench] FAIL: cannot parse {path}: {exc}", file=sys.stderr)
-            sys.exit(1)
+
+    # Criterion 0.5 layout: <group>/<function>/new/estimates.json holds the
+    # latency in ns; change/ holds a relative delta and base/ the old run.
+    # Accept ONLY `new/` -- reading `change/` published 0.1 "ns" tables.
+    if len(parts) < 5 or parts[-2] != "new":
+        continue
+    key = parts[-3]
+    group = parts[-4]
+    label = labels.get(key, key)
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            mean_ns = float(data["mean"]["point_estimate"])
+            if not (mean_ns >= 0.0):
+                raise ValueError(f"non-finite mean {mean_ns!r}")
+
+            if mean_ns < 1000.0:
+                latency = f"{mean_ns:.1f} ns"
+            else:
+                latency = f"{mean_ns / 1000.0:.2f} us"
+
+            print(f"| `{label}` | **{latency}** | {group} bench |")
+    except Exception as exc:
+        # A corrupt or half-written estimate must fail the export: the
+        # old `continue` silently dropped rows and still published.
+        print(f"[bench] FAIL: cannot parse {path}: {exc}", file=sys.stderr)
+        sys.exit(1)
 EOF
 
 if [ ! -s "${TMP_OUT}" ] || [ "$(grep -c '^| `' "${TMP_OUT}" 2>/dev/null)" = "0" ]; then

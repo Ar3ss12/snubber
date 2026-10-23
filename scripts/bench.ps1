@@ -78,24 +78,32 @@ $rows.Add("|---|---|---|")
 $estimates = Get-ChildItem -Path $criterionDir -Recurse -Filter "estimates.json" |
     Where-Object {
         $rel = $_.FullName.Substring($criterionDir.Length + 1).Replace("\", "/")
-        # Primary run estimate only: <group>/<function>/estimates.json
-        # (skip baseline subfolders <group>/<function>/new|base/estimates.json).
-        $rel -notmatch "(^|/)(new|base)/estimates\.json$"
+        # Criterion 0.5 layout: <group>/<function>/new/estimates.json holds
+        # the latency in ns. change/ holds a relative delta, base/ the old
+        # run; reading those published 0.1 "ns" tables. Accept ONLY new/.
+        $rel -match "(^|/)new/estimates\.json$"
     } | Sort-Object FullName
 
 foreach ($est in $estimates) {
+    # $rel is relative to $criterionDir: <group>/<function>/new/estimates.json
     $rel = $est.FullName.Substring($criterionDir.Length + 1).Replace("\", "/")
     $parts = $rel.Split("/")
-    if ($parts.Count -lt 3) { continue }
-    $key = $parts[$parts.Count - 2]   # function name sits before estimates.json
-    $group = $parts[$parts.Count - 3]
+    if ($parts.Count -lt 4) { continue }
+    $key = $parts[$parts.Count - 3]
+    $group = $parts[$parts.Count - 4]
     $label = if ($labels.ContainsKey($key)) { $labels[$key] } else { $key }
     try {
         $json = Get-Content $est.FullName -Raw | ConvertFrom-Json
         $meanNs = [double]$json.mean.point_estimate
     } catch {
-        Write-Warning "Skipping unparsable estimate: $rel"
-        continue
+        # An unparsable estimate must fail the export, not drop a row: a
+        # partial table would still publish as a green run.
+        Write-Error "Cannot parse bench estimate $rel : $_"
+        exit 1
+    }
+    if (-not ($meanNs -ge 0.0)) {
+        Write-Error "Non-finite bench mean in $rel : $meanNs"
+        exit 1
     }
     $ns = if ($meanNs -lt 1000) {
         "{0:F1} ns" -f $meanNs

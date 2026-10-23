@@ -15,6 +15,7 @@ REPORT="target/termination_report.json"
 STATS="target/stress_stats.json"
 SAMPLE_EVERY=5
 MAX_GROWTH_MB=2.0
+MAX_FD_GROWTH=16
 POS=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -27,6 +28,11 @@ while [ $# -gt 0 ]; do
             case "${1:-}" in ''|*[!0-9.]*) echo "Error: --max-growth-mb requires a numeric value" >&2; exit 1 ;; esac
             MAX_GROWTH_MB="$1"
             ;;
+        --max-fd-growth)
+            shift
+            case "${1:-}" in ''|*[!0-9]*) echo "Error: --max-fd-growth requires an integer" >&2; exit 1 ;; esac
+            MAX_FD_GROWTH="$1"
+            ;;
         *) POS+=("$1") ;;
     esac
     shift
@@ -37,6 +43,23 @@ MIN_SLEEP="${POS[2]:-$MIN_SLEEP}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
+
+# Sampling backends: /proc on Linux; ps/lsof on macOS and BSD. Probe once so
+# a platform without either fails the garbage-collection gates explicitly
+# instead of sampling nothing and reporting PASS.
+IS_LINUX=0
+case "$(uname -s 2>/dev/null)" in Linux*) IS_LINUX=1 ;; esac
+LSOF=""
+if [ "$IS_LINUX" = 0 ]; then
+    if command -v lsof > /dev/null 2>&1; then
+        LSOF=lsof
+    elif [ -x /usr/sbin/lsof ]; then
+        LSOF=/usr/sbin/lsof
+    fi
+fi
+FD_SAMPLING=0
+[ "$IS_LINUX" = 1 ] && FD_SAMPLING=1
+[ -n "$LSOF" ] && FD_SAMPLING=1
 
 PID_FILES=("target/supervised_worker.pid" "target/chaos_worker.pid")
 EXE="target/$PROFILE/examples/$TARGET_PROCESS"
@@ -57,9 +80,30 @@ now_ms() {
     if [ "$HAVE_NS" = 1 ]; then echo $(( $(date +%s%N) / 1000000 )); else echo $(( SECONDS * 1000 )); fi
 }
 
-rss_kb() { awk '/^VmRSS:/ {print $2; exit}' "/proc/$1/status" 2>/dev/null; }
-threads_n() { awk '/^Threads:/ {print $2; exit}' "/proc/$1/status" 2>/dev/null; }
-fds_n() { ls "/proc/$1/fd" 2>/dev/null | wc -l | tr -d ' '; }
+rss_kb() {
+    if [ -r "/proc/$1/status" ]; then
+        awk '/^VmRSS:/ {print $2; exit}' "/proc/$1/status" 2>/dev/null
+        return
+    fi
+    # macOS/BSD: ps rss is in KiB, same unit as VmRSS.
+    ps -o rss= -p "$1" 2>/dev/null | awk 'NF {print $1; exit}'
+}
+threads_n() {
+    if [ -r "/proc/$1/status" ]; then
+        awk '/^Threads:/ {print $2; exit}' "/proc/$1/status" 2>/dev/null
+        return
+    fi
+    ps -o thcount= -p "$1" 2>/dev/null | awk 'NF {print int($1); exit}'
+}
+fds_n() {
+    if [ -d "/proc/$1/fd" ]; then
+        ls "/proc/$1/fd" 2>/dev/null | wc -l | tr -d ' '
+        return
+    fi
+    # lsof -F f prints one "f<fd>" line per descriptor; -nP skips lookups.
+    [ -n "$LSOF" ] || return 0
+    "$LSOF" -nP -p "$1" -F f 2>/dev/null | awk '/^f/ {n++} END {print n + 0}'
+}
 
 LAST_KILLED_START_S=0
 TARGET_START_S=0
@@ -84,10 +128,40 @@ target_is_worker() {
         [ "$TARGET_START_S" -gt "$LAST_KILLED_START_S" ] || return 1
         return 0
     fi
-    comm_line=$(ps -o comm= -p "$pid" 2>/dev/null | tail -n 1)
-    [ "$(basename "$comm_line")" = "$TARGET_PROCESS" ]
+    # No /proc (macOS/BSD): image name plus process creation time. Without
+    # the creation-time gate a recycled pid with the same image name would
+    # be SIGKILLed; if the time cannot be resolved the kill is refused.
+    comm_line=$(ps -ww -o comm= -p "$pid" 2>/dev/null | tail -n 1)
+    [ "$(basename "$comm_line")" = "$TARGET_PROCESS" ] || return 1
+    lstart=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//;s/ *$//')
+    [ -n "$lstart" ] || return 1
+    if [ "$IS_LINUX" = 1 ]; then
+        start_s=$(date -d "$lstart" +%s 2>/dev/null)
+    else
+        start_s=$(date -j -f "%a %b %d %T %Y" "$lstart" +%s 2>/dev/null)
+    fi
+    case "$start_s" in ''|*[!0-9]*) return 1 ;; esac
+    TARGET_START_S=$start_s
+    [ "$TARGET_START_S" -gt "$LAST_KILLED_START_S" ] || return 1
 }
-cpu_ticks() { sed 's/^[^)]*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $12+$13}'; }
+cpu_ticks() {
+    if [ -r "/proc/$1/stat" ]; then
+        sed 's/^[^)]*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $12+$13}'
+        return
+    fi
+    # macOS/BSD: parse `ps -o time=` ([dd-]hh:mm:ss[.cc]) into ticks.
+    ps -o time= -p "$1" 2>/dev/null | awk -v c="$CLK_TCK" '
+        NF {
+            t = $1; d = 0
+            if (index(t, "-") > 0) { split(t, p, "-"); d = p[1]; t = p[2] }
+            n = split(t, a, ":")
+            if (n == 3) sec = a[1] * 3600 + a[2] * 60 + a[3]
+            else if (n == 2) sec = a[1] * 60 + a[2]
+            else sec = a[1]
+            printf "%d\n", int((d * 86400 + sec) * c)
+            exit
+        }'
+}
 
 SUP_PID=""
 SUP_EXIT=""
@@ -98,6 +172,9 @@ SUP_RSS_FIRST=0
 SUP_RSS_LAST=0
 SUP_THREADS_PEAK=0
 SUP_FDS_PEAK=0
+SUP_FDS_N=0
+SUP_FDS_FIRST=0
+SUP_FDS_LAST=0
 SUP_CPU_TICKS=0
 W_RSS_PEAK=0
 W_RSS_SUM=0
@@ -124,6 +201,11 @@ sample_sup() {
     [ "$rss" -gt "$SUP_RSS_PEAK" ] && SUP_RSS_PEAK=$rss
     [ "${th:-0}" -gt "$SUP_THREADS_PEAK" ] && SUP_THREADS_PEAK=$th
     [ "${fds:-0}" -gt "$SUP_FDS_PEAK" ] && SUP_FDS_PEAK=$fds
+    if [ -n "${fds:-}" ]; then
+        [ "$SUP_FDS_N" -eq 0 ] && SUP_FDS_FIRST=$fds
+        SUP_FDS_LAST=$fds
+        SUP_FDS_N=$((SUP_FDS_N + 1))
+    fi
     [ -n "${tks:-}" ] && SUP_CPU_TICKS=$tks
 }
 
@@ -309,6 +391,11 @@ add_check() {
         CHECKS_FAILED=$((CHECKS_FAILED + 1))
     fi
 }
+# An unavailable platform probe is reported explicitly; it must not read as
+# either PASS or FAIL (mirrors stress_multi_lineage.py's SKIP accounting).
+add_skip() {
+    CHECK_LINES="${CHECK_LINES}Check           : SKIP $1"$'\n'
+}
 if [ -n "$REAPED" ]; then
     [ "$REAPED" -eq "$EXECUTED" ] && add_check 1 "reaped == kills" || add_check 0 "reaped == kills"
     [ $((TOKENS + CLEAN)) -eq "$REAPED" ] && add_check 1 "rescue + clean == reaped" || add_check 0 "rescue + clean == reaped"
@@ -335,6 +422,19 @@ elif [ "$LAUNCH" = "1" ]; then
     # sampler could not read /proc): a run with no samples proves
     # nothing and must fail, not pass.
     add_check 0 "sampler collected supervisor samples (got 0)"
+fi
+if [ "$FD_SAMPLING" = "1" ]; then
+    if [ "$SUP_FDS_N" -gt 0 ]; then
+        FD_GROWTH=$((SUP_FDS_LAST - SUP_FDS_FIRST))
+        [ "$FD_GROWTH" -le "$MAX_FD_GROWTH" ] && add_check 1 "supervisor fd growth $FD_GROWTH <= $MAX_FD_GROWTH" \
+            || add_check 0 "supervisor fd growth $FD_GROWTH <= $MAX_FD_GROWTH"
+    elif [ "$LAUNCH" = "1" ]; then
+        # Descriptor sampling was available but produced nothing: the
+        # leak gate must not pass on no data.
+        add_check 0 "sampler collected supervisor fd samples (got 0)"
+    fi
+else
+    add_skip "supervisor fd growth (no /proc and no lsof)"
 fi
 
 VERDICT="FAIL"
@@ -383,7 +483,8 @@ if [ -n "$REAPED" ]; then
 fi
 if [ "$SUP_RSS_N" -gt 0 ]; then
     SUP_GROWTH_KB=$((SUP_RSS_LAST - SUP_RSS_FIRST))
-    echo "Supervisor res  : ws peak $(awk -v k="$SUP_RSS_PEAK" 'BEGIN{printf "%.2f", k/1024}') MB avg $(awk -v k="$SUP_RSS_AVG_KB" 'BEGIN{printf "%.2f", k/1024}') MB growth $(awk -v k="$SUP_GROWTH_KB" 'BEGIN{printf "%+.2f", k/1024}') MB | threads peak $SUP_THREADS_PEAK | fds peak $SUP_FDS_PEAK"
+    SUP_FD_GROWTH=$((SUP_FDS_LAST - SUP_FDS_FIRST))
+    echo "Supervisor res  : ws peak $(awk -v k="$SUP_RSS_PEAK" 'BEGIN{printf "%.2f", k/1024}') MB avg $(awk -v k="$SUP_RSS_AVG_KB" 'BEGIN{printf "%.2f", k/1024}') MB growth $(awk -v k="$SUP_GROWTH_KB" 'BEGIN{printf "%+.2f", k/1024}') MB | threads peak $SUP_THREADS_PEAK | fds first ${SUP_FDS_FIRST:-0} peak $SUP_FDS_PEAK last ${SUP_FDS_LAST:-0} growth ${SUP_FD_GROWTH:+$SUP_FD_GROWTH}"
     echo "CPU             : supervisor avg ${SUP_CPU_PCT}% (${SUP_CPU_SEC}s cpu)"
 fi
 if [ "$W_RSS_N" -gt 0 ]; then
@@ -408,7 +509,13 @@ if [ "$SUP_RSS_N" -gt 0 ]; then
       "growth": $(awk -v k=$((SUP_RSS_LAST - SUP_RSS_FIRST)) 'BEGIN{printf "%.3f", k/1024}')
     },
     "threads_peak": $SUP_THREADS_PEAK,
-    "fds_peak": $SUP_FDS_PEAK,
+    "fds": {
+      "samples": $SUP_FDS_N,
+      "first": $SUP_FDS_FIRST,
+      "peak": $SUP_FDS_PEAK,
+      "last": $SUP_FDS_LAST,
+      "growth": $((SUP_FDS_LAST - SUP_FDS_FIRST))
+    },
     "cpu_seconds": $SUP_CPU_SEC,
     "cpu_percent_avg": $SUP_CPU_PCT
   }
@@ -447,6 +554,8 @@ cat > "$STATS" <<EOF
   "kills_requested": $KILLS,
   "kills_completed": $EXECUTED,
   "max_growth_mb": $MAX_GROWTH_MB,
+  "max_fd_growth": $MAX_FD_GROWTH,
+  "fd_sampling": $FD_SAMPLING,
   "misses": $MISSES,
   "not_found_polls": $NOT_FOUND,
   "duration_ms": $DUR_MS,

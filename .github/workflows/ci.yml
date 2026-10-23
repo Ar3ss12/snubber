@@ -153,6 +153,8 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Run Miri on Core Library
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks -Zmiri-strict-provenance"
         run: cargo miri test --locked --lib
 
       - name: Run Miri on Core Suites
@@ -231,3 +233,14 @@ jobs:
 
       - name: Check Benchmark Compiles (no measurement)
         run: cargo bench --locked --bench admission_bench --no-run
+
+      # The exporter used to read `change/estimates.json` (a relative delta)
+      # and publish 0.1 "ns" rows; compile-check alone never exercised it.
+      # One short real benchmark produces a genuine `new/` estimate, then
+      # the exporter must turn it into a latency row.
+      - name: Benchmark Export Smoke (real estimate, no publish)
+        run: |
+          cargo bench --locked --bench admission_bench -- guard_new_commit \
+            --sample-size 10 --measurement-time 1 --warm-up-time 0.5
+          bash scripts/bench.sh --skip-run
+          grep -q 'SnubberGuard::new + commit' target/bench/snapshot.md

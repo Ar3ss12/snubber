@@ -53,7 +53,11 @@ fi
 # (scoped to node.rs on purpose: the fields are private to it — tests,
 # benches, and examples define their own unrelated `in_flight`s.)
 echo -n "[2/6] Auditing saturating counters in src/node.rs... "
-PLUS_EQ_HITS="$(grep -En '(^|[^_[:alnum:]])(in_flight|total_started|committed|bulkhead_rejections|poison_recoveries|stale_epochs_rejected)[[:space:]]*\+=' "${REPO_ROOT}/src/node.rs" 2>&1)"
+# Every monotonic counter the node books, not just the six that existed
+# when this gate was written. A new bucket (rate/breaker/memory/evicted/
+# preempted/implicit drops/trips) must not be writable with a bare `+=`.
+COUNTERS='in_flight|total_started|committed|explicit_aborts|implicit_drops|bulkhead_rejections|poison_recoveries|stale_epochs_rejected|rate_rejected|breaker_rejections|memory_rejections|evicted|preempted|breaker_trips|reported'
+PLUS_EQ_HITS="$(grep -En "(^|[^_[:alnum:]])(${COUNTERS})[[:space:]]*\+=" "${REPO_ROOT}/src/node.rs" 2>&1)"
 rc=$?
 if [ "$rc" -eq 0 ]; then
     # Doc/comment lines are not code: `committed += 1` in a contract
@@ -76,27 +80,43 @@ fi
 
 # Gate 3: Lock-hygiene audit in Phase A/C
 echo -n "[3/6] Auditing zero-panic mutex discipline in src/node.rs... "
-# Extract the FULL `fn record_locked` body (signature line to the closing
-# brace at the SIGNATURE's own indent — portable POSIX awk: `match` +
-# RLENGTH, no gawk `gensub`). The previous fixed `^    \}$` anchor ran to
-# EOF if the fn moved one indent deeper (false-FAIL, fails safe but loud).
-GATE3_BODY="$(awk '
-    match($0, /^[[:space:]]*/) { ind = RLENGTH }
-    /^[[:space:]]*fn record_locked\(/ { flag = 1; sig = ind; print; next }
-    flag {
-        print
-        if (ind == sig && $0 ~ /^[[:space:]]*\}[[:space:]]*$/) exit
-    }
-' "${REPO_ROOT}/src/node.rs")"
-if [ -z "${GATE3_BODY}" ] || ! printf '%s\n' "${GATE3_BODY}" | head -1 | grep -q 'fn record_locked('; then
-    echo "FAIL: could not extract the fn record_locked body from src/node.rs (renamed or moved?)"
+# Scan the three functions that run with (or immediately around) the node
+# mutex held, not just `record_locked`: a `format!`/`panic!` introduced in
+# the admission fast path must fail this gate. Bodies are extracted from
+# the signature line to the closing brace at the SIGNATURE's indent
+# (portable POSIX awk: `match` + RLENGTH, no gawk `gensub`).
+extract_fn() { # $1 = literal signature fragment
+    awk -v pat="$1" '
+        { match($0, /^[[:space:]]*/); ind = RLENGTH }
+        !flag && index($0, pat) > 0 { flag = 1; sig = ind; print; next }
+        flag {
+            print
+            if (ind == sig && $0 ~ /^[[:space:]]*\}[[:space:]]*$/) exit
+        }
+    ' "${REPO_ROOT}/src/node.rs"
+}
+GATE3_SYNC="$(extract_fn 'fn enter_inner<')"
+GATE3_ASYNC="$(extract_fn 'fn enter_async_attempt<')"
+GATE3_RECORD="$(extract_fn 'fn record_locked(')"
+GATE3_BAD=""
+for body in GATE3_SYNC GATE3_ASYNC GATE3_RECORD; do
+    [ -n "${!body}" ] || GATE3_BAD="${GATE3_BAD}${body} (body not found); "
+done
+# `enter_async_attempt` legitimately uses `expect` for the pre-lock
+# `rollback.take()`; everything else must stay non-panicking.
+if [ -n "$GATE3_BAD" ]; then
+    echo "FAIL: could not extract the lock-path function bodies from src/node.rs: ${GATE3_BAD}(renamed or moved?)"
     FAILURES=$((FAILURES + 1))
-elif printf '%s\n' "${GATE3_BODY}" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\(' > /dev/null 2>&1; then
-    echo "FAIL: panicking/formatting call inside record_locked:"
-    printf '%s\n' "${GATE3_BODY}" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
+elif printf '%s\n%s\n' "$GATE3_SYNC" "$GATE3_RECORD" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\(' > /dev/null 2>&1; then
+    echo "FAIL: panicking/formatting call inside the sync lock path:"
+    printf '%s\n%s\n' "$GATE3_SYNC" "$GATE3_RECORD" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
+    FAILURES=$((FAILURES + 1))
+elif printf '%s\n' "$GATE3_ASYNC" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)' > /dev/null 2>&1; then
+    echo "FAIL: panicking/formatting call inside the async lock path:"
+    printf '%s\n' "$GATE3_ASYNC" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)'
     FAILURES=$((FAILURES + 1))
 else
-    echo "OK (no format!/panic! under lock)"
+    echo "OK (no format!/panic! in enter_inner, enter_async_attempt, record_locked)"
 fi
 
 # Gate 4: Zero-metaphor scan across codebase (AGENTS.md Section 14)

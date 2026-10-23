@@ -184,4 +184,5 @@ jobs:
             --test supervisor_pool_stress_lease \
             --test supervisor_pool_stress_mixed \
             --test supervisor_termination \
+            --test stress_breaker_churn \
             -- --ignored
