@@ -208,21 +208,27 @@ impl IsrBridge {
     }
 
     /// Pop one signal in the main loop. `None` when empty.
+    ///
+    /// A malformed cell (opcode 0 is not a valid opcode) is skipped:
+    /// returning `None` on it would end the caller's `while let` drain
+    /// with signals still pending behind it.
     #[inline]
     pub fn try_pop(&self) -> Option<IsrSignal> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Acquire);
-        if head == tail {
-            return None;
+        loop {
+            let tail = self.tail.load(Ordering::Relaxed);
+            let head = self.head.load(Ordering::Acquire);
+            if head == tail {
+                return None;
+            }
+            let idx = (tail & ISR_RING_MASK) as usize;
+            let cell = self.cells[idx].load(Ordering::Relaxed);
+            self.tail.store(tail.wrapping_add(1), Ordering::Release);
+            let signal = IsrSignal::from_raw(cell);
+            if signal.opcode() == 0 {
+                continue;
+            }
+            return Some(signal);
         }
-        let idx = (tail & ISR_RING_MASK) as usize;
-        let cell = self.cells[idx].load(Ordering::Relaxed);
-        self.tail.store(tail.wrapping_add(1), Ordering::Release);
-        let signal = IsrSignal::from_raw(cell);
-        if signal.opcode() == 0 {
-            return None;
-        }
-        Some(signal)
     }
 
     /// Signals waiting (`head - tail`, wrapping-safe).

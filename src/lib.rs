@@ -456,6 +456,25 @@ impl EpochGate {
         }
     }
 
+    /// Non-mutating freshness check: `true` if [`EpochGate::observe`]
+    /// would accept this header, WITHOUT adopting the epoch or generation.
+    ///
+    /// Admission pipelines peek first (cheap early rejection of stale
+    /// packets) and observe only at arming: a rejection that happens
+    /// after the peek (bulkhead full, rate limit) must not burn the
+    /// caller's epoch — the retry with the same header stays fresh.
+    #[inline]
+    #[must_use]
+    pub const fn peek(&self, header: &TransactionHeader) -> bool {
+        if header.generation > self.current_generation {
+            return true;
+        }
+        if header.generation < self.current_generation {
+            return false;
+        }
+        header.epoch > self.last_seen
+    }
+
     /// Highest epoch accepted so far in the current generation.
     #[inline]
     #[must_use]
@@ -725,6 +744,30 @@ mod unit_tests {
         // Later epochs flow normally.
         assert!(gate.observe(&TransactionHeader::with_generation(1, 1, 1)));
         assert!(!gate.observe(&TransactionHeader::with_generation(1, 1, 1)));
+    }
+
+    #[test]
+    fn peek_is_observe_without_adoption() {
+        let mut gate = EpochGate::new();
+        // Fresh packet: peek agrees with observe.
+        assert!(gate.peek(&TransactionHeader::new(1, 1)));
+        assert!(gate.observe(&TransactionHeader::new(1, 1)));
+        // Replay: both cut.
+        assert!(!gate.peek(&TransactionHeader::new(1, 1)));
+        assert!(!gate.observe(&TransactionHeader::new(1, 1)));
+        // Higher epoch in the same generation: both fresh.
+        assert!(gate.peek(&TransactionHeader::new(2, 1)));
+        // New generation: peek is fresh WITHOUT adopting anything.
+        assert!(gate.peek(&TransactionHeader::with_generation(3, 0, 1)));
+        assert_eq!(gate.generation(), 0, "peek must not adopt");
+        assert_eq!(gate.last_seen(), 1, "peek must not advance");
+        // observe still adopts afterwards.
+        assert!(gate.observe(&TransactionHeader::with_generation(3, 0, 1)));
+        assert_eq!(gate.generation(), 3);
+        // Old generation after the adoption: both cut, state untouched.
+        assert!(!gate.peek(&TransactionHeader::with_generation(2, 99, 1)));
+        assert!(!gate.observe(&TransactionHeader::with_generation(2, 99, 1)));
+        assert_eq!(gate.last_seen(), 0);
     }
 
     #[test]

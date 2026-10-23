@@ -406,9 +406,13 @@ pub const DEFAULT_POLICIES: [FaultPolicy; FaultKind::COUNT] = [
         "UI lags, packet ignored",
         "stale_packets_dropped",
     ),
-    // BulkheadFull — capacity saturated under RejectNew: warn + count.
+    // BulkheadFull — capacity saturation: counted, NEVER trips the
+    // breaker (operational shedding is not failure). Parking is the
+    // node-level BackpressurePolicy's call, so the default action stays
+    // passive; an EXPLICIT `FaultAction::BreakerOpen` overrides it and
+    // sheds the caller immediately.
     FaultPolicy::arm(
-        FaultAction::BreakerOpen,
+        FaultAction::DiscardSilently,
         LogLevel::Warn,
         "bulkhead full, newcomer rejected",
         "bulkhead_rejections_total",
@@ -1607,9 +1611,11 @@ impl SnubberNode {
 
     /// Copy-snapshot of the live telemetry counters.
     ///
-    /// Touch point: also reaps expired watchdog deadlines (see
-    /// [`SnubberNodeBuilder::timeout_ms`]) — a hung guard is declared
-    /// `Timeout` here if nobody touched the node since the deadline.
+    /// Watchdog settlement is cooperative, not polled here: a blown
+    /// deadline is declared `Timeout` by [`TrackedGuard::check_timeout`],
+    /// which the guard owner calls at its loop edge. `stats()` reaps
+    /// nothing — the node cannot see live guards (deadlines live on the
+    /// guard side), so there is no background reaper either.
     ///
     /// HONEST NOTE: this is a cold diagnostic path, NOT hot PHASE A/C.
     /// `last_fault: Option<FaultRecord>` may own `FaultDetail::Owned`
@@ -1810,20 +1816,16 @@ impl SnubberNode {
         out
     }
 
-    /// Reap watchdog-expired guards: any tracked guard whose deadline
-    /// passed without settle is rolled back + reported as `Timeout`.
-    /// Called at every node touch point (`enter`, `report`, `stats`);
-    /// no background thread, no timer wheel.
-    fn reap_timeouts(&self) {
-        // Deadline bookkeeping lives on the guard side (TrackGuard carries
-        // `deadline_ms: Option<u64>` + arming timestamp). The node cannot
-        // see live guards — it sees the timeout via `report(Timeout)` from
-        // the reaper. This hook exists so `stats()` never hides a hang:
-        // subclasses override the touch-point ordering in tests.
-        // (Real reaping happens in `TrackedGuard::is_expired` + the next
-        // `enter` that finds `in_flight` slots held past deadline.)
-        let _ = self.lock().timeouts_fired;
-    }
+    /// Watchdog touch-point hook (deliberately a no-op).
+    ///
+    /// The node cannot see live guards — deadlines live on the guard side
+    /// (`TrackedGuard::deadline_ms` + `armed_at_ms`), and a blown deadline
+    /// is settled cooperatively by [`TrackedGuard::check_timeout`], which
+    /// rolls the guard back and reports `Timeout`. There is no background
+    /// reaper and `stats()` declares no timeouts. The hook stays as the
+    /// named touch point so a future guard registry could reap here
+    /// without changing `stats()`'s signature.
+    fn reap_timeouts(&self) {}
 
     /// Publish `last_fault` WITHOUT allocating under the lock (PHASE B).
     /// Both clones happen BEFORE the second lock is taken (no lock held
@@ -2132,6 +2134,10 @@ impl SnubberNode {
     /// * `Drop` without `commit` runs the user's rollback — the hardware
     ///   is still protected; the node book-keeping stays on the probe's
     ///   clean path (no phantom implicit-drop).
+    /// * If the admission landed while the breaker was HalfOpen, the
+    ///   probe settles with the ERASED guard's outcome, not the
+    ///   throwaway commit: `commit()` → Closed, drop/abort → Open
+    ///   (a failed probe re-opens — the downstream was NOT healthy).
     ///
     /// Use `enter` when you need typed per-guard settle accounting; use
     /// `enter_erased` when the guard must LIVE in a struct.
@@ -2158,8 +2164,30 @@ impl SnubberNode {
         // Single admission: reserve slot + epoch, commit the probe so the
         // books are clean, then hand the user a nameable rollback owner.
         // Rejection returns BEFORE boxing: zero cost on the cold path.
-        self.enter_inner(epoch, task_id, None, || {})?.commit();
-        Ok(crate::ErasedGuard::new(rollback))
+        // The admission guard's probe role is DEFERRED, not consumed
+        // here: a throwaway `commit()` would close the breaker while
+        // the real transaction's outcome is still unknown. The erased
+        // guard settles the breaker when ITS outcome lands (commit →
+        // Closed, drop/abort → Open — a failed probe re-opens).
+        let probed = self.enter_inner(epoch, task_id, None, || {})?;
+        let was_probe = {
+            let mut g = probed;
+            let was_probe = g.is_probe;
+            g.is_probe = false;
+            g.commit();
+            was_probe
+        };
+        let node = self.clone();
+        let node2 = self.clone();
+        Ok(crate::ErasedGuard::with_commit_hook(
+            move || {
+                rollback();
+                node.settle_erased_probe(was_probe, false);
+            },
+            move || {
+                node2.settle_erased_probe(was_probe, true);
+            },
+        ))
     }
 
     /// Next monotonically minted sequence ticket for this node (lock-free `AtomicU64`).
@@ -2642,13 +2670,26 @@ impl SnubberNode {
         token.task = seq;
         token.emit_if_supervised();
 
-        self.enter_inner(seq, seq, None, || {})?.commit();
+        // Probe settlement is DEFERRED to the erased guard's real
+        // outcome — see `enter_erased`.
+        let probed = self.enter_inner(seq, seq, None, || {})?;
+        let was_probe = {
+            let mut g = probed;
+            let was_probe = g.is_probe;
+            g.is_probe = false;
+            g.commit();
+            was_probe
+        };
+        let node = self.clone();
+        let node2 = self.clone();
         Ok(crate::ErasedGuard::with_commit_hook(
             move || {
                 rollback();
+                node.settle_erased_probe(was_probe, false);
                 crate::ProcessToken::commit(seq).emit_if_supervised();
             },
             move || {
+                node2.settle_erased_probe(was_probe, true);
                 crate::ProcessToken::commit(seq).emit_if_supervised();
             },
         ))
@@ -2858,7 +2899,11 @@ impl SnubberNode {
         // F3 CONTRACT: HARD refusal, no hidden retry in-crate. The bounded
         // stale-retry loop lives ONLY in `tests/concurrency_stress.rs` (storm
         // imitation). Smuggling a retry here turns fail-fast into a lot.
-        if !inner.gate.observe(&header) {
+        // PEEK, don't observe: the epoch is adopted only at arming, so a
+        // BulkheadFull/RateLimited rejection leaves the caller's epoch
+        // free — the retry with the same header stays fresh. Mirrors the
+        // async attempt (observe at slot commit).
+        if !inner.gate.peek(&header) {
             if inner.breaker == BreakerState::HalfOpen {
                 inner.half_open_probe = false;
             }
@@ -2945,6 +2990,16 @@ impl SnubberNode {
                     };
                     let (park_ms, shed_now) = if custom_mode {
                         (0, false)
+                    } else if matches!(snap_action, FaultAction::BreakerOpen) {
+                        // Explicit per-kind override (mirrors BlockCaller,
+                        // which also reaches parking from the policy side):
+                        // reject the caller NOW, no friction park — "as if
+                        // the circuit breaker were OPEN" (FaultAction doc).
+                        // NOT the default action anymore: the default
+                        // BulkheadFull policy defers parking to the
+                        // node-level BackpressurePolicy so AdaptiveBlock
+                        // can park as documented.
+                        (0, true)
                     } else {
                         match snap_policy {
                             BackpressurePolicy::AdaptiveBlock {
@@ -2971,8 +3026,15 @@ impl SnubberNode {
                     } else {
                         let _wait_ms_inner = if legacy_ms > 0 { legacy_ms } else { park_ms };
                         if custom_mode {
-                            let bp =
-                                Backpressure::new(friction_wait, depth, FaultKind::BulkheadFull);
+                            // The advisory never exceeds the node's own
+                            // pacing ceiling (`cap`): advising a longer
+                            // wait than AdaptiveBlock itself would ever
+                            // sleep makes the telemetry lie.
+                            let bp = Backpressure::new(
+                                friction_wait.min(cap),
+                                depth,
+                                FaultKind::BulkheadFull,
+                            );
                             drop(inner);
                             if let Some(react) = snap_pressure {
                                 react(bp);
@@ -3110,6 +3172,24 @@ impl SnubberNode {
         }
 
         // PHASE C (commit): integers only, saturating, hard clamp.
+        // Adopt the epoch only NOW: every rejection path above (bulkhead
+        // park/shed, rate limit) left it free. If a racing call with a
+        // higher epoch armed first, this header is genuinely late —
+        // reject as StaleEpoch without burning a slot.
+        if !inner.gate.observe(&header) {
+            if inner.breaker == BreakerState::HalfOpen {
+                inner.half_open_probe = false;
+            }
+            let record = FaultRecord {
+                kind: FaultKind::StaleEpoch,
+                ..arming.clone()
+            };
+            let mut outcome = Self::record_locked(&mut inner, FaultKind::StaleEpoch, 2, 0);
+            drop(inner);
+            self.publish_fault(&mut outcome, &record);
+            Self::emit(outcome, record);
+            return Err(EnterError::StaleEpoch);
+        }
         inner.in_flight = inner.in_flight.saturating_add(1);
         inner.queued = inner.queued.saturating_add(1);
         let lane = priority.code().min(2) as usize;
@@ -3190,6 +3270,30 @@ impl SnubberNode {
         inner.half_open_probe = false;
         inner.consecutive_failures = 0;
         inner.stats.breaker_state = BreakerState::Closed;
+    }
+
+    /// Deferred probe settlement for the erased admissions
+    /// ([`Self::enter_erased`] / [`Self::enter_supervised_erased`]):
+    /// the admission-time probe commit does not settle a HalfOpen
+    /// breaker (the real transaction's outcome is still unknown), so
+    /// the erased guard's own outcome does. `ok` mirrors the guard's
+    /// settle paths: commit → Closed + streak reset; rollback
+    /// (drop/abort) → Open, the cooling window restarts.
+    #[cfg(feature = "alloc")]
+    fn settle_erased_probe(&self, was_probe: bool, ok: bool) {
+        if !was_probe {
+            return;
+        }
+        let mut inner = self.lock();
+        inner.half_open_probe = false;
+        if ok {
+            inner.breaker = BreakerState::Closed;
+            inner.consecutive_failures = 0;
+            inner.stats.breaker_state = BreakerState::Closed;
+        } else {
+            inner.breaker = BreakerState::Open;
+            inner.stats.breaker_state = BreakerState::Open;
+        }
     }
 
     /// Compile-time error budget: bake `MAX_ERRORS` into the call site.
@@ -3356,15 +3460,10 @@ impl SnubberNode {
         // A generation bump is ALWAYS fresh (re-handshake): a rebooted
         // client's first packet must not be dropped, even at epoch 0 —
         // it would be retransmitted forever against a gate that already
-        // adopted the generation. Mirrors `EpochGate::observe`.
-        let is_fresh = if header.generation > inner.gate.generation() {
-            true
-        } else if header.generation < inner.gate.generation() {
-            false
-        } else {
-            header.epoch > inner.gate.last_seen()
-        };
-        if !is_fresh {
+        // adopted the generation. Mirrors `EpochGate::observe`. The
+        // epoch itself is adopted at slot commit (step 5) — a queue
+        // rejection here must not burn the caller's coordinates.
+        if !inner.gate.peek(&header) {
             if inner.breaker == BreakerState::HalfOpen {
                 inner.half_open_probe = false;
             }
@@ -3750,9 +3849,15 @@ impl SnubberNode {
         // admission time (enter_inner parks the caller); if a fault FIRES
         // while BlockCaller is armed, the firing itself is silent.
         let custom: Option<fn()> = match policy.action {
-            FaultAction::DiscardSilently
-            | FaultAction::BreakerOpen
-            | FaultAction::BlockCaller(_) => None,
+            FaultAction::DiscardSilently | FaultAction::BlockCaller(_) => None,
+            FaultAction::BreakerOpen => {
+                // Caller-rejection action: realized at ADMISSION — the
+                // BulkheadFull verdict sheds immediately instead of
+                // parking. Under the lock there is nothing to command:
+                // every path that reports a kind with this action is
+                // already rejecting the caller.
+                None
+            }
             FaultAction::RollbackAndAlert => {
                 inner.alert_pending = true;
                 None
@@ -4792,6 +4897,14 @@ impl<F: FnOnce()> TrackedGuard<F> {
             inner.stats.deadlock_suspected = inner.deadlock_suspected;
         }
         Self::note_outcome(&mut inner, true);
+        // Watchdog timeouts feed the streak: a hung task IS a failure
+        // (the doc says "streak fed" — the trip was missing). A probe
+        // is skipped here: its failure already re-opened the breaker
+        // above, and a streak trip must not schedule a fresh probe
+        // over that verdict.
+        if !self.is_probe {
+            Self::streak_trip_locked(&mut inner);
+        }
         inner.stats.timeouts_fired = inner.timeouts_fired;
         inner.stats.window_outcomes = inner.window_outcomes;
         inner.stats.window_failures = inner.window_failures;
@@ -4860,6 +4973,34 @@ impl<F: FnOnce()> TrackedGuard<F> {
             inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
         } else {
             inner.consecutive_failures = 0;
+        }
+    }
+
+    /// Streak trip shared by the settle paths (`settle_implicit`,
+    /// `check_timeout`): when the consecutive-failure streak reaches
+    /// `trip_after_failures`, trip from Closed (fresh trip — HalfOpen
+    /// with the probe scheduled on the next `enter`, trip counter +1)
+    /// or schedule the probe from Open. A HalfOpen breaker already has
+    /// its probe — re-arming here would open a SECOND probe and
+    /// inflate `breaker_trips`.
+    fn streak_trip_locked(inner: &mut NodeInner) {
+        let trips = inner.trip_after_failures;
+        if trips == 0 || inner.consecutive_failures < trips {
+            return;
+        }
+        match inner.breaker {
+            BreakerState::Closed => {
+                inner.breaker = BreakerState::HalfOpen;
+                inner.half_open_probe = false;
+                inner.stats.breaker_trips = inner.stats.breaker_trips.saturating_add(1);
+                inner.stats.breaker_state = BreakerState::HalfOpen;
+            }
+            BreakerState::Open => {
+                inner.breaker = BreakerState::HalfOpen;
+                inner.half_open_probe = false;
+                inner.stats.breaker_state = BreakerState::HalfOpen;
+            }
+            BreakerState::HalfOpen => {}
         }
     }
 
@@ -4948,24 +5089,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         Self::note_outcome(&mut inner, true);
         inner.stats.window_outcomes = inner.window_outcomes;
         inner.stats.window_failures = inner.window_failures;
-        let trips = inner.trip_after_failures;
-        if trips > 0 && inner.consecutive_failures >= trips {
-            // Fresh trip: OPEN + half-open probe scheduled on next enter.
-            if inner.breaker != BreakerState::Open {
-                inner.breaker = BreakerState::Open;
-                inner.stats.breaker_trips = inner.stats.breaker_trips.saturating_add(1);
-                inner.stats.breaker_state = BreakerState::Open;
-                // Schedule the recovery probe: next `enter` admits one
-                // call in HalfOpen instead of failing fast forever.
-                inner.breaker = BreakerState::HalfOpen;
-                inner.half_open_probe = false;
-                inner.stats.breaker_state = BreakerState::HalfOpen;
-            } else {
-                inner.breaker = BreakerState::HalfOpen;
-                inner.half_open_probe = false;
-                inner.stats.breaker_state = BreakerState::HalfOpen;
-            }
-        }
+        Self::streak_trip_locked(&mut inner);
         // Probe that settled implicitly: downstream still degraded → back to Open.
         if self.is_probe {
             inner.breaker = BreakerState::Open;

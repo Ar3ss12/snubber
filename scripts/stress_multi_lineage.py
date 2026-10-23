@@ -280,7 +280,11 @@ def monitor(args: argparse.Namespace, lanes: list[Lane], supervisors: set[int], 
                     lane.sup_fds.note(proc_fds(lane.sup.pid))
                 worker = read_pid(lane.dir / "target" / "supervised_worker.pid")
                 if worker and worker not in supervisors:
-                    lane.worker_rss.note(proc_rss_mb(worker))
+                    # Same identity gate as the killer: a recycled pid must
+                    # never pollute worker resource samples.
+                    ident = proc_identity(worker)
+                    if ident is not None and ident[1] == args.target:
+                        lane.worker_rss.note(proc_rss_mb(worker))
         if now - last_line >= 0.5:
             last_line = now
             total = sum(lane.killed for lane in lanes)

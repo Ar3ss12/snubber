@@ -162,3 +162,28 @@ fn hard_clamp_slots_guarantees_ceiling_under_evict_oldest_stress() {
         "every admitted transaction must settle exactly once"
     );
 }
+
+// Regression (0.6.2, bug 14): a BulkheadFull rejection must not burn the
+// caller's epoch — the retry with the SAME header stays fresh. Before the
+// fix the sync path adopted the epoch at the gate check, so an honest
+// retry after a full bulkhead came back StaleEpoch forever.
+#[test]
+fn bulkhead_rejection_leaves_the_epoch_free_for_retry() {
+    let node = SnubberNode::builder("wall/retry-same-epoch")
+        .max_in_flight(1)
+        .build();
+    let held = node.enter(1, 1, || {}).expect("first slot");
+
+    // Bulkhead full: rejected (AdviseOnly -> immediate, no parking).
+    match node.enter(2, 2, || {}) {
+        Err(EnterError::BulkheadFull) => {}
+        Ok(_) => panic!("bulkhead is full, must reject"),
+        Err(e) => panic!("expected BulkheadFull, got {e:?}"),
+    }
+
+    // Slot freed: the REJECTED epoch retries cleanly.
+    held.commit();
+    node.enter(2, 2, || {})
+        .expect("same epoch must stay fresh after BulkheadFull")
+        .commit();
+}

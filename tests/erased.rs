@@ -189,3 +189,53 @@ fn closure_debug_does_not_leak_captures() {
     });
     assert_eq!(format!("{:?}", policy), "ClosurePolicy(..)");
 }
+
+// Regression (0.6.2, bug 8): the admission-time throwaway probe commit
+// used to close a HalfOpen breaker while the real transaction's outcome
+// was still unknown. The probe must settle with the ERASED guard.
+#[test]
+fn erased_admission_does_not_close_half_open_breaker() {
+    let node = SnubberNode::builder("erased/probe")
+        .trip_after_failures(1)
+        .build();
+    {
+        let _g = node.enter(1, 1, || {}).expect("enter");
+    } // implicit drop -> trip -> HalfOpen
+    assert_eq!(node.stats().breaker_state, snubber::BreakerState::HalfOpen);
+
+    let g = node.enter_erased(2, 2, || {}).expect("probe admitted");
+    // The throwaway commit must NOT have closed the breaker: a second
+    // call is refused while the erased guard holds the probe.
+    assert!(
+        matches!(node.enter(3, 3, || {}), Err(EnterError::BreakerOpen)),
+        "probe must stay armed, not consumed by the erased admission"
+    );
+
+    g.commit();
+    assert_eq!(
+        node.stats().breaker_state,
+        snubber::BreakerState::Closed,
+        "erased commit settles the probe: breaker closes"
+    );
+    node.enter(4, 4, || {}).expect("admits after recovery").commit();
+}
+
+#[test]
+fn erased_drop_reopens_breaker_like_a_failed_probe() {
+    let node = SnubberNode::builder("erased/probe-drop")
+        .trip_after_failures(1)
+        .build();
+    {
+        let _g = node.enter(1, 1, || {}).expect("enter");
+    } // HalfOpen
+    let g = node.enter_erased(2, 2, || {}).expect("probe admitted");
+    drop(g); // rollback without commit: downstream still degraded
+    assert_eq!(
+        node.stats().breaker_state,
+        snubber::BreakerState::Open,
+        "failed erased probe must re-open the breaker"
+    );
+    assert!(matches!(node.enter(3, 3, || {}), Err(EnterError::BreakerOpen)));
+    node.reset_breaker();
+    node.enter(4, 4, || {}).expect("recovers").commit();
+}

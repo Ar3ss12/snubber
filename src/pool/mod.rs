@@ -78,6 +78,12 @@ pub struct PoolConfig {
     pub memory: MemoryPolicy,
     /// Maximum wait for drain EOF before a reap is reported as
     /// [`ReapClass::Deadlocked`], ms.
+    ///
+    /// `0` disables the window entirely: the drain is polled once
+    /// without waiting, and a pipe that has not reached EOF at that
+    /// instant is reaped as Deadlocked (an existing, tested contract —
+    /// use it only when a misclassification is cheaper than the wait).
+    /// `u64::MAX` waits for EOF unboundedly (no Deadlocked verdict).
     pub eof_grace_ms: u64,
 }
 
@@ -118,6 +124,9 @@ impl PoolConfig {
     }
 
     /// Set the EOF grace window used by [`PoolLane::note_death`].
+    ///
+    /// `0` polls EOF once with no wait (instant `Deadlocked` on a
+    /// non-EOF drain); `u64::MAX` waits unboundedly.
     #[must_use]
     pub const fn with_eof_grace(mut self, eof_grace_ms: u64) -> Self {
         self.eof_grace_ms = eof_grace_ms;

@@ -13,6 +13,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# All relative paths (target/criterion, snapshot output) resolve from the
+# repo root — including the --skip-run export path.
+cd "${ROOT_DIR}"
+
 BENCH_DIR="${ROOT_DIR}/target"
 CRITERION_DIR="${BENCH_DIR}/criterion"
 OUT_DIR="${BENCH_DIR}/bench"
@@ -50,8 +54,18 @@ fi
 
 mkdir -p "${OUT_DIR}"
 
+# Python parser (python3 on POSIX; the Windows launcher installs as `python`)
+if command -v python3 > /dev/null 2>&1; then
+    PY=python3
+elif command -v python > /dev/null 2>&1; then
+    PY=python
+else
+    echo -e "\033[31mError: neither python3 nor python found in PATH.\033[0m"
+    exit 1
+fi
+
 # Python or jq/awk parser for Criterion estimates.json
-python3 - << 'EOF' > "${OUT_FILE}"
+"$PY" - << 'EOF' > "${OUT_FILE}"
 import os
 import json
 import glob

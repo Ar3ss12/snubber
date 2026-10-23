@@ -114,3 +114,64 @@ fn custom_friction_curve_calculates_backpressure_delay() {
     let ms = start.elapsed().as_millis();
     assert!((4..=60).contains(&ms), "capped friction park: {ms}ms");
 }
+
+// Regression (0.6.2, bug 7): an EXPLICIT `FaultAction::BreakerOpen` policy
+// on BulkheadFull sheds the caller immediately — no friction park — even
+// under a node-level AdaptiveBlock that would otherwise sleep. The DEFAULT
+// policy no longer carries BreakerOpen, so AdaptiveBlock keeps parking as
+// documented (see `adaptive_block_parks_on_friction_then_admits`).
+#[test]
+fn explicit_breaker_open_action_sheds_without_parking() {
+    use snubber::{FaultAction, FaultKind, FaultPolicy, LogLevel};
+    let node = SnubberNode::builder("pace/explicit-breaker-open")
+        .max_in_flight(1)
+        .backpressure(BackpressurePolicy::AdaptiveBlock {
+            max_wait_ms: 5000,
+            shed_deeper_than: None,
+        })
+        .policy(
+            FaultKind::BulkheadFull,
+            FaultPolicy::arm(
+                FaultAction::BreakerOpen,
+                LogLevel::Warn,
+                "shed now",
+                "bulkhead_rejections_total",
+            ),
+        )
+        .build();
+    let _held = node.enter(1, 1, || {}).expect("first slot");
+    let start = std::time::Instant::now();
+    let r = node.enter(2, 2, || {});
+    assert!(matches!(r, Err(EnterError::BulkheadFull)));
+    assert!(
+        start.elapsed().as_millis() < 100,
+        "BreakerOpen must shed, not park 5 s"
+    );
+}
+
+// Regression (0.6.2, bug 19): the custom-mode pressure advisory is capped
+// by the node's own pacing ceiling — a runaway friction curve must not
+// advise a retry wait the node itself would never sleep.
+#[test]
+fn custom_pressure_advisory_is_capped_by_the_node_ceiling() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    fn reactor(bp: snubber::Backpressure) {
+        SEEN.store(bp.retry_after_ms, Ordering::SeqCst);
+    }
+    fn runaway(_in_flight: u32, _max: u32) -> u64 {
+        50_000
+    }
+    let node = SnubberNode::builder("pace/custom-cap")
+        .max_in_flight(1)
+        .friction_fn(runaway)
+        .backpressure(BackpressurePolicy::Custom(reactor))
+        .build();
+    let _held = node.enter(1, 1, || {}).expect("first slot");
+    assert!(matches!(node.enter(2, 2, || {}), Err(EnterError::BulkheadFull)));
+    assert_eq!(
+        SEEN.load(Ordering::SeqCst),
+        1000,
+        "advisory capped at the node ceiling (1 s), not the 50 s curve"
+    );
+}

@@ -221,7 +221,9 @@ impl PoolLane {
     /// 2. EOF + un-settled arm → [`ReapClass::Ambush`] + token handed back;
     /// 3. EOF + commits only → [`ReapClass::Escape`];
     /// 4. EOF + silence → [`ReapClass::Stillborn`];
-    /// 5. no EOF inside the grace → [`ReapClass::Deadlocked`], token `None`.
+    /// 5. no EOF inside the grace → [`ReapClass::Deadlocked`], token `None`
+    ///    (`eof_grace_ms == 0` polls once with no wait; `u64::MAX` waits
+    ///    unboundedly).
     ///
     /// The lane generation is bumped exactly once per reported death and
     /// BEFORE the EOF grace wait, so a successor attaching while the dead

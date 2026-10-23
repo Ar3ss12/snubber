@@ -1324,9 +1324,11 @@ impl Supervisor {
     /// is the APP's (`/proc/<pid>/status`, `GetProcessMemoryInfo`, cgroup);
     /// the crate stays `#![forbid(unsafe_code)]`.
     ///
-    /// * `Soft` — logged once as `[SUPERVISOR:MEMORY_DRAIN]`: the worker has
-    ///   been told to refuse admissions, drain in-flight guards, hand off a
-    ///   [`StateDigest`] and exit for a successor generation. Never killed.
+    /// * `Soft` — logged once as `[SUPERVISOR:MEMORY_DRAIN]`: telemetry for
+    ///   the operator, NOT a control message — the pipe is one-way
+    ///   (child → out), the supervisor never signals the worker. The child
+    ///   is expected to sample its own memory (`SnubberNode` soft limit →
+    ///   [`EnterError::MemoryPressure`]) and drain itself. Never killed.
     /// * `Hard` — `child.kill()` WITHOUT draining and
     ///   [`DeathCause::MemoryLimit`] stamped via [`death_event`].
     pub fn run_supervised_guard_with_memory<F, S>(
@@ -1472,8 +1474,17 @@ impl Supervisor {
                                         break;
                                     }
                                     if verdict == MemoryVerdict::Soft && !was_soft {
+                                        // Telemetry, not a control message: the
+                                        // pipe is one-way (child -> out), the
+                                        // supervisor cannot signal the worker.
+                                        // The CHILD is expected to sample its own
+                                        // memory (`SnubberNode` soft limit ->
+                                        // `EnterError::MemoryPressure`) and drain
+                                        // itself; this line tells the operator to
+                                        // expect a graceful exit and that the
+                                        // supervisor will NOT kill.
                                         eprintln!(
-                                            "[SUPERVISOR:MEMORY_DRAIN] child_pid={pid} used_kb={used_kb} soft_kb={} action=refuse_admissions_and_handoff",
+                                            "[SUPERVISOR:MEMORY_DRAIN] child_pid={pid} used_kb={used_kb} soft_kb={} action=no_kill_self_drain_expected",
                                             watch.soft_kb()
                                         );
                                     }
@@ -1501,11 +1512,17 @@ impl Supervisor {
                 );
             }
 
-            for _ in 0..50 {
-                if drain.eof() {
-                    break;
-                }
-                std::thread::yield_now();
+            // Bounded EOF grace (same ceiling as the pool reaper,
+            // `crate::pool::DEFAULT_EOF_GRACE_MS`): a bare yield-spin
+            // never observes a pipe that still holds buffered bytes —
+            // the rescue token would be missed and the death reported
+            // CLEAN while the child's last words are still in flight.
+            let eof_started = drain.now_ms();
+            while !drain.eof()
+                && drain.now_ms().saturating_sub(eof_started)
+                    <= crate::pool::DEFAULT_EOF_GRACE_MS
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
 
             if let Some(token) = drain.take_armed() {
@@ -1522,7 +1539,10 @@ impl Supervisor {
         }
 
         let next_gen = clock.restart();
-        println!("[SUPERVISOR:RESTART] lineage_bump_gen={next_gen}");
+        // One-shot supervision: this call does NOT spawn a successor —
+        // it bumps the lineage so the NEXT invocation (the caller's
+        // restart loop) mints a fresh generation, then returns.
+        println!("[SUPERVISOR:LINEAGE_BUMP] gen={next_gen} restart=caller_decides");
         true
     }
 

@@ -278,3 +278,67 @@ fn probe_timeout_reopens_breaker_instead_of_wedging_half_open() {
         .expect("probe slot must be released after timeout")
         .commit();
 }
+
+// ============================================================================
+// 9. Regression (0.6.2): streak trip correctness
+// ============================================================================
+
+// Bug 10: an implicit drop settling while the breaker was already
+// HalfOpen used to re-arm a SECOND probe and inflate breaker_trips.
+#[test]
+fn implicit_drop_in_half_open_does_not_arm_a_second_probe() {
+    let node = SnubberNode::builder("streak/second-probe")
+        .trip_after_failures(2)
+        .build();
+    // Hold one guard admitted while Closed; two more drop implicitly ->
+    // streak 2 -> trip -> HalfOpen with the probe scheduled.
+    let held = node.enter(1, 1, || {}).expect("hold slot");
+    {
+        let _g = node.enter(2, 2, || {}).expect("b");
+    }
+    {
+        let _g = node.enter(3, 3, || {}).expect("c");
+    }
+    let trips_before = node.stats().breaker_trips;
+    assert_eq!(trips_before, 1);
+    assert_eq!(node.stats().breaker_state, BreakerState::HalfOpen);
+
+    // Now the held guard drops while HalfOpen: the streak fires again,
+    // but a probe is already scheduled — no second probe, no extra trip.
+    drop(held);
+    let s = node.stats();
+    assert_eq!(s.breaker_trips, 1, "HalfOpen must not re-trip");
+    assert_eq!(s.breaker_state, BreakerState::HalfOpen);
+
+    // Exactly one probe is admitted, and committing it closes.
+    node.enter(4, 4, || {}).expect("single probe").commit();
+    assert_eq!(node.stats().breaker_state, BreakerState::Closed);
+}
+
+// Bug 15: watchdog timeouts feed the failure streak — a hung task IS a
+// failure. Before the fix `check_timeout` advanced the streak counter
+// but the breaker never tripped at `trip_after_failures`.
+#[test]
+fn watchdog_timeouts_trip_the_streak_breaker() {
+    let node = SnubberNode::builder("streak/timeout")
+        .trip_after_failures(2)
+        .timeout_ms(1)
+        .build();
+    for epoch in [1u64, 2] {
+        let g = node.enter(epoch, epoch, || {}).expect("admit");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        match g.check_timeout() {
+            Err(TimeoutCheck::TimedOut) => {}
+            Err(other) => panic!("unexpected watchdog verdict: {other:?}"),
+            Ok(_) => panic!("1 ms deadline must fire after 5 ms"),
+        }
+    }
+    let s = node.stats();
+    assert_eq!(s.timeouts_fired, 2);
+    assert_eq!(s.breaker_trips, 1, "two hung tasks must trip the streak");
+    assert_eq!(s.breaker_state, BreakerState::HalfOpen);
+
+    // The probe recovers on a clean commit.
+    node.enter(3, 3, || {}).expect("probe").commit();
+    assert_eq!(node.stats().breaker_state, BreakerState::Closed);
+}

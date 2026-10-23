@@ -264,9 +264,9 @@ impl ProfileHarness {
         let mut streak = 0u32;
         for &sample in &samples {
             if sample > median_us {
-                streak += 1;
+                streak = streak.saturating_add(1);
                 if streak == self.burst_len {
-                    bursts += 1;
+                    bursts = bursts.saturating_add(1);
                     burst_samples = burst_samples.saturating_add(streak);
                     streak = 0;
                 }

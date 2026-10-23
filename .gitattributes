@@ -1,0 +1,5 @@
+# Shell scripts must be LF: CRLF makes bash execute `env bash\r` and
+# every line dies with `\r: command not found` on real Linux.
+*.sh text eol=lf
+*.py text eol=lf
+*.rs text eol=lf

@@ -19,9 +19,9 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-if grep -En "\bunsafe\s*\{|\bunsafe\s+fn\b" "${REPO_ROOT}/src/"*.rs > /dev/null 2>&1; then
+if grep -rEIn "\bunsafe\s*\{|\bunsafe\s+fn\b" --include='*.rs' "${REPO_ROOT}/src" > /dev/null 2>&1; then
     echo "FAIL: Found raw unsafe keyword in src/:"
-    grep -En "\bunsafe\s*\{|\bunsafe\s+fn\b" "${REPO_ROOT}/src/"*.rs
+    grep -rEIn "\bunsafe\s*\{|\bunsafe\s+fn\b" --include='*.rs' "${REPO_ROOT}/src"
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -37,20 +37,25 @@ fi
 
 # Gate 3: Lock-hygiene audit in Phase A/C
 echo -n "[3/6] Auditing zero-panic mutex discipline in src/node.rs... "
-# Simple check ensuring no raw println! or panic! calls inside node.rs lock helpers
-if grep -En "fn record_locked" "${REPO_ROOT}/src/node.rs" | grep -q "format!"; then
-    echo "FAIL: format! call detected in record_locked"
+# Extract the FULL `fn record_locked` body (signature line to the first
+# method-indent closing brace) and forbid panicking/allocating calls
+# inside it. The previous grep only ever saw the signature line, so the
+# gate passed unconditionally.
+GATE3_BODY="$(awk '/fn record_locked/{flag=1} flag{print; if ($0 ~ /^    \}$/) exit}' "${REPO_ROOT}/src/node.rs")"
+if printf '%s\n' "${GATE3_BODY}" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\(' > /dev/null 2>&1; then
+    echo "FAIL: panicking/formatting call inside record_locked:"
+    printf '%s\n' "${GATE3_BODY}" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
     FAILURES=$((FAILURES + 1))
 else
-    echo "OK (no format! under lock)"
+    echo "OK (no format!/panic! under lock)"
 fi
 
 # Gate 4: Zero-metaphor scan across codebase (AGENTS.md Section 14)
 echo -n "[4/6] Auditing forbidden metaphors... "
 FORBIDDEN_METAPHORS='(\bwizard\b|\bspaceship\b|\bbulletproof\b|\bpanacea\b|\bsilver\s+bullet\b)'
-if grep -EIn "${FORBIDDEN_METAPHORS}" "${REPO_ROOT}/src/"*.rs > /dev/null 2>&1; then
+if grep -rEIn "${FORBIDDEN_METAPHORS}" --include='*.rs' "${REPO_ROOT}/src" > /dev/null 2>&1; then
     echo "FAIL: Found informal metaphors in src/:"
-    grep -EIn "${FORBIDDEN_METAPHORS}" "${REPO_ROOT}/src/"*.rs
+    grep -rEIn "${FORBIDDEN_METAPHORS}" --include='*.rs' "${REPO_ROOT}/src"
     FAILURES=$((FAILURES + 1))
 else
     echo "OK (technical language strictly adhered)"

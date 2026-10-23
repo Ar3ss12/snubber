@@ -17,7 +17,11 @@ fi
 
 echo -n "[API] semver diff"
 if [ -z "${BASELINE}" ]; then
-    echo " SKIP (no git tag baseline)"
+    if [ -f "${REPO_ROOT}/.git/shallow" ]; then
+        echo " SKIP (no git tag baseline; shallow clone — run: git fetch --tags --unshallow)"
+    else
+        echo " SKIP (no git tag baseline)"
+    fi
     exit 0
 fi
 
@@ -27,8 +31,16 @@ if ! command -v cargo-semver-checks > /dev/null 2>&1 \
     exit 0
 fi
 
-echo " baseline=${BASELINE}"
+# A baseline pointing at HEAD diffs an empty range: the gate would PASS
+# trivially unless the worktree is dirty. Say so instead of passing silently.
+if [ "$(git -C "${REPO_ROOT}" rev-parse "${BASELINE}^{commit}" 2>/dev/null || true)" = "$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || true)" ]; then
+    echo " WARN (baseline ${BASELINE} is HEAD: committed-but-untagged API changes are invisible to this gate)"
+fi
+
+CRATE="$(sed -n 's/^name *= *\"\(.*\)\"/\1/p' "${REPO_ROOT}/Cargo.toml" | head -1)"
+echo " baseline=${BASELINE} package=${CRATE}"
 cd "${REPO_ROOT}"
-# `--release-type auto` lets the crate version (0.6.0 minor) classify the
-# change; explicit breaking removals still fail the gate.
-cargo semver-checks check-release --baseline-rev "${BASELINE}"
+# `--package` limits both sides to this crate (one build, not the
+# whole workspace). `--release-type auto` lets the crate version (0.6.x
+# minor) classify the change; explicit breaking removals still fail.
+cargo semver-checks check-release --baseline-rev "${BASELINE}" --package "${CRATE}"

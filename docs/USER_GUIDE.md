@@ -883,9 +883,12 @@ Supervisor::run_supervised_guard_with_memory(
 );
 ```
 
-* **Soft** — logged once as `[SUPERVISOR:MEMORY_DRAIN]`; the worker refuses
-  admissions, drains in-flight guards, emits a `StateDigest` (§4.6) and exits
-  for a successor generation. The supervisor never kills at soft.
+* **Soft** — logged once as `[SUPERVISOR:MEMORY_DRAIN]`. Telemetry for the
+  operator, NOT a control message: the pipe is one-way (child → out), so the
+  supervisor cannot command the drain. The worker is expected to sample its
+  own memory (`SnubberNode` soft limit → `EnterError::MemoryPressure`),
+  refuse admissions, drain in-flight guards, emit a `StateDigest` (§4.6) and
+  exit for a successor generation. The supervisor never kills at soft.
 * **Hard** — `child.kill()` WITHOUT draining; the death is stamped
   `DeathCause::MemoryLimit` (`"process exceeded hard memory limit"`, never
   confused with `HangTimeout`).
@@ -1530,6 +1533,30 @@ Six audit-driven fixes; each has a deterministic regression test.
 
 Bench group `layer2_async_waiters` (ready poll ~202 ns, park/wake/admit
 roundtrip ~574 ns) pins the async admission path.
+
+## Fixed in 0.6.2: audit hardening
+
+Second audit pass; behavioral fixes, each with a regression test.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| Bulkhead shedding vs breaker | Default `FaultAction` for `BulkheadFull` was `BreakerOpen`: capacity saturation closed a HalfOpen probe as if work had succeeded | Default is `DiscardSilently` (counted, never trips — Capacity Shedding law); an explicit per-kind `FaultAction::BreakerOpen` still sheds the caller immediately, overriding `AdaptiveBlock` parking | `tests/backpressure.rs::explicit_breaker_open_action_sheds_without_parking` |
+| Erased probe settlement | `enter_erased` / `enter_supervised_erased` committed a throwaway probe at admission — the breaker went Closed before the real work ran | The probe settles on the erased guard: `commit()` = Closed, drop/abort = Open; nothing else closes it meanwhile | `tests/erased.rs::erased_admission_does_not_close_half_open_breaker` |
+| `IsrBridge::try_pop` vs malformed cells | An opcode-0 cell consumed a ring slot and returned a zeroed `IsrSignal` to the caller | `try_pop` drains malformed cells internally and keeps walking; a valid signal behind them is always delivered | `tests/isr_bridge.rs::malformed_cell_does_not_stall_the_drain` |
+| Second probe in HalfOpen | An implicit drop while already HalfOpen armed a second probe; the first stayed half-settled | One probe at a time: the streak path only re-arms from Closed/Open, never HalfOpen | `tests/circuit_breaker.rs::implicit_drop_in_half_open_does_not_arm_a_second_probe` |
+| Watchdog feeds the streak breaker | `check_timeout` TimedOut settled counters but never counted toward `trip_after_failures` | Non-probe timeouts feed the streak like any other failure and can trip the breaker | `tests/circuit_breaker.rs::watchdog_timeouts_trip_the_streak_breaker` |
+| Bulkhead rejection burned the epoch | The sync admission path adopted the epoch before the bulkhead decision — a `BulkheadFull` rejection made the caller's retry a `StaleEpoch` | The epoch is adopted only at PHASE C arming; admission checks freshness with `peek` (no adoption), so a shed caller can retry the same packet | `tests/bulkhead_capacity.rs::bulkhead_rejection_leaves_the_epoch_free_for_retry` |
+| Custom advisory uncapped | A custom `friction_fn` could return `retry_after_ms` far above the node's own pacing ceiling | The `Custom` verdict's advisory is clamped to the node's configured cap | `tests/backpressure.rs::custom_pressure_advisory_is_capped_by_the_node_ceiling` |
+| Supervisor EOF busy spin | The drain wait spun `yield_now` 50 times regardless of the child's exit progress | Bounded 250 ms grace with 1 ms sleeps (`DEFAULT_EOF_GRACE_MS`), then proceeds | existing `supervisor_memory_loop` coverage |
+| Soft verdict honesty | `[SUPERVISOR:MEMORY_DRAIN]` read like a command to the child, but the pipe is one-way and nothing was sent | Log line ends `action=no_kill_self_drain_expected`; docs state the worker self-drains via its own `SnubberNode` soft limit | `tests/supervisor_memory.rs` (log-tag asserts unchanged) |
+| Lineage bump tag | `[SUPERVISOR:RESTART]` printed although the one-shot call never spawns a successor | `[SUPERVISOR:LINEAGE_BUMP] gen=N restart=caller_decides` | no test asserted the old tag |
+| Harness burst counters | `ProfileHarness` burst/streak counters wrapped on `usize` overflow | Saturating arithmetic | `tests/harness.rs` (unchanged determinism) |
+
+Documentation-only corrections in the same pass: `eof_grace_ms = 0` (poll
+once, instant `Deadlocked`) and `u64::MAX` (unbounded) are now written into
+`PipeDrain` docs; `reap_timeouts` is a documented no-op touch-point (watchdog
+settlement is cooperative via `check_timeout`); `INVARIANTS.md` tags the
+Windows-only stress command with its POSIX equivalents.
 
 ## API & Cost Quick Reference
 

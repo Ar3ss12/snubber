@@ -330,6 +330,8 @@ cargo test --test guard_settle_reclaim
 cargo test --test guard_alloc_budget
 
 # Verify out-of-process kill path under armed-hold (true ambush >= 70%)
+# Windows (PowerShell); POSIX equivalents: scripts/stress_harness.sh --launch --aggressive
+# and scripts/stress_multi_lineage.py
 powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 1000 -Launch -RawKill -Aggressive -ArmedHold
 
 # Verify N independent lineages under a parallel death storm (Windows, 4 x 2,500 kills)

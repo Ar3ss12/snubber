@@ -22,7 +22,11 @@ while [ $# -gt 0 ]; do
         --build) BUILD=1 ;;
         --debug) PROFILE="debug" ;;
         --aggressive) AGGRESSIVE=1 ;;
-        --max-growth-mb) shift; MAX_GROWTH_MB="${1:-2.0}" ;;
+        --max-growth-mb)
+            shift
+            case "${1:-}" in ''|*[!0-9.]*) echo "Error: --max-growth-mb requires a numeric value" >&2; exit 1 ;; esac
+            MAX_GROWTH_MB="$1"
+            ;;
         *) POS+=("$1") ;;
     esac
     shift

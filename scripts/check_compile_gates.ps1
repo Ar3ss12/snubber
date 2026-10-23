@@ -18,8 +18,10 @@ if ($LibContent -match '#!\[forbid\(unsafe_code\)\]') {
     $Failures++
 }
 
-# Scan all src/*.rs files for raw `unsafe ` blocks
-$UnsafeMatches = Select-String -Path "$RepoRoot\src\*.rs" -Pattern "\bunsafe\s*\{|\bunsafe\s+fn\b"
+# Scan all src/*.rs files for raw `unsafe ` blocks (recursive: pool,
+# async_engine, and any future submodule included)
+$SrcFiles = Get-ChildItem "$RepoRoot\src" -Recurse -Filter *.rs | ForEach-Object { $_.FullName }
+$UnsafeMatches = Select-String -Path $SrcFiles -Pattern "\bunsafe\s*\{|\bunsafe\s+fn\b"
 if ($UnsafeMatches) {
     Write-Host " FAIL: Found raw unsafe keyword in src/:" -ForegroundColor Red
     $UnsafeMatches | ForEach-Object { Write-Host "   $($_.Filename):$($_.LineNumber): $($_.Line.Trim())" }
@@ -40,10 +42,24 @@ if ($CounterViolations) {
 
 # Gate 3: Lock-hygiene audit in Phase A/C (no foreign calls / formatting under lock)
 Write-Host "[3/6] Auditing zero-panic mutex discipline in src/node.rs..." -NoNewline
-# Search for format! or println! inside record_locked or enter_inner lock sections
-$FormatUnderLock = Select-String -Path "$RepoRoot\src\node.rs" -Pattern "fn record_locked[\s\S]*?format!"
+# Extract the FULL `fn record_locked` body (signature line to the first
+# method-indent closing brace) and forbid panicking/formatting calls
+# inside it. Select-String is line-based and cannot span lines, so the
+# previous single-pattern check only ever saw the signature line.
+$NodeLines = Get-Content "$RepoRoot\src\node.rs"
+$InFn = $false
+$FnBody = New-Object System.Collections.Generic.List[string]
+foreach ($Line in $NodeLines) {
+    if (-not $InFn -and $Line -match 'fn record_locked') { $InFn = $true }
+    if ($InFn) {
+        $FnBody.Add($Line)
+        if ($Line -match '^    \}$') { break }
+    }
+}
+$FormatUnderLock = $FnBody | Select-String -Pattern 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
 if ($FormatUnderLock) {
-    Write-Host " FAIL: format! call detected under lock" -ForegroundColor Red
+    Write-Host " FAIL: panicking/formatting call inside record_locked" -ForegroundColor Red
+    $FormatUnderLock | ForEach-Object { Write-Host "   line $($_.LineNumber): $($_.Line.Trim())" }
     $Failures++
 } else {
     Write-Host " OK (no format! under lock)" -ForegroundColor Green
@@ -61,7 +77,7 @@ $ForbiddenPatterns = @(
 )
 $MetaphorMatches = @()
 foreach ($Pat in $ForbiddenPatterns) {
-    $Found = Select-String -Path "$RepoRoot\src\*.rs" -Pattern $Pat
+    $Found = Select-String -Path $SrcFiles -Pattern $Pat
     if ($Found) { $MetaphorMatches += $Found }
 }
 if ($MetaphorMatches.Count -gt 0) {
@@ -100,21 +116,36 @@ if ($LibContent -notmatch '#!\[cfg_attr\(not\(feature = "std"\), no_std\)\]') {
 
 # Gate 6: Public API semver diff (cargo-semver-checks when installed)
 Write-Host "[6/6] Auditing public API against the last release..." -NoNewline
-$ApiBaseline = (git -C "$RepoRoot" describe --tags --abbrev=0 2>$null)
-if ($LASTEXITCODE -ne 0 -or -not $ApiBaseline) {
+# PS 5.1 wraps native stderr lines in ErrorRecords: under
+# $ErrorActionPreference = "Stop" a SKIP-path `git describe` writing to
+# stderr would kill the script. Run native calls with Continue locally.
+$PrevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$ApiBaseline = & git -C "$RepoRoot" describe --tags --abbrev=0 2>$null
+$GitExit = $LASTEXITCODE
+$ErrorActionPreference = $PrevEap
+if ($GitExit -ne 0 -or -not $ApiBaseline) {
     Write-Host " SKIP (no git tag baseline)" -ForegroundColor Yellow
 } else {
+    $PrevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     & cargo semver-checks --version *> $null
-    if ($LASTEXITCODE -ne 0) {
+    $SemverInstalled = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = $PrevEap
+    if (-not $SemverInstalled) {
         Write-Host " SKIP (cargo-semver-checks not installed)" -ForegroundColor Yellow
     } else {
         Push-Location $RepoRoot
         try {
+            $PrevEap = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
             & cargo semver-checks check-release --baseline-rev $ApiBaseline *> $null
-            if ($LASTEXITCODE -eq 0) {
+            $SemverExit = $LASTEXITCODE
+            $ErrorActionPreference = $PrevEap
+            if ($SemverExit -eq 0) {
                 Write-Host " OK (no breaking change vs $ApiBaseline)" -ForegroundColor Green
             } else {
-                Write-Host " FAIL (breaking API change vs $ApiBaseline: run scripts/check_api_diff.ps1)" -ForegroundColor Red
+                Write-Host " FAIL (breaking API change vs ${ApiBaseline}: run scripts/check_api_diff.ps1)" -ForegroundColor Red
                 $Failures++
             }
         } finally {
