@@ -109,12 +109,17 @@ fn worker_pool_lease_storm() {
         content.contains("\"deadlock\":false"),
         "a killed-after-lease child must still reach EOF: {content}"
     );
-    assert!(
-        content.contains(&format!("\"reaped\":{expected}")),
+    // Read the actual numbers: a substring gate would accept `"reaped":40`
+    // for an expected 4 (value-prefix collision) — the overcount class this
+    // stress exists to catch.
+    assert_eq!(
+        json_num(&content, "reaped"),
+        expected,
         "expected {expected} reaps: {content}"
     );
-    assert!(
-        content.contains(&format!("\"stillborn\":{expected}")),
+    assert_eq!(
+        json_num(&content, "stillborn"),
+        expected,
         "heartbeats are not settlements — every reap is stillborn: {content}"
     );
     for zero in [
@@ -124,11 +129,16 @@ fn worker_pool_lease_storm() {
         "deadlocks",
         "conservation_breaks",
     ] {
-        assert!(
-            content.contains(&format!("\"{zero}\":0")),
-            "expected {zero}=0: {content}"
-        );
+        assert_eq!(json_num(&content, zero), 0, "expected {zero}=0: {content}");
     }
+    // Bookkeeping cross-check: the per-class buckets must add up to reaped.
+    assert_eq!(
+        json_num(&content, "ambush")
+            + json_num(&content, "escape")
+            + json_num(&content, "stillborn"),
+        json_num(&content, "reaped"),
+        "class buckets must sum to reaped: {content}"
+    );
     assert_eq!(
         json_num(&content, "lease_kills"),
         expected,

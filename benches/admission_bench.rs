@@ -209,8 +209,10 @@ fn bench_layer2(c: &mut Criterion) {
 fn bench_telemetry(c: &mut Criterion) {
     let mut g = c.benchmark_group("layer2_telemetry");
 
-    // Full gateway roundtrip: try_send lands, try_recv drains, depth
-    // bookkeeping runs both sides (~10 ns class).
+    // Full gateway roundtrip on ONE thread: try_send lands, try_recv
+    // drains, depth bookkeeping runs both sides. This is a same-thread
+    // send/receive pair, not a cross-core producer/consumer roundtrip --
+    // no cache-line ping-pong or wakeup is included.
     g.bench_function("gateway_roundtrip_send_recv", |b| {
         let (tx, rx) = gateway::<u8>(1);
         b.iter(|| {
@@ -753,9 +755,13 @@ fn bench_contended(c: &mut Criterion) {
                 for h in handles {
                     let _ = h.join();
                 }
+                // Stop the clock when the producers finish: the drain
+                // thread's remaining queue sweep and its join are teardown,
+                // not part of the measured contended send path.
+                let elapsed = start.elapsed();
                 draining.store(false, Ordering::Relaxed);
                 let _ = rx_handle.join();
-                start.elapsed()
+                elapsed
             });
         });
     }

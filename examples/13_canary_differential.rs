@@ -10,6 +10,7 @@
 //! Run: `cargo run --example 13_canary_differential`
 
 use snubber::SnubberNode;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Domain-neutral virtual driver: press/hold/release bookkeeping only.
@@ -42,19 +43,25 @@ fn main() {
 
     let driver = VirtualDriver::new();
 
-    // Cycle 1: naked — pass-through node, rollback dropped uninvoked.
+    // Cycle 1: naked — pass-through node. The rollback is an invocation probe:
+    // if the dummy guard ever ran it, `rollback_ran` would flip.
     println!("\nCycle 1: naked pass-through, fault leaks");
     let naked = SnubberNode::builder("canary/naked")
         .max_in_flight(4)
         .passthrough(true)
         .build();
+    let rollback_ran = Cell::new(false);
     driver.press();
     {
         let _guard = naked
-            .enter_auto(|| driver.release())
+            .enter_auto(|| rollback_ran.set(true))
             .expect("transit never refuses");
         // Fault here: dummy Drop runs nothing, driver stays held.
     }
+    assert!(
+        !rollback_ran.get(),
+        "pass-through must not invoke the rollback"
+    );
     assert!(driver.is_held(), "naked must leak the hold");
     assert_eq!(naked.stats().passthrough_admissions, 1);
     assert_eq!(naked.stats().total_started, 0);

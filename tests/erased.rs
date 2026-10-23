@@ -260,6 +260,14 @@ fn erased_rollback_books_an_abort_and_clears_the_depth_gauge() {
     assert_eq!(stats.explicit_aborts, 1, "rollback is a planned abort");
     assert_eq!(stats.committed, 0, "nothing is booked as a success");
     assert_eq!(stats.implicit_drops, 0, "no phantom implicit drop");
+    // The frame gauge is computed from the counters above, so also read the
+    // live per-lane histogram: it is maintained independently at admission
+    // and release and would still show a ghost slot if the rollback leaked.
+    assert_eq!(
+        node.lane_in_flight(),
+        [0, 0, 0],
+        "live lane gauge must not retain the erased slot"
+    );
     assert_eq!(stats.depth_at(4), 0, "no ghost pending work");
 }
 

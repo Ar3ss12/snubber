@@ -28,9 +28,11 @@
 //! The supervisor and pool modules require `std` (OS pipes and reader
 //! threads). The frame parser itself is core-only: [`drain::SnubScanner`]
 //! accepts raw chunks (UART/DMA buffers, sockets, pipes) and delivers
-//! parsed [`ProcessToken`]s with no allocator and no threads, and
-//! [`ProcessToken::write_to`](crate::ProcessToken::write_to) targets any
-//! `Write` sink instead of stdout.
+//! parsed [`ProcessToken`]s with no allocator and no threads. The
+//! `std`-gated [`ProcessToken::write_to`](crate::ProcessToken::write_to)
+//! targets any `Write` sink instead of stdout; on bare metal, use
+//! [`ProcessToken::to_bytes`](crate::ProcessToken::to_bytes) and hand the
+//! 44-byte frame to your own transport.
 //!
 //! # Minimal example
 //!

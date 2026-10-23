@@ -166,7 +166,7 @@ Contract: the watcher MUST NOT kill the worker thread or drop its
 guard from outside (poisoned mutexes, leaked allocator state). On a
 missed pulse it drives iron to safe state past the thread and reports
 via `node.note_pulse_stall(lag_ms)` — the lag lands in `SnapshotV1`
-(v3: `pulse_stalls` + `max_pulse_lag_ms`) and fires
+(pulse fields since v3; the frame is now v5) and fires
 `AnomalyKind::PulseStall`, so the post-mortem dump answers lag with
 `[DIAG 0x… <node> pulse_stall <lag>%]`. The worker settles itself at
 its next `check_timeout`.
@@ -667,9 +667,9 @@ match verdict {
   streak, never trips the breaker); `stats().memory_pressure` mirrors the flag.
 * **`MemoryWatch` / `MemoryVerdict`** are `core`-only and `Copy` (32 B), so
   firmware can reuse the verdict math without the `std` node.
-* **Snapshot v4** carries `memory_used_kb`, `memory_peak_kb`,
+* **Snapshot v5** carries `memory_used_kb`, `memory_peak_kb`,
   `memory_soft_kb`, `memory_hard_kb`, `memory_rejections`, `memory_pressure`,
-  `queue_depth` and `queue_capacity`. Still 512 B (314/508 payload bytes used).
+  `queue_depth` and `queue_capacity`. Still 512 B (322/508 payload bytes used).
 * **Anomalies**: `AnomalyKind::MemoryGrowth` fires on any pressured sample
   (ignores `min_sample`), `AnomalyKind::QueueSaturation` fires when
   `queue_depth / queue_capacity > bottleneck_pct`.
@@ -797,9 +797,11 @@ counter makes lease tests deterministic and a firmware `SysTick` read removes
 the hidden `Instant`.
 
 On the worker side, `ProcessToken::write_to(&mut sink)` and
-`StateDigest::write_to(&mut sink)` write the 44-byte frames to any
-`std::io::Write` (socket, UART bridge, buffer). `emit_if_supervised` is only a
-stdout wrapper over `write_to` plus the `SNUBBER_SUPERVISED` check.
+`StateDigest::write_to(&mut sink)` (both `std`-gated) write the 44-byte
+frames to any `std::io::Write` (socket, UART bridge, buffer).
+`emit_if_supervised` is only a stdout wrapper over `write_to` plus the
+`SNUBBER_SUPERVISED` check. On bare metal there is no `Write`: use
+`to_bytes() -> [u8; 44]` and feed your own register/DMA/transport.
 
 ### Out-of-Process Hard Termination Harness (10,000 OS Kills):
 The architecture has been verified against **10,000 real Windows `TerminateProcess` executions** without a single pipe deadlock or lost token. Every reap is classified: **true ambush** (an armed token was still pending at death), **clean escape** (at least one commit was observed) or **stillborn** (no commit and no armed token, typically a kill during process startup). The three counters sum to `reaped` on every run.
@@ -1156,13 +1158,13 @@ note_death` ~220 ns (ambush) / ~177 ns (escape), four-lane `report()`
 ~112 ns, four-lane `expired_lanes(5)` ~539 ns (~135 ns per lane, one
 state lock each), `namespace_task` ~2 ns, `note_memory_kb` ~12 ns. The
 storm gates on this machine (debug): 4 lanes × 8 armed kills = 32/32
-ambush in 0.34 s; the mixed storm produces an equal four-way split (A/E/S/D =
-8/8/8/8, 8 rescued) in 0.82 s with `deadlock=true` — the orphan mode
+ambush, `wall_ms=74`; the mixed storm produces an equal four-way split (A/E/S/D =
+8/8/8/8, 8 rescued) with `deadlock=true` and `wall_ms=486` — the orphan mode
 keeps its pipe open past the 150 ms grace, so the deadlock bucket is
 proven, not simulated. The lease storm kills 24 workers that beat once
 and then hang (4 lanes × 6, 25 ms lease): 24/24 stillborn, `lease_kills=24`,
-0 deadlocks, 0 conservation breaks over 99,392 live `report()` samples
-from the observer thread, `[7,7,7,7]` generations, 0.42 s.
+0 deadlocks, 0 conservation breaks over ~90k live `report()` samples
+from the observer thread, `[7,7,7,7]` generations, `wall_ms=220`.
 
 **Reference:** `examples/19_worker_pool.rs` (supervisor and worker modes,
 `--mixed` four-class storm, `--lease-ms` euthanasia storm, JSON report),
@@ -1241,7 +1243,7 @@ let (_event, profile, verdict) = guard.commit_enveloped(payload_bytes);
   gets `TimeVerdict::Inside`. The payload half is exact for any guard.
 * Floor misses tick `SnubberStats::envelope_underflows`, ceiling misses tick
   `envelope_overflows`. Neither feeds the breaker, neither changes
-  `SnubberEvent`, neither enters `SnapshotV1` (the 512 B frame stays v4).
+  `SnubberEvent`, neither enters `SnapshotV1` (the 512 B frame stays v5).
 * An underflow is the silent-skip signal: work returned faster or smaller
   than promised, so the cache was stale or the loop never ran.
 
@@ -1667,7 +1669,7 @@ gate teeth.
 | Erased admission booking | A throwaway `commit()` at admission wrote `committed += 1` and a clean breaker outcome before any work ran | Admission settles the slot only; the erased guard's real `commit()` books `committed`, one window outcome and the streak reset | `tests/supervisor.rs`, `tests/erased.rs` |
 | Erased rollback booking | A rollback (drop/panic) booked NO settle counter: the `total_started` from admission stayed unmatched and the depth gauge reported a ghost in-flight transaction forever | Rollback books one planned abort (`explicit_aborts += 1`) and re-opens a HalfOpen probe; the failure streak is untouched (sync `abort()` parity) | `tests/erased.rs::erased_rollback_books_an_abort_and_clears_the_depth_gauge` |
 | Poisoned locks on cold paths | Gateway books, conduit drafts and the cancel-reason guard used `if let Ok` / `.ok()`: the update was dropped, and the notify fired unlocked | `into_inner` recovery; the cancel notify stays under the guard | `tests/conduit.rs`, `tests/channel.rs` |
-| `Protect` order | `abort()` took the resource before running the rollback, so the closure saw a freed value | Rollback first, resource second (same order as `Drop`) | `tests/protect.rs` |
+| `Protect` order | `abort()` took the resource before running the rollback, so the closure saw a freed value | Rollback first, resource second (same order as `Drop`) | `tests/guard.rs` (`error_drops_resource_and_executes_rollback_once`) |
 | Drain ordering | `feed` checked EOF before taking the ingest lock (a concurrent close could interleave); the `ClockFn` ran under the state lock | Ingest lock taken before the EOF check; one clock read per chunk outside the state lock (`apply_token_at`) | `tests/drain_feed.rs` |
 | Channel HWM / throttle | `capacity * 3 / 4` could overflow at absurd capacities; depth loaded `Relaxed` could bypass an armed throttle | `capacity - capacity / 4`; `Acquire` depth load | `tests/channel.rs` |
 | Overflow / clamp | `ttl.as_millis() as u64` truncated on 128-bit `as_millis`; restart reserve could overflow; recovered lane histograms could exceed `in_flight`; `slowest_stage` indexed past `stage_count` | `try_from` saturating cast; `saturating_add`; lane clamp to the aggregate after recovery; clamped stage slice | `tests/profiling.rs`, `tests/node_stats.rs` |
@@ -1680,7 +1682,7 @@ Documentation-only: README saturation figure restated as measured
 (~1.1M admissions/sec on six contending threads), `WorkerPulse`
 footprint arch-conditional (8 B / 4 B), pool and contention numbers
 re-measured on this machine, storm timings re-measured (mixed storm
-0.82 s, 99,392 lease samples), and the API table gains `PoolReap`,
+`wall_ms=486`, ~90k lease samples), and the API table gains `PoolReap`,
 `LaneSnapshot`, `PoolTotals`, `expired_lanes`, `DEFAULT_EOF_GRACE_MS`
 and the argv-twin rows.
 
@@ -1727,7 +1729,7 @@ cites the TTL regression test.
 | `IsrSignal::new(opc, reason, value)` | 1 / core | 4 B, const | Pack `OP_EMERGENCY_TRIP` / `OP_PULSE` / `OP_PAUSE` |
 | `IdlePark::park` (`SpinPark`/firmware `wfi`/`wfe`) | 1 / core | structural: 0% CPU by design | 0%-CPU park: `Condvar` on `std`, `wfi`/`wfe` impl on firmware (`wfe` needs `SEVONPEND=1` at boot) |
 | `WdtSink::feed` / `NoWdt` | 1 / core | structural: no-op on std | Stroke HW WDT on firmware (same `kick()` feeds it) |
-| `node.note_pulse_stall(lag_ms)` | 2 / std | structural: 1 atomic max | Record missed pulse into `SnapshotV1` v3 + `AnomalyKind::PulseStall` |
+| `node.note_pulse_stall(lag_ms)` | 2 / std | structural: 1 atomic max | Record missed pulse into `SnapshotV1` (pulse fields since v3; frame is v5) + `AnomalyKind::PulseStall` |
 | `node.note_memory_kb(used_kb)` + `memory_verdict()` | 2 / std | 1 lock + 1 atomic store | External RSS sample → `MemoryVerdict` (Ok/Soft/Hard); admissions refuse lock-free above soft |
 | `MemoryWatch` + `MemoryVerdict` | 1 / core | 32 B, `Copy` | Verdict math for firmware; `hard < soft` clamps up |
 | `MemoryPolicy::new(soft, hard)` + `note(used)` | 2 / std | pure integer compares | Supervisor verdict: soft drains, hard kills; `death_cause()` names `MemoryLimit` |
@@ -1771,7 +1773,7 @@ cites the TTL regression test.
 | `GatewayStats` | 2 / std | plain `Copy` counters | Gateway channel books: `sent` / `admitted` / `shed` / `throttled` (saturating) |
 | `ResumeFuture` | 2 / std | 0% CPU waker park | Future resolved by the next directive (pause/resume/cancel); reads the directive under the wakers lock, never duplicates a payload |
 | `PulseTick` (type alias) | 1 / core | structural: one atomic | Internal tick storage type behind `WorkerPulse` (a private detail surfaced through `WorkerPulse::observe`): `AtomicU64`, or `AtomicU32` wrapping at 2^32 on targets without 64-bit CAS. Not a public API — drive pulses through `WorkerPulse` |
-| `EnvelopeVerdict`, `crc32_ieee`, `diagnostic_hash`, `scan_anomalies_for_snapshot`, `find_anomalies_for_snapshot`, `write_diagnostic_line`, `write_health` (Layer 5 helpers) | 7 / std (`find_anomalies_for_snapshot`: alloc) | `Copy` verdict / pure fns / `Write` renderers | Frame-envelope verdict types and the anomaly-scan/hash/render helpers the pool and diagnostic layers are built on; exposed for harnesses that reuse the same classification outside the crate |
+| `EnvelopeVerdict`, `crc32_ieee`, `diagnostic_hash`, `scan_anomalies_for_snapshot`, `find_anomalies_for_snapshot`, `write_diagnostic_line`, `write_health` (Layer 5 helpers) | 5 / std (`find_anomalies_for_snapshot`: alloc) | `Copy` verdict / pure fns / `Write` renderers | Frame-envelope verdict types and the anomaly-scan/hash/render helpers the pool and diagnostic layers are built on; exposed for harnesses that reuse the same classification outside the crate |
 | `LeaseEvent { task_id, stage, kind }` | 3 / std | `Copy` event | Reaper mailbox payload fired by `AsyncLease` drop; overflow accounting goes through `LeaseChannel::fire` |
 | `run_supervised_guard_with_grace(worker_flag, lease_ms, eof_grace_ms, on_dead_token)` | 3 / std | one reaped child process | Supervised guard with a configurable terminal EOF grace: a slow-flushing child (big buffered stdout) gets more than the default grace before death classification, so an in-flight rescue token is never misreported CLEAN |
 | `ProcessToken` / `SnubScanner` (core `drain` module) | 1 / core | 44-byte wire frame; zero allocation | Token parser reachable without `std`: `to_bytes` / `from_bytes` / `from_body_bytes` and the streaming `SnubScanner::push` work on bare metal; `feed`/`write_to` drive it without a reader thread |
@@ -1781,3 +1783,11 @@ cites the TTL regression test.
 | `LaneSnapshot` / `PoolTotals` | 3 / std | `Clone` row / `Copy` totals | Rows carry `conserved()` (`ambush+escape+stillborn+deadlocks == reaps`); totals fold the same four honest buckets, never a guessed fifth |
 | `DEFAULT_EOF_GRACE_MS` (250 ms) | 3 / std | published const, compile-asserted | Default terminal EOF grace; `run_supervised_guard_with_grace` and the pool builder override it per call/site |
 | `Supervisor::run_supervised_guard_with_lease_argv(..)` / `..._with_memory_argv(..)` | 3 / std | explicit `&[String]` argv | Argv twins of the lease/RSS watchdogs for tests, embedded launchers and shells that parsed their own command line (index 0 is the program name) |
+| `DrainCounters { frames, arms, commits }` | 3 / std | `Copy`, updated per parsed frame | Drain-side frame census: `commits > 0` means the worker settled at least once; `arms > commits` means it was armed more often than it settled (`OP_SNAPSHOT` frames are diagnostics, never counted as arms) |
+| `TokenRollback` (`fn(u32, [u8; TOKEN_PAYLOAD_LEN])`) | 3 / std | bare fn pointer | Emergency handler invoked in the supervisor when a dead child leaves an armed token; fast, idempotent, lock-free |
+| `ProfiledEnterFuture` | 2 / std (opt-in) | 1 `Box` + clock reads | Future returned by `enter_async_auto_profiled`: same waker parking; profile arms on the admitting poll |
+| `backpressure_of(&EnterError)` | 2 / std | pure | `Some(Backpressure)` (retry-after + queue depth) for capacity refusals, `None` when retrying cannot help |
+| `GatewaySender<T>` / `GatewayHost<T>` | 2 / std | sender `Clone`; host unique | Channel gateway endpoints from `gateway(capacity)`: signed depth books, HWM/LWM throttle; the host runs the consumer loop |
+| `TOKEN_MAGIC` / `SNAPSHOT_MAGIC` | 1 / core | `[u8; 4]` (`SNUB`) | Wire and snapshot magic constants. Same literal, separate contracts: token framing vs the 512-byte snapshot header |
+| `LANE_SHIFT` (48) / `TASK_LOCAL_MASK` | 1 / core | published consts | Task-id packing: `lane << LANE_SHIFT \| (local & TASK_LOCAL_MASK)`; use `namespace_task` / `task_lane` / `task_local` |
+| `STATE_LEN` (64) | 1 / core | const, compile-asserted | Size of `StateDigest`; streamed as three `OP_STATE` frames (24 + 24 + 16) |

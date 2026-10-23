@@ -137,8 +137,8 @@ impl<S, D> TaskConduit<S, D> {
                     .inner
                     .cancel_reason
                     .lock()
-                    .ok()
-                    .and_then(|r| *r)
+                    .map(|r| *r)
+                    .unwrap_or_else(|poisoned| *poisoned.into_inner())
                     .unwrap_or("cancelled");
                 Directive::Cancel(reason)
             }
@@ -152,8 +152,8 @@ impl<S, D> TaskConduit<S, D> {
                     .inner
                     .cancel_reason
                     .lock()
-                    .ok()
-                    .and_then(|r| *r)
+                    .map(|r| *r)
+                    .unwrap_or_else(|poisoned| *poisoned.into_inner())
                     .unwrap_or("preempted");
                 Directive::Preempted(reason)
             }
@@ -312,10 +312,15 @@ impl<S, D> TaskHandle<S, D> {
                 self.inner.directive.store(DIR_PAUSE, Ordering::Release);
             }
             Directive::Cancel(reason) => {
-                let mut reason_lock = self.inner.cancel_reason.lock();
-                if let Ok(slot) = reason_lock.as_deref_mut() {
-                    *slot = Some(reason);
-                }
+                // A poisoned reason cell still holds a valid slot. `.ok()`
+                // silently dropped the caller's reason and `wait_for_resume`
+                // fell back to the generic "cancelled" — recover, never
+                // discard the directive payload.
+                let mut reason_lock = match self.inner.cancel_reason.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *reason_lock = Some(reason);
                 self.inner.directive.store(DIR_CANCEL, Ordering::Release);
                 // Notify while already holding `cancel_reason` (see
                 // `notify_sync`): same lost-wakeup discipline, no re-lock.
@@ -331,10 +336,11 @@ impl<S, D> TaskHandle<S, D> {
                 self.wake_async();
             }
             Directive::Preempted(reason) => {
-                let mut reason_lock = self.inner.cancel_reason.lock();
-                if let Ok(slot) = reason_lock.as_deref_mut() {
-                    *slot = Some(reason);
-                }
+                let mut reason_lock = match self.inner.cancel_reason.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *reason_lock = Some(reason);
                 self.inner.directive.store(DIR_PREEMPTED, Ordering::Release);
                 self.inner.condvar.notify_all();
                 drop(reason_lock);
@@ -371,7 +377,12 @@ impl<S, D> TaskHandle<S, D> {
 
     /// Take the draft artifact from the shared table.
     pub fn take_draft(&self) -> Option<D> {
-        self.inner.draft.lock().ok().and_then(|mut d| d.take())
+        // Parity with `TaskConduit::take_draft`: a poisoned table still
+        // holds a valid slot — `.ok()` would make the draft vanish.
+        match self.inner.draft.lock() {
+            Ok(mut d) => d.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
     }
 
     /// Drafts overwritten before the caller sampled them (mirror of
@@ -488,5 +499,50 @@ impl<S, D> Future for ResumeFuture<S, D> {
             }
             _ => Poll::Ready(Ok(())),
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod poison_tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    fn poison<T>(lock: &Mutex<T>) {
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = lock.lock().expect("fresh lock");
+            panic!("deliberate poison");
+        }));
+        assert!(lock.is_poisoned(), "the panic must poison the mutex");
+    }
+
+    #[test]
+    fn poisoned_cancel_reason_keeps_the_directive_payload() {
+        let (conduit, handle): (TaskConduit<u8>, TaskHandle<u8>) = TaskConduit::pair(0);
+        poison(&handle.inner.cancel_reason);
+        handle.send_directive(Directive::Cancel("stage 3 aborted"));
+        match conduit.check_directive() {
+            Directive::Cancel(reason) => assert_eq!(reason, "stage 3 aborted"),
+            other => panic!("expected Cancel, got {other:?}"),
+        }
+        let _ = conduit.check_directive();
+        poison(&handle.inner.cancel_reason);
+        handle.send_directive(Directive::Preempted("critical lane"));
+        match conduit.check_directive() {
+            Directive::Preempted(reason) => assert_eq!(reason, "critical lane"),
+            other => panic!("expected Preempted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poisoned_draft_table_still_yields_the_draft() {
+        let (conduit, handle): (TaskConduit<u8, u32>, TaskHandle<u8, u32>) = TaskConduit::pair(0);
+        assert!(!conduit.publish_draft(41));
+        poison(&handle.inner.draft);
+        assert_eq!(
+            handle.take_draft(),
+            Some(41),
+            "poison must not eat the draft"
+        );
+        assert_eq!(handle.take_draft(), None);
     }
 }

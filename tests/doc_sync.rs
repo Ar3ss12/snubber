@@ -4,14 +4,17 @@
 //! don't. If a refactor deletes or renames an anchor, this test goes red
 //! and names the missing tag.
 //!
-//! Twin audit note (compile-only doc-tests): the 7 `no_run` fences
-//! (`spawn_guarded` x2, `console_node`, `ErasedGuard`, `assert_no_anomalies`,
-//! `wait_while_paused`, LegalMove) are guarded by REAL twins in the
-//! integration suite: `supervisor.rs::spawn_*`, `task_engine.rs`
-//! state-snapshot round-trip, `diagnostics.rs` renderers, `conduit.rs`
-//! pause/resume, `stdin_digest.rs`. A change to those APIs must keep both
-//! sides compiling — cargo does that per doc-fence; the twins prove the
-//! behavior itself.
+//! Twin audit note (compile-only doc-tests): the 6 `rust,no_run` fences
+//! (`spawn_guarded`, `console_node`, `ErasedGuard`, `assert_no_anomalies`,
+//! `wait_while_paused`, `LegalMove`) are guarded by REAL twins in the
+//! integration suite: `supervisor.rs::spawn_guarded_*`,
+//! `circuit_breaker.rs` + `stdin_digest.rs` (`console_node`),
+//! `erased.rs` + `worker_lifecycle.rs` (`ErasedGuard`),
+//! `diagnostics.rs` renderers, `conduit.rs` pause/resume,
+//! `scoped_transactions.rs` (`LegalMove`). A change to those APIs must keep
+//! both sides compiling — cargo does that per doc-fence; the twins prove the
+//! behavior itself. `test_no_run_fences_match_header` keeps this list
+//! honest.
 
 /// Every anchor named in the FLOOR MAP header must exist exactly once in
 /// the node source (header mention + one definition site = 2 hits).
@@ -88,4 +91,57 @@ fn test_low_level_entries_point_at_canonical() {
         source.contains("# 🟢 CANONICAL APPLICATION ENTRY"),
         "TRIPWIRE FIRED: canonical header missing from enter_erased_auto.",
     );
+}
+
+/// The header above names one twin per `rust,no_run` fence. If a fence is
+/// added, removed, or moved, this test goes red and the header must follow.
+#[test]
+fn test_no_run_fences_match_header() {
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect_rs(std::path::Path::new("src"), &mut files);
+
+    let mut fences = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("read source file");
+        for (line_no, line) in text.lines().enumerate() {
+            if line.contains("```rust,no_run") {
+                fences.push(format!("{}:{}", file.display(), line_no + 1));
+            }
+        }
+    }
+
+    const EXPECTED: usize = 6;
+    assert_eq!(
+        fences.len(),
+        EXPECTED,
+        "TRIPWIRE FIRED: found {} `rust,no_run` fences, header claims {EXPECTED}: {fences:?}",
+        fences.len(),
+    );
+
+    for twin in [
+        "tests/supervisor.rs",
+        "tests/circuit_breaker.rs",
+        "tests/stdin_digest.rs",
+        "tests/erased.rs",
+        "tests/worker_lifecycle.rs",
+        "tests/diagnostics.rs",
+        "tests/conduit.rs",
+        "tests/scoped_transactions.rs",
+    ] {
+        assert!(
+            std::path::Path::new(twin).exists(),
+            "doc twin '{twin}' is gone — update the header twin map",
+        );
+    }
 }

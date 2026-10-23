@@ -153,6 +153,7 @@ fn supervisor(
         )
         .with_eof_grace(grace_ms);
     let pool = WorkerPool::new(config).expect("pool config");
+    let storm_boot = Instant::now();
     println!(
         "[POOL] lanes={lanes} kills_per_lane={kills} policy=Always window=unlimited mixed={mixed} grace_ms={grace_ms} lease_ms={lease_ms}"
     );
@@ -210,7 +211,7 @@ fn supervisor(
         .collect::<Vec<_>>()
         .join(",");
     let json = format!(
-        "{{\"lanes\":{},\"reaped\":{},\"rescued\":{},\"ambush\":{},\"escape\":{},\"stillborn\":{},\"deadlocks\":{},\"deadlock\":{},\"conserved\":{},\"lease_kills\":{},\"monitor_checks\":{},\"conservation_breaks\":{},\"final_generation\":[{}]}}",
+        "{{\"lanes\":{},\"reaped\":{},\"rescued\":{},\"ambush\":{},\"escape\":{},\"stillborn\":{},\"deadlocks\":{},\"deadlock\":{},\"conserved\":{},\"lease_kills\":{},\"monitor_checks\":{},\"conservation_breaks\":{},\"wall_ms\":{},\"final_generation\":[{}]}}",
         report.totals.lanes,
         report.totals.reaps,
         report.totals.rescued,
@@ -223,6 +224,7 @@ fn supervisor(
         lease_kills,
         monitor_checks,
         conservation_breaks,
+        storm_boot.elapsed().as_millis(),
         generations
     );
     if let Some(parent) = std::path::Path::new(report_path).parent() {

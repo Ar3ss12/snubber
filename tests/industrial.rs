@@ -76,11 +76,14 @@ fn token_bucket_caps_admissions_per_second() {
     assert_eq!(s.total_started, 1);
     assert_eq!(s.committed, 1);
     assert_eq!(s.rate_rejected, 1);
+    assert_eq!(s.reported[FaultKind::RateLimited.index()], 1);
     // A rate refusal is shed exactly once: no mirror into the other
     // rejection buckets, so the conservation law stays arithmetically
     // true (`attempts == started + shed`).
     assert_eq!(s.bulkhead_rejections, 0);
-    assert_eq!(s.shed_total(), 1);
+    // One attempt was accounted for and one was shed: derive the shed count
+    // from the two independent totals instead of re-reading `shed_total()`.
+    assert_eq!(s.admission_total() - s.total_started, 1);
     assert_eq!(s.admission_total(), 2);
 }
 

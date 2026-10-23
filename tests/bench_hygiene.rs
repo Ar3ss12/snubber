@@ -140,19 +140,78 @@ const COVERED: &[&str] = &[
     "async_park_wake_admit_roundtrip",
 ];
 
-/// Extract literal names from `g.bench_function("name"` sites.
-fn static_bench_names(source: &str) -> Vec<String> {
-    const MARKER: &str = "g.bench_function(\"";
-    let mut names = Vec::new();
-    let mut rest = source;
-    while let Some(pos) = rest.find(MARKER) {
-        let after = &rest[pos + MARKER.len()..];
-        match after.find('"') {
-            Some(end) => names.push(after[..end].to_string()),
-            None => break,
+/// Split `b.iter_batched(setup, routine, size)` arguments at top-level
+/// commas. Used to prove the timed routine does not construct anything.
+fn iter_batched_args(timed: &str) -> Option<Vec<String>> {
+    let marker = "b.iter_batched(";
+    let start = timed.find(marker)? + marker.len();
+    let bytes = timed.as_bytes();
+    let mut depth = 0i32;
+    let mut args = Vec::new();
+    let mut begin = start;
+    let mut i = start;
+    while i < timed.len() {
+        match bytes[i] as char {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                if depth == 0 {
+                    args.push(timed[begin..i].to_string());
+                    args.retain(|arg| !arg.trim().is_empty());
+                    return Some(args);
+                }
+                depth -= 1;
+            }
+            ',' if depth == 0 => {
+                let arg = &timed[begin..i];
+                if !arg.trim().is_empty() {
+                    args.push(arg.to_string());
+                }
+                begin = i + 1;
+            }
+            _ => {}
         }
-        rest = after;
+        i += 1;
     }
+    None
+}
+
+/// Extract literal names from every `bench_function("name", ...)` site.
+///
+/// Deliberately stricter than a substring marker: a site whose name is a
+/// helper indirection must abort the gate, not silently disappear from the
+/// scan. The only allowed variable spelling is the hoisted
+/// `let name = format!(...)` used by the sized contended benches.
+fn static_bench_names(source: &str) -> Vec<String> {
+    const MARKER: &str = "bench_function";
+    let mut names = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(pos) = source[cursor..].find(MARKER) {
+        let abs = cursor + pos;
+        let after = &source[abs + MARKER.len()..];
+        let after = after.trim_start().strip_prefix('(').unwrap_or_else(|| {
+            panic!("{MARKER} site without '(' — helper indirection hides benches")
+        });
+        let after = after.trim_start();
+        if after.starts_with("name,") {
+            let window = &source[abs.saturating_sub(600)..abs];
+            assert!(
+                window.contains("let name = format!("),
+                "{MARKER}(name, ..) without a nearby `let name = format!(..)` binding"
+            );
+            cursor = abs + MARKER.len();
+            continue;
+        }
+        let after = after.strip_prefix('"').unwrap_or_else(|| {
+            panic!("{MARKER} with a non-literal name — hygiene gate cannot see it")
+        });
+        let end = after.find('"').expect("unterminated bench name");
+        names.push(after[..end].to_string());
+        cursor = abs + MARKER.len();
+    }
+    assert!(
+        !names.is_empty(),
+        "no {MARKER} sites found — the scan is blind"
+    );
     names
 }
 
@@ -246,10 +305,30 @@ fn bench_setup_outside_hot_loop() {
         );
         let name_s: &str = name;
         if BATCHED_SETUP.contains(&name_s) {
-            // Construction must live in the setup closure.
+            // Construction must live in the setup closure. Proving that
+            // `iter_batched` merely EXISTS is not enough: the routine
+            // closure (second argument) is inside the timed window and must
+            // stay constructor-free.
             assert!(
                 timed.contains("b.iter_batched("),
                 "bench '{name}' must time via iter_batched so drain construction is untimed"
+            );
+            let args = iter_batched_args(&timed)
+                .unwrap_or_else(|| panic!("bench '{name}': cannot split iter_batched arguments"));
+            assert_eq!(
+                args.len(),
+                3,
+                "bench '{name}': iter_batched needs (setup, routine, size)"
+            );
+            for ctor in HEAVY {
+                assert!(
+                    !args[1].contains(ctor),
+                    "bench '{name}' builds '{ctor}' inside the timed routine"
+                );
+            }
+            assert!(
+                HEAVY.iter().any(|ctor| args[0].contains(ctor)),
+                "bench '{name}': batched setup builds no heavy constructor — stale BATCHED_SETUP entry"
             );
             continue;
         }
@@ -264,11 +343,14 @@ fn bench_setup_outside_hot_loop() {
         }
     }
     // A discarding writer skips the copy the API is being measured on:
-    // `sink()` understates every `write_to` bench. Use a real writer.
-    assert!(
-        !source.contains("std::io::sink()"),
-        "benches must write into a real buffer, not std::io::sink()"
-    );
+    // `sink()` understates every `write_to` bench. Reject the exact call
+    // and the `use ...::sink [as alias]` spellings that hide it.
+    for needle in ["std::io::sink", "io::sink", "sink(", "sink as", "{sink"] {
+        assert!(
+            !source.contains(needle),
+            "benches must write into a real buffer, found '{needle}'"
+        );
+    }
     for (tag, pin) in [
         ("IDEAL-1", "bench_contended_enter"),
         ("IDEAL-2", "bench_contended_scoped"),
@@ -276,4 +358,45 @@ fn bench_setup_outside_hot_loop() {
     ] {
         assert!(source.contains(pin), "{tag} lost pin '{pin}'");
     }
+}
+
+/// Every `[[bench]]` target in Cargo.toml must be the file this gate scans.
+/// A second bench file would otherwise run unexamined (setup-in-timer etc.).
+#[test]
+fn every_registered_bench_target_is_hygiene_checked() {
+    let manifest = src("Cargo.toml");
+    let mut targets: Vec<String> = Vec::new();
+    let mut in_bench = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line == "[[bench]]" {
+            in_bench = true;
+            continue;
+        }
+        if in_bench {
+            if line.starts_with('[') {
+                in_bench = false;
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("name") {
+                let value = value.trim_start();
+                if let Some(value) = value.strip_prefix('=') {
+                    targets.push(value.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        !targets.is_empty(),
+        "no [[bench]] target found in Cargo.toml — the hygiene gate would scan an unregistered file"
+    );
+    assert_eq!(
+        targets,
+        vec!["admission_bench".to_string()],
+        "new bench target(s) {targets:?}: extend this gate to scan them before registering"
+    );
+    assert!(
+        std::path::Path::new("benches/admission_bench.rs").exists(),
+        "registered bench file is missing"
+    );
 }

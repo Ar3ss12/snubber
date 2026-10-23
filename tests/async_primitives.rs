@@ -522,3 +522,23 @@ fn paced_enter_sleeps_exactly_the_advertised_wait_then_admits() {
         "sleeper must receive the advertised friction_wait_ms"
     );
 }
+
+#[test]
+fn async_rate_shedding_files_its_own_kind() {
+    // Parity with the sync path: a token-bucket refusal is reported as
+    // `RateLimited`, never as `BulkheadFull` — the two share no policy row.
+    let node = SnubberNode::builder("async/bucket").rate_per_sec(1).build();
+    block_on(node.enter_async(1, 1, || {}))
+        .expect("token 1")
+        .commit();
+    match block_on(node.enter_async(2, 2, || {})) {
+        Err(EnterError::RateLimited) => {}
+        Ok(_) => panic!("bucket empty must rate-limit"),
+        Err(other) => panic!("expected RateLimited, got {other:?}"),
+    }
+    let s = node.stats();
+    assert_eq!(s.rate_rejected, 1);
+    assert_eq!(s.reported[FaultKind::RateLimited.index()], 1);
+    assert_eq!(s.reported[FaultKind::BulkheadFull.index()], 0);
+    assert_eq!(s.bulkhead_rejections, 0);
+}

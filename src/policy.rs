@@ -45,11 +45,15 @@ pub enum FaultKind {
     /// Work slot relinquished to satisfy a higher-priority `Priority::Critical` admission.
     /// Classified as operational load shedding; does not indicate system failure.
     Preempted,
+    /// Token bucket exhausted (`rate_per_sec`); admission shed before a slot
+    /// was taken. Operational load shedding with its OWN column — never
+    /// merged into `BulkheadFull`, never fed to that kind's policy.
+    RateLimited,
 }
 
 impl FaultKind {
     /// Total number of variants — matches lookup table dimensions.
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
 
     /// Dense array index corresponding to declaration order.
     #[must_use]
@@ -67,6 +71,7 @@ impl FaultKind {
             Self::PoisonedPayload => 9,
             Self::ProcessDied => 10,
             Self::Preempted => 11,
+            Self::RateLimited => 12,
         }
     }
 
@@ -84,6 +89,7 @@ impl FaultKind {
         Self::PoisonedPayload,
         Self::ProcessDied,
         Self::Preempted,
+        Self::RateLimited,
     ];
 
     /// Discriminates unrecoverable failures from operational backpressure shedding.
@@ -91,7 +97,8 @@ impl FaultKind {
     /// * `true` — Catastrophic: anomalous termination (`Panic`, `Timeout`, `ProcessDied`)
     ///   or uncommitted drops (`ImplicitDrop`). Feeds circuit breaker consecutive failure streaks.
     /// * `false` — Operational Shedding: defensive backpressure limits (`BulkheadFull`,
-    ///   `BufferOverflow`, `EvictedOldest`, `StaleEpoch`, `BreakerOpen`, `PoisonedPayload`, `Preempted`).
+    ///   `BufferOverflow`, `EvictedOldest`, `StaleEpoch`, `BreakerOpen`, `PoisonedPayload`,
+    ///   `Preempted`, `RateLimited`).
     ///   Tracked in telemetry; does not increment breaker failure streaks.
     #[must_use]
     pub const fn is_catastrophic(self) -> bool {
@@ -104,7 +111,8 @@ impl FaultKind {
             | Self::EvictedOldest
             | Self::BreakerOpen
             | Self::PoisonedPayload
-            | Self::Preempted => false,
+            | Self::Preempted
+            | Self::RateLimited => false,
         }
     }
 }
@@ -225,7 +233,7 @@ impl fmt::Display for FaultDetail {
 // Enforces table bounds and alignment guarantees at build time.
 const _: () = {
     assert!(
-        FaultKind::COUNT == 12,
+        FaultKind::COUNT == 13,
         "CRITICAL: FaultKind::COUNT drifted — update policy tables + SnapshotV1::reported"
     );
     assert!(
@@ -233,8 +241,8 @@ const _: () = {
         "CRITICAL: FaultKind::ALL out of sync with COUNT"
     );
     assert!(
-        FaultKind::Preempted.index() + 1 == FaultKind::COUNT,
-        "CRITICAL: Preempted must stay the last dense index"
+        FaultKind::RateLimited.index() + 1 == FaultKind::COUNT,
+        "CRITICAL: RateLimited must stay the last dense index"
     );
     assert!(
         Priority::Background as u8 == 0,
@@ -268,6 +276,7 @@ const _: () = {
     assert!(!FaultKind::BreakerOpen.is_catastrophic());
     assert!(!FaultKind::PoisonedPayload.is_catastrophic());
     assert!(!FaultKind::Preempted.is_catastrophic());
+    assert!(!FaultKind::RateLimited.is_catastrophic());
 };
 
 /// Telemetry metric sample capturing fault occurrences per node.

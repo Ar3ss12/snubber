@@ -271,12 +271,12 @@ fn pulse_stall_lands_in_snapshot_and_anomaly() {
     assert_eq!(node.stats().pulse_stalls, 2);
     assert_eq!(node.stats().max_pulse_lag_ms, 2400);
 
-    // Cold frame carries the trace (v3 roundtrip).
+    // Cold frame carries the trace (current-version roundtrip).
     let snap = node.snapshot_v1();
     assert_eq!(snap.pulse_stalls, 2);
     assert_eq!(snap.max_pulse_lag_ms, 2400);
     let bytes = snap.encode();
-    let back = SnapshotV1::decode(&bytes).expect("v3 frame decodes");
+    let back = SnapshotV1::decode(&bytes).expect("current-version frame decodes");
     assert_eq!(back, snap);
 
     // Anomaly scan fires PulseStall even on an idle node (no min_sample).

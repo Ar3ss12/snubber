@@ -13,7 +13,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[test]
-#[ignore = "Spawns background supervisor & killer and executes hundreds/thousands of hard OS kills. Run explicitly: cargo test --test process_kill_stress -- --ignored --nocapture"]
+#[ignore = "Spawns background supervisor & killer and executes hundreds/thousands of hard OS kills. Run explicitly: cargo test --test supervisor_termination -- --ignored --nocapture"]
 fn process_kill_stress_test() {
     let report_file = "target/termination_report.json";
     if Path::new(report_file).exists() {

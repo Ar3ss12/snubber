@@ -480,6 +480,15 @@ pub const DEFAULT_POLICIES: [FaultPolicy; FaultKind::COUNT] = [
         "background slot yielded to critical admission",
         "preemptions_total",
     ),
+    // RateLimited — token bucket empty: spam shedding, never capacity.
+    // Own kind so a `BulkheadFull` TripBreaker override cannot fire here
+    // and hooks/health see the honest event.
+    FaultPolicy::arm(
+        FaultAction::DiscardSilently,
+        LogLevel::Warn,
+        "rate limit exceeded, newcomer rejected",
+        "rate_limited_total",
+    ),
 ];
 
 /// Builder for [`SnubberNode`]. All limits are compile-time-visible
@@ -962,7 +971,7 @@ impl SnubberNodeBuilder {
         let memory_pressure = Arc::new(AtomicBool::new(false));
         SnubberNode {
             // Passthrough law sealed OUTSIDE the mutex: transit never locks.
-            // `name` is Copy-mirrored for lock-free arming stamps.
+            // `name` is cloned once here for lock-free arming stamps.
             passthrough: self.passthrough,
             passthrough_name: self.name.clone(),
             passthrough_admissions: Arc::new(AtomicU64::new(0)),
@@ -1016,7 +1025,6 @@ impl SnubberNodeBuilder {
                 deadlock_suspected: 0,
                 pulse_stalls: 0,
                 max_pulse_lag_ms: 0,
-                rate_rejected: 0,
                 stats: SnubberStats {
                     memory_soft_kb: self.memory_soft_kb,
                     memory_hard_kb: self.memory_hard_kb,
@@ -1109,7 +1117,6 @@ struct NodeInner {
     deadlock_suspected: u64,
     pulse_stalls: u64,
     max_pulse_lag_ms: u64,
-    rate_rejected: u64,
     stats: SnubberStats,
 }
 
@@ -1185,7 +1192,9 @@ pub enum EnterError {
     BreakerOpen,
     /// Bulkhead full under `RejectNew`.
     BulkheadFull,
-    /// Token bucket empty: over `rate_per_sec`. Counted as bulkhead.
+    /// Token bucket empty: over `rate_per_sec`. Counted in `rate_rejected`
+    /// (own column) and reported as [`FaultKind::RateLimited`] — never as
+    /// `BulkheadFull`.
     RateLimited,
     /// Stale epoch (replay / reorder).
     StaleEpoch,
@@ -1221,7 +1230,7 @@ impl EnterError {
             Self::BulkheadFull | Self::QueueFull => {
                 Some(Backpressure::new(10, 128, FaultKind::BulkheadFull))
             }
-            Self::RateLimited => Some(Backpressure::new(10, 128, FaultKind::BulkheadFull)),
+            Self::RateLimited => Some(Backpressure::new(10, 128, FaultKind::RateLimited)),
             Self::BreakerOpen => Some(Backpressure::new(50, 255, FaultKind::BreakerOpen)),
             Self::StaleEpoch
             | Self::InvariantBreach(_)
@@ -1576,7 +1585,7 @@ impl SnubberNode {
                 elapsed_ms: 0,
                 retry_count: 0,
             };
-            let mut outcome = Self::record_locked(&mut inner, FaultKind::PoisonedPayload, 5, 0);
+            let mut outcome = Self::record_locked(&mut inner, FaultKind::PoisonedPayload, 5);
             drop(inner);
             self.publish_fault(&mut outcome, &record);
             Self::emit(outcome, record);
@@ -1924,7 +1933,7 @@ impl SnubberNode {
             elapsed_ms: 0,
             retry_count: 0,
         };
-        let mut outcome = Self::record_locked(&mut inner, FaultKind::StaleEpoch, 2, 0);
+        let mut outcome = Self::record_locked(&mut inner, FaultKind::StaleEpoch, 2);
         drop(inner);
         self.publish_fault(&mut outcome, &record);
         Self::emit(outcome, record);
@@ -1976,7 +1985,7 @@ impl SnubberNode {
             streak_trip_locked(&mut inner);
         }
         Self::bump_reported(&mut inner, kind);
-        let mut outcome = Self::record_locked(&mut inner, kind, 0, 0);
+        let mut outcome = Self::record_locked(&mut inner, kind, 0);
         drop(inner);
         self.publish_fault(&mut outcome, &record);
         Self::emit(outcome, record);
@@ -2108,7 +2117,7 @@ impl SnubberNode {
             return true;
         }
         inner.preempt_requested = true;
-        let mut outcome = Self::record_locked(&mut inner, FaultKind::Preempted, 7, 0);
+        let mut outcome = Self::record_locked(&mut inner, FaultKind::Preempted, 7);
         drop(inner);
         let record = FaultRecord {
             kind: FaultKind::Preempted,
@@ -2837,7 +2846,7 @@ impl SnubberNode {
                     elapsed_ms: 0,
                     retry_count: 0,
                 };
-                let mut outcome = Self::record_locked(&mut inner, FaultKind::PoisonedPayload, 5, 0);
+                let mut outcome = Self::record_locked(&mut inner, FaultKind::PoisonedPayload, 5);
                 drop(inner);
                 self.publish_fault(&mut outcome, &record);
                 Self::emit(outcome, record);
@@ -2851,8 +2860,9 @@ impl SnubberNode {
     ///
     // [ANCHOR: ADMISSION_PHASE] — the load-bearing pipeline, PHASE A/B/C.
     /// PHASE MAP (load-bearing, not cosmetic):
-    /// * PHASE A (under lock): `Copy` snapshot only — breaker flag,
-    ///   gate observe, slot integers, `Arc` hook bump in `record_locked`.
+    /// * PHASE A (under lock): non-allocating snapshot only — breaker flag,
+    ///   gate observe, slot integers, one `Arc` refcount bump in
+    ///   `record_locked`. No `format!`, no `String`, no record clones.
     /// * PHASE B (NO lock): `arming.clone()`, `format!`, `record.clone()`
     ///   (`FaultDetail::Owned` allocates), friction math, hooks, console.
     /// * PHASE C (under lock): `saturating_*` writes + `hard_clamp_slots`.
@@ -2877,9 +2887,11 @@ impl SnubberNode {
     ) -> Result<TrackedGuard<F>, EnterError> {
         let loc = core::panic::Location::caller();
         let header = TransactionHeader::new(epoch, task_id);
-        // PHASE A HEAD: grab `Copy` node name under a SHORT lock, then
-        // build `arming` OUTSIDE (its `detail: Option<FaultDetail>` may own
-        // an `alloc::String` — cloning it under the lock would allocate).
+        // PHASE A HEAD: read the node name under a SHORT lock. `NodeName`
+        // is not `Copy`, but cloning it is one `Arc` refcount bump (or a
+        // `&'static str` copy) — no heap allocation. Then build `arming`
+        // OUTSIDE: its `detail: Option<FaultDetail>` may own an
+        // `alloc::String`, and cloning it under the lock would allocate.
         let node_name = self.lock().name.clone();
         let arming = FaultRecord {
             kind: FaultKind::ImplicitDrop,
@@ -2947,24 +2959,24 @@ impl SnubberNode {
         // PHASE A (under lock): integers + Arc bump only — see record_locked.
         match inner.breaker {
             BreakerState::Open => {
+                let mut outcome = Self::record_locked(&mut inner, FaultKind::BreakerOpen, 1);
+                drop(inner);
                 let record = FaultRecord {
                     kind: FaultKind::BreakerOpen,
                     ..arming.clone()
                 };
-                let mut outcome = Self::record_locked(&mut inner, FaultKind::BreakerOpen, 1, 0);
-                drop(inner);
                 self.publish_fault(&mut outcome, &record);
                 Self::emit(outcome, record);
                 return Err(EnterError::BreakerOpen);
             }
             BreakerState::HalfOpen => {
                 if inner.half_open_probe {
+                    let mut outcome = Self::record_locked(&mut inner, FaultKind::BreakerOpen, 1);
+                    drop(inner);
                     let record = FaultRecord {
                         kind: FaultKind::BreakerOpen,
                         ..arming.clone()
                     };
-                    let mut outcome = Self::record_locked(&mut inner, FaultKind::BreakerOpen, 1, 0);
-                    drop(inner);
                     self.publish_fault(&mut outcome, &record);
                     Self::emit(outcome, record);
                     return Err(EnterError::BreakerOpen);
@@ -2986,12 +2998,12 @@ impl SnubberNode {
             if inner.breaker == BreakerState::HalfOpen {
                 inner.half_open_probe = false;
             }
+            let mut outcome = Self::record_locked(&mut inner, FaultKind::StaleEpoch, 2);
+            drop(inner);
             let record = FaultRecord {
                 kind: FaultKind::StaleEpoch,
                 ..arming.clone()
             };
-            let mut outcome = Self::record_locked(&mut inner, FaultKind::StaleEpoch, 2, 0);
-            drop(inner);
             self.publish_fault(&mut outcome, &record);
             Self::emit(outcome, record);
             return Err(EnterError::StaleEpoch);
@@ -3025,7 +3037,7 @@ impl SnubberNode {
                 && !inner.preempt_requested
             {
                 inner.preempt_requested = true;
-                let mut outcome = Self::record_locked(&mut inner, FaultKind::Preempted, 7, 0);
+                let mut outcome = Self::record_locked(&mut inner, FaultKind::Preempted, 7);
                 drop(inner);
                 let record = FaultRecord {
                     kind: FaultKind::Preempted,
@@ -3131,13 +3143,13 @@ impl SnubberNode {
                                 if inner.breaker == BreakerState::HalfOpen {
                                     inner.half_open_probe = false;
                                 }
+                                let mut outcome =
+                                    Self::record_locked(&mut inner, FaultKind::BulkheadFull, 3);
+                                drop(inner);
                                 let record = FaultRecord {
                                     kind: FaultKind::BulkheadFull,
                                     ..arming.clone()
                                 };
-                                let mut outcome =
-                                    Self::record_locked(&mut inner, FaultKind::BulkheadFull, 3, 0);
-                                drop(inner);
                                 self.publish_fault(&mut outcome, &record);
                                 Self::emit(outcome, record);
                                 return Err(EnterError::BulkheadFull);
@@ -3147,13 +3159,13 @@ impl SnubberNode {
                             if inner.breaker == BreakerState::HalfOpen {
                                 inner.half_open_probe = false;
                             }
+                            let mut outcome =
+                                Self::record_locked(&mut inner, FaultKind::BulkheadFull, 3);
+                            drop(inner);
                             let record = FaultRecord {
                                 kind: FaultKind::BulkheadFull,
                                 ..arming.clone()
                             };
-                            let mut outcome =
-                                Self::record_locked(&mut inner, FaultKind::BulkheadFull, 3, 0);
-                            drop(inner);
                             self.publish_fault(&mut outcome, &record);
                             Self::emit(outcome, record);
                             return Err(EnterError::BulkheadFull);
@@ -3171,13 +3183,13 @@ impl SnubberNode {
                             if inner.breaker == BreakerState::HalfOpen {
                                 inner.half_open_probe = false;
                             }
+                            let mut outcome =
+                                Self::record_locked(&mut inner, FaultKind::BulkheadFull, 3);
+                            drop(inner);
                             let record = FaultRecord {
                                 kind: FaultKind::BulkheadFull,
                                 ..arming.clone()
                             };
-                            let mut outcome =
-                                Self::record_locked(&mut inner, FaultKind::BulkheadFull, 3, 0);
-                            drop(inner);
                             self.publish_fault(&mut outcome, &record);
                             Self::emit(outcome, record);
                             return Err(EnterError::BulkheadFull);
@@ -3193,13 +3205,13 @@ impl SnubberNode {
                         if inner.breaker == BreakerState::HalfOpen {
                             inner.half_open_probe = false;
                         }
+                        let mut outcome =
+                            Self::record_locked(&mut inner, FaultKind::BulkheadFull, 3);
+                        drop(inner);
                         let record = FaultRecord {
                             kind: FaultKind::BulkheadFull,
                             ..arming.clone()
                         };
-                        let mut outcome =
-                            Self::record_locked(&mut inner, FaultKind::BulkheadFull, 3, 0);
-                        drop(inner);
                         self.publish_fault(&mut outcome, &record);
                         Self::emit(outcome, record);
                         return Err(EnterError::BulkheadFull);
@@ -3218,24 +3230,23 @@ impl SnubberNode {
                         if inner.breaker == BreakerState::HalfOpen {
                             inner.half_open_probe = false;
                         }
+                        let mut outcome =
+                            Self::record_locked(&mut inner, FaultKind::BulkheadFull, 3);
+                        drop(inner);
                         let record = FaultRecord {
                             kind: FaultKind::BulkheadFull,
                             ..arming.clone()
                         };
-                        let mut outcome =
-                            Self::record_locked(&mut inner, FaultKind::BulkheadFull, 3, 0);
-                        drop(inner);
                         self.publish_fault(&mut outcome, &record);
                         Self::emit(outcome, record);
                         return Err(EnterError::BulkheadFull);
                     }
+                    let mut outcome = Self::record_locked(&mut inner, FaultKind::EvictedOldest, 4);
+                    drop(inner);
                     let record = FaultRecord {
                         kind: FaultKind::EvictedOldest,
                         ..arming.clone()
                     };
-                    let mut outcome =
-                        Self::record_locked(&mut inner, FaultKind::EvictedOldest, 4, 0);
-                    drop(inner);
                     self.publish_fault(&mut outcome, &record);
                     Self::emit(outcome, record);
                     inner = self.lock();
@@ -3248,12 +3259,12 @@ impl SnubberNode {
         // counting a bulkhead rejection would double-book an admission
         // that goes on to succeed.
         if inner.queued >= inner.queue_limit {
+            let mut outcome = Self::record_locked(&mut inner, FaultKind::BufferOverflow, 0);
+            drop(inner);
             let record = FaultRecord {
                 kind: FaultKind::BufferOverflow,
                 ..arming.clone()
             };
-            let mut outcome = Self::record_locked(&mut inner, FaultKind::BufferOverflow, 0, 0);
-            drop(inner);
             self.publish_fault(&mut outcome, &record);
             Self::emit(outcome, record);
             inner = self.lock();
@@ -3270,21 +3281,20 @@ impl SnubberNode {
                 if inner.breaker == BreakerState::HalfOpen {
                     inner.half_open_probe = false;
                 }
-                inner.rate_rejected = inner.rate_rejected.saturating_add(1);
-                let rate_rejected = inner.rate_rejected;
+                let mut outcome = Self::record_locked(&mut inner, FaultKind::RateLimited, 6);
+                drop(inner);
+                // PHASE B: the record (and its optional owned detail) is
+                // built OUTSIDE the lock — same contract as every other
+                // rejection arm.
                 let record = FaultRecord {
-                    kind: FaultKind::BulkheadFull,
+                    kind: FaultKind::RateLimited,
                     ..arming.clone()
                 };
-                let mut outcome =
-                    Self::record_locked(&mut inner, FaultKind::BulkheadFull, 6, rate_rejected);
-                drop(inner);
                 self.publish_fault(&mut outcome, &record);
                 Self::emit(outcome, record);
                 return Err(EnterError::RateLimited);
             }
             inner.rate_tokens -= 1.0;
-            inner.stats.rate_rejected = inner.rate_rejected;
         }
 
         // PHASE C (commit): integers only, saturating, hard clamp.
@@ -3296,12 +3306,12 @@ impl SnubberNode {
             if inner.breaker == BreakerState::HalfOpen {
                 inner.half_open_probe = false;
             }
+            let mut outcome = Self::record_locked(&mut inner, FaultKind::StaleEpoch, 2);
+            drop(inner);
             let record = FaultRecord {
                 kind: FaultKind::StaleEpoch,
                 ..arming.clone()
             };
-            let mut outcome = Self::record_locked(&mut inner, FaultKind::StaleEpoch, 2, 0);
-            drop(inner);
             self.publish_fault(&mut outcome, &record);
             Self::emit(outcome, record);
             return Err(EnterError::StaleEpoch);
@@ -3539,7 +3549,7 @@ impl SnubberNode {
                 elapsed_ms: 0,
                 retry_count: 0,
             };
-            let mut outcome = Self::record_locked(&mut inner, FaultKind::Timeout, 0, 0);
+            let mut outcome = Self::record_locked(&mut inner, FaultKind::Timeout, 0);
             drop(inner);
             self.publish_fault(&mut outcome, &record);
             Self::emit(outcome, record);
@@ -3562,7 +3572,7 @@ impl SnubberNode {
                     elapsed_ms: 0,
                     retry_count: 0,
                 };
-                let mut outcome = Self::record_locked(&mut inner, FaultKind::BreakerOpen, 1, 0);
+                let mut outcome = Self::record_locked(&mut inner, FaultKind::BreakerOpen, 1);
                 drop(inner);
                 self.publish_fault(&mut outcome, &record);
                 Self::emit(outcome, record);
@@ -3583,7 +3593,7 @@ impl SnubberNode {
                         elapsed_ms: 0,
                         retry_count: 0,
                     };
-                    let mut outcome = Self::record_locked(&mut inner, FaultKind::BreakerOpen, 1, 0);
+                    let mut outcome = Self::record_locked(&mut inner, FaultKind::BreakerOpen, 1);
                     drop(inner);
                     self.publish_fault(&mut outcome, &record);
                     Self::emit(outcome, record);
@@ -3618,7 +3628,7 @@ impl SnubberNode {
                 elapsed_ms: 0,
                 retry_count: 0,
             };
-            let mut outcome = Self::record_locked(&mut inner, FaultKind::StaleEpoch, 2, 0);
+            let mut outcome = Self::record_locked(&mut inner, FaultKind::StaleEpoch, 2);
             drop(inner);
             self.publish_fault(&mut outcome, &record);
             Self::emit(outcome, record);
@@ -3670,7 +3680,7 @@ impl SnubberNode {
                             retry_count: 0,
                         };
                         let mut outcome =
-                            Self::record_locked(&mut inner, FaultKind::BufferOverflow, 3, 0);
+                            Self::record_locked(&mut inner, FaultKind::BufferOverflow, 3);
                         drop(inner);
                         self.publish_fault(&mut outcome, &record);
                         Self::emit(outcome, record);
@@ -3717,7 +3727,7 @@ impl SnubberNode {
             });
             let evicted_outcome = evicted_record
                 .as_ref()
-                .map(|_| Self::record_locked(&mut inner, FaultKind::EvictedOldest, 4, 0));
+                .map(|_| Self::record_locked(&mut inner, FaultKind::EvictedOldest, 4));
             drop(inner);
             if let (Some(record), Some(mut outcome)) = (evicted_record, evicted_outcome) {
                 self.publish_fault(&mut outcome, &record);
@@ -3739,11 +3749,12 @@ impl SnubberNode {
                 if inner.breaker == BreakerState::HalfOpen {
                     inner.half_open_probe = false;
                 }
-                inner.rate_rejected = inner.rate_rejected.saturating_add(1);
-                let rate_rejected = inner.rate_rejected;
+                let node_name = inner.name.clone();
+                let mut outcome = Self::record_locked(&mut inner, FaultKind::RateLimited, 6);
+                drop(inner);
                 let record = FaultRecord {
-                    kind: FaultKind::BulkheadFull,
-                    node: inner.name.clone(),
+                    kind: FaultKind::RateLimited,
+                    node: node_name,
                     file: loc.file(),
                     line: loc.line(),
                     header,
@@ -3754,15 +3765,11 @@ impl SnubberNode {
                     elapsed_ms: 0,
                     retry_count: 0,
                 };
-                let mut outcome =
-                    Self::record_locked(&mut inner, FaultKind::BulkheadFull, 6, rate_rejected);
-                drop(inner);
                 self.publish_fault(&mut outcome, &record);
                 Self::emit(outcome, record);
                 return core::task::Poll::Ready(Err(EnterError::RateLimited));
             }
             inner.rate_tokens -= 1.0;
-            inner.stats.rate_rejected = inner.rate_rejected;
         }
 
         // 5. Commit slot. The epoch is adopted only here so a queue
@@ -3786,7 +3793,7 @@ impl SnubberNode {
                 elapsed_ms: 0,
                 retry_count: 0,
             };
-            let mut outcome = Self::record_locked(&mut inner, FaultKind::StaleEpoch, 2, 0);
+            let mut outcome = Self::record_locked(&mut inner, FaultKind::StaleEpoch, 2);
             drop(inner);
             self.publish_fault(&mut outcome, &record);
             Self::emit(outcome, record);
@@ -3995,6 +4002,9 @@ impl SnubberNode {
             FaultKind::Preempted => {
                 inner.stats.preempted = inner.stats.preempted.saturating_add(1);
             }
+            FaultKind::RateLimited => {
+                inner.stats.rate_rejected = inner.stats.rate_rejected.saturating_add(1);
+            }
             _ => {}
         }
     }
@@ -4017,14 +4027,13 @@ impl SnubberNode {
     /// state) so the signature itself cannot smuggle a panicking call
     /// under the lock: 0 = none, 1 = breaker_rejections,
     /// 2 = stale_epochs_rejected, 3 = bulkhead_rejections, 4 = evicted,
-    /// 5 = poisoned_rejected (+reported), 6 = rate_rejected
-    /// (write-through, `extra` = the new value), 7 = preempted
-    /// (+reported).
+    /// 5 = poisoned_rejected (+reported), 6 = rate_rejected (+reported),
+    /// 7 = preempted (+reported). Every bump is a `saturating_add(1)`:
+    /// no caller can rewind a published counter.
     fn record_locked(
         inner: &mut NodeInner,
         record_kind: FaultKind,
         bump_kind: u8,
-        extra: u64,
     ) -> ReportOutcome {
         let policy = inner.policies[record_kind.index()];
         match bump_kind {
@@ -4051,7 +4060,9 @@ impl SnubberNode {
                 // `bulkhead_rejections` made `admission_total()` count one
                 // RateLimited attempt twice and contaminated
                 // `shed_bulkhead()` with rate pressure.
-                inner.stats.rate_rejected = extra;
+                inner.stats.rate_rejected = inner.stats.rate_rejected.saturating_add(1);
+                inner.stats.reported[record_kind.index()] =
+                    inner.stats.reported[record_kind.index()].saturating_add(1);
             }
             7 => {
                 inner.stats.preempted = inner.stats.preempted.saturating_add(1);
@@ -5242,7 +5253,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             elapsed_ms: now_ms().saturating_sub(self.armed_at_ms),
             retry_count: self.retry_count,
         };
-        let mut outcome = SnubberNode::record_locked(&mut inner, FaultKind::Timeout, 0, 0);
+        let mut outcome = SnubberNode::record_locked(&mut inner, FaultKind::Timeout, 0);
         let waker = inner.waiters.pop_front();
         drop(inner);
         publish_fault_arc(&self.node, &mut outcome, &record);
@@ -5352,7 +5363,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             inner.half_open_probe = false;
             inner.stats.breaker_state = BreakerState::Open;
         }
-        let mut outcome = SnubberNode::record_locked(&mut inner, FaultKind::ImplicitDrop, 0, 0);
+        let mut outcome = SnubberNode::record_locked(&mut inner, FaultKind::ImplicitDrop, 0);
         let waker = inner.waiters.pop_front();
         drop(inner);
         publish_fault_arc(&self.node, &mut outcome, &record);

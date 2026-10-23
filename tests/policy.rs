@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 #[test]
 fn default_table_covers_every_kind() {
     use snubber::DEFAULT_POLICIES;
-    assert_eq!(snubber::FaultKind::COUNT, 12);
-    assert_eq!(DEFAULT_POLICIES.len(), 12);
+    assert_eq!(snubber::FaultKind::COUNT, 13);
+    assert_eq!(DEFAULT_POLICIES.len(), 13);
     // Spot-check philosophy: lag is Debug, death is Critical.
     assert_eq!(
         DEFAULT_POLICIES[FaultKind::StaleEpoch.index()].log_level,
@@ -97,6 +97,45 @@ fn custom_command_runs_outside_the_lock() {
     assert_eq!(node.reported()[FaultKind::Panic.index()], 1);
     let tags = seen.lock().unwrap();
     assert_eq!(tags.as_slice(), [Some("critical_panics_total")]);
+}
+
+#[test]
+fn rate_shedding_files_its_own_kind() {
+    // A BulkheadFull TripBreaker override must NOT see token-bucket
+    // shedding: rate limiting is its own kind, own column, own policy.
+    let node = SnubberNode::builder("rate/own_kind")
+        .rate_per_sec(1)
+        .policy(
+            FaultKind::BulkheadFull,
+            FaultPolicy::new(FaultAction::TripBreaker),
+        )
+        .build();
+    let mut admitted = 0u64;
+    for i in 1..=50u64 {
+        match node.enter(i, i, || {}) {
+            Ok(g) => {
+                admitted += 1;
+                g.commit();
+            }
+            Err(snubber::EnterError::RateLimited) => {}
+            Err(other) => panic!("unexpected refusal: {other:?}"),
+        }
+    }
+    let s = node.stats();
+    assert!(admitted >= 1, "the first call takes the token");
+    assert!(s.rate_rejected > 0, "the bucket must shed the burst");
+    assert_eq!(
+        s.reported[FaultKind::RateLimited.index()],
+        s.rate_rejected,
+        "every rate shed is reported under its own kind"
+    );
+    assert_eq!(
+        s.reported[FaultKind::BulkheadFull.index()],
+        0,
+        "rate shedding must never masquerade as bulkhead"
+    );
+    assert_eq!(s.bulkhead_rejections, 0);
+    assert_eq!(s.breaker_trips, 0, "BulkheadFull policy must not fire");
 }
 
 #[test]

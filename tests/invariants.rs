@@ -227,16 +227,40 @@ fn verify_slot_containment_and_single_shot_rollback() {
         (THREADS * ATTEMPTS_PER_THREAD) as u64,
         "every attempt must be either admitted or counted as shed"
     );
+    assert!(
+        accepted > 0,
+        "stress must admit at least one guard, otherwise the books prove nothing"
+    );
     let s = node.stats();
     assert_eq!(
         s.total_started, accepted,
         "node books must match admissions"
     );
     assert_eq!(s.shed_total(), refused, "node books must match shed count");
+    // This node has no rate limit, breaker trip or memory ceiling, so a
+    // refusal can only be a bulkhead slot shortage or a stale epoch (auto
+    // entries race the shared EpochGate by design and the caller retries).
+    // Enumerating the buckets proves no refusal hides in a fifth counter;
+    // comparing admission_total to the sum of the same accessors would be
+    // an algebraic tautology.
+    assert_eq!(
+        s.bulkhead_rejections
+            .saturating_add(s.stale_epochs_rejected),
+        refused,
+        "refusals must land in the bulkhead or stale-epoch bucket: {s:?}"
+    );
+    assert_eq!(
+        s.rate_rejected
+            .saturating_add(s.breaker_rejections)
+            .saturating_add(s.memory_rejections)
+            .saturating_add(s.poisoned_rejected),
+        0,
+        "no other shed bucket may fire in this node shape: {s:?}"
+    );
     assert_eq!(
         s.admission_total(),
-        s.total_started + s.shed_total(),
-        "conservation law: admission_total == total_started + shed_total"
+        (THREADS * ATTEMPTS_PER_THREAD) as u64,
+        "every attempt must be accounted for exactly once"
     );
 
     // Invariant 2: Quiescent state must have zero slots in flight

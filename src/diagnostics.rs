@@ -28,11 +28,12 @@ pub const SNAPSHOT_LEN: usize = 512;
 
 const _: () = assert!(SNAPSHOT_LEN == 512, "snapshot frame is a 512 B contract");
 /// Snapshot format version (bytes 4..8, LE).
-/// v4: memory bounds/sample/peak/rejections + waiter queue gauges
-/// (Phase 2 memory control). v3 added `pulse_stalls` +
-/// `max_pulse_lag_ms`; older frames refuse as `BadVersion`, never
-/// half-parse.
-pub const SNAPSHOT_VERSION: u32 = 4;
+/// v5: the per-kind `reported` tail grew 12 -> 13 for `RateLimited`
+/// (rate shedding has its own kind, never `BulkheadFull`). v4 added
+/// memory bounds/sample/peak/rejections + waiter queue gauges (Phase 2
+/// memory control); v3 added `pulse_stalls` + `max_pulse_lag_ms`. Older
+/// frames refuse as `BadVersion`, never half-parse.
+pub const SNAPSHOT_VERSION: u32 = 5;
 /// Snapshot magic: `b"SNUB"` (bytes 0..4).
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SNUB";
 /// CRC covers bytes `0..508`; stored LE at `508..512`.
@@ -40,9 +41,10 @@ pub const SNAPSHOT_CRC_RANGE: usize = 508;
 
 // COMPILE-TIME GATES (cold-frame wire math, always compiled):
 // the 512 B frame = 508 B payload + 4 B CRC; the `reported` tail must
-// track `FaultKind::COUNT` (v2 grew 11 -> 12 for Preempted);
+// track `FaultKind::COUNT` (v2 grew 11 -> 12 for Preempted; v5 grew
+// 12 -> 13 for RateLimited);
 // v3 appended `pulse_stalls` + `max_pulse_lag_ms` (Front 4);
-// v4 appends memory + queue gauges (Phase 2) and still fits: 314/508 B.
+// v4 appends memory + queue gauges (Phase 2); v5 still fits: 322/508 B.
 const _: () = {
     assert!(
         SNAPSHOT_LEN == 512,

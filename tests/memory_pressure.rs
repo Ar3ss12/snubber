@@ -1,5 +1,5 @@
 //! Phase 2: external memory samples, drain-on-soft, lock-free refusal,
-//! v4 snapshot gauges, and the memory/queue anomaly verdicts.
+//! v5 snapshot gauges, and the memory/queue anomaly verdicts.
 
 use snubber::{
     classify, find_anomalies_for_snapshot, write_triage, AnomalyKind, AnomalyPolicy, EnterError,
@@ -127,7 +127,7 @@ fn async_admission_refuses_before_parking() {
 }
 
 #[test]
-fn queue_gauges_ride_the_v4_snapshot() {
+fn queue_gauges_ride_the_v5_snapshot() {
     let node = SnubberNode::builder("queue")
         .max_in_flight(1)
         .queue_limit(8)
@@ -148,9 +148,9 @@ fn queue_gauges_ride_the_v4_snapshot() {
     assert_eq!(snap.memory_rejections, 0);
 
     let bytes = snap.encode();
-    assert_eq!(SNAPSHOT_VERSION, 4);
-    assert_eq!(&bytes[4..8], &4u32.to_le_bytes());
-    assert_eq!(SnapshotV1::decode(&bytes).expect("v4 roundtrip"), snap);
+    assert_eq!(SNAPSHOT_VERSION, 5);
+    assert_eq!(&bytes[4..8], &5u32.to_le_bytes());
+    assert_eq!(SnapshotV1::decode(&bytes).expect("v5 roundtrip"), snap);
 
     holder.commit();
 }

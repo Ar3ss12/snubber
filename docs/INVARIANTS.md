@@ -64,7 +64,7 @@ stripped, code hits trip).
 ### Invariant 7: Pulse Lag Is Never Silent (Black-Box Trace)
 Every missed `WorkerPulse` verdict recorded via
 `SnubberNode::note_pulse_stall(lag_ms)` lands in the cold frame:
-`SnapshotV1.pulse_stalls` / `max_pulse_lag_ms` (v3, 512 B kept) and
+`SnapshotV1.pulse_stalls` / `max_pulse_lag_ms` (pulse fields since v3, 512 B kept) and
 fires `AnomalyKind::PulseStall` (`pulse_stall`, ignores `min_sample`
 like desync). A post-mortem dump answers "did it lag?" with
 `[DIAG 0x… <node> pulse_stall <lag>%]` instead of "0 errors".
@@ -288,13 +288,13 @@ cargo test --lib isr
 # Verify zero-nesting lock law (deadlock impossibility)
 cargo test --test lock_hierarchy
 
-# Verify pulse black-box (stall verdicts in v3 snapshot + anomaly)
+# Verify pulse black-box (stall verdicts in the current-version snapshot + anomaly)
 cargo test --test diagnostics pulse_stall
 
 # Verify extensibility contract (hooks outside the lock, names, ceilings, argv)
 cargo test --test extensibility
 
-# Verify memory refusal + snapshot v4 gauges (soft refuses, hard verdicts)
+# Verify memory refusal + snapshot v5 gauges (soft refuses, hard verdicts)
 cargo test --test memory_pressure
 
 # Verify supervisor euthanasia decisions and the real soft-drain loop

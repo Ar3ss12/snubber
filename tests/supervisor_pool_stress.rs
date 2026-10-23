@@ -109,6 +109,21 @@ fn worker_pool_storm() {
         expected,
         "every armed worker must hand its token back: {content}"
     );
+    // Bookkeeping cross-check: the per-class buckets must add up to the
+    // reap total. A lost or double-counted reap shows here even when every
+    // individual field looks plausible on its own.
+    assert_eq!(
+        json_num(&content, "ambush")
+            + json_num(&content, "escape")
+            + json_num(&content, "stillborn"),
+        json_num(&content, "reaped"),
+        "class buckets must sum to reaped: {content}"
+    );
+    assert_eq!(
+        json_num(&content, "deadlocks"),
+        0,
+        "no lane may deadlock: {content}"
+    );
 
     let generations = std::iter::repeat(kills + 1)
         .take(lanes as usize)
