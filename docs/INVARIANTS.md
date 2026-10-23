@@ -274,7 +274,6 @@ cargo test --test concurrency_stress
 cargo test --test supervisor
 
 # Verify bulkhead pushback and rate limits
-
 cargo test --test bulkhead_capacity
 cargo test --test circuit_breaker
 

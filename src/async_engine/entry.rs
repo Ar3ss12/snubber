@@ -10,6 +10,13 @@
 //! resolves to `Err(EnterError::QueueFull)` instead of hanging forever;
 //! dropping a parked future deregisters exactly its own queue entry.
 //!
+//! Known window (accepted, self-healing): a settle pops its winner under
+//! the lock and wakes it AFTER unlocking. If the winner's task is dropped
+//! in that gap, the wake is a no-op and the freed slot is handed off only
+//! on the NEXT settle — one waiter waits one extra settle, bounded by
+//! traffic. A dead waker cannot be detected portably, so the alternative
+//! is waking two waiters per settle (wake storm) — not taken.
+//!
 //! Works with Tokio, async-std, smol, embassy — anything polling `Future`.
 //! Queue is capped (1024, oldest evicted); atomic admission reserves the slot
 //! and only consumes the rollback on success — no lost wakeup, no burnt `FnOnce`.

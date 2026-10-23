@@ -59,6 +59,12 @@ if command -v python3 > /dev/null 2>&1; then
     PY=python3
 elif command -v python > /dev/null 2>&1; then
     PY=python
+    # The f-string parser below is Python 3 only: bare `python` may be a
+    # Python 2 interpreter that dies with a SyntaxError mid-pipeline.
+    if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)' 2> /dev/null; then
+        echo -e "\033[31mError: 'python' is Python 2 — the parser needs Python 3 (install python3).\033[0m" >&2
+        exit 1
+    fi
 else
     echo -e "\033[31mError: neither python3 nor python found in PATH.\033[0m"
     exit 1
@@ -127,6 +133,12 @@ EOF
 
 if [ ! -s "${OUT_FILE}" ] || [ "$(grep -c '^| `' "${OUT_FILE}" 2>/dev/null)" = "0" ]; then
     echo -e "\033[33m[bench] WARNING: snapshot produced no benchmark rows — run without --skip-run or check target/criterion\033[0m" >&2
+    if [ "$GITHUB_MODE" = true ]; then
+        # An empty table published to the step summary looks like a clean
+        # run — fail the step instead of publishing a blank report.
+        echo -e "\033[31m[bench] FAIL: empty snapshot in --github mode\033[0m" >&2
+        exit 1
+    fi
 fi
 
 echo ""

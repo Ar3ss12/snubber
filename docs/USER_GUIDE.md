@@ -550,7 +550,10 @@ guard.commit();
 ```
 
 ### 2. Async Settle Across `.await` (`settle_async`)
-`TrackedGuard` holds **NO mutex across `.await` points**. The lock is held for only ~80 nanoseconds during admission and completion:
+`TrackedGuard` holds **NO mutex across `.await` points**. The lock is taken only for the
+admission/completion bookkeeping — the same short critical sections behind the measured
+`node.enter_auto` / `commit` latencies in the benchmark table (tens of nanoseconds on the
+bench machine, unbenchmarked in isolation):
 
 ```rust
 // Runs the future across .await, commits if Ok, aborts and rolls back if Err:
@@ -847,8 +850,8 @@ fn pack_state(x: i32, y: i32, flags: u32, clicks: u64) -> StateDigest {
     // bytes 20..64 stay zero until the next field earns them
     StateDigest::new(b)
 }
-```
-```rust
+
+// --- child process side (same crate) ---
 use snubber::StateDigest;
 // Child process: pack flat (or a storage ticket for 100 MB on disk)…
 let digest = StateDigest::new(packed_64_bytes);
@@ -1618,9 +1621,9 @@ refusal.
 | `guard.check_timeout()` | 2 / std | 1 clock + 1 sample | Cooperative watchdog: `WithinBudget` / `TimedOut` / `SpinDetected` / `DeadlockSuspected` |
 | `IsrBridge::try_push/pop` + `trip/take_trips` + `IsrSignal` | 1 / core | 80 B, ~2 bus cycles | ISR signal into main loop; trip latch bypasses a full ring; no mutex/alloc/`unsafe` (M0-safe byte atomics); `head`/`tail` separated by 64 B cells, no `align(64)` pads |
 | `IsrSignal::new(opc, reason, value)` | 1 / core | 4 B, const | Pack `OP_EMERGENCY_TRIP` / `OP_PULSE` / `OP_PAUSE` |
-| `IdlePark::park` (`SpinPark`/firmware `wfi`/`wfe`) | 1 / core | 0% CPU | 0%-CPU park: `Condvar` on `std`, `wfi`/`wfe` impl on firmware (`wfe` needs `SEVONPEND=1` at boot) |
-| `WdtSink::feed` / `NoWdt` | 1 / core | no-op on std | Stroke HW WDT on firmware (same `kick()` feeds it) |
-| `node.note_pulse_stall(lag_ms)` | 2 / std | 1 atomic max | Record missed pulse into `SnapshotV1` v3 + `AnomalyKind::PulseStall` |
+| `IdlePark::park` (`SpinPark`/firmware `wfi`/`wfe`) | 1 / core | structural: 0% CPU by design | 0%-CPU park: `Condvar` on `std`, `wfi`/`wfe` impl on firmware (`wfe` needs `SEVONPEND=1` at boot) |
+| `WdtSink::feed` / `NoWdt` | 1 / core | structural: no-op on std | Stroke HW WDT on firmware (same `kick()` feeds it) |
+| `node.note_pulse_stall(lag_ms)` | 2 / std | structural: 1 atomic max | Record missed pulse into `SnapshotV1` v3 + `AnomalyKind::PulseStall` |
 | `node.note_memory_kb(used_kb)` + `memory_verdict()` | 2 / std | 1 lock + 1 atomic store | External RSS sample → `MemoryVerdict` (Ok/Soft/Hard); admissions refuse lock-free above soft |
 | `MemoryWatch` + `MemoryVerdict` | 1 / core | 32 B, `Copy` | Verdict math for firmware; `hard < soft` clamps up |
 | `MemoryPolicy::new(soft, hard)` + `note(used)` | 2 / std | pure integer compares | Supervisor verdict: soft drains, hard kills; `death_cause()` names `MemoryLimit` |
@@ -1658,3 +1661,10 @@ refusal.
 | `node.snapshot_v1()` + `encode()` | 2 / cold | 512 B, CRC32 | Crash-safe persistence, app-owned flush thread |
 | `find_anomalies()` / `assert_no_anomalies!` | 2 / cold | pure `u128` math | CI gate + diagnostics console + `[DIAG 0x…]` bug reports |
 | `NodeSet` set | 2 / cold | explicit `&Node` list + saturating aggregates | Multi-node pulse, never a `static` |
+| `SafeLockExt` (`Mutex::safe_lock(&node)`) | 2 / std | structural: 1 counter on recovery | Poison-tolerant locking: foreign panic recovers the lock, `poison_recoveries` counts each recovery |
+| `ClosurePolicy::new(closure)` + `run()` | 2 / alloc | 1 `Box` at construction | Capturing self-healing command: `run()` executes the boxed closure outside the node lock |
+| `TransactionHeader { generation, epoch, task_id }` | 1 / core | 24 B `Copy` | Stamped header for trust boundaries; `task_id` doubles as the reply-correlation check |
+| `GatewayStats` | 2 / std | plain `Copy` counters | Gateway channel books: `sent` / `admitted` / `shed` / `throttled` (saturating) |
+| `ResumeFuture` | 2 / std | 0% CPU waker park | Future resolved by the next directive (pause/resume/cancel); reads the directive under the wakers lock, never duplicates a payload |
+| `PulseTick` (type alias) | 1 / core | structural: one atomic | `WorkerPulse` tick storage: `AtomicU64`, or `AtomicU32` wrapping at 2^32 on targets without 64-bit CAS |
+| `LeaseEvent { task_id, stage, kind }` | 3 / std | `Copy` event | Reaper mailbox payload fired by `AsyncLease` drop; overflow accounting goes through `LeaseChannel::fire` |

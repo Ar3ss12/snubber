@@ -425,10 +425,20 @@ def run(args: argparse.Namespace, repo: Path) -> int:
             try:
                 lane.sup_exit = lane.sup.wait(timeout=args.supervisor_wait)
             except subprocess.TimeoutExpired:
-                lane.sup.kill()
-                lane.sup.wait(timeout=5)
-                lane.sup_exit = -9
-                lane.error = lane.error or "supervisor did not exit"
+                # Grace before the hard kill: SIGTERM (POSIX) lets a
+                # slow-but-alive supervisor finish and write its report;
+                # only a wedged one reaches the SIGKILL below (its
+                # missing report is then expected and reported, not a
+                # silent gate hole). Windows terminate() is already
+                # immediate — the kill branch stays unreachable there.
+                lane.sup.terminate()
+                try:
+                    lane.sup.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    lane.sup.kill()
+                    lane.sup.wait(timeout=5)
+                lane.sup_exit = lane.sup.returncode
+                lane.error = lane.error or "supervisor did not exit (terminated after grace)"
 
         for lane in lanes:
             try:

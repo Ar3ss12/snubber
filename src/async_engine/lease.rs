@@ -69,6 +69,9 @@ impl LeaseChannel {
 ///
 /// Bounded by construction: `SyncSender` has a hard capacity ceiling (no memory
 /// leaks during load spikes). `try_send` in `Drop` never blocks the worker thread.
+/// `Drop` fires `try_send` directly and DISCARDS the `Full` / `Disconnected`
+/// legs — only [`LeaseChannel::fire`] counts them. Callers that need overflow
+/// accounting must fire explicitly instead of relying on `Drop`.
 #[must_use = "an uncommitted AsyncLease immediately sends an abort event on drop"]
 #[derive(Debug)]
 pub struct AsyncLease {

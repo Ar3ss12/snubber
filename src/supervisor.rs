@@ -879,7 +879,8 @@ pub fn now_ms() -> u64 {
 pub struct DrainCounters {
     /// Total parsed 40-byte frames (arms, commits, heartbeats, state chunks).
     pub frames: u64,
-    /// Arm-class frames (any opcode outside commit/heartbeat/state).
+    /// Arm-class frames (any opcode outside commit/heartbeat/state/
+    /// snapshot — `OP_SNAPSHOT` is diagnostics and never counted here).
     pub arms: u64,
     /// `OP_COMMIT` frames.
     pub commits: u64,
@@ -1091,13 +1092,19 @@ impl PipeDrain {
     }
 
     /// Take the last un-settled token, if any (call AFTER `EOF`/reap).
+    ///
+    /// Poison-safe: `DrainState` is plain counters + `Option` slots (no
+    /// cross-field invariants a panic could tear), so a poisoned lock is
+    /// recovered through the guard instead of silently dropping the
+    /// rescue token.
     #[must_use]
     pub fn take_armed(&self) -> Option<ProcessToken> {
         self.inner
             .state
             .lock()
-            .ok()
-            .and_then(|mut state| state.armed.take())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .armed
+            .take()
     }
 
     /// Parsed-frame counters (cheap snapshot under one short lock).
@@ -1117,14 +1124,17 @@ impl PipeDrain {
     /// consuming it — the next call returns `None`. Call after process
     /// exit and hand the bytes to the replacement process at startup
     /// (child stdin/env/file — the crate delivers, the app injects).
-    /// Copy-out under one short lock — no alloc, never panics.
+    /// Copy-out under one short lock — no alloc, never panics. Poison
+    /// is recovered (`DrainState` holds no tearable invariants — see
+    /// [`PipeDrain::take_armed`]).
     #[must_use]
     pub fn take_state(&self) -> Option<StateDigest> {
         self.inner
             .state
             .lock()
-            .ok()
-            .and_then(|mut state| state.state.take())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state
+            .take()
     }
 
     /// Peek without taking (supervisor polls before spawning replacement process).
@@ -1533,6 +1543,9 @@ impl Supervisor {
             // never observes a pipe that still holds buffered bytes —
             // the rescue token would be missed and the death reported
             // CLEAN while the child's last words are still in flight.
+            // Same boundary as the pool (`elapsed > grace` = give up):
+            // spelled here as `<= grace` = keep waiting, in pool/lane.rs
+            // as `> grace` = stop — equivalent, kept so both grep alike.
             let eof_started = drain.now_ms();
             while !drain.eof()
                 && drain.now_ms().saturating_sub(eof_started) <= crate::pool::DEFAULT_EOF_GRACE_MS

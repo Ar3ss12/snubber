@@ -7,10 +7,17 @@ $RepoRoot = Resolve-Path "$ScriptDir\.."
 
 Write-Host "=== Snubber Architectural Invariant Audit ===" -ForegroundColor Cyan
 $Failures = 0
+$Skips = 0
+
+# CI mode: GitHub Actions sets CI=true. A SKIP in a controlled
+# environment is a hole in the audit, not a pass (parity with the .sh).
+$InCi = [bool]$env:CI
 
 # Gate 1: Check #![forbid(unsafe_code)] in src/lib.rs
 Write-Host "[1/6] Auditing unsafe code veto..." -NoNewline
-$LibContent = Get-Content "$RepoRoot\src\lib.rs" -Raw
+# TrimStart the BOM: a UTF-8 BOM would otherwise defeat every `(?m)^#!`
+# anchor below (false-FAIL that fails safe, but loud for nothing).
+$LibContent = (Get-Content "$RepoRoot\src\lib.rs" -Raw).TrimStart([char]0xFEFF)
 if ($LibContent -match '(?m)^#!\[forbid\(unsafe_code\)\]') {
     Write-Host " OK (forbid(unsafe_code) active)" -ForegroundColor Green
 } else {
@@ -48,12 +55,19 @@ Write-Host "[3/6] Auditing zero-panic mutex discipline in src/node.rs..." -NoNew
 # previous single-pattern check only ever saw the signature line.
 $NodeLines = Get-Content "$RepoRoot\src\node.rs"
 $InFn = $false
+$SigIndent = 0
 $FnBody = New-Object System.Collections.Generic.List[string]
 foreach ($Line in $NodeLines) {
-    if (-not $InFn -and $Line -match '^\s*fn record_locked\(') { $InFn = $true }
+    if (-not $InFn -and $Line -match '^(\s*)fn record_locked\(') {
+        $InFn = $true
+        $SigIndent = $Matches[1].Length
+    }
     if ($InFn) {
         $FnBody.Add($Line)
-        if ($Line -match '^    \}$') { break }
+        # Closing brace at the SIGNATURE's own indent (survives the fn
+        # moving one indent deeper; the old fixed `^    \}$` anchor ran
+        # to EOF and failed safe but loud).
+        if ($Line -match '^(\s*)\}\s*$' -and $Matches[1].Length -eq $SigIndent) { break }
     }
 }
 # A gate that scans nothing must fail, not pass: a renamed/moved
@@ -74,6 +88,8 @@ if ($FnBody.Count -eq 0 -or ($FnBody[0] -notmatch 'fn record_locked\(')) {
 
 # Gate 4: Zero-metaphor scan across codebase (AGENTS.md Section 14)
 Write-Host "[4/6] Auditing forbidden metaphors..." -NoNewline
+# Scope: src + benches + examples + tests — public examples are as
+# user-visible as the docs the rule protects (parity with the .sh gate).
 # Excludes binary header magic terminology ("magic bytes / magic number") which is technical standard.
 $ForbiddenPatterns = @(
     "\bwizard\b",
@@ -82,13 +98,20 @@ $ForbiddenPatterns = @(
     "\bpanacea\b",
     "\bsilver\s+bullet\b"
 )
+$ScanFiles = @($SrcFiles)
+foreach ($Dir in @("benches", "examples", "tests")) {
+    $Path = Join-Path $RepoRoot $Dir
+    if (Test-Path $Path) {
+        $ScanFiles += (Get-ChildItem $Path -Recurse -Filter *.rs | ForEach-Object { $_.FullName })
+    }
+}
 $MetaphorMatches = @()
 foreach ($Pat in $ForbiddenPatterns) {
-    $Found = Select-String -Path $SrcFiles -Pattern $Pat
+    $Found = Select-String -Path $ScanFiles -Pattern $Pat
     if ($Found) { $MetaphorMatches += $Found }
 }
 if ($MetaphorMatches.Count -gt 0) {
-    Write-Host " FAIL: Found informal metaphors in src/:" -ForegroundColor Red
+    Write-Host " FAIL: Found informal metaphors in src/ benches/ examples/ tests/:" -ForegroundColor Red
     $MetaphorMatches | ForEach-Object { Write-Host "   $($_.Filename):$($_.LineNumber): $($_.Line.Trim())" }
     $Failures++
 } else {
@@ -102,9 +125,21 @@ if ($LibContent -notmatch '(?m)^#!\[cfg_attr\(not\(feature = "std"\), no_std\)\]
     Write-Host " FAIL (missing #![cfg_attr(not(feature = `"std`"), no_std)] in src/lib.rs)" -ForegroundColor Red
     $Failures++
 } elseif (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
-    Write-Host " SKIP (rustup not installed)" -ForegroundColor Yellow
+    if ($InCi) {
+        Write-Host " FAIL (CI: rustup missing — workflow must install the toolchain)" -ForegroundColor Red
+        $Failures++
+    } else {
+        Write-Host " SKIP (rustup not installed)" -ForegroundColor Yellow
+        $Skips++
+    }
 } elseif (-not ((rustup target list --installed) -contains $BareMetalTarget)) {
-    Write-Host " SKIP (target not installed: rustup target add $BareMetalTarget)" -ForegroundColor Yellow
+    if ($InCi) {
+        Write-Host " FAIL (CI: bare-metal target missing — workflow must run: rustup target add $BareMetalTarget)" -ForegroundColor Red
+        $Failures++
+    } else {
+        Write-Host " SKIP (target not installed: rustup target add $BareMetalTarget)" -ForegroundColor Yellow
+        $Skips++
+    }
 } else {
     Push-Location $RepoRoot
     try {
@@ -134,7 +169,13 @@ $ApiBaseline = & git -C "$RepoRoot" describe --tags --abbrev=0 2>$null
 $GitExit = $LASTEXITCODE
 $ErrorActionPreference = $PrevEap
 if ($GitExit -ne 0 -or -not $ApiBaseline) {
-    Write-Host " SKIP (no git tag baseline)" -ForegroundColor Yellow
+    if ($InCi) {
+        Write-Host " FAIL (CI: no git tag baseline — checkout must fetch tags and the repo must be tagged per release)" -ForegroundColor Red
+        $Failures++
+    } else {
+        Write-Host " SKIP (no git tag baseline)" -ForegroundColor Yellow
+        $Skips++
+    }
 } else {
     # Parity with check_api_diff.ps1: a tag equal to HEAD hides every
     # committed-but-untagged API change; warn instead of trivially passing.
@@ -149,7 +190,13 @@ if ($GitExit -ne 0 -or -not $ApiBaseline) {
     $SemverInstalled = ($LASTEXITCODE -eq 0)
     $ErrorActionPreference = $PrevEap
     if (-not $SemverInstalled) {
-        Write-Host " SKIP (cargo-semver-checks not installed)" -ForegroundColor Yellow
+        if ($InCi) {
+            Write-Host " FAIL (CI: cargo-semver-checks missing — workflow must install it)" -ForegroundColor Red
+            $Failures++
+        } else {
+            Write-Host " SKIP (cargo-semver-checks not installed)" -ForegroundColor Yellow
+            $Skips++
+        }
     } else {
         $Crate = (Select-String -Path "$RepoRoot\Cargo.toml" -Pattern '^name *= *"([^"]+)"').Matches[0].Groups[1].Value
         Push-Location $RepoRoot
@@ -172,6 +219,11 @@ if ($GitExit -ne 0 -or -not $ApiBaseline) {
 }
 
 Write-Host "---------------------------------------------"
+if ($Skips -gt 0) {
+    # Never a PASS-looking summary over a reduced audit: the skip count
+    # is on its own line, next to the verdict.
+    Write-Host "$Skips gate(s) SKIPPED — the audit ran at reduced coverage." -ForegroundColor Yellow
+}
 if ($Failures -eq 0) {
     Write-Host "All invariant gates PASSED." -ForegroundColor Green
     exit 0

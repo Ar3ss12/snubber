@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
+  # Weekly scheduled lane for the `#[ignore]` pool-stress gates: they
+  # hard-kill real processes and are too heavy (and too flaky on shared
+  # runners) for every push — but they are the ONLY coverage for lane
+  # lease euthanasia and pool hard-kill, so they must not be manual-only.
+  schedule:
+    - cron: "0 3 * * 1"
 
 concurrency:
   group: stress-${{ github.ref }}
@@ -24,13 +30,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Stable Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Python Runtime
         run: python3 --version
@@ -47,7 +53,7 @@ jobs:
 
       - name: Upload Armed-Hold Artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: multi-lineage-armed-hold-${{ matrix.os }}
           path: |
@@ -67,7 +73,7 @@ jobs:
 
       - name: Upload Free-Running Artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: multi-lineage-free-${{ matrix.os }}
           path: |
@@ -75,3 +81,26 @@ jobs:
             target/multi_lineage_report_free.json
           if-no-files-found: warn
           retention-days: 14
+
+  ignored-stress-gates:
+    name: Ignored stress gates (cargo test -- --ignored)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Run all #[ignore] stress gates
+        run: |
+          cargo test --release \
+            --test supervisor_pool_stress \
+            --test supervisor_pool_stress_lease \
+            --test supervisor_pool_stress_mixed \
+            --test supervisor_termination \
+            -- --ignored

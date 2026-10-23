@@ -646,13 +646,16 @@ impl SnubberNodeBuilder {
     /// Sliding-window trip: open the breaker when `percent`% of the last
     /// `window` settled outcomes failed (implicit drops + supervisor
     /// failures). `window = 0` disables (default — streak mode governs).
+    /// `percent` is clamped to `1..=100`: `0` would make the `>= 0%`
+    /// comparison fire on ANY filled window (even an all-success one), so
+    /// it is raised to 1 — "any failure in the window trips".
     /// Cloud-grade: `failure_rate(100, 50)` trips at "50 of last 100 died",
     /// catching the intermittently failing node that streak mode misses
     /// (fail-ok-fail-ok-… never trips a consecutive counter).
     #[must_use]
     pub fn failure_rate(mut self, window: u32, percent: u8) -> Self {
         self.failure_window = window;
-        self.failure_threshold_percent = percent.min(100);
+        self.failure_threshold_percent = percent.clamp(1, 100);
         self
     }
 
@@ -939,6 +942,7 @@ impl SnubberNodeBuilder {
             passthrough_admissions: Arc::new(AtomicU64::new(0)),
             memory_pressure: Arc::clone(&memory_pressure),
             memory_rejections: Arc::new(AtomicU64::new(0)),
+            auto_seq: Arc::new(AtomicU64::new(1)),
             inner: Arc::new(Mutex::new(NodeInner {
                 name: self.name,
                 max_in_flight: self.max_in_flight,
@@ -987,7 +991,6 @@ impl SnubberNodeBuilder {
                 pulse_stalls: 0,
                 max_pulse_lag_ms: 0,
                 rate_rejected: 0,
-                auto_seq: AtomicU64::new(1),
                 stats: SnubberStats {
                     memory_soft_kb: self.memory_soft_kb,
                     memory_hard_kb: self.memory_hard_kb,
@@ -1081,7 +1084,6 @@ struct NodeInner {
     pulse_stalls: u64,
     max_pulse_lag_ms: u64,
     rate_rejected: u64,
-    auto_seq: AtomicU64,
     stats: SnubberStats,
 }
 
@@ -1388,6 +1390,12 @@ pub struct SnubberNode {
     memory_pressure: Arc<AtomicBool>,
     /// Admissions refused by that flag (`Relaxed`, own column).
     memory_rejections: Arc<AtomicU64>,
+    /// Monotonic sequence minter, OUTSIDE the mutex (`Relaxed`):
+    /// `next_sequence` is a pure atomic bump — taking the bulkhead
+    /// lock to mint a ticket would serialize admissions needlessly.
+    /// `Arc`-shared so a cloned node mints from the SAME counter
+    /// (clone = same node, one ticket stream).
+    auto_seq: Arc<AtomicU64>,
 }
 
 impl SnubberNode {
@@ -1597,6 +1605,10 @@ impl SnubberNode {
     /// Admit with an async pace: compute the friction wait, sleep in YOUR
     /// runtime, then admit once. `sleep_fn(wait_ms)` is YOUR timer
     /// (e.g. `|ms| tokio::time::sleep(Duration::from_millis(ms))`).
+    /// `AdviseOnly` / `Custom` nodes skip the sleep; a still-full
+    /// `AdaptiveBlock` node parks the OS thread in the final `enter()`
+    /// (bounded by `max_wait_ms`) — use `enter_async` when the executor
+    /// thread must never block.
     pub async fn enter_paced_async<F, Sf, SfFut>(
         &self,
         epoch: u64,
@@ -2136,6 +2148,12 @@ impl SnubberNode {
     ///   probe settles with the ERASED guard's outcome, not the
     ///   throwaway commit: `commit()` → Closed, drop/abort → Open
     ///   (a failed probe re-opens — the downstream was NOT healthy).
+    /// * The bulkhead ceiling applies at ADMISSION only: the probe's
+    ///   instant commit releases the slot, so LIVE erased guards are not
+    ///   bounded by `max_in_flight` and `committed` counts before the
+    ///   work runs. A daemon holding many erased guards must enforce its
+    ///   own in-flight ceiling (semaphore / owned counter) — the node
+    ///   cannot see the guards it no longer tracks.
     ///
     /// Use `enter` when you need typed per-guard settle accounting; use
     /// `enter_erased` when the guard must LIVE in a struct.
@@ -2200,7 +2218,7 @@ impl SnubberNode {
     /// Next monotonically minted sequence ticket for this node (lock-free `AtomicU64`).
     #[inline]
     pub fn next_sequence(&self) -> u64 {
-        self.lock().auto_seq.fetch_add(1, Ordering::Relaxed)
+        self.auto_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     /// ⚠️ *Low-level primitive.* If you are building a background worker or
@@ -2663,6 +2681,10 @@ impl SnubberNode {
     /// 1. Emits the armed `ProcessToken` to `stdout` if running under a supervisor (`SNUBBER_SUPERVISED`).
     /// 2. If rollback runs (unwind/abort), notifies the supervisor via `ProcessToken::commit(seq)`.
     /// 3. If clean `commit()` is called, notifies the supervisor via `ProcessToken::commit(seq)`.
+    ///
+    /// Same bulkhead note as [`Self::enter_erased`]: the probe commits
+    /// instantly, so LIVE supervised guards are not bounded by
+    /// `max_in_flight` — enforce an in-flight ceiling in the daemon.
     #[track_caller]
     #[cfg(feature = "alloc")]
     pub fn enter_supervised_erased<F>(
@@ -3034,7 +3056,9 @@ impl SnubberNode {
                     // while PHASE B ran (no TOCTOU — admit if free).
                     inner = self.lock();
                     if inner.in_flight < inner.max_in_flight {
-                        // Freed while computing — fall through to admit.
+                        // Freed while computing — skip the wait/reject arm.
+                        // Not an immediate admit: the pacing park below
+                        // still applies before the slot is taken.
                     } else {
                         let _wait_ms_inner = if legacy_ms > 0 { legacy_ms } else { park_ms };
                         if custom_mode {
@@ -3055,7 +3079,9 @@ impl SnubberNode {
                             }
                             inner = self.lock();
                             if inner.in_flight < inner.max_in_flight {
-                                // Freed while reacting — admit.
+                                // Freed while reacting — skip the reject
+                                // arm; the pacing park below still applies
+                                // before the slot is taken.
                             } else {
                                 if inner.breaker == BreakerState::HalfOpen {
                                     inner.half_open_probe = false;

@@ -110,7 +110,13 @@ foreach ($est in $estimates) {
 }
 
 if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
-$rows | Set-Content -Path $outFile -Encoding utf8
+# BOM-less UTF-8: PS 5.1 `Set-Content -Encoding utf8` writes a BOM that
+# makes the snapshot differ byte-wise from the .sh flavor (and upsets
+# naive markdown diffs).
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$SnapshotText = ($rows -join "`r`n") + "`r`n"
+$OutFilePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($outFile)
+[System.IO.File]::WriteAllText($OutFilePath, $SnapshotText, $Utf8NoBom)
 
 Write-Host "" -ForegroundColor DarkGray
 Write-Host "=== BENCH SNAPSHOT (ns/op mean point estimate) ===" -ForegroundColor Green

@@ -37,7 +37,7 @@ if [ "$(git -C "${REPO_ROOT}" rev-parse "${BASELINE}^{commit}" 2>/dev/null || tr
     echo " WARN (baseline ${BASELINE} is HEAD: committed-but-untagged API changes are invisible to this gate)"
 fi
 
-CRATE="$(sed -n 's/^name *= *\"\(.*\)\"/\1/p' "${REPO_ROOT}/Cargo.toml" | head -1)"
+CRATE="$(sed -n 's/^name *= *\"\([^\"]*\)\".*/\1/p' "${REPO_ROOT}/Cargo.toml" | head -1)"
 echo " baseline=${BASELINE} package=${CRATE}"
 cd "${REPO_ROOT}"
 # `--package` limits both sides to this crate (one build, not the

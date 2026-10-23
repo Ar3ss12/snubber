@@ -161,9 +161,10 @@ impl ThrottleState {
 }
 
 /// Precomputed watermarks: HWM = 75% of capacity, LWM = 50%.
-/// Capacities below 4 engage throttling only at hard-full: HWM is set
-/// above capacity so the latch can only arm on a saturated `try_send`
-/// path that reports `Full` (early pacing stays disabled).
+/// Capacities below 4 disable early pacing entirely: HWM is set above
+/// the reachable depth, so the Ok-arm latch (set at `depth >= HWM`
+/// after a successful send) can never arm. The `Full` arm never
+/// touches the latch — `shed` is its only counter.
 #[inline]
 fn watermarks(capacity: usize) -> (usize, usize) {
     if capacity < THROTTLE_MIN_CAP {

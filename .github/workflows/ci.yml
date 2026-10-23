@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
+  # Weekly re-run: nothing else re-checks the gates against `stable`
+  # toolchain drift or dependency updates between PRs.
+  schedule:
+    - cron: "0 4 * * 3"
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,7 +20,7 @@ jobs:
     name: Code Quality & no_std Gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # Full history + tags: Gate 6 diffs the public API against the
           # last release tag via `git describe`; a depth-1 checkout makes
@@ -30,12 +34,12 @@ jobs:
           targets: thumbv7em-none-eabihf
 
       - name: Install cargo-semver-checks (Gate 6)
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
         with:
           tool: cargo-semver-checks
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Check Formatting (cargo fmt)
         run: cargo fmt --check
@@ -55,7 +59,16 @@ jobs:
         run: bash scripts/check_compile_gates.sh
 
       - name: Validate Documentation Links (cargo doc)
+        # `cargo doc` exits 0 on broken intra-doc links — deny warnings
+        # or the link gate is decorative.
+        env:
+          RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --no-deps --all-features
+
+      - name: Cargo.lock Freshness (--locked)
+        # Cargo.lock is tracked: a stale lock must fail the PR, not
+        # surface at release time.
+        run: cargo metadata --locked --format-version 1 > /dev/null
 
       - name: Package Integrity (dry-run publish)
         run: cargo publish --dry-run
@@ -70,22 +83,42 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Full tags for the Windows PowerShell gate (Gate 6 needs a tag
+          # baseline); the bare-metal target feeds Gate 5 there.
+          fetch-depth: 0
 
       - name: Install Stable Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Install Bare-Metal Target (Windows gate parity)
+        if: runner.os == 'Windows'
+        run: rustup target add thumbv7em-none-eabihf
+
+      - name: Install cargo-semver-checks (Windows gate parity)
+        if: runner.os == 'Windows'
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+        with:
+          tool: cargo-semver-checks
 
       - name: Run Full Test Suite
-        run: cargo test
+        run: cargo test --locked
+
+      - name: Architectural Invariant Gates (PowerShell 5.1 flavor)
+        # The .sh flavor never runs on Windows; without this step the
+        # PS-specific gate rot would be invisible.
+        if: runner.os == 'Windows'
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check_compile_gates.ps1
 
       - name: Verify Release Build Performance
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Run Release Concurrency Stress (40,000 transactions)
-        run: cargo test --release --test concurrency_stress
+        run: cargo test --release --locked --test concurrency_stress
 
       - name: Run Release Hard Clamp & Bulkhead Capacity
         run: |
@@ -97,7 +130,7 @@ jobs:
     needs: quality
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Nightly Rust with Miri
         uses: dtolnay/rust-toolchain@nightly
@@ -105,7 +138,7 @@ jobs:
           components: miri, rust-src
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Run Miri on Core Library
         run: cargo miri test --lib
@@ -154,13 +187,13 @@ jobs:
     needs: quality
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Stable Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Check Benchmark Compiles (no measurement)
         run: cargo bench --bench admission_bench --no-run

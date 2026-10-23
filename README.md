@@ -64,7 +64,7 @@ drain.finish();                                        // EOF → rescue classif
 ## 🛡️ Architecture & Guarantees
 
 * **Zero-Boilerplate RAII Rollback:** No manual token tracking. Scoped executions auto-commit on success and guarantee resource release via `Drop` on panics, errors, or early returns.
-* **Single-Digit-Nanosecond Overhead:** Base stack guard costs **~5.4 ns**; commit takes the rollback and forgets an allocation-free `Copy` shell and adds **+0 bytes** to executable size. Concurrency-limited nodes process over **8.2M ops/sec** (`core`-only / `std`).
+* **Single-Digit-Nanosecond Overhead:** Base stack guard costs **~5.4 ns**; commit takes the rollback and forgets an allocation-free `Copy` shell (no heap, no extra wire bytes). Concurrency-limited nodes process over **8.2M ops/sec** (`core`-only / `std`).
 * **Strict Determinism:** `#![forbid(unsafe_code)]`, zero external dependencies. Predictable behavior across bare-metal microcontrollers and multi-socket servers alike.
 * **Runtime-Agnostic Async:** Bounded waker queue built on `core::task::Waker` consuming **0% CPU** without depending on Tokio, async-std, or background threads.
 * **Adaptive Backpressure & Pacing:** Refusals carry physical telemetry (`retry_after_ms`, queue depth 0..255) allowing clients to pace incoming traffic instead of overwhelming dead hardware.
@@ -105,12 +105,12 @@ Measured on AMD Ryzen 5 4600H release build
 | `ConflateSender::publish` (occupied slot) | Layer 2 (`std`) | **~16.3 ns** | Replaced value counted, never queued |
 | `guard.commit_enveloped(64)` | Layer 2 (`std`) | **~152 ns** | Payload corridor exact; wall corridor only for profiled guards |
 | `enter_async_auto` | Layer 3 (`std`) | **0% CPU** | Pure `core::task::Waker` parking, no runtime deps |
-| `enter_async_auto_profiled` | Layer 3 (`std`, opt-in) | 1 `Box` + 2 clock reads | Same waker parking, profile arms on the admitting poll |
+| `enter_async_auto_profiled` | Layer 3 (`std`, opt-in) | structural: 1 `Box` + 2 clock reads | Same waker parking, profile arms on the admitting poll |
 | `enter_async_auto` (ready poll) | Layer 3 (`std`) | **~202 ns** | Full admission through the future; the ready path allocates nothing |
 | `enter_async_auto` park/wake/admit roundtrip | Layer 3 (`std`) | **~574 ns** | Park (queue push + identity flag) -> slot release wake -> admitting re-poll |
 | `static_node.enter + commit` | Layer 2 (`std`) | **~120 ns** | Compile-time capacity assert + bulkhead + auto-commit |
-| `node.note_pulse_stall(lag_ms)` | Layer 2 (`std`) | **1 atomic max** | Missed heartbeat lands in `SnapshotV1` v3 + `AnomalyKind::PulseStall` |
-| `node.note_memory_kb(used)` | Layer 2 (`std`, cold) | 1 lock + 1 atomic store | External memory sample → soft/hard verdict; admissions refuse lock-free above soft |
+| `node.note_pulse_stall(lag_ms)` | Layer 2 (`std`) | structural: 1 atomic max | Missed heartbeat lands in `SnapshotV1` v3 + `AnomalyKind::PulseStall` |
+| `node.note_memory_kb(used)` | Layer 2 (`std`, cold) | structural: 1 lock + 1 atomic store | External memory sample → soft/hard verdict; admissions refuse lock-free above soft |
 | `process_token.to_bytes()` | Layer 4 (`core`) | **~7.7 ns** | 44-byte framed wire serialization (`to_le_bytes`) |
 | `ProcessToken::from_bytes()` | Layer 4 (`core`) | **~7.3 ns** | 40-byte body parse, no allocation |
 | `state_digest.crc()` | Layer 4 (`core`) | **~266 ns** | 64-byte hardware cache line digest verification |
@@ -125,16 +125,16 @@ Measured on AMD Ryzen 5 4600H release build
 | `pool.report()` (4 lanes) | Layer 4 (`std`) | **~107 ns** | Four short lane locks + totals fold, no allocation |
 | `lane.note_memory_kb` | Layer 4 (`std`, cold) | **~12 ns** | Per-lane watch: one lock + integer compares |
 | `pool.expired_lanes(lease)` (4 lanes) | Layer 4 (`std`, cold) | **~536 ns** | One sweep over four silent pipes: one state lock per lane, no child touched |
-| `run_supervised_guard_with_memory` | Layer 4 (`std`) | 1 sampler call / 10 ms tick | Soft logs `MEMORY_DRAIN`; hard `kill()` without draining (`DeathCause::MemoryLimit`) |
-| `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | Layer 2 (`std`, opt-in) | 1 `Box` + 1 clock/stage | Stage wall/CPU breakdown; default `enter*` reads no profile clock |
+| `run_supervised_guard_with_memory` | Layer 4 (`std`) | structural: 1 sampler call / 10 ms tick | Soft logs `MEMORY_DRAIN`; hard `kill()` without draining (`DeathCause::MemoryLimit`) |
+| `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | Layer 2 (`std`, opt-in) | structural: 1 `Box` + 1 clock/stage | Stage wall/CPU breakdown; default `enter*` reads no profile clock |
 | `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.13 µs** | 512-byte zero-allocation snapshot CRC32 codec |
 | `friction_fn` handler call (`Arc<dyn Fn>`) | Layer 4 (`std`) | **~1.8 ns** | Capture-capable friction: one dynamic dispatch outside the node lock |
 | `friction_wait_ms` (adaptive, Arc handler) | Layer 4 (`std`) | **~21.5 ns** | Lock + `Arc` clone + handler; identical to the legacy fn-pointer path (~21.5 ns) |
 | `NodeName::Static` clone | Layer 4 (`std`) | **~1.5 ns** | Fat-pointer copy, no allocation |
 | `NodeName::Owned` clone | Layer 4 (`std`) | **~9.9 ns** | One `Arc<str>` increment; `as_str` ~1.0 ns |
-| `snapshot_v1()` + `find_anomalies()` | Layer 5 (cold) | **512 B, CRC32** | Zero-allocation telemetry; `assert_no_anomalies!()` CI gate |
-| `before.diff(&after)` + `write_triage` | Layer 5 (cold) | pure `Copy` math + `fmt::Write` | Counter deltas since last sample; one ASCII verdict card |
-| `memory_limits(soft, hard)` + admission | Layer 2 (`std`) | 1 relaxed load | Over soft → `EnterError::MemoryPressure` without taking the mutex |
+| `snapshot_v1()` + `find_anomalies()` | Layer 5 (cold) | structural: 512 B, CRC32 | Zero-allocation telemetry; `assert_no_anomalies!()` CI gate |
+| `before.diff(&after)` + `write_triage` | Layer 5 (cold) | structural: pure `Copy` math + `fmt::Write` | Counter deltas since last sample; one ASCII verdict card |
+| `memory_limits(soft, hard)` + admission | Layer 2 (`std`) | structural: 1 relaxed load | Over soft → `EnterError::MemoryPressure` without taking the mutex |
 
 ### ⚡ Contended Multi-Threaded Latencies (Real Cross-Core Saturation)
 Measured with half of available hardware cores active (6 concurrent threads under contention, AMD Ryzen 5 4600H):

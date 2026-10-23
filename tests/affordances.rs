@@ -1,6 +1,7 @@
 //! Shared-memory aggregate + poison-tolerant lock + blocking pause gate.
 
 use snubber::{Directive, NodeSet, SafeLockExt, SnubberNode, TaskConduit};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
@@ -53,6 +54,7 @@ fn safelock_recovers_poisoned_mutex() {
 
 #[test]
 fn wait_while_paused_blocks_on_condvar_until_resume() {
+    static WORKER_PASSED: AtomicBool = AtomicBool::new(false);
     let (conduit, handle): (TaskConduit<u8>, _) = TaskConduit::pair(0);
     // Fast path: no pause armed.
     assert_eq!(conduit.wait_while_paused(), Directive::Proceed);
@@ -61,12 +63,22 @@ fn wait_while_paused_blocks_on_condvar_until_resume() {
     let b = Arc::clone(&barrier);
     let worker = std::thread::spawn(move || {
         b.wait();
-        conduit.wait_while_paused()
+        let d = conduit.wait_while_paused();
+        WORKER_PASSED.store(true, Ordering::Release);
+        d
     });
     barrier.wait();
     // Give the worker a real chance to park (no sleep-poll on OUR side —
     // the worker itself sleeps in the kernel via Condvar).
     std::thread::sleep(Duration::from_millis(50));
+    // Regression guard (not a sleep guess): the worker MUST still be
+    // parked behind the pause. If `wait_while_paused` ever stopped
+    // blocking, it would fly past this point and the assert fails.
+    assert!(
+        !WORKER_PASSED.load(Ordering::Acquire),
+        "worker passed wait_while_paused while the directive was still Pause"
+    );
     handle.resume();
     assert_eq!(worker.join().expect("worker joins"), Directive::Proceed);
+    assert!(WORKER_PASSED.load(Ordering::Acquire));
 }
