@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-337%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-347%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -74,6 +74,7 @@ drain.finish();                                        // EOF → rescue classif
 * **SPIN vs SLEEP Classification:** A hot `loop {}` settles as `SpinDetected`, a blocked syscall as `TimedOut` — identical rollback, distinct verdict, no thread ever killed. 8-byte `WorkerPulse` heartbeat strokes the hardware WDT on firmware.
 * **Zero-Allocation Telemetry:** 512-byte diagnostic snapshots with CRC32 integrity, zero heap allocations on the hot path, and CI validation via `assert_no_anomalies!()`.
 * **Selective Pass-Through (Canary Law):** Builder-sealed `passthrough(true)` runs open-doors transit for differential proof — naked leaks counted lock-free, guarded rescues; wire frame stays 512 B.
+* **Extensible by Contract:** Public error/classification enums are `#[non_exhaustive]` (0.6.0), so new verdicts are additive — downstream matches must keep a `_` arm, and the crate's own internal matches stay exhaustive. `friction_fn` / `pressure_fn` accept capturing closures stored in `Arc<dyn Fn>` and run outside the node lock; `snub_check_map!` maps invariant breaches into your error type; `NodeName::{Static, Owned}` names nodes at runtime without touching the `Copy` telemetry frames; format ceilings (3 priority lanes, 4 profile stages, 16 ISR slots, 28 B token payload, 512 B snapshot, 250 ms EOF grace) are published constants.
 * **Impedance Bridge:** A 10 000 msg/s producer feeding a 60 FPS consumer gets a one-slot `ConflateSender` — latest wins, replacements counted, backlog stays at 0 or 1. A 16-byte `ExecutionEnvelope` also guards the other wall: work that returns too fast (stale cache, skipped loop) ticks `envelope_underflows` without feeding the breaker. `ProfileHarness` measures min/median/max/jitter/burst and derives the envelope from real numbers.
 
 ---
@@ -83,7 +84,7 @@ drain.finish();                                        // EOF → rescue classif
 Measured on AMD Ryzen 5 4600H release build
 (`cargo bench --bench admission_bench`, Criterion: 800 ms warmup,
 2 s measurement, 50 samples, isolated node per bench; re-measured
-2026-10-23 after the drain-feed and token-sink groups were added):
+2026-10-23 after the drain-feed, token-sink and extensibility groups were added):
 
 | Operation | Architecture Layer | Average Latency | Notes |
 |---|---|---|---|
@@ -123,6 +124,10 @@ Measured on AMD Ryzen 5 4600H release build
 | `run_supervised_guard_with_memory` | Layer 4 (`std`) | 1 sampler call / 10 ms tick | Soft logs `MEMORY_DRAIN`; hard `kill()` without draining (`DeathCause::MemoryLimit`) |
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | Layer 2 (`std`, opt-in) | 1 `Box` + 1 clock/stage | Stage wall/CPU breakdown; default `enter*` reads no profile clock |
 | `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.13 µs** | 512-byte zero-allocation snapshot CRC32 codec |
+| `friction_fn` handler call (`Arc<dyn Fn>`) | Layer 4 (`std`) | **~1.8 ns** | Capture-capable friction: one dynamic dispatch outside the node lock |
+| `friction_wait_ms` (adaptive, Arc handler) | Layer 4 (`std`) | **~21.5 ns** | Lock + `Arc` clone + handler; identical to the legacy fn-pointer path (~21.5 ns) |
+| `NodeName::Static` clone | Layer 4 (`std`) | **~1.5 ns** | Fat-pointer copy, no allocation |
+| `NodeName::Owned` clone | Layer 4 (`std`) | **~9.9 ns** | One `Arc<str>` increment; `as_str` ~1.0 ns |
 | `snapshot_v1()` + `find_anomalies()` | Layer 5 (cold) | **512 B, CRC32** | Zero-allocation telemetry; `assert_no_anomalies!()` CI gate |
 | `before.diff(&after)` + `write_triage` | Layer 5 (cold) | pure `Copy` math + `fmt::Write` | Counter deltas since last sample; one ASCII verdict card |
 | `memory_limits(soft, hard)` + admission | Layer 2 (`std`) | 1 relaxed load | Over soft → `EnterError::MemoryPressure` without taking the mutex |

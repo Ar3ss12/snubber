@@ -12,6 +12,11 @@
 > CPU-spin classifier (`TimedOut` vs `SpinDetected` vs `DeadlockSuspected`,
 > silence ceiling optional), 8-byte `WorkerPulse`
 > heartbeat. See [Layer 1.5](#layer-15-hang-classification-spin-vs-sleep-vs-deadlock--pulse).
+>
+> Extensibility (v0.6.0): `#[non_exhaustive]` verdict enums,
+> capture-capable `friction_fn` / `pressure_fn` hooks, runtime
+> `NodeName`, mapped invariant gate `snub_check_map!`, explicit-argv
+> supervision. See [Extensibility](#extensibility-v060-hooks-names-gates).
 
 ---
 
@@ -1361,6 +1366,103 @@ CPS in a hot loop (F10 — the `last_fault` clone shows up in the
 profiler at 160 CPS).
 
 ---
+
+## Extensibility (0.6.0): hooks, names, gates
+
+### Public verdict enums are `#[non_exhaustive]`
+
+`EnterError`, `FaultKind`, `AnomalyKind`, `ReapClass`, `RestartDecision`,
+`Directive`, `Refusal`, `GateError`, `MemoryVerdict`, `DeathCause`,
+`GatewaySendError`/`GatewayRecvError`, `PoolError`, `IsrPushError`,
+`StallKind`, `TimeVerdict`, `PayloadVerdict`, `SnapshotError`,
+`BreakerState`, `SnubberError`, `StageKind` and `TimeoutCheck` carry
+`#[non_exhaustive]`. Two consequences:
+
+* Your matches against them must keep a `_` arm. A new verdict compiles
+  against your code and hits your arm explicitly — it is never silently
+  reinterpreted.
+* This is why the release is 0.6.0, not a patch. Inside the crate the
+  matches stay exhaustive on purpose: the attribute only binds
+  downstream crates, and a wildcard there would be dead code.
+
+### Capture-capable backpressure hooks
+
+`.friction_fn(f)` accepts any `Fn(u32, u32) -> u64 + Send + Sync +
+'static` — a plain `fn` still compiles unchanged, a capturing closure now
+compiles too. The handler is stored behind `Arc<dyn Fn>` and invoked
+OUTSIDE the node lock (the lock is dropped before the call, so a handler
+may re-enter the node). `.friction_fn_ptr(f)` is the explicit
+fn-pointer wrapper kept for code that names `FrictionFn` in signatures.
+
+`.pressure_fn(f)` accepts any `Fn(Backpressure) + Send + Sync + 'static`
+and puts the node in custom-reaction mode: saturation refuses the caller
+without parking and hands the readings to your closure. It is the
+closure-friendly replacement for `BackpressurePolicy::Custom(fn)`, which
+stays as the legacy variant. Measured cost of the dynamic dispatch:
+~1.8 ns per handler call; the full `friction_wait_ms` path is identical
+with either storage (~21.5 ns on the reference machine).
+
+### Runtime node names
+
+`SnubberNode::builder` accepts `impl Into<NodeName>`:
+
+```rust,no_run
+use snubber::{SnubberNode, NodeName};
+
+let a = SnubberNode::builder("static/label").build();          // Static, no allocation
+let b = SnubberNode::builder(format!("shard-{}", 7)).build();  // Owned, Arc<str>
+let c = SnubberNode::builder(NodeName::owned("worker-3".to_string())).build();
+```
+
+`node.name()` returns `NodeName` (clone: a fat-pointer copy for
+`Static`, one `Arc` increment for `Owned`). `FaultRecord::node` carries
+the same label. The `Copy` telemetry frames (`SnapshotV1`, `MetricSample`,
+`Anomaly`, wire headers) stay `&'static str`: metric rows and anomaly
+verdicts for an owned-name node export the marker `<owned>` — read
+`FaultRecord::node` or `node.name()` for the exact label.
+
+### Mapped invariant gate
+
+```rust
+use snubber::snub_check_map;
+
+#[derive(Debug, PartialEq)]
+enum Gate { Amount }
+
+impl From<&'static str> for Gate {
+    fn from(_: &'static str) -> Self { Gate::Amount }
+}
+
+fn check(amount: i64) -> Result<(), Gate> {
+    snub_check_map!(amount > 0, "amount must be positive");
+    Ok(())
+}
+assert_eq!(check(-1), Err(Gate::Amount));
+```
+
+`snub_check!(cond, reason)` is unchanged (`&'static str` early return);
+`snub_check_map!(cond, err)` routes the reason through `From` into the
+function's own error type.
+
+### Explicit-argv supervision
+
+`Supervisor::run_supervised_guard`, `..._with_lease` and
+`..._with_memory` have `_argv` twins that take the full argument vector
+(index 0 is the program name, same shape as `std::env::args()`). Tests,
+embedded launchers and shells that parsed their own command line use
+them instead of inheriting the process argv. Without `--supervisor`, or
+when `worker_flag` is present, they return `false` immediately — a
+cheap unit-test hook.
+
+### Format ceilings are a contract
+
+Published constants, compile-asserted in the source, not tunables:
+3 priority lanes (`Priority::COUNT`), 4 inline profile stages
+(`PROFILE_STAGES`), 16 ISR ring slots (`ISR_RING_CAP`), 28 B token
+payload / 40 B body (`TOKEN_PAYLOAD_LEN` / `TOKEN_BODY_LEN`), 512 B
+snapshot frame (`SNAPSHOT_LEN`), 250 ms default pool EOF grace
+(`DEFAULT_EOF_GRACE_MS`). Changing any of them is a wire-format version
+bump, not a patch.
 
 ## Multiplatform POSIX / Linux & Embedded Integration
 

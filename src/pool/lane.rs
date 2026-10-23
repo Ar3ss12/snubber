@@ -18,6 +18,7 @@ use super::{PoolConfig, PoolError};
 
 /// How a reaped child is classified from ITS OWN drain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ReapClass {
     /// An un-settled arm frame was still in the pipe at death.
     Ambush,

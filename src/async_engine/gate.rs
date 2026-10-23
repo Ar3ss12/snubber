@@ -105,6 +105,7 @@ impl AsyncGate {
 /// Why the gate refused to wrap / admit.
 #[must_use = "a GateError forbids parking a thread under async — rebuild AdviseOnly, never drop it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum GateError {
     /// Node would park a thread (`BlockCaller`/`AdaptiveBlock` armed).
     /// Rebuild with `BackpressurePolicy::AdviseOnly`.
@@ -131,6 +132,7 @@ pub fn classify(err: &EnterError) -> Refusal {
 /// Async outcome of one admission attempt.
 #[must_use = "a Refusal maps to an HTTP verdict (FailFast/Backoff/Ignore/BadRequest) — handle it, never drop it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Refusal {
     /// Failing downstream target — serve fallback, `200` with degraded body.
     FailFast,

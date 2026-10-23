@@ -204,6 +204,39 @@ delivery cannot depend on how the transport sliced the stream:
   bytes as `to_bytes()` / `to_frames()`, so a sink round-trip through
   `feed` yields the same counters and rescue classification as stdout.
 
+### Invariant 12: Public API Extensibility Contract (0.6.0)
+
+The public verdict surface evolves additively and honestly:
+
+- Error/classification enums (`EnterError`, `FaultKind`, `AnomalyKind`,
+  `ReapClass`, `RestartDecision`, `Directive`, `Refusal`, `GateError`,
+  `MemoryVerdict`, `DeathCause`, `GatewaySendError`,
+  `GatewayRecvError`, `PoolError`, `IsrPushError`, `StallKind`,
+  `TimeVerdict`, `PayloadVerdict`, `SnapshotError`, `BreakerState`,
+  `SnubberError`, `StageKind`, `TimeoutCheck`) are `#[non_exhaustive]`:
+  a new variant is additive semver, and downstream matches must carry a
+  `_` arm. Internal (defining-crate) matches stay exhaustive — the
+  attribute binds only downstream crates, and a wildcard there would be
+  unreachable code.
+- Foreign hooks never run under the node lock. `friction_fn` /
+  `friction_fn_ptr` / `pressure_fn` handlers are stored as
+  `Arc<dyn Fn + Send + Sync>`, cloned (one atomic increment) under the
+  lock and invoked after it is dropped; a handler may re-enter the node
+  without deadlock.
+- Node identity is dynamic without touching the `Copy` telemetry frames:
+  `NodeName::{Static, Owned}` clones as a fat-pointer copy or one `Arc`
+  increment; `SnapshotV1`, `MetricSample`, `Anomaly` and the wire
+  headers keep `&'static str` (owned labels export the `<owned>`
+  marker there).
+- Format ceilings are published constants, not accidents:
+  `Priority::COUNT` (3), `PROFILE_STAGES` (4), `ISR_RING_CAP` (16),
+  `TOKEN_PAYLOAD_LEN` (28) / `TOKEN_BODY_LEN` (40), `SNAPSHOT_LEN`
+  (512), `DEFAULT_EOF_GRACE_MS` (250). Each is compile-asserted in the
+  source; changing one is a wire-format version bump.
+- `Supervisor::..._argv(&[String])` variants run the supervisor loop on
+  an explicit argument vector; without `--supervisor` or with the worker
+  flag present they return `false` before spawning anything.
+
 ---
 
 ## 2. Verification Protocol
@@ -233,6 +266,9 @@ cargo test --test lock_hierarchy
 
 # Verify pulse black-box (stall verdicts in v3 snapshot + anomaly)
 cargo test --test diagnostics pulse_stall
+
+# Verify extensibility contract (hooks outside the lock, names, ceilings, argv)
+cargo test --test extensibility
 
 # Verify memory refusal + snapshot v4 gauges (soft refuses, hard verdicts)
 cargo test --test memory_pressure
@@ -286,7 +322,7 @@ python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggres
 
 ## 3. Reporting a Discrepancy
 
-If you identify a scenario where any of the eleven invariants above fails using purely Safe Rust:
+If you identify a scenario where any of the twelve invariants above fails using purely Safe Rust:
 
 1. **Minimal Reproduction:** Construct an isolated integration test demonstrating the violation (failing an explicit `assert!`).
 2. **Deterministic Trigger:** The test must run and fail within 30 seconds without requiring external infrastructure.

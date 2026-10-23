@@ -13,6 +13,7 @@
 
 /// Verdict for one external memory sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum MemoryVerdict {
     /// `used < soft` (or no limits configured): admit normally.
     #[default]

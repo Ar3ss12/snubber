@@ -95,6 +95,12 @@ fn main() {
                     println!("[WORKER:PREEMPT] reason={reason}");
                     return Err(reason);
                 }
+                // `Directive` is #[non_exhaustive]: steering modes are a
+                // format contract — a new one must be handled, not ignored.
+                _ => {
+                    println!("[WORKER:DIRECTIVE] action=unknown_directive");
+                    return Err("unknown_directive");
+                }
             }
             thread::sleep(Duration::from_millis(25));
             conduit.update_state(|s| {

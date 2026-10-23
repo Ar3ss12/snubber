@@ -18,6 +18,7 @@ use core::fmt;
 /// Dense, zero-allocation `Copy` enum sized by [`FaultKind::COUNT`].
 /// Enables indexed table lookups and metrics tracking without hashing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum FaultKind {
     /// Guard dropped without explicit `commit`/`abort` (early return, `?`, unhandled drop).
     ImplicitDrop,
@@ -121,6 +122,15 @@ pub enum Priority {
 }
 
 impl Priority {
+    /// Number of priority lanes — FORMAT CONTRACT, not a tunable.
+    ///
+    /// The wire histogram, telemetry arrays and preemption law are
+    /// indexed `0..COUNT`; changing it is a snapshot/wire version bump.
+    pub const COUNT: usize = 3;
+
+    /// Every lane in ascending order (`Background → Normal → Critical`).
+    pub const ALL: [Priority; Self::COUNT] = [Self::Background, Self::Normal, Self::Critical];
+
     /// Numerical representation of priority ranking.
     #[inline]
     #[must_use]

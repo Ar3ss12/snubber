@@ -107,6 +107,12 @@ const COVERED: &[&str] = &[
     "contended_node_scoped_threads_",
     "contended_gateway_mpsc_threads_",
     "cross_thread_isr_bridge_push_pop",
+    "friction_handler_arc_call",
+    "friction_wait_adaptive_arc",
+    "friction_wait_adaptive_fn",
+    "node_name_clone_static",
+    "node_name_clone_owned",
+    "node_name_as_str",
 ];
 
 /// Extract literal names from `g.bench_function("name"` sites.

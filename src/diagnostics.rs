@@ -21,7 +21,12 @@ use alloc::vec::Vec;
 use super::{SnubberNode, SnubberStats};
 
 /// Snapshot wire size: exactly 512 bytes, zero-padded, CRC32 in last 4.
+///
+/// FORMAT CONTRACT: every `SnapshotV1` frame is 512 B — file dumps,
+/// sidecar pipes and the supervisor's `OP_SNAPSHOT` all assume it.
 pub const SNAPSHOT_LEN: usize = 512;
+
+const _: () = assert!(SNAPSHOT_LEN == 512, "snapshot frame is a 512 B contract");
 /// Snapshot format version (bytes 4..8, LE).
 /// v4: memory bounds/sample/peak/rejections + waiter queue gauges
 /// (Phase 2 memory control). v3 added `pulse_stalls` +
@@ -346,6 +351,7 @@ impl SnapshotV1 {
 /// Snapshot decode refusal (hard, never half-parsed).
 #[must_use = "a SnapshotError names why the cold frame refused (BadMagic/BadVersion/BadCrc) — match it, never drop it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SnapshotError {
     /// First 4 bytes are not `b"SNUB"`.
     BadMagic,
@@ -418,6 +424,7 @@ pub fn diagnostic_hash(node: &str, snap: &SnapshotV1) -> u32 {
 
 /// Anomaly verdict kind (cold math, no IO).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum AnomalyKind {
     /// `shed_bulkhead / total > bottleneck_pct`: slow worker, raise the
     /// limit or shorten the critical section.
@@ -1217,7 +1224,10 @@ macro_rules! assert_no_anomalies {
     ($node:expr, $policy:expr) => {{
         let __stats = $node.stats();
         let __name = $node.name();
-        let __hits = $crate::find_anomalies(__name, &__stats, $policy);
+        // `Anomaly` is `Copy` and `core`-only: owned names export the
+        // marker, exact label stays on `$node.name()`.
+        let __label = __name.as_static().unwrap_or("<owned>");
+        let __hits = $crate::find_anomalies(__label, &__stats, $policy);
         assert!(
             __hits.is_empty(),
             "snubber anomalies on node {:?}: {:?} (stats: {:?})",

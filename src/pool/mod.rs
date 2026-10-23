@@ -50,6 +50,14 @@ use std::sync::Arc;
 
 use crate::supervisor::{Backoff, MemoryPolicy, RestartPolicy, RestartWindow};
 
+/// Default EOF grace before a silent drain is reaped as
+/// [`ReapClass::Deadlocked`], ms.
+///
+/// FORMAT CONTRACT: 250 ms is the published default that the pool tests
+/// and the supervisor examples assume; it is overridable per pool via
+/// [`PoolConfig::with_eof_grace`], never silently changed.
+pub const DEFAULT_EOF_GRACE_MS: u64 = 250;
+
 /// Declarative pool configuration, copied into every lane.
 ///
 /// The restart parts are PER LANE: lane 3's crash storm advances only lane
@@ -84,7 +92,7 @@ impl PoolConfig {
             backoff: Backoff::exponential(50, 1000),
             window: RestartWindow::new(3, 10),
             memory: MemoryPolicy::new(0, 0),
-            eof_grace_ms: 250,
+            eof_grace_ms: DEFAULT_EOF_GRACE_MS,
         }
     }
 
@@ -126,6 +134,7 @@ impl Default for PoolConfig {
 
 /// Pool construction refusal. Lane-level refusals are listed last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum PoolError {
     /// Zero lanes requested.
     NoLanes,

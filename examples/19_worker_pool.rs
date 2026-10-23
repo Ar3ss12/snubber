@@ -418,6 +418,12 @@ fn run_lane(lane: Arc<PoolLane>, kills: u64, mixed: bool, lease_ms: u64) -> u64 
                 );
                 return lease_kills;
             }
+            // `RestartDecision` is #[non_exhaustive]: a new verdict stops
+            // the lane instead of looping on an unknown policy.
+            _ => {
+                eprintln!("[POOL:LANE {index}] decision=unknown");
+                return lease_kills;
+            }
         }
     }
     lease_kills

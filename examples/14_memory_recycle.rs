@@ -88,6 +88,9 @@ fn main() {
                 );
                 assert_eq!(cause, DeathCause::MemoryLimit);
             }
+            // `MemoryVerdict` is #[non_exhaustive]: a future band (e.g. a
+            // hysteresis state) is compiled against, never silently ignored.
+            _ => unreachable!("this example only configures soft + hard"),
         }
     }
 

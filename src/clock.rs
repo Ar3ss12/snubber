@@ -54,6 +54,7 @@ pub trait CpuClock: Copy {
 /// Stall verdict from one `(wall_delta, cpu_delta)` sample pair.
 /// Pure `const` math — no clock reads, no syscalls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum StallKind {
     /// Within budget — keep working.
     WithinBudget,

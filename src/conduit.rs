@@ -18,6 +18,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 /// Directives sent by the caller/observer to the executing worker.
 #[must_use = "IGNORING DIRECTIVES INVITES DEADLOCK: match Proceed/Pause/Cancel/SkipStage/Preempted — never drop the verdict sight unseen"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Directive {
     /// Continue execution.
     Proceed,
@@ -187,6 +188,8 @@ impl<S, D> TaskConduit<S, D> {
     ///         Directive::Proceed | Directive::SkipStage => { /* one unit */ }
     ///         Directive::Pause => continue, // re-armed before wake; re-park
     ///         Directive::Cancel(r) | Directive::Preempted(r) => break, // r: &'static str
+    ///         // `Directive` is #[non_exhaustive]: unknown steering stops the unit.
+    ///         _ => break,
     ///     }
     ///     let _ = &handle;
     ///     break;

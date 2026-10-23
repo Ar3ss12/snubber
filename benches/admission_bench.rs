@@ -775,9 +775,64 @@ fn bench_contended(c: &mut Criterion) {
 
     g.finish();
 }
+fn bench_extensibility(c: &mut Criterion) {
+    use snubber::{BackpressurePolicy, NodeName};
+    use std::sync::Arc;
+
+    let mut g = c.benchmark_group("layer4_extensibility");
+
+    // Capture-capable handler: one dynamic dispatch through Arc<dyn Fn>.
+    let handler: Arc<dyn Fn(u32, u32) -> u64 + Send + Sync> =
+        Arc::new(|in_flight, max| 1 + u64::from(in_flight) * 3 + u64::from(max));
+    g.bench_function("friction_handler_arc_call", |b| {
+        b.iter(|| black_box(handler(black_box(4), black_box(16))));
+    });
+
+    // Full cold read: lock, Arc clone, dyn call outside the lock.
+    let adaptive = SnubberNode::builder("bench/friction")
+        .max_in_flight(16)
+        .backpressure(BackpressurePolicy::AdaptiveBlock {
+            max_wait_ms: 500,
+            shed_deeper_than: None,
+        })
+        .friction_fn(|in_flight, max| 1 + u64::from(in_flight) * 3 + u64::from(max))
+        .build();
+    g.bench_function("friction_wait_adaptive_arc", |b| {
+        b.iter(|| black_box(adaptive.friction_wait_ms()));
+    });
+
+    // Legacy fn-pointer math on the same path.
+    let legacy = SnubberNode::builder("bench/friction-fn")
+        .max_in_flight(16)
+        .backpressure(BackpressurePolicy::AdaptiveBlock {
+            max_wait_ms: 500,
+            shed_deeper_than: None,
+        })
+        .friction_fn_ptr(|in_flight, max| 1 + u64::from(in_flight) * 3 + u64::from(max))
+        .build();
+    g.bench_function("friction_wait_adaptive_fn", |b| {
+        b.iter(|| black_box(legacy.friction_wait_ms()));
+    });
+
+    // Node identity: static clone is a fat-pointer copy, owned is an Arc bump.
+    let static_name = NodeName::Static("bench/node");
+    let owned_name = NodeName::owned(String::from("bench/node"));
+    g.bench_function("node_name_clone_static", |b| {
+        b.iter(|| black_box(static_name.clone()));
+    });
+    g.bench_function("node_name_clone_owned", |b| {
+        b.iter(|| black_box(owned_name.clone()));
+    });
+    g.bench_function("node_name_as_str", |b| {
+        b.iter(|| black_box(owned_name.as_str()));
+    });
+
+    g.finish();
+}
+
 criterion_group!(
     name = benches;
     config = fast();
-    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_impedance, bench_layer4_layer5, bench_pipe_drain, bench_drain_feed, bench_pool, bench_contended
+    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_impedance, bench_layer4_layer5, bench_pipe_drain, bench_drain_feed, bench_pool, bench_extensibility, bench_contended
 );
 criterion_main!(benches);

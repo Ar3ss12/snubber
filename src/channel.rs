@@ -172,6 +172,7 @@ fn depth_u8(depth: usize) -> u8 {
 
 /// Why a `send` call was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum GatewaySendError {
     /// Channel capacity exceeded. Non-blocking drop.
     Full,
@@ -216,6 +217,7 @@ impl GatewaySendError {
 
 /// Why a blocking `recv` returned without a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum GatewayRecvError {
     /// All senders dropped and the channel queue is empty.
     Disconnected,

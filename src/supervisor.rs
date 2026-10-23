@@ -77,6 +77,7 @@ impl Default for GenerationClock {
 
 /// Why the worker died (`Copy` only — no handles).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum DeathCause {
     /// Pipe broke / handle signaled (`abort()`, panic-abort, SIGKILL).
     AbortUnwind,
@@ -317,6 +318,7 @@ impl Default for RestartWindow {
 /// is ADVICE the caller sleeps with its own sleeper.
 #[must_use = "a RestartDecision orders the lineage (Stop/GiveUp/Restart) — match it, never drop it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum RestartDecision {
     /// Do not re-spawn: `Never`, clean exit under `OnCrash`, or storm.
     Stop,
@@ -465,6 +467,22 @@ impl RestartTracker {
     }
 }
 
+/// Payload bytes carried by one [`ProcessToken`] frame.
+///
+/// FORMAT CONTRACT: 28 B on the wire (`u64 task + u32 opcode + 28 B
+/// payload` = 40 B body after [`TOKEN_MAGIC`]). The state handoff splits
+/// the 64 B digest into 28/28/16 chunks against this ceiling.
+pub const TOKEN_PAYLOAD_LEN: usize = 28;
+
+/// One token body: payload plus `task`/`opcode` fields, bytes.
+pub const TOKEN_BODY_LEN: usize = core::mem::size_of::<ProcessToken>();
+
+const _: () = assert!(
+    TOKEN_PAYLOAD_LEN == 28,
+    "token payload is a 28 B format contract"
+);
+const _: () = assert!(TOKEN_BODY_LEN == 40, "token body is a 40 B format contract");
+
 /// Last-armed 40-byte token: `[task u64 | opcode u32 | payload [u8;28]]`.
 ///
 /// `OP_COMMIT` clears the armed token (settled clean). Any other opcode
@@ -477,7 +495,7 @@ pub struct ProcessToken {
     /// Action code (`OP_COMMIT` = settle-clean, else emergency opcode).
     pub opcode: u32,
     /// Fixed payload (file id, relay index — never a path).
-    pub payload: [u8; 28],
+    pub payload: [u8; TOKEN_PAYLOAD_LEN],
 }
 
 /// Framing sync-word prefix ("SNUB" = 0x53, 0x4E, 0x55, 0x42).
@@ -509,7 +527,7 @@ impl ProcessToken {
     /// Build from parts (worker side, no alloc).
     #[inline]
     #[must_use]
-    pub const fn new(task: u64, opcode: u32, payload: [u8; 28]) -> Self {
+    pub const fn new(task: u64, opcode: u32, payload: [u8; TOKEN_PAYLOAD_LEN]) -> Self {
         Self {
             task,
             opcode,
@@ -827,8 +845,8 @@ struct DrainState {
     commits: u64,
     /// Last verified complete StateDigest.
     state: Option<StateDigest>,
-    /// Reassembly scratch: chunks per seq (24/24/16) + got-mask + full CRC.
-    scratch: [[u8; 28]; 3],
+    /// Reassembly scratch: chunks per seq (28/28/8) + got-mask + full CRC.
+    scratch: [[u8; TOKEN_PAYLOAD_LEN]; 3],
     scratch_got: u8,
     scratch_full_crc: u32,
 }
@@ -1199,7 +1217,7 @@ fn apply_token(state: &mut DrainState, token: ProcessToken, now_ms: u64) {
 
 /// Emergency opcode handler `fn(opcode, payload)` — runs in the
 /// SUPERVISOR, fast + idempotent + lock-free (same as any rollback).
-pub type TokenRollback = fn(u32, [u8; 28]);
+pub type TokenRollback = fn(u32, [u8; TOKEN_PAYLOAD_LEN]);
 
 /// External RSS sampler: child pid -> resident KiB (the APP's platform call).
 type MemorySampler<'a> = &'a dyn Fn(u32) -> Option<u64>;
@@ -1248,6 +1266,23 @@ impl Supervisor {
         Self::run_supervised_guard_with_lease(worker_flag, 0, on_dead_token)
     }
 
+    /// Explicit-argv form of [`Self::run_supervised_guard`].
+    ///
+    /// `argv` is the FULL argument vector, index 0 is the program name
+    /// (identical shape to `std::env::args()`). Use it from tests,
+    /// embedded launchers, or shells that already parsed their own
+    /// command line instead of inheriting the process argv.
+    pub fn run_supervised_guard_argv<F>(
+        worker_flag: &'static str,
+        argv: &[String],
+        on_dead_token: F,
+    ) -> bool
+    where
+        F: Fn(ProcessToken),
+    {
+        Self::run_supervised_guard_with_lease_argv(worker_flag, argv, 0, on_dead_token)
+    }
+
     /// Inspect command line args and run the child process supervisor loop with an active silence lease (`lease_ms`).
     ///
     /// If `lease_ms > 0` and the child worker is silent (pipe open but no tokens/heartbeats)
@@ -1262,7 +1297,24 @@ impl Supervisor {
     where
         F: Fn(ProcessToken),
     {
-        Self::run_loop(worker_flag, lease_ms, None, on_dead_token)
+        let argv: Vec<String> = std::env::args().collect();
+        Self::run_loop(worker_flag, &argv, lease_ms, None, on_dead_token)
+    }
+
+    /// Explicit-argv form of [`Self::run_supervised_guard_with_lease`].
+    ///
+    /// `argv[0]` is the program name; `--supervisor` and `worker_flag`
+    /// are stripped before forwarding to the child.
+    pub fn run_supervised_guard_with_lease_argv<F>(
+        worker_flag: &'static str,
+        argv: &[String],
+        lease_ms: u64,
+        on_dead_token: F,
+    ) -> bool
+    where
+        F: Fn(ProcessToken),
+    {
+        Self::run_loop(worker_flag, argv, lease_ms, None, on_dead_token)
     }
 
     /// Supervised loop with an external memory sampler (Phase 3).
@@ -1288,8 +1340,32 @@ impl Supervisor {
         F: Fn(ProcessToken),
         S: Fn(u32) -> Option<u64>,
     {
+        let argv: Vec<String> = std::env::args().collect();
         Self::run_loop(
             worker_flag,
+            &argv,
+            lease_ms,
+            Some((policy, &sample)),
+            on_dead_token,
+        )
+    }
+
+    /// Explicit-argv form of [`Self::run_supervised_guard_with_memory`].
+    pub fn run_supervised_guard_with_memory_argv<F, S>(
+        worker_flag: &'static str,
+        argv: &[String],
+        lease_ms: u64,
+        policy: MemoryPolicy,
+        sample: S,
+        on_dead_token: F,
+    ) -> bool
+    where
+        F: Fn(ProcessToken),
+        S: Fn(u32) -> Option<u64>,
+    {
+        Self::run_loop(
+            worker_flag,
+            argv,
             lease_ms,
             Some((policy, &sample)),
             on_dead_token,
@@ -1298,6 +1374,7 @@ impl Supervisor {
 
     fn run_loop<F>(
         worker_flag: &'static str,
+        args: &[String],
         lease_ms: u64,
         memory: Option<(MemoryPolicy, MemorySampler<'_>)>,
         on_dead_token: F,
@@ -1306,7 +1383,6 @@ impl Supervisor {
         F: Fn(ProcessToken),
     {
         let mut memory = memory;
-        let args: Vec<String> = std::env::args().collect();
         let is_worker = args.iter().any(|a| a == worker_flag);
         let wants_supervisor = args.iter().any(|a| a == "--supervisor");
 
@@ -1326,10 +1402,12 @@ impl Supervisor {
             }
         };
 
-        // Forward args except --supervisor
+        // Forward args except --supervisor and our own worker flag.
+        // `skip(1)`: index 0 is the program name; an empty custom argv
+        // simply forwards nothing.
         let mut child_cmd = std::process::Command::new(current_exe);
         child_cmd.arg(worker_flag);
-        for arg in &args[1..] {
+        for arg in args.iter().skip(1) {
             if arg != "--supervisor" && arg != worker_flag {
                 child_cmd.arg(arg);
             }

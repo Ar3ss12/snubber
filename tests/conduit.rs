@@ -40,6 +40,9 @@ fn sync_intercom_live_inspection_and_directives() {
                 }
                 Directive::Cancel(_) | Directive::Preempted(_) => return Err("cancelled"),
                 Directive::SkipStage => break,
+                // `Directive` is #[non_exhaustive]: treat unknown steering
+                // modes as a stop rather than running through them.
+                _ => return Err("unknown_directive"),
             }
             std::thread::sleep(Duration::from_millis(1));
         }

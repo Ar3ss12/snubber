@@ -14,6 +14,7 @@
 
 /// Time half of the verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum TimeVerdict {
     /// Inside the declared corridor (or no bounds declared).
     #[default]
@@ -37,6 +38,7 @@ pub enum TimeVerdict {
 
 /// Payload half of the verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum PayloadVerdict {
     /// Inside the declared corridor (or no bounds declared).
     #[default]

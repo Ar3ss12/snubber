@@ -117,6 +117,9 @@ fn cycle_torture_conservation_holds() {
                         Err(EnterError::MemoryPressure) => {
                             unreachable!("no memory limits armed in this node");
                         }
+                        // `EnterError` is #[non_exhaustive]: a future refusal
+                        // must be handled explicitly, never silently counted.
+                        Err(_) => unreachable!("unknown refusal in stress loop"),
                     }
                 }
                 if i % 97 == 0 {

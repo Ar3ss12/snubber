@@ -69,9 +69,45 @@ extern crate std;
 /// ```
 #[macro_export]
 macro_rules! snub_check {
-    ($cond:expr, $reason:expr) => {
+    ($cond:expr, $reason:expr $(,)?) => {
         if !($cond) {
             return Err($reason);
+        }
+    };
+}
+
+/// Invariant assertion with error MAPPING: `Err(From::from(err))`.
+///
+/// Use it when the invariant reason must become the caller's error type
+/// (`&'static str` → `String`, domain enum, `anyhow::Error`, …) without a
+/// hand-written `return Err(...into())` at every gate. The target type is
+/// inferred from the function's return type.
+///
+/// # Examples
+/// ```rust
+/// use snubber::snub_check_map;
+///
+/// #[derive(Debug, PartialEq)]
+/// struct Refused(&'static str);
+///
+/// impl From<&'static str> for Refused {
+///     fn from(reason: &'static str) -> Self {
+///         Self(reason)
+///     }
+/// }
+///
+/// fn check_order(amount: i64) -> Result<(), Refused> {
+///     snub_check_map!(amount > 0, "order amount must be positive");
+///     Ok(())
+/// }
+/// assert!(check_order(100).is_ok());
+/// assert_eq!(check_order(-5), Err(Refused("order amount must be positive")));
+/// ```
+#[macro_export]
+macro_rules! snub_check_map {
+    ($cond:expr, $err:expr $(,)?) => {
+        if !($cond) {
+            return Err(::core::convert::From::from($err));
         }
     };
 }
@@ -120,6 +156,12 @@ pub mod protect;
 
 #[cfg(feature = "alloc")]
 pub mod erased;
+
+#[cfg(feature = "alloc")]
+pub mod name;
+
+#[cfg(feature = "alloc")]
+pub use name::NodeName;
 
 pub use policy::{
     Backpressure, BackpressurePolicy, FaultAction, FaultDetail, FaultKind, FaultPolicy, FrictionFn,
@@ -183,13 +225,14 @@ pub use supervisor::{
     now_ms, take_stdin_digest, Backoff, ClockFn, DeathCause, DrainCounters, GenerationClock,
     MemoryPolicy, NoOrphanGuard, OrphanGuard, PipeDrain, ProcessToken, RestartDecision,
     RestartPolicy, RestartTracker, RestartWindow, StateDigest, Supervisor, TokenRollback,
-    OP_COMMIT, OP_HEARTBEAT, OP_SNAPSHOT, OP_STATE, STATE_LEN,
+    OP_COMMIT, OP_HEARTBEAT, OP_SNAPSHOT, OP_STATE, STATE_LEN, TOKEN_BODY_LEN, TOKEN_PAYLOAD_LEN,
 };
 
 #[cfg(feature = "std")]
 pub use pool::{
     namespace_task, task_lane, task_local, LaneSnapshot, PoolConfig, PoolError, PoolLane, PoolReap,
-    PoolReport, PoolTotals, ReapClass, WorkerPool, LANE_SHIFT, MAX_LANES, TASK_LOCAL_MASK,
+    PoolReport, PoolTotals, ReapClass, WorkerPool, DEFAULT_EOF_GRACE_MS, LANE_SHIFT, MAX_LANES,
+    TASK_LOCAL_MASK,
 };
 
 #[cfg(feature = "std")]

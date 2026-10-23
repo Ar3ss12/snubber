@@ -39,6 +39,7 @@ use super::{
 use super::{EpochGate, SnubberEvent, TransactionHeader};
 use crate::envelope::{EnvelopeVerdict, ExecutionEnvelope, TimeVerdict};
 use crate::memory::{MemoryVerdict, MemoryWatch};
+use crate::NodeName;
 #[cfg(feature = "std")]
 use std::collections::VecDeque;
 #[cfg(feature = "std")]
@@ -57,8 +58,8 @@ use std::sync::{Arc, Mutex};
 pub struct FaultRecord {
     /// Class of the fault.
     pub kind: FaultKind,
-    /// Node that observed it.
-    pub node: &'static str,
+    /// Node that observed it: static literal or `Arc`-shared runtime name.
+    pub node: NodeName,
     /// File that armed the transaction (`#[track_caller]`).
     pub file: &'static str,
     /// Line that armed the transaction (`#[track_caller]`).
@@ -103,6 +104,7 @@ pub struct GuardSnapshot {
 /// fallback. HalfOpen = one probe call decides: success closes,
 /// failure re-opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum BreakerState {
     /// Traffic flows normally.
     #[default]
@@ -460,7 +462,7 @@ pub const DEFAULT_POLICIES: [FaultPolicy; FaultKind::COUNT] = [
 /// single machine byte is generated. The runtime builder stays lenient
 /// on purpose (`max_in_flight(0)` is the "always full" test backdoor).
 pub struct SnubberNodeBuilder {
-    name: &'static str,
+    name: NodeName,
     max_in_flight: usize,
     queue_limit: usize,
     overflow: OverflowPolicy,
@@ -482,7 +484,8 @@ pub struct SnubberNodeBuilder {
     hooks: Vec<FaultHook>,
     policies: [FaultPolicy; FaultKind::COUNT],
     backpressure_policy: BackpressurePolicy,
-    friction_fn: Option<FrictionFn>,
+    friction_fn: Option<Arc<dyn Fn(u32, u32) -> u64 + Send + Sync>>,
+    pressure_fn: Option<Arc<dyn Fn(Backpressure) + Send + Sync>>,
     passthrough: bool,
     memory_soft_kb: u64,
     memory_hard_kb: u64,
@@ -490,9 +493,9 @@ pub struct SnubberNodeBuilder {
 
 // [ANCHOR: BUILDER] — node builder, presets (desktop/embedded/server).
 impl SnubberNodeBuilder {
-    fn new(name: &'static str) -> Self {
+    fn new(name: impl Into<NodeName>) -> Self {
         Self {
-            name,
+            name: name.into(),
             max_in_flight: 16,
             queue_limit: 32,
             overflow: OverflowPolicy::RejectNew,
@@ -517,6 +520,7 @@ impl SnubberNodeBuilder {
             policies: DEFAULT_POLICIES,
             backpressure_policy: BackpressurePolicy::AdviseOnly,
             friction_fn: None,
+            pressure_fn: None,
             passthrough: false,
         }
     }
@@ -841,8 +845,10 @@ impl SnubberNodeBuilder {
     /// Custom friction math `(in_flight, max_in_flight) -> wait_ms`.
     ///
     /// Default (no call): soft linear spring
-    /// `1 + depth * max_wait / 255`. Plug a quadratic/exponential curve
-    /// or a fixed hardware cycle here:
+    /// `1 + depth * max_wait / 255`. Plug a quadratic/exponential curve,
+    /// a fixed hardware cycle, or a capturing closure that reads live
+    /// sensor state — the handler is stored behind `Arc` and invoked
+    /// OUTSIDE the node lock. A plain `fn` still compiles unchanged.
     ///
     /// ```rust
     /// use snubber::SnubberNode;
@@ -851,10 +857,64 @@ impl SnubberNodeBuilder {
     ///     (10.0 + r * r * 500.0) as u64
     /// }
     /// let node = SnubberNode::builder("bus").friction_fn(quadratic).build();
+    ///
+    /// // Capture-capable form (0.6.0): shares state with the caller.
+    /// let scale = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(500));
+    /// let s = std::sync::Arc::clone(&scale);
+    /// let node = SnubberNode::builder("bus")
+    ///     .friction_fn(move |in_flight, max| {
+    ///         let r = in_flight as f32 / max.max(1) as f32;
+    ///         let k = s.load(std::sync::atomic::Ordering::Relaxed);
+    ///         (10.0 + r * r * k as f32) as u64
+    ///     })
+    ///     .build();
     /// ```
     #[must_use]
-    pub fn friction_fn(mut self, f: FrictionFn) -> Self {
-        self.friction_fn = Some(f);
+    pub fn friction_fn<F>(mut self, f: F) -> Self
+    where
+        F: Fn(u32, u32) -> u64 + Send + Sync + 'static,
+    {
+        self.friction_fn = Some(Arc::new(f));
+        self
+    }
+
+    /// Legacy explicit fn-pointer setter: wrapper over [`Self::friction_fn`].
+    ///
+    /// Kept for code that names [`FrictionFn`] in a signature; fn pointers
+    /// satisfy the generic bound, so both forms store the same `Arc`.
+    #[must_use]
+    pub fn friction_fn_ptr(self, f: FrictionFn) -> Self {
+        self.friction_fn(f)
+    }
+
+    /// Capture-capable backpressure reaction, invoked outside the node lock.
+    ///
+    /// Setting this puts the node in custom-reaction mode: saturation
+    /// refuses the caller immediately (no parking) and hands the
+    /// [`Backpressure`] readings to `f`. This is the closure-friendly
+    /// replacement for [`BackpressurePolicy::Custom`], which only accepts
+    /// a non-capturing fn pointer.
+    ///
+    /// ```rust
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    /// use std::sync::Arc;
+    /// use snubber::SnubberNode;
+    ///
+    /// let sheds = Arc::new(AtomicU64::new(0));
+    /// let seen = Arc::clone(&sheds);
+    /// let node = SnubberNode::builder("api")
+    ///     .max_in_flight(1)
+    ///     .pressure_fn(move |bp| {
+    ///         seen.fetch_add(u64::from(bp.depth) + 1, Ordering::Relaxed);
+    ///     })
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn pressure_fn<F>(mut self, f: F) -> Self
+    where
+        F: Fn(Backpressure) + Send + Sync + 'static,
+    {
+        self.pressure_fn = Some(Arc::new(f));
         self
     }
 
@@ -868,7 +928,7 @@ impl SnubberNodeBuilder {
             // Passthrough law sealed OUTSIDE the mutex: transit never locks.
             // `name` is Copy-mirrored for lock-free arming stamps.
             passthrough: self.passthrough,
-            passthrough_name: self.name,
+            passthrough_name: self.name.clone(),
             passthrough_admissions: Arc::new(AtomicU64::new(0)),
             memory_pressure: Arc::clone(&memory_pressure),
             memory_rejections: Arc::new(AtomicU64::new(0)),
@@ -901,6 +961,7 @@ impl SnubberNodeBuilder {
                 policies: self.policies,
                 backpressure_policy: self.backpressure_policy,
                 friction_fn: self.friction_fn,
+                pressure_fn: self.pressure_fn,
                 gate: EpochGate::new(),
                 waiters: VecDeque::new(),
                 in_flight: 0,
@@ -932,7 +993,7 @@ impl SnubberNodeBuilder {
 }
 
 struct NodeInner {
-    name: &'static str,
+    name: NodeName,
     max_in_flight: usize,
     queue_limit: usize,
     overflow: OverflowPolicy,
@@ -969,7 +1030,11 @@ struct NodeInner {
     hooks: Arc<Vec<FaultHook>>,
     policies: [FaultPolicy; FaultKind::COUNT],
     backpressure_policy: BackpressurePolicy,
-    friction_fn: Option<FrictionFn>,
+    // Immutable after `build()`: cloned as `Arc` under the lock (one
+    // atomic increment), invoked OUTSIDE it — foreign code never runs
+    // under the node mutex.
+    friction_fn: Option<Arc<dyn Fn(u32, u32) -> u64 + Send + Sync>>,
+    pressure_fn: Option<Arc<dyn Fn(Backpressure) + Send + Sync>>,
     gate: EpochGate,
     waiters: VecDeque<core::task::Waker>,
     in_flight: usize,
@@ -1059,6 +1124,7 @@ pub(crate) fn now_ms() -> u64 {
 /// Entry rejection reason (returned by `enter` without arming a guard).
 #[must_use = "an EnterError indicates why admission was rejected (BreakerOpen/BulkheadFull/StaleEpoch/...) — match or map it, never drop it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EnterError {
     /// Breaker OPEN and this call is not the half-open probe.
     BreakerOpen,
@@ -1130,6 +1196,7 @@ impl EnterError {
 /// protected work unit (where RAII rollback has already been executed).
 #[must_use = "a SnubberError names the failure origin (Admission = admission rejected, Work = rollback already ran) — match it, never drop it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SnubberError<E> {
     /// Node rejected admission at the perimeter gate (breaker open, bulkhead full, rate limit, invariant breach).
     /// Protected resource was never touched; no rollback executed.
@@ -1275,7 +1342,7 @@ impl<const IN_FLIGHT: usize, const QUEUE: usize> StaticNode<IN_FLIGHT, QUEUE> {
     };
 
     /// Build the node, validating capacities at compile-time FIRST (before any arming).
-    pub fn build(name: &'static str) -> SnubberNode {
+    pub fn build(name: impl Into<NodeName>) -> SnubberNode {
         let () = Self::_CAPACITY_ASSERT;
         SnubberNode::builder(name)
             .max_in_flight(IN_FLIGHT)
@@ -1293,9 +1360,9 @@ pub struct SnubberNode {
     /// Builder-sealed pass-through law (immutable after `build()`).
     /// Outside the mutex: transit reads it without locking.
     passthrough: bool,
-    /// Node name mirrored outside the mutex (`&'static str`, `Copy`):
-    /// sealed at build, stamps dummy arming records without locking.
-    passthrough_name: &'static str,
+    /// Node name mirrored outside the mutex (`NodeName`, sealed at build):
+    /// stamps dummy arming records without locking.
+    passthrough_name: NodeName,
     /// Lock-free transit counter (`Relaxed`): every dummy admission bumps
     /// it without touching the mutex. Read via `stats()` / observer.
     passthrough_admissions: Arc<AtomicU64>,
@@ -1308,8 +1375,12 @@ pub struct SnubberNode {
 
 impl SnubberNode {
     /// Start a builder: `SnubberNode::builder("win32_mouse_driver")`.
+    ///
+    /// Accepts `&'static str` (zero-allocation
+    /// [`NodeName::Static`](crate::NodeName)) or an owned runtime name:
+    /// `SnubberNode::builder(format!("shard-{id}"))`.
     #[must_use]
-    pub fn builder(name: &'static str) -> SnubberNodeBuilder {
+    pub fn builder(name: impl Into<NodeName>) -> SnubberNodeBuilder {
         SnubberNodeBuilder::new(name)
     }
 
@@ -1317,7 +1388,7 @@ impl SnubberNode {
     /// Single-flight critical path, breaker on 3 consecutive drops,
     /// console reporter armed with a small budget.
     #[must_use]
-    pub fn desktop(name: &'static str) -> SnubberNode {
+    pub fn desktop(name: impl Into<NodeName>) -> SnubberNode {
         Self::builder(name)
             .max_in_flight(1)
             .queue_limit(32)
@@ -1331,7 +1402,7 @@ impl SnubberNode {
     /// Tight bulkhead, no console spam (hooks/stats only), breaker on
     /// first repeated failure — silence over noise on the wire.
     #[must_use]
-    pub fn embedded(name: &'static str) -> SnubberNode {
+    pub fn embedded(name: impl Into<NodeName>) -> SnubberNode {
         Self::builder(name)
             .max_in_flight(4)
             .queue_limit(16)
@@ -1345,7 +1416,7 @@ impl SnubberNode {
     /// Wide bulkhead, sliding-window breaker (50 of last 100 failed),
     /// fail-fast overflow, no console (exporters poll `stats()`).
     #[must_use]
-    pub fn server(name: &'static str) -> SnubberNode {
+    pub fn server(name: impl Into<NodeName>) -> SnubberNode {
         Self::builder(name)
             .max_in_flight(1024)
             .queue_limit(4096)
@@ -1357,9 +1428,11 @@ impl SnubberNode {
             .build()
     }
 
-    /// Node name (for reports).
-    pub fn name(&self) -> &'static str {
-        self.lock().name
+    /// Node name (for reports). Clones the shared label — an `Arc`
+    /// increment on [`NodeName::Owned`](crate::NodeName), allocation-free
+    /// on the static arm.
+    pub fn name(&self) -> NodeName {
+        self.lock().name.clone()
     }
 
     /// Who owns the wait on this node (for [`crate::AsyncGate`]).
@@ -1431,7 +1504,7 @@ impl SnubberNode {
             let mut inner = self.lock();
             let record = FaultRecord {
                 kind: FaultKind::PoisonedPayload,
-                node: inner.name,
+                node: inner.name.clone(),
                 file: loc.file(),
                 line: loc.line(),
                 header: TransactionHeader::new(epoch, task_id),
@@ -1454,22 +1527,30 @@ impl SnubberNode {
     /// Friction wait under the CURRENT load, ms (same spring as the sync
     /// `AdaptiveBlock` path: custom curve or `1 + depth * cap / 255`).
     /// `AdviseOnly` nodes return `0` (nothing to pace — admit now).
-    /// Under lock: `Copy` reads only, ZERO-PANIC. The CALLER sleeps
+    /// The handler is cloned (`Arc`, one atomic increment) under the lock
+    /// and invoked AFTER it is dropped — a capturing closure may call back
+    /// into anything without deadlocking the node. The CALLER sleeps
     /// (async: YOUR timer via `enter_paced_async`).
     #[must_use]
     pub fn friction_wait_ms(&self) -> u64 {
-        let inner = self.lock();
-        match inner.backpressure_policy {
-            BackpressurePolicy::AdviseOnly | BackpressurePolicy::Custom(_) => 0,
-            BackpressurePolicy::AdaptiveBlock { max_wait_ms, .. } => {
-                let max = inner.max_in_flight.max(1) as u64;
-                let depth = ((inner.in_flight as u64 * 255 / max).min(255)) as u8;
-                let cap = max_wait_ms.max(1);
-                match inner.friction_fn {
-                    Some(f) => f(inner.in_flight as u32, inner.max_in_flight as u32).min(cap),
-                    None => 1 + depth as u64 * cap / 255,
-                }
-            }
+        let (policy, handler, in_flight, max_in_flight) = {
+            let inner = self.lock();
+            (
+                inner.backpressure_policy,
+                inner.friction_fn.clone(),
+                inner.in_flight,
+                inner.max_in_flight,
+            )
+        };
+        let BackpressurePolicy::AdaptiveBlock { max_wait_ms, .. } = policy else {
+            return 0;
+        };
+        let max = max_in_flight.max(1) as u64;
+        let depth = ((in_flight as u64 * 255 / max).min(255)) as u8;
+        let cap = max_wait_ms.max(1);
+        match handler {
+            Some(f) => f(in_flight as u32, max_in_flight as u32).min(cap),
+            None => 1 + depth as u64 * cap / 255,
         }
     }
 
@@ -1566,11 +1647,12 @@ impl SnubberNode {
         self.passthrough_admissions.load(Ordering::Relaxed)
     }
 
-    /// Node name mirrored outside the mutex (`&'static str`, `Copy`,
-    /// sealed at build): stamps dummy arming records with zero locking.
+    /// Node name mirrored outside the mutex (sealed at build): stamps
+    /// dummy arming records without locking. `NodeName::Static` is still
+    /// allocation-free; an owned name costs one `Arc` increment here.
     /// Guarded paths keep using the locked read.
-    fn passthrough_name(&self) -> &'static str {
-        self.passthrough_name
+    fn passthrough_name(&self) -> NodeName {
+        self.passthrough_name.clone()
     }
 
     /// Instant health snapshot — ergonomic alias of [`SnubberNode::stats`].
@@ -1692,8 +1774,14 @@ impl SnubberNode {
     /// stays ZERO-PANIC; poison here is counted via `lock()`.
     /// SCOPE: exporters poll rarely — fine. Per-CPS polling belongs in
     /// cached snapshots, not here.
+    ///
+    /// [`crate::MetricSample`] is `Copy` and `core`-only, so a node with a
+    /// runtime [`crate::NodeName::Owned`] label exports the marker
+    /// `<owned>` here; read `FaultRecord::node` or [`SnubberNode::name`]
+    /// for the exact label.
     pub fn metric_samples(&self) -> Vec<crate::MetricSample> {
         let inner = self.lock();
+        let node = inner.name.as_static().unwrap_or("<owned>");
         let mut out = Vec::new();
         for kind in FaultKind::ALL {
             let policy = inner.policies[kind.index()];
@@ -1702,7 +1790,7 @@ impl SnubberNode {
                 if count > 0 {
                     out.push(crate::MetricSample {
                         tag,
-                        node: inner.name,
+                        node,
                         kind: kind.index(),
                         count,
                     });
@@ -1759,7 +1847,7 @@ impl SnubberNode {
         }
         let record = FaultRecord {
             kind: FaultKind::StaleEpoch,
-            node: inner.name,
+            node: inner.name.clone(),
             file: loc.file(),
             line: loc.line(),
             header: *header,
@@ -1796,7 +1884,7 @@ impl SnubberNode {
         let mut inner = self.lock();
         let record = FaultRecord {
             kind,
-            node: inner.name,
+            node: inner.name.clone(),
             file: loc.file(),
             line: loc.line(),
             header: TransactionHeader::new(epoch, task_id),
@@ -1908,7 +1996,7 @@ impl SnubberNode {
     ) -> Result<TrackedGuard<F>, EnterError> {
         let loc = core::panic::Location::caller();
         let header = TransactionHeader::new(epoch, task_id);
-        let node_name = self.lock().name;
+        let node_name = self.lock().name.clone();
         let arming = FaultRecord {
             kind: FaultKind::ImplicitDrop,
             node: node_name,
@@ -1963,7 +2051,7 @@ impl SnubberNode {
         drop(inner);
         let record = FaultRecord {
             kind: FaultKind::Preempted,
-            node: self.lock().name,
+            node: self.lock().name.clone(),
             file: file!(),
             line: line!(),
             header: TransactionHeader::new(0, 0),
@@ -2000,7 +2088,7 @@ impl SnubberNode {
     ) -> Result<TrackedGuard<F>, EnterError> {
         let loc = core::panic::Location::caller();
         let header = TransactionHeader::with_generation(generation, epoch, task_id);
-        let node_name = self.lock().name;
+        let node_name = self.lock().name.clone();
         let arming = FaultRecord {
             kind: FaultKind::ImplicitDrop,
             node: node_name,
@@ -2608,7 +2696,7 @@ impl SnubberNode {
                 let mut inner = self.lock();
                 let record = FaultRecord {
                     kind: FaultKind::PoisonedPayload,
-                    node: inner.name,
+                    node: inner.name.clone(),
                     file: loc.file(),
                     line: loc.line(),
                     header: TransactionHeader::new(epoch, task_id),
@@ -2662,7 +2750,7 @@ impl SnubberNode {
         // PHASE A HEAD: grab `Copy` node name under a SHORT lock, then
         // build `arming` OUTSIDE (its `detail: Option<FaultDetail>` may own
         // an `alloc::String` — cloning it under the lock would allocate).
-        let node_name = self.lock().name;
+        let node_name = self.lock().name.clone();
         let arming = FaultRecord {
             kind: FaultKind::ImplicitDrop,
             node: node_name,
@@ -2822,7 +2910,12 @@ impl SnubberNode {
                     let snap_in_flight = inner.in_flight;
                     let snap_max = inner.max_in_flight;
                     let snap_policy = inner.backpressure_policy;
-                    let snap_friction = inner.friction_fn;
+                    let snap_friction = inner.friction_fn.clone();
+                    let snap_pressure = inner.pressure_fn.clone();
+                    // Custom reaction = shared closure handler OR the legacy
+                    // fn-pointer variant. The handler wins when both are set.
+                    let custom_mode = snap_pressure.is_some()
+                        || matches!(snap_policy, BackpressurePolicy::Custom(_));
                     let snap_action = inner.policies[FaultKind::BulkheadFull.index()].action;
                     drop(inner);
                     // PHASE B (no lock): foreign + float math here.
@@ -2840,19 +2933,24 @@ impl SnubberNode {
                         FaultAction::BlockCaller(ms) => ms,
                         _ => 0,
                     };
-                    let (park_ms, shed_now) = match snap_policy {
-                        BackpressurePolicy::AdaptiveBlock {
-                            max_wait_ms,
-                            shed_deeper_than,
-                        } => {
-                            if shed_deeper_than.is_some_and(|d| depth > d) {
-                                (0, true)
-                            } else {
-                                (friction_wait.min(max_wait_ms.max(1)), false)
+                    let (park_ms, shed_now) = if custom_mode {
+                        (0, false)
+                    } else {
+                        match snap_policy {
+                            BackpressurePolicy::AdaptiveBlock {
+                                max_wait_ms,
+                                shed_deeper_than,
+                            } => {
+                                if shed_deeper_than.is_some_and(|d| depth > d) {
+                                    (0, true)
+                                } else {
+                                    (friction_wait.min(max_wait_ms.max(1)), false)
+                                }
+                            }
+                            BackpressurePolicy::Custom(_) | BackpressurePolicy::AdviseOnly => {
+                                (0, false)
                             }
                         }
-                        BackpressurePolicy::Custom(_) => (0, false),
-                        BackpressurePolicy::AdviseOnly => (0, false),
                     };
                     // PHASE C: re-lock for the verdict (fresh state!).
                     // Re-check under the FRESH lock: a slot may have freed
@@ -2862,11 +2960,13 @@ impl SnubberNode {
                         // Freed while computing — fall through to admit.
                     } else {
                         let _wait_ms_inner = if legacy_ms > 0 { legacy_ms } else { park_ms };
-                        if matches!(snap_policy, BackpressurePolicy::Custom(_)) {
+                        if custom_mode {
                             let bp =
                                 Backpressure::new(friction_wait, depth, FaultKind::BulkheadFull);
                             drop(inner);
-                            if let BackpressurePolicy::Custom(react) = snap_policy {
+                            if let Some(react) = snap_pressure {
+                                react(bp);
+                            } else if let BackpressurePolicy::Custom(react) = snap_policy {
                                 react(bp);
                             }
                             inner = self.lock();
@@ -3009,7 +3109,6 @@ impl SnubberNode {
         }
         inner.stats.total_started = inner.stats.total_started.saturating_add(1);
         hard_clamp_slots(&mut inner);
-        let node_name = inner.name;
         let was_half_open = inner.breaker == BreakerState::HalfOpen;
         let deadline = inner.timeout_ms;
         let cpu_budget = inner.cpu_budget_ms;
@@ -3019,7 +3118,6 @@ impl SnubberNode {
 
         Ok(TrackedGuard {
             node: self.inner.clone(),
-            node_name,
             guard: Some(super::SnubberGuard::new(epoch, task_id, rollback)),
             arming,
             settled: false,
@@ -3054,7 +3152,6 @@ impl SnubberNode {
         let _ = rollback;
         TrackedGuard {
             node: self.inner.clone(),
-            node_name: arming.node,
             guard: None,
             arming,
             settled: false,
@@ -3095,7 +3192,9 @@ impl SnubberNode {
     ///
     /// When `MAX_ERRORS == 0` the node still records hooks + `stats()`,
     /// it just never prints.
-    pub fn with_error_budget<const MAX_ERRORS: usize>(name: &'static str) -> SnubberNodeBuilder {
+    pub fn with_error_budget<const MAX_ERRORS: usize>(
+        name: impl Into<NodeName>,
+    ) -> SnubberNodeBuilder {
         SnubberNode::builder(name)
             .console_report(MAX_ERRORS > 0)
             .console_cap(MAX_ERRORS)
@@ -3114,7 +3213,7 @@ impl SnubberNode {
     /// use snubber::SnubberNode;
     /// let node = SnubberNode::console_node::<8>("win32_mouse_driver");
     /// ```
-    pub fn console_node<const MAX_ERRORS: usize>(name: &'static str) -> SnubberNode {
+    pub fn console_node<const MAX_ERRORS: usize>(name: impl Into<NodeName>) -> SnubberNode {
         Self::with_error_budget::<MAX_ERRORS>(name)
             .console_report(self::console_attached())
             .build()
@@ -3175,7 +3274,7 @@ impl SnubberNode {
         if inner.task_ttl_ms > 0 && wait_ms > inner.task_ttl_ms {
             let record = FaultRecord {
                 kind: FaultKind::Timeout,
-                node: inner.name,
+                node: inner.name.clone(),
                 file: loc.file(),
                 line: loc.line(),
                 header,
@@ -3198,7 +3297,7 @@ impl SnubberNode {
             BreakerState::Open => {
                 let record = FaultRecord {
                     kind: FaultKind::BreakerOpen,
-                    node: inner.name,
+                    node: inner.name.clone(),
                     file: loc.file(),
                     line: loc.line(),
                     header,
@@ -3219,7 +3318,7 @@ impl SnubberNode {
                 if inner.half_open_probe {
                     let record = FaultRecord {
                         kind: FaultKind::BreakerOpen,
-                        node: inner.name,
+                        node: inner.name.clone(),
                         file: loc.file(),
                         line: loc.line(),
                         header,
@@ -3255,7 +3354,7 @@ impl SnubberNode {
             }
             let record = FaultRecord {
                 kind: FaultKind::StaleEpoch,
-                node: inner.name,
+                node: inner.name.clone(),
                 file: loc.file(),
                 line: loc.line(),
                 header,
@@ -3292,7 +3391,7 @@ impl SnubberNode {
                     OverflowPolicy::RejectNew => {
                         let record = FaultRecord {
                             kind: FaultKind::BufferOverflow,
-                            node: inner.name,
+                            node: inner.name.clone(),
                             file: loc.file(),
                             line: loc.line(),
                             header,
@@ -3334,7 +3433,7 @@ impl SnubberNode {
                 let rate_rejected = inner.rate_rejected;
                 let record = FaultRecord {
                     kind: FaultKind::BulkheadFull,
-                    node: inner.name,
+                    node: inner.name.clone(),
                     file: loc.file(),
                     line: loc.line(),
                     header,
@@ -3370,7 +3469,7 @@ impl SnubberNode {
         let stall_ceiling_ms = inner.stall_ceiling_ms;
         let envelope = inner.envelope;
         let node_arc = self.inner.clone();
-        let node_name = inner.name;
+        let node_name = inner.name.clone();
         drop(inner);
 
         let rb = rollback.take().expect("rollback present on admission");
@@ -3391,7 +3490,6 @@ impl SnubberNode {
         core::task::Poll::Ready(Ok(TrackedGuard {
             guard: Some(guard),
             node: node_arc,
-            node_name,
             arming,
             deadline_ms,
             cpu_budget_ms,
@@ -3835,7 +3933,13 @@ pub fn std_mono_ns() -> u64 {
 }
 
 /// Stage slots carried inline by [`ExecutionProfile`] (no allocation).
+///
+/// FORMAT CONTRACT: exactly 4 named stages; stage 5+ sets
+/// [`PROFILE_STAGE_OVERFLOW`] and merges into the last slot. Changing the
+/// count changes the profile frame encoding.
 pub const PROFILE_STAGES: usize = 4;
+
+const _: () = assert!(PROFILE_STAGES == 4, "profile carries 4 stage slots");
 
 /// A CPU clock was attached: `work_cpu_us` and `cpu_utilization_pct` are real.
 pub const PROFILE_HAS_CPU: u16 = 1 << 0;
@@ -3847,6 +3951,7 @@ pub const PROFILE_STAGE_OVERFLOW: u16 = 1 << 2;
 /// How a timed stage spent its wall time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum StageKind {
     /// On-CPU work (also the bucket for unnamed time inside the guard).
     #[default]
@@ -4161,7 +4266,6 @@ impl ProfileState {
 #[must_use = "a TrackedGuard that is never committed rolls back on drop"]
 pub struct TrackedGuard<F: FnOnce()> {
     node: Arc<Mutex<NodeInner>>,
-    node_name: &'static str,
     guard: Option<super::SnubberGuard<F>>,
     arming: FaultRecord,
     settled: bool,
@@ -4190,6 +4294,7 @@ pub struct TrackedGuard<F: FnOnce()> {
 /// Watchdog outcome for [`TrackedGuard::check_timeout`].
 #[must_use = "a TimedOut guard already settled (rollback ran) — propagate, never keep working"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TimeoutCheck {
     /// Within budget (or no deadline armed) — keep working.
     WithinBudget,
@@ -4609,7 +4714,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         self.settled = true;
         let loc = core::panic::Location::caller();
         let header = self.arming.header;
-        let node_name = self.arming.node;
+        let node_name = self.arming.node.clone();
         let lane = self.priority.code().min(2) as usize;
         if let Some(g) = self.guard.take() {
             drop(g); // hardware rollback runs HERE
@@ -4832,7 +4937,6 @@ impl<F: FnOnce()> Drop for TrackedGuard<F> {
             drop(g); // hardware rollback runs HERE
         }
         self.settle_implicit();
-        let _ = self.node_name;
     }
 }
 

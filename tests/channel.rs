@@ -53,6 +53,9 @@ fn four_senders_one_host_reject_new() {
                             ));
                         }
                         Err(GatewaySendError::Disconnected) => return (ok, shed),
+                        // `GatewaySendError` is #[non_exhaustive]: a future
+                        // refusal mode must be handled, not silently retried.
+                        Err(_) => return (ok, shed),
                     }
                 }
             }

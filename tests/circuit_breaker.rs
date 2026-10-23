@@ -240,5 +240,8 @@ fn compile_time_budget_bakes_cap_into_builder() {
         let _g = auto.enter(1, 1, || {}).expect("enter");
     }
     assert_eq!(auto.stats().implicit_drops, 1);
-    assert_eq!(auto.stats().last_fault.map(|f| f.node), Some("auto"));
+    assert_eq!(
+        auto.stats().last_fault.as_ref().map(|f| f.node.as_str()),
+        Some("auto")
+    );
 }

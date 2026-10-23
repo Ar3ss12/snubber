@@ -22,9 +22,20 @@
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU8, Ordering};
 
 /// Ring capacity (power of two; index mask = `CAP - 1`).
+///
+/// FORMAT CONTRACT: 16 slots is the published ceiling — the mask, the
+/// `u8` head/tail counters and the firmware-side producer all assume it.
+/// Raising it needs a lock-free-safe mask change and a version bump, not
+/// just a bigger number.
 pub const ISR_RING_CAP: usize = 16;
 /// Index mask for the wrapping ring position.
 pub const ISR_RING_MASK: u8 = (ISR_RING_CAP as u8) - 1;
+
+const _: () = assert!(ISR_RING_CAP == 16, "ISR ring is a 16-slot contract");
+const _: () = assert!(
+    ISR_RING_CAP.count_ones() == 1,
+    "ISR ring capacity must stay a power of two"
+);
 
 /// Opcodes packed in the signal cell (`bits 24..32`).
 pub const OP_EMERGENCY_TRIP: u8 = 0x01;
@@ -87,6 +98,7 @@ impl IsrSignal {
 
 /// Push refusal (ring full — counted by the caller, never blocking).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum IsrPushError {
     /// Ring holds `ISR_RING_CAP` unread signals; oldest is kept
     /// (fresh ISRs must not evict an unread emergency trip).

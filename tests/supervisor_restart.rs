@@ -30,6 +30,9 @@ fn storm_guard_trips_after_three_fast_crashes() {
             RestartDecision::Restart { delay_ms, .. } => delays.push(delay_ms),
             RestartDecision::GiveUp { .. } => stops += 1,
             RestartDecision::Stop => panic!("crash must never Stop under OnCrash"),
+            // `RestartDecision` is #[non_exhaustive]: a future verdict must
+            // be handled explicitly, never fall through as a restart.
+            _ => panic!("unexpected restart decision"),
         }
         now_ms += 100; // 100 ms apart — all inside the 10 s window.
     }
