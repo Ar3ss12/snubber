@@ -3,6 +3,15 @@
 //! Line numbers in comments die the day someone adds an import. Text tags
 //! don't. If a refactor deletes or renames an anchor, this test goes red
 //! and names the missing tag.
+//!
+//! Twin audit note (compile-only doc-tests): the 7 `no_run` fences
+//! (`spawn_guarded` x2, `console_node`, `ErasedGuard`, `assert_no_anomalies`,
+//! `wait_while_paused`, LegalMove) are guarded by REAL twins in the
+//! integration suite: `supervisor.rs::spawn_*`, `task_engine.rs`
+//! state-snapshot round-trip, `diagnostics.rs` renderers, `conduit.rs`
+//! pause/resume, `stdin_digest.rs`. A change to those APIs must keep both
+//! sides compiling — cargo does that per doc-fence; the twins prove the
+//! behavior itself.
 
 /// Every anchor named in the FLOOR MAP header must exist exactly once in
 /// the node source (header mention + one definition site = 2 hits).

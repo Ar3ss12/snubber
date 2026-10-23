@@ -18,7 +18,7 @@ Write-Host "[1/6] Auditing unsafe code veto..." -NoNewline
 # TrimStart the BOM: a UTF-8 BOM would otherwise defeat every `(?m)^#!`
 # anchor below (false-FAIL that fails safe, but loud for nothing).
 $LibContent = (Get-Content "$RepoRoot\src\lib.rs" -Raw).TrimStart([char]0xFEFF)
-if ($LibContent -match '(?m)^#!\[forbid\(unsafe_code\)\]') {
+if ($LibContent -cmatch '(?m)^#!\[forbid\(unsafe_code\)\]') {
     Write-Host " OK (forbid(unsafe_code) active)" -ForegroundColor Green
 } else {
     Write-Host " FAIL (missing #![forbid(unsafe_code)] in src/lib.rs)" -ForegroundColor Red
@@ -28,7 +28,7 @@ if ($LibContent -match '(?m)^#!\[forbid\(unsafe_code\)\]') {
 # Scan all src/*.rs files for raw `unsafe ` blocks (recursive: pool,
 # async_engine, and any future submodule included)
 $SrcFiles = Get-ChildItem "$RepoRoot\src" -Recurse -Filter *.rs | ForEach-Object { $_.FullName }
-$UnsafeMatches = Select-String -Path $SrcFiles -Pattern "\bunsafe\s*\{|\bunsafe\s+fn\b"
+$UnsafeMatches = Select-String -Path $SrcFiles -CaseSensitive -Pattern "\bunsafe\s*\{|\bunsafe\s+fn\b"
 if ($UnsafeMatches) {
     Write-Host " FAIL: Found raw unsafe keyword in src/:" -ForegroundColor Red
     $UnsafeMatches | ForEach-Object { Write-Host "   $($_.Filename):$($_.LineNumber): $($_.Line.Trim())" }
@@ -38,7 +38,7 @@ if ($UnsafeMatches) {
 # Gate 2: Saturating arithmetic on counters in src/node.rs
 Write-Host "[2/6] Auditing saturating counters in src/node.rs..." -NoNewline
 # Counter increment check: flag direct `+= 1` on known counter fields
-$CounterViolations = Select-String -Path "$RepoRoot\src\node.rs" -Pattern "\b(in_flight|total_started|committed|bulkhead_rejections|poison_recoveries|stale_epochs_rejected)\s*\+="
+$CounterViolations = Select-String -Path "$RepoRoot\src\node.rs" -CaseSensitive -Pattern "\b(in_flight|total_started|committed|bulkhead_rejections|poison_recoveries|stale_epochs_rejected)\s*\+="
 if ($CounterViolations) {
     Write-Host " FAIL: Direct += found on counter:" -ForegroundColor Red
     $CounterViolations | ForEach-Object { Write-Host "   $($_.Filename):$($_.LineNumber): $($_.Line.Trim())" }
@@ -76,7 +76,7 @@ if ($FnBody.Count -eq 0 -or ($FnBody[0] -notmatch 'fn record_locked\(')) {
     Write-Host " FAIL: could not extract the fn record_locked body from src\node.rs (renamed or moved?)" -ForegroundColor Red
     $Failures++
 } else {
-    $FormatUnderLock = $FnBody | Select-String -Pattern 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
+    $FormatUnderLock = $FnBody | Select-String -CaseSensitive -Pattern 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
     if ($FormatUnderLock) {
         Write-Host " FAIL: panicking/formatting call inside record_locked" -ForegroundColor Red
         $FormatUnderLock | ForEach-Object { Write-Host "   body line $($_.LineNumber): $($_.Line.Trim())" }
@@ -121,7 +121,7 @@ if ($MetaphorMatches.Count -gt 0) {
 # Gate 5: TRUE no_std - crate attribute + bare-metal target compile
 Write-Host "[5/6] Auditing true no_std on bare metal..." -NoNewline
 $BareMetalTarget = "thumbv7em-none-eabihf"
-if ($LibContent -notmatch '(?m)^#!\[cfg_attr\(not\(feature = "std"\), no_std\)\]') {
+if ($LibContent -cnotmatch '(?m)^#!\[cfg_attr\(not\(feature = "std"\), no_std\)\]') {
     Write-Host " FAIL (missing #![cfg_attr(not(feature = `"std`"), no_std)] in src/lib.rs)" -ForegroundColor Red
     $Failures++
 } elseif (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {

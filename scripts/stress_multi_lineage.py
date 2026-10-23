@@ -298,6 +298,20 @@ def monitor(args: argparse.Namespace, lanes: list[Lane], supervisors: set[int], 
         time.sleep(0.05)
 
 
+def kill_lane_worker(lane: "Lane", supervisors: set[int], target: str) -> None:
+    """Kill one lane's live worker, identity-gated (same rule as cleanup)."""
+    worker = read_pid(lane.dir / "target" / "supervised_worker.pid")
+    if worker is None or worker in supervisors:
+        return
+    ident = proc_identity(worker)
+    if ident is None or ident[1] != target:
+        return
+    try:
+        os.kill(worker, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 def cleanup(lanes: list[Lane], supervisors: set[int], target: str) -> None:
     """Abort path: never leave spinning supervisors or workers behind."""
     for lane in lanes:
@@ -309,16 +323,7 @@ def cleanup(lanes: list[Lane], supervisors: set[int], target: str) -> None:
             except subprocess.TimeoutExpired:
                 pass
     for lane in lanes:
-        worker = read_pid(lane.dir / "target" / "supervised_worker.pid")
-        if worker is None or worker in supervisors:
-            continue
-        ident = proc_identity(worker)
-        if ident is None or ident[1] != target:
-            continue
-        try:
-            os.kill(worker, signal.SIGKILL)
-        except OSError:
-            pass
+        kill_lane_worker(lane, supervisors, target)
 
 
 def run(args: argparse.Namespace, repo: Path) -> int:
@@ -439,6 +444,10 @@ def run(args: argparse.Namespace, repo: Path) -> int:
                     lane.sup.wait(timeout=5)
                 lane.sup_exit = lane.sup.returncode
                 lane.error = lane.error or "supervisor did not exit (terminated after grace)"
+                # A hard-killed supervisor cannot reap its own child: the
+                # worker would spin forever past `finalized=True`. Kill it
+                # here, identity-gated (same rule as cleanup()).
+                kill_lane_worker(lane, supervisors, args.target)
 
         for lane in lanes:
             try:

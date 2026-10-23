@@ -3,6 +3,9 @@
 //! verifies that hard process terminations (TerminateProcess on Windows, SIGKILL on Unix)
 //! are survived with 0 pipe deadlocks and 100% token accounting.
 
+mod common;
+
+use common::json_num;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -27,7 +30,7 @@ fn process_kill_stress_test() {
         "failed to build process_termination_loop example"
     );
 
-    let kills: u32 = std::env::var("STRESS_TARGET_KILLS")
+    let kills: u64 = std::env::var("STRESS_TARGET_KILLS")
         .or_else(|_| std::env::var("CHAOS_KILLS"))
         .ok()
         .and_then(|s| s.parse().ok())
@@ -127,7 +130,13 @@ fn process_kill_stress_test() {
         if Path::new(report_file).exists() {
             std::thread::sleep(Duration::from_millis(200));
             if let Ok(mut f) = File::open(report_file) {
-                if f.read_to_string(&mut report_content).is_ok() && !report_content.is_empty() {
+                // Require the closing brace: a torn first read must not
+                // freeze a truncated JSON (fail-flake); keep polling
+                // until the writer flushed the whole report.
+                report_content.clear();
+                if f.read_to_string(&mut report_content).is_ok()
+                    && report_content.trim_end().ends_with('}')
+                {
                     break;
                 }
             }
@@ -147,12 +156,14 @@ fn process_kill_stress_test() {
         report_content.contains("\"deadlock\": false"),
         "Supervisor reported deadlock!"
     );
-    assert!(
-        report_content.contains(&format!("\"total_reaped\": {}", kills)),
+    assert_eq!(
+        json_num(&report_content, "total_reaped"),
+        kills,
         "Total reaped count mismatch!"
     );
-    assert!(
-        report_content.contains(&format!("\"final_generation\": {}", kills + 1)),
+    assert_eq!(
+        json_num(&report_content, "final_generation"),
+        kills + 1,
         "Final generation mismatch! Expected generation = kills + 1"
     );
 

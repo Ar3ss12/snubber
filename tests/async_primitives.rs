@@ -456,3 +456,69 @@ fn async_eviction_reports_evicted_oldest_telemetry() {
         "the async eviction must fire the per-kind policy path (sync-arm parity)"
     );
 }
+
+#[test]
+fn paced_enter_skips_the_sleep_for_advise_only_nodes() {
+    // AdviseOnly / Custom nodes have friction_wait_ms == 0: the paced
+    // path must admit WITHOUT ever calling the sleeper.
+    static SLEPT: AtomicU64 = AtomicU64::new(0);
+    static SLEPT_MS: AtomicU64 = AtomicU64::new(0);
+    let node = SnubberNode::builder("async/pace/advise")
+        .backpressure(snubber::BackpressurePolicy::AdviseOnly)
+        .max_in_flight(1)
+        .build();
+    let _hold = node.enter(1, 1, || {}).expect("hold the only slot");
+    assert_eq!(node.friction_wait_ms(), 0, "AdviseOnly never paces");
+    let g = block_on(node.enter_paced_async(
+        2,
+        2,
+        || {},
+        |ms| async move {
+            SLEPT.fetch_add(1, Ordering::SeqCst);
+            SLEPT_MS.fetch_add(ms, Ordering::SeqCst);
+        },
+    ));
+    // AdviseOnly refuses honestly when full (never parks the caller) —
+    // the point here is that the paced path NEVER calls the sleeper.
+    assert!(g.is_err(), "AdviseOnly full bulkhead refuses");
+    assert_eq!(SLEPT.load(Ordering::SeqCst), 0, "sleeper must not run");
+    assert_eq!(SLEPT_MS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn paced_enter_sleeps_exactly_the_advertised_wait_then_admits() {
+    // Full AdaptiveBlock node: the paced path must sleep the advertised
+    // friction_wait_ms and admit once the sleeper "frees" the slot.
+    static SLEPT_MS: AtomicU64 = AtomicU64::new(0);
+    let node = SnubberNode::builder("async/pace/admit")
+        .backpressure(snubber::BackpressurePolicy::AdaptiveBlock {
+            max_wait_ms: 50,
+            shed_deeper_than: None,
+        })
+        .max_in_flight(1)
+        .build();
+    let hold = node.enter(1, 1, || {}).expect("hold the only slot");
+    let want = node.friction_wait_ms();
+    assert!(want > 0, "spring loaded when full");
+    let n2 = node.clone();
+    let g = block_on(node.enter_paced_async(
+        2,
+        2,
+        || {},
+        move |ms| {
+            let n = n2.clone();
+            async move {
+                SLEPT_MS.fetch_add(ms, Ordering::SeqCst);
+                // The timer IS the release: when it fires, the slot frees.
+                hold.commit();
+                let _ = n;
+            }
+        },
+    ));
+    assert!(g.is_ok(), "freed-while-paced must admit");
+    assert_eq!(
+        SLEPT_MS.load(Ordering::SeqCst),
+        want,
+        "sleeper must receive the advertised friction_wait_ms"
+    );
+}

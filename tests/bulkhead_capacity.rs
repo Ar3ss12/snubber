@@ -260,3 +260,56 @@ fn evict_oldest_overbooking_caps_at_max_plus_one() {
     );
     assert_eq!(node.lane_in_flight(), [0, 0, 0], "clean drain");
 }
+
+// Regression (0.6.6): with a zero-wait pacing policy (`AdaptiveBlock`
+// with `max_wait_ms: 0`), a slot freed while the caller was inside
+// PHASE B (the friction function runs OUTSIDE the node lock) must be
+// admitted, not refused: the old unconditional reject at `wait_ms == 0`
+// refused a verified-free slot. A still-full bulkhead keeps refusing.
+#[test]
+fn zero_wait_caller_admits_a_slot_freed_during_friction() {
+    use std::sync::atomic::AtomicBool;
+
+    static IN_FRICTION: AtomicBool = AtomicBool::new(false);
+    static RELEASED: AtomicBool = AtomicBool::new(false);
+
+    let node = Arc::new(
+        SnubberNode::builder("wall/zero-wait-recheck")
+            .max_in_flight(1)
+            .trip_after_failures(0)
+            .backpressure(snubber::BackpressurePolicy::AdaptiveBlock {
+                max_wait_ms: 0,
+                shed_deeper_than: None,
+            })
+            .friction_fn(|_in_flight, _max| {
+                IN_FRICTION.store(true, Ordering::SeqCst);
+                while !RELEASED.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                0
+            })
+            .build(),
+    );
+
+    let first = node.enter(1, 1, || {}).expect("first admission");
+    let n2 = Arc::clone(&node);
+    let handle = std::thread::spawn(move || n2.enter(2, 2, || {}));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !IN_FRICTION.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second caller never reached PHASE B friction"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // Slot freed while the second caller is between the bulkhead check
+    // and the zero-wait verdict.
+    first.commit();
+    RELEASED.store(true, Ordering::SeqCst);
+    let second = handle
+        .join()
+        .expect("join")
+        .expect("zero-wait caller must admit the slot freed during PHASE B");
+    second.commit();
+    assert_eq!(node.lane_in_flight(), [0, 0, 0], "clean drain");
+}

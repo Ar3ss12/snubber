@@ -226,6 +226,13 @@ fn bench_telemetry(c: &mut Criterion) {
         for i in 0..6u8 {
             tx.send_critical(i).expect("fill to HWM");
         }
+        // Prove the latch actually fires: without this, a shifted HWM
+        // would silently make the bench measure uncontended sends under
+        // a throttled name.
+        assert!(
+            tx.send(255).is_err(),
+            "gateway above HWM must refuse: the throttled-latch bench would be measuring the fast path"
+        );
         b.iter(|| {
             let r = tx.send(black_box(255));
             let _ = black_box(r);
@@ -614,7 +621,6 @@ fn bench_contended(c: &mut Criterion) {
                 let iters_per_thread = (iters as usize / concurrency).max(1);
                 let barrier = Arc::new(Barrier::new(concurrency + 1));
                 let mut handles = Vec::with_capacity(concurrency);
-                let start = std::time::Instant::now();
                 for _ in 0..concurrency {
                     let n = Arc::clone(&node);
                     let s = Arc::clone(&stale);
@@ -638,6 +644,10 @@ fn bench_contended(c: &mut Criterion) {
                         }
                     }));
                 }
+                // Start the clock at the barrier, not before the spawn
+                // loop: workers are parked in their own `br.wait()`, so
+                // this measures the contended section, not thread spawn.
+                let start = std::time::Instant::now();
                 barrier.wait();
                 for h in handles {
                     let _ = h.join();
@@ -661,7 +671,6 @@ fn bench_contended(c: &mut Criterion) {
                 let iters_per_thread = (iters as usize / concurrency).max(1);
                 let barrier = Arc::new(Barrier::new(concurrency + 1));
                 let mut handles = Vec::with_capacity(concurrency);
-                let start = std::time::Instant::now();
                 for _ in 0..concurrency {
                     let n = Arc::clone(&node);
                     let br = Arc::clone(&barrier);
@@ -681,6 +690,10 @@ fn bench_contended(c: &mut Criterion) {
                         }
                     }));
                 }
+                // Start the clock at the barrier, not before the spawn
+                // loop: workers are parked in their own `br.wait()`, so
+                // this measures the contended section, not thread spawn.
+                let start = std::time::Instant::now();
                 barrier.wait();
                 for h in handles {
                     let _ = h.join();
@@ -714,7 +727,6 @@ fn bench_contended(c: &mut Criterion) {
                     count
                 });
                 let mut handles = Vec::with_capacity(concurrency);
-                let start = std::time::Instant::now();
                 for _ in 0..concurrency {
                     let sender = tx.clone();
                     let br = Arc::clone(&barrier);
@@ -725,6 +737,9 @@ fn bench_contended(c: &mut Criterion) {
                         }
                     }));
                 }
+                // Start the clock at the barrier, not before the spawn loop —
+                // thread spawn is not part of the measured contended path.
+                let start = std::time::Instant::now();
                 barrier.wait();
                 for h in handles {
                     let _ = h.join();
@@ -757,6 +772,9 @@ fn bench_contended(c: &mut Criterion) {
                     }
                     popped
                 });
+                // Give the consumer a chance to enter its pop loop so
+                // the measured window starts on a live consumer.
+                thread::yield_now();
                 let start = std::time::Instant::now();
                 for i in 0..iters {
                     while bridge

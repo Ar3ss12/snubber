@@ -106,10 +106,16 @@ impl<S, D> TaskConduit<S, D> {
     }
 
     /// Update the live telemetry state via a mutating closure.
+    ///
+    /// Poison-recovering (same discipline as [`Self::inspect`]): a panicked
+    /// state closure must not freeze all future state publishing — the
+    /// poison is absorbed and the closure still runs on the recovered guard.
     pub fn update_state<F: FnOnce(&mut S)>(&self, f: F) {
-        if let Ok(mut lock) = self.inner.state.write() {
-            f(&mut lock);
-        }
+        let mut lock = match self.inner.state.write() {
+            Ok(l) => l,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        f(&mut lock);
     }
 
     /// Fast, non-blocking check for pending directives from the caller.
@@ -173,6 +179,7 @@ impl<S, D> TaskConduit<S, D> {
     pub fn wait_for_resume_async(&self) -> ResumeFuture<S, D> {
         ResumeFuture {
             inner: self.inner.clone(),
+            waker: None,
         }
     }
 
@@ -364,14 +371,32 @@ impl<S, D> TaskHandle<S, D> {
 /// Future for asynchronous pause/resume waiting.
 ///
 /// Zero-bound like the intercom itself: polling never duplicates `S`.
+///
+/// Cancellation-safe: the waker pushed while parked is remembered in the
+/// future itself and removed from the queue on `Drop`, so a future dropped
+/// mid-pause (e.g. a timeout branch in `select!`) cannot leave a dead waker
+/// behind — each later `resume` wakes only live waiters.
 pub struct ResumeFuture<S, D> {
     inner: Arc<IntercomInner<S, D>>,
+    waker: Option<Waker>,
+}
+
+impl<S, D> Drop for ResumeFuture<S, D> {
+    fn drop(&mut self) {
+        if let Some(w) = self.waker.take() {
+            if let Ok(mut wakers) = self.inner.wakers.lock() {
+                wakers.retain(|queued| !queued.will_wake(&w));
+            }
+        }
+    }
 }
 
 impl<S, D> Future for ResumeFuture<S, D> {
     type Output = Result<(), &'static str>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Unpin: the only field is an Arc plus an Option<Waker>.
+        let this = self.get_mut();
         // P0 fix: read the directive WHILE holding the wakers lock.
         //
         // wake_async() also acquires the wakers lock before draining.
@@ -390,11 +415,11 @@ impl<S, D> Future for ResumeFuture<S, D> {
         // release of wakers lock and the directive load, leaving Case A
         // open: controller could drain (empty list) before poller pushed,
         // and poller would park forever.
-        let mut wakers = match self.inner.wakers.lock() {
+        let mut wakers = match this.inner.wakers.lock() {
             Ok(w) => w,
             Err(_) => return Poll::Ready(Err("wakers lock poisoned")),
         };
-        let dir = self.inner.directive.load(Ordering::Acquire);
+        let dir = this.inner.directive.load(Ordering::Acquire);
         match dir {
             DIR_PAUSE => {
                 // P1 fix: deduplicate via will_wake — repeated polls from
@@ -405,10 +430,14 @@ impl<S, D> Future for ResumeFuture<S, D> {
                 } else {
                     wakers.push(current.clone());
                 }
+                // Remember the pushed waker so Drop can retire it.
+                this.waker = Some(current.clone());
                 Poll::Pending
             }
             DIR_CANCEL | DIR_PREEMPTED => {
-                let reason = self
+                // The entry is about to resolve; nothing is parked anymore.
+                this.waker = None;
+                let reason = this
                     .inner
                     .cancel_reason
                     .lock()
@@ -417,7 +446,10 @@ impl<S, D> Future for ResumeFuture<S, D> {
                     .unwrap_or("cancelled");
                 Poll::Ready(Err(reason))
             }
-            _ => Poll::Ready(Ok(())),
+            _ => {
+                this.waker = None;
+                Poll::Ready(Ok(()))
+            }
         }
     }
 }

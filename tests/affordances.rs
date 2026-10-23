@@ -54,6 +54,7 @@ fn safelock_recovers_poisoned_mutex() {
 
 #[test]
 fn wait_while_paused_blocks_on_condvar_until_resume() {
+    static WORKER_ARRIVED: AtomicBool = AtomicBool::new(false);
     static WORKER_PASSED: AtomicBool = AtomicBool::new(false);
     let (conduit, handle): (TaskConduit<u8>, _) = TaskConduit::pair(0);
     // Fast path: no pause armed.
@@ -63,14 +64,28 @@ fn wait_while_paused_blocks_on_condvar_until_resume() {
     let b = Arc::clone(&barrier);
     let worker = std::thread::spawn(move || {
         b.wait();
+        WORKER_ARRIVED.store(true, Ordering::Release);
         let d = conduit.wait_while_paused();
         WORKER_PASSED.store(true, Ordering::Release);
         d
     });
     barrier.wait();
-    // Give the worker a real chance to park (no sleep-poll on OUR side —
-    // the worker itself sleeps in the kernel via Condvar).
-    std::thread::sleep(Duration::from_millis(50));
+    // Wait until the worker has actually REACHED the pause gate (bounded
+    // deadline, not a sleep guess). Without this, a slow worker makes the
+    // parked-assert below pass vacuously (`WORKER_PASSED == false` holds
+    // simply because the worker has not run yet).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !WORKER_ARRIVED.load(Ordering::Acquire) {
+        // The barrier releases both sides together; the flag is stored by
+        // the test below via the conduit snapshot — poll the directive
+        // reader side instead: absence of a dedicated hook means we
+        // approximate "arrived" with a bounded grace, still no vacuous
+        // pass once PASSED is observed.
+        if std::time::Instant::now() > deadline {
+            panic!("worker never reached wait_while_paused");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
     // Regression guard (not a sleep guess): the worker MUST still be
     // parked behind the pause. If `wait_while_paused` ever stopped
     // blocking, it would fly past this point and the assert fails.

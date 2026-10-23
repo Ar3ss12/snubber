@@ -36,7 +36,11 @@ pub struct EnterFuture<F: FnOnce()> {
     task_id: u64,
     rollback: Option<F>,
     loc: &'static core::panic::Location<'static>,
-    enqueued_at_ms: u64,
+    /// TTL clock: stamped when the future first PARKS (first `waiters`
+    /// entry), not at construction — an executor may buffer the future
+    /// long before the first poll, and "expired in queue" must mean it
+    /// really queued.
+    enqueued_at_ms: Option<u64>,
     /// Identity of this future's parked queue entry (`Arc` pointer
     /// equality with the node's `ParkedWaiter.evicted`). `None` until the
     /// future actually parks — the ready admission path stays alloc-free.
@@ -59,7 +63,7 @@ impl<F: FnOnce()> EnterFuture<F> {
             task_id,
             rollback: Some(rollback),
             loc,
-            enqueued_at_ms: node::now_ms(),
+            enqueued_at_ms: None,
             evicted: None,
         }
     }
@@ -98,7 +102,8 @@ impl<F: FnOnce() + Unpin> Future for EnterFuture<F> {
             &mut this.rollback,
             cx.waker(),
             &mut evicted_slot,
-            this.enqueued_at_ms,
+            this.evicted.as_ref(),
+            &mut this.enqueued_at_ms,
         );
         if attempt.is_pending() {
             let new_flag = evicted_slot.take();

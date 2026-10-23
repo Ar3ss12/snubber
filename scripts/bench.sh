@@ -124,7 +124,7 @@ for path in estimate_files:
                 if mean_ns < 1000.0:
                     latency = f"{mean_ns:.1f} ns"
                 else:
-                    latency = f"{mean_ns / 1000.0:.2f} µs"
+                    latency = f"{mean_ns / 1000.0:.2f} us"
                     
                 print(f"| `{label}` | **{latency}** | {group} bench |")
         except Exception:

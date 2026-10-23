@@ -210,6 +210,51 @@ fn fake_waker() -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
 }
 
+static WOKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn counting_waker() -> Waker {
+    unsafe fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &COUNTING_VTABLE)
+    }
+    unsafe fn wake(_: *const ()) {
+        WOKEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    unsafe fn wake_by_ref(_: *const ()) {
+        WOKEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    unsafe fn drop(_: *const ()) {}
+    static COUNTING_VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &COUNTING_VTABLE)) }
+}
+
+fn counting_waker_woken() -> usize {
+    WOKEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+// Regression (0.6.6): a ResumeFuture dropped mid-`.await` (e.g. by
+// `tokio::select!`) must remove its parked waker from the conduit queue.
+// Before the `Drop` impl, `resume()` woken the stale waker of a dead
+// future — a leak that grew with every cancellation.
+#[test]
+fn dropped_resume_future_removes_its_parked_waker() {
+    let (conduit, handle) = TaskConduit::<WorkerState>::pair(WorkerState::default());
+
+    handle.send_directive(Directive::Pause);
+    let mut fut = Box::pin(conduit.wait_for_resume_async());
+    let waker = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
+
+    // Cancellation: drop the future before any directive releases it.
+    drop(fut);
+    handle.resume();
+    assert_eq!(
+        counting_waker_woken(),
+        0,
+        "a dropped ResumeFuture must never be woken"
+    );
+}
+
 /// Zero-Bound Clone Invariant: hand-written `Clone` on the intercom pair must
 /// carry NO bounds. `#[derive(Clone)]` would demand `S: Clone, D: Clone`
 /// even though cloning the inner `Arc` never touches the payload — a

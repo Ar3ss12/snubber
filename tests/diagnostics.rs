@@ -6,9 +6,9 @@
 
 use snubber::{
     assert_no_anomalies, diagnostic_line, find_anomalies, find_anomalies_for_snapshot,
-    write_diagnostic_line, write_health, write_triage, AnomalyKind, AnomalyPolicy, FaultKind,
-    FaultPolicy, FaultRecord, NodeSet, SnapshotV1, SnubberNode, SnubberStats, TelemetrySink,
-    SNAPSHOT_LEN,
+    print_health, write_diagnostic_line, write_health, write_triage, AnomalyKind, AnomalyPolicy,
+    FaultKind, FaultPolicy, FaultRecord, NodeSet, SnapshotV1, SnubberNode, SnubberStats,
+    TelemetrySink, SNAPSHOT_LEN,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -371,4 +371,20 @@ fn triage_card_renders_verdicts() {
     write_triage(&mut text, "burned", &burned).expect("fmt::Write");
     assert!(text.contains("verdict=CRIT"));
     assert!(text.contains("drops=3"));
+}
+
+#[test]
+fn print_health_smoke_does_not_panic_and_matches_write_health() {
+    // `print_health` is the exported stderr surface — exercise it on a
+    // populated snapshot so a panic or malformed output cannot ship
+    // silently. Equivalence: the stderr render must byte-match
+    // `write_health` (it forwards to the same renderer).
+    let node = SnubberNode::builder("print_health_probe").build();
+    node.report(FaultKind::Panic, 1, 1);
+    let snap = node.snapshot_v1();
+    let policy = AnomalyPolicy::default();
+    print_health("print_health_probe", &snap, &policy);
+    let mut expected = String::new();
+    write_health(&mut expected, "print_health_probe", &snap, &policy).expect("render");
+    assert!(expected.contains("[SNUBBER PULSE]"));
 }

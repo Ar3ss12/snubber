@@ -344,22 +344,36 @@ The function that merely creates the thread (`thread::spawn`) must not
 touch the node's slots — it is just a dispatcher. The slot is taken by
 **the worker itself from the inside**, once awake in the OS:
 
+> **Scope correction.** The erased path (`enter_erased_auto`) is an
+> admission probe, not a lease on the slot for the worker's lifetime:
+> the probe is committed at admission, so the slot is free again while
+> the worker keeps running. `max_in_flight(1)` therefore does NOT
+> serialize two live erased workers — it only bounds how many are being
+> *admitted* at once. If "at most one live clicker" is a hardware
+> invariant, enforce it with your own semaphore/flag around the spawn
+> (the `Err` arm below still fires, but a plain bulkhead-full race is
+> not a mutual-exclusion guarantee). For a true lifetime slot on a
+> non-erased worker, keep the typed `TrackedGuard` alive for the whole
+> loop and commit in the epilogue.
+
 ```rust
 // Main thread just spawns, holding NO snubber slots:
 std::thread::spawn(move || {
-    // The worker woke up and FIRST takes the single slot for its whole life:
+    // The worker woke up and takes the probe admission for its own telemetry:
     let guard = match click_node.enter_erased_auto(|| emergency_release_all_hardware()) {
         Ok(g) => g,
         Err(_) => {
-            // We land here ONLY if the user really spammed "Start" and a
-            // second worker is already running in parallel.
+            // Bulkhead full, breaker open, rate limited, memory pressure —
+            // admission refused. This is NOT proof that another worker is
+            // running (see the scope correction above); serialize live
+            // workers with your own guard if that is the invariant.
             return;
         }
     };
 
     // ... the click loop spins for minutes/hours ...
 
-    guard.commit(); // clean exit, slot freed
+    guard.commit(); // release the admission probe
 });
 ```
 
@@ -548,6 +562,14 @@ let guard = node.enter_async_auto(|| rollback_transaction()).await?;
 do_async_io().await?;
 guard.commit();
 ```
+
+Wake-window semantics: when a guard settles, ONE parked waiter is woken and
+its `poll` re-runs the full admission check from scratch — the wake is a
+hint, not a reservation. Between the slot freeing and the woken task's
+re-poll, a concurrent admission may take the slot; the waiter then resolves
+to an honest `Err(QueueFull)` instead of hanging, and the caller retries.
+The queue also evicts its OLDEST parked waiter (telemetry parity with the
+sync `EvictOldest` path) so a queue never hides a wedged consumer.
 
 ### 2. Async Settle Across `.await` (`settle_async`)
 `TrackedGuard` holds **NO mutex across `.await` points**. The lock is taken only for the
@@ -1606,6 +1628,30 @@ settle verdicts `SpinDetected` / `DeadlockSuspected` belong to
 `guard.check_timeout()`); INVARIANTS.md states the enforced $C+1$
 refusal.
 
+## Fixed in 0.6.6: fifth-audit batch
+
+Async liveness, storm-harness hygiene, and CI hardening.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| `ResumeFuture` waker leak | A future dropped mid-`.await` (e.g. by `tokio::select!`) left its waker in the conduit directive queue: the queue grew per cancellation and stale wakers were woken on the next directive | `Drop` removes the future's own parked waker (identity `will_wake` match under the wakers lock); no leak, no stale wake | `tests/conduit.rs::dropped_resume_future_removes_its_parked_waker` |
+| Zero-wait refusal after re-check | `enter` with `wait_ms == 0` (AdaptiveBlock `max_wait_ms: 0` / zero-friction custom curve) refused with `BulkheadFull` even when the slot freed while the caller was inside PHASE B (friction runs OUTSIDE the lock) | `else if in_flight >= max_in_flight` — the verified-free slot is admitted; a genuinely full bulkhead still refuses | `tests/bulkhead_capacity.rs::zero_wait_caller_admits_a_slot_freed_during_friction` |
+| Async waiter identity | Re-poll dedup used `will_wake`, so two `EnterFuture`s inside one task cross-matched and the sibling's queue entry was orphaned | Identity is the queue entry's own `evicted` flag (`Arc::ptr_eq`); re-park replaces the waker on that entry only | `tests/async_primitives.rs::enter_async_repeated_polls_do_not_bloat_waiter_queue` |
+| Async queue TTL origin | `enqueued_at_ms` never reset on re-parks: TTL/queue-wait measured from construction of the future, not from actual waiting | Stamped at the first park; TTL measures real queue time | `tests/async_primitives.rs::dropped_parked_future_deregisters_its_queue_slot` |
+| Conduit poison | `update_state` silently returned on a poisoned state lock — the pause/cancel directive update vanished | Lock is recovered (`into_inner`) and the update applied; poison bookkeeping stays with the poisoner | `tests/conduit.rs` |
+| EOF grace forever-loop | `note_death`'s grace loop compared only against the clock: a non-advancing injected clock (firmware, tests) spun forever without a verdict | Poll-count backstop `polls >= grace*2` breaks without a deadlock verdict (a verdict needs a clock) | `tests/supervisor_pool.rs` grace window |
+| Storm-gate JSON parsing | Three storm gates asserted numbers by substring (`"reaped":32` matches `"reaped":320`): a collision false-passed the gate | Shared `json_num` parses the exact field value; mismatch is a loud FAIL | `tests/common/mod.rs`, three storm tests |
+| Harness worker orphan (.py) | After a supervisor hard-kill the worker kept spinning past `finalized=True` — the supervisor that would reap it was dead | The lane worker is killed right after the hard kill, identity-gated | `scripts/stress_multi_lineage.py` |
+| PS gate case sensitivity | The PowerShell gate flavor matched case-insensitively where the `.sh` gate is case-sensitive (unsafe scan, counter gate, lock-hygiene, attribute anchors) | `-CaseSensitive` / `-cmatch` on the parity gates | `scripts/check_compile_gates.ps1` |
+
+Scope corrections (documentation-only): the erased "iron law" section now
+states that the admission probe is not a lifetime lease on the slot —
+`max_in_flight(1)` does not serialize two live erased workers; Layer 3
+documents the settle wake-window semantics (a wake is a hint, not a
+reservation); the README lists the real `no_std` surface; `PulseTick` is
+documented as internal; the Layer 5 helper exports got a quick-reference
+row.
+
 ## API & Cost Quick Reference
 
 | Operation | Layer | Latency / Footprint | When to Use |
@@ -1666,5 +1712,6 @@ refusal.
 | `TransactionHeader { generation, epoch, task_id }` | 1 / core | 24 B `Copy` | Stamped header for trust boundaries; `task_id` doubles as the reply-correlation check |
 | `GatewayStats` | 2 / std | plain `Copy` counters | Gateway channel books: `sent` / `admitted` / `shed` / `throttled` (saturating) |
 | `ResumeFuture` | 2 / std | 0% CPU waker park | Future resolved by the next directive (pause/resume/cancel); reads the directive under the wakers lock, never duplicates a payload |
-| `PulseTick` (type alias) | 1 / core | structural: one atomic | `WorkerPulse` tick storage: `AtomicU64`, or `AtomicU32` wrapping at 2^32 on targets without 64-bit CAS |
+| `PulseTick` (type alias) | 1 / core | structural: one atomic | Internal tick storage type behind `WorkerPulse` (a private detail surfaced through `WorkerPulse::observe`): `AtomicU64`, or `AtomicU32` wrapping at 2^32 on targets without 64-bit CAS. Not a public API — drive pulses through `WorkerPulse` |
+| `EnvelopeVerdict`, `crc32_ieee`, `diagnostic_hash`, `scan_anomalies_for_snapshot`, `find_anomalies_for_snapshot`, `write_diagnostic_line`, `write_health` (Layer 5 helpers) | 7 / std (`find_anomalies_for_snapshot`: alloc) | `Copy` verdict / pure fns / `Write` renderers | Frame-envelope verdict types and the anomaly-scan/hash/render helpers the pool and diagnostic layers are built on; exposed for harnesses that reuse the same classification outside the crate |
 | `LeaseEvent { task_id, stage, kind }` | 3 / std | `Copy` event | Reaper mailbox payload fired by `AsyncLease` drop; overflow accounting goes through `LeaseChannel::fire` |

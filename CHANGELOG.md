@@ -4,6 +4,57 @@ All notable changes to `snubber`. Benchmarks live in [README.md](README.md);
 the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 ("Fixed in …" sections) and [docs/INVARIANTS.md](docs/INVARIANTS.md).
 
+## 0.6.6 — 2026-10-23
+
+Fifth-audit batch: async liveness, storm-harness hygiene, CI hardening.
+Details: USER_GUIDE "Fixed in 0.6.6".
+
+- `ResumeFuture` implements `Drop`: the parked waker is removed from the
+  directive queue when the future is dropped mid-`.await` (no leak, no
+  stale wake).
+- `enter_async_auto` zero-wait re-check no longer refuses a verified-free
+  slot: after the post-park admission re-check, a `wait_ms == 0` caller
+  (AdviseOnly / Custom pacing) is admitted like any other.
+- Async waiter identity is the queue entry itself (own `evicted` flag
+  via `Arc::ptr_eq`), not `will_wake` — two `EnterFuture`s inside one
+  task no longer cross-match and orphan a sibling's queue entry.
+- Async queue TTL now counts from the FIRST park (re-parks refresh the
+  waker, not the clock), so queue-wait telemetry and TTL expiry measure
+  real waiting time.
+- `note_memory_kb` stores the pressure verdict under the bulkhead lock
+  (no more out-of-lock window where pressure state could be overwritten
+  by a concurrent admission).
+- `TaskConduit::update_state` recovers from a poisoned state lock
+  instead of silently no-op-ing the update.
+- `run_supervised_guard_with_grace`: EOF grace is configurable; the
+  pool's `note_death` grace loop backs off with a poll-count bound so a
+  non-advancing injected clock cannot spin forever.
+- OP_STATE doc corrected to 3 frames; the false-"SNUB"-byte desync
+  limitation is documented on `PipeDrain` (wire-format break to fix in a
+  major release, not silently).
+- Storm harnesses: `stress_multi_lineage.py` kills the lane worker after
+  a hard-killed supervisor (no orphaned spinner past `finalized`),
+  `stress_harness.sh` traps EXIT/INT/TERM and uses `mktemp` latency
+  files; `bench.ps1` refuses to publish an empty snapshot and drops its
+  dead `$layer` table; `bench.sh`/`bench.ps1` units unified (`us`).
+- Gate scripts: PowerShell flavor is case-sensitive on parity-critical
+  gates; the `.sh` Gate 6 no longer swallows the baseline==HEAD warn.
+- CI: `permissions: contents: read` on both workflows, `concurrency`
+  group + `timeout-minutes` on every CI job, `--locked` on every cargo
+  invocation, checkout/upload-artifact re-pinned to current majors
+  (v7), and a scheduled/manual Windows lane running the Win32
+  `stress_multi_lineage.ps1` storm.
+- Tests: `failure_rate` clamp/disable semantics covered (3 new tests),
+  `enter_paced_async` both branches (AdviseOnly refusal + admit after
+  pace), `print_health` smoke, exact-JSON-number parsing for storm gates
+  (`json_num`), token-bucket test de-flaked, storm gate now an
+  `#[ignore]` breaker-churn stress; the three numeric storm-gate asserts
+  no longer match by substring.
+- Docs: erased-guard "iron law" scope correction (the admission probe is
+  not a lifetime lease; serialize live workers yourself), wake-window
+  semantics in Layer 3, honest `no_std` surface list in the README,
+  `PulseTick` reworded as internal, Layer 5 helper exports row.
+
 ## 0.6.5 — 2026-10-23
 
 Fourth-audit cleanup batch: every remaining P2/P3 finding closed.

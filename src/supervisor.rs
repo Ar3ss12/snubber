@@ -414,6 +414,14 @@ impl RestartTracker {
     /// Report one death at `now_ms` (caller clock, monotonic).
     /// `exit_code: None` = killed/hung from outside (always a crash).
     /// Returns the decision; the CALLER sleeps/spawns/reports.
+    ///
+    /// Generation semantics NOTE: the internal clock bumps only on
+    /// AUTHORIZED restarts (`Restart { .. }`). [`crate::pool::PoolLane`]
+    /// bumps its own clock on EVERY reap — under `RestartPolicy::Never` /
+    /// a `GiveUp`, `RestartTracker::generation()` and
+    /// `PoolLane::generation()` legitimately diverge. Each is consistent
+    /// with its own meaning (restarts served vs lineages seen); do not
+    /// compare them across the two types.
     pub fn note_death(&mut self, exit_code: Option<i32>, now_ms: u64) -> RestartDecision {
         self.attempts = self.attempts.saturating_add(1);
         if !self.policy.wants_restart(exit_code) {
@@ -516,11 +524,12 @@ pub const OP_HEARTBEAT: u32 = 1;
 /// diagnostics, never as an armed token — arms nothing, clears nothing.
 pub const OP_SNAPSHOT: u32 = 2;
 
-/// Hot state handoff (Phase 3): the 40 B body carries a chunk of the
-/// 64 B `StateDigest` (2 frames: seq 0 = bytes `0..28` + CRC, seq 1 =
-/// bytes `28..64`). The drain keeps the LAST valid digest in its own
-/// slot — never armed as a token, never rolled back. The supervisor
-/// hands it to the next generation on tick 0 (`take_state()`).
+/// Hot state handoff (Phase 3): the 64 B `StateDigest` travels as THREE
+/// `OP_STATE` frames (seq in `task`: 0 = bytes `0..24`, 1 = `24..48`,
+/// 2 = `48..64` + full-digest CRC), each with its own frame CRC. The
+/// drain keeps the LAST valid digest in its own slot — never armed as a
+/// token, never rolled back. The supervisor hands it to the next
+/// generation on tick 0 (`take_state()`).
 pub const OP_STATE: u32 = 3;
 
 impl ProcessToken {
@@ -959,6 +968,15 @@ struct DrainInner {
 /// (e.g. `println!` logs) in stdout is transparently skipped without losing
 /// frame alignment or crashing.
 ///
+/// Known limitation (accepted): frames carry NO CRC (fixed 44 B wire,
+/// zero-dep budget), so the literal magic `SNUB` embedded in a worker's
+/// TEXT output within 40 following bytes can fake a frame; an unknown
+/// opcode in that fake body arms a garbage emergency token (spurious
+/// rollback) and the real frame is swallowed. Worker stdout must not
+/// embed the magic followed by 40 binary-looking bytes — logs do not.
+/// A per-frame CRC would close this and is a wire-format break, not a
+/// patch.
+///
 /// Three drivers share one parser:
 /// * [`PipeDrain::spawn`] — OS reader thread (default `std` flow);
 /// * [`PipeDrain::drain_sync`] — blocking read to EOF (buffers, fuzzing);
@@ -1286,6 +1304,34 @@ impl Supervisor {
         Self::run_supervised_guard_with_lease(worker_flag, 0, on_dead_token)
     }
 
+    /// Supervised guard with a configurable terminal EOF grace.
+    ///
+    /// The default [`Self::run_supervised_guard`] waits at most
+    /// [`crate::pool::DEFAULT_EOF_GRACE_MS`] after process death for the
+    /// pipe to flush its last frames before classifying the death. A
+    /// slow-flushing child (big buffered stdout) can be misreported CLEAN
+    /// when its rescue token is still in flight — pass a larger
+    /// `eof_grace_ms` here. Mirrors the pool's `with_eof_grace`.
+    pub fn run_supervised_guard_with_grace<F>(
+        worker_flag: &'static str,
+        lease_ms: u64,
+        eof_grace_ms: u64,
+        on_dead_token: F,
+    ) -> bool
+    where
+        F: Fn(ProcessToken),
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        Self::run_loop(
+            worker_flag,
+            &argv,
+            lease_ms,
+            None,
+            eof_grace_ms,
+            on_dead_token,
+        )
+    }
+
     /// Explicit-argv form of [`Self::run_supervised_guard`].
     ///
     /// `argv` is the FULL argument vector, index 0 is the program name
@@ -1318,7 +1364,14 @@ impl Supervisor {
         F: Fn(ProcessToken),
     {
         let argv: Vec<String> = std::env::args().collect();
-        Self::run_loop(worker_flag, &argv, lease_ms, None, on_dead_token)
+        Self::run_loop(
+            worker_flag,
+            &argv,
+            lease_ms,
+            None,
+            crate::pool::DEFAULT_EOF_GRACE_MS,
+            on_dead_token,
+        )
     }
 
     /// Explicit-argv form of [`Self::run_supervised_guard_with_lease`].
@@ -1334,7 +1387,14 @@ impl Supervisor {
     where
         F: Fn(ProcessToken),
     {
-        Self::run_loop(worker_flag, argv, lease_ms, None, on_dead_token)
+        Self::run_loop(
+            worker_flag,
+            argv,
+            lease_ms,
+            None,
+            crate::pool::DEFAULT_EOF_GRACE_MS,
+            on_dead_token,
+        )
     }
 
     /// Supervised loop with an external memory sampler (Phase 3).
@@ -1368,6 +1428,7 @@ impl Supervisor {
             &argv,
             lease_ms,
             Some((policy, &sample)),
+            crate::pool::DEFAULT_EOF_GRACE_MS,
             on_dead_token,
         )
     }
@@ -1390,6 +1451,7 @@ impl Supervisor {
             argv,
             lease_ms,
             Some((policy, &sample)),
+            crate::pool::DEFAULT_EOF_GRACE_MS,
             on_dead_token,
         )
     }
@@ -1399,6 +1461,7 @@ impl Supervisor {
         args: &[String],
         lease_ms: u64,
         memory: Option<(MemoryPolicy, MemorySampler<'_>)>,
+        eof_grace_ms: u64,
         on_dead_token: F,
     ) -> bool
     where
@@ -1538,18 +1601,18 @@ impl Supervisor {
                 );
             }
 
-            // Bounded EOF grace (same ceiling as the pool reaper,
-            // `crate::pool::DEFAULT_EOF_GRACE_MS`): a bare yield-spin
-            // never observes a pipe that still holds buffered bytes —
-            // the rescue token would be missed and the death reported
-            // CLEAN while the child's last words are still in flight.
-            // Same boundary as the pool (`elapsed > grace` = give up):
-            // spelled here as `<= grace` = keep waiting, in pool/lane.rs
-            // as `> grace` = stop — equivalent, kept so both grep alike.
+            // Bounded EOF grace (default ceiling: the pool reaper's
+            // `crate::pool::DEFAULT_EOF_GRACE_MS`; configurable via
+            // `run_supervised_guard_with_grace`, same role as the pool's
+            // `with_eof_grace`): a bare yield-spin never observes a pipe
+            // that still holds buffered bytes — the rescue token would be
+            // missed and the death reported CLEAN while the child's last
+            // words are still in flight. Same boundary as the pool
+            // (`elapsed > grace` = give up): spelled here as `<= grace` =
+            // keep waiting, in pool/lane.rs as `> grace` = stop —
+            // equivalent, kept so both grep alike.
             let eof_started = drain.now_ms();
-            while !drain.eof()
-                && drain.now_ms().saturating_sub(eof_started) <= crate::pool::DEFAULT_EOF_GRACE_MS
-            {
+            while !drain.eof() && drain.now_ms().saturating_sub(eof_started) <= eof_grace_ms {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
 

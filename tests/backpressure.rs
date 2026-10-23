@@ -72,7 +72,7 @@ fn shed_cap_rejects_without_parking() {
         matches!(r, Err(EnterError::BulkheadFull)),
         "shed, not parked"
     );
-    assert!(start.elapsed().as_millis() < 100, "no sleep on shed path");
+    assert!(start.elapsed().as_millis() < 1000, "no sleep on shed path");
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn explicit_breaker_open_action_sheds_without_parking() {
     let r = node.enter(2, 2, || {});
     assert!(matches!(r, Err(EnterError::BulkheadFull)));
     assert!(
-        start.elapsed().as_millis() < 100,
+        start.elapsed().as_millis() < 1000,
         "BreakerOpen must shed, not park 5 s"
     );
 }

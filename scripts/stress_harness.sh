@@ -40,8 +40,13 @@ cd "$ROOT" || exit 1
 
 PID_FILES=("target/supervised_worker.pid" "target/chaos_worker.pid")
 EXE="target/$PROFILE/examples/$TARGET_PROCESS"
-LAT_FILE="target/stress_latencies.tmp"
+# mktemp: two concurrent harness runs must not share a latency temp file.
+LAT_FILE="$(mktemp "${TMPDIR:-/tmp}/snubber_stress_lat.XXXXXX")" || exit 1
 : > "$LAT_FILE"
+# INT/TERM/EXIT: never leave a launched supervisor or a temp file behind.
+trap '[ -n "$SUP_PID" ] && kill -9 "$SUP_PID" 2>/dev/null; rm -f "$LAT_FILE"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 HAVE_NS=0
 if [ -n "$(date +%s%N 2>/dev/null | tr -dc '0-9')" ] && [ "$(date +%s%N 2>/dev/null | tr -dc '0-9' | wc -c)" -ge 18 ]; then

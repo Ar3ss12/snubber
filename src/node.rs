@@ -1743,9 +1743,12 @@ impl SnubberNode {
     /// [`MemoryVerdict::Hard`] and the supervisor may terminate without
     /// draining (`DeathCause::MemoryLimit`, Phase 3).
     ///
-    /// Cold path: one short lock for integer bookkeeping, the pressure
-    /// flag is stored OUTSIDE (release) so admission never waits on the
-    /// sampler. In-flight guards are never touched — drain is cooperative.
+    /// Cold path: one short lock for integer bookkeeping. The pressure
+    /// flag is stored INSIDE the locked block so concurrent samplers can
+    /// never land out of lock order (flag true while the last locked
+    /// verdict was Ok until the next sample). The store is one atomic
+    /// write — admission readers of the flag take no lock. In-flight
+    /// guards are never touched — drain is cooperative.
     pub fn note_memory_kb(&self, used_kb: u64) -> MemoryVerdict {
         let verdict = {
             let mut inner = self.lock();
@@ -1753,10 +1756,10 @@ impl SnubberNode {
             inner.stats.memory_used_kb = used_kb;
             inner.stats.memory_peak_kb = inner.memory.peak_kb();
             inner.stats.memory_pressure = verdict.is_pressured();
+            self.memory_pressure
+                .store(verdict.is_pressured(), Ordering::Release);
             verdict
         };
-        self.memory_pressure
-            .store(verdict.is_pressured(), Ordering::Release);
         verdict
     }
 
@@ -3137,7 +3140,14 @@ impl SnubberNode {
                             Self::emit(outcome, record);
                             return Err(EnterError::BulkheadFull);
                         }
-                    } else {
+                    } else if inner.in_flight >= inner.max_in_flight {
+                        // Still full with a zero-wait policy: refuse. (A
+                        // zero wait means the policy never sleeps — the
+                        // reject IS the pacing.) If the PHASE C re-check
+                        // above verified a free slot, this arm is skipped
+                        // and the caller falls through to admit; the old
+                        // unconditional reject refused a verified-free slot
+                        // whenever `wait_ms` was 0.
                         if inner.breaker == BreakerState::HalfOpen {
                             inner.half_open_probe = false;
                         }
@@ -3417,7 +3427,8 @@ impl SnubberNode {
         rollback: &mut Option<F>,
         waker: &core::task::Waker,
         evicted_out: &mut Option<Arc<AtomicBool>>,
-        enqueued_at_ms: u64,
+        prior_flag: Option<&Arc<AtomicBool>>,
+        enqueued_at_ms: &mut Option<u64>,
     ) -> core::task::Poll<Result<TrackedGuard<F>, EnterError>> {
         // Pass-through transit: ready dummy NOW, never park a Waker.
         // Consumes the rollback UNINVOKED (`take` + `let _` frees captures
@@ -3446,7 +3457,11 @@ impl SnubberNode {
             return core::task::Poll::Ready(Err(EnterError::MemoryPressure));
         }
         let now = now_ms();
-        let wait_ms = now.saturating_sub(enqueued_at_ms);
+        // The TTL clock starts when the future actually PARKS (first
+        // `waiters` entry), not at future construction: an executor may
+        // buffer a future long before the first poll, and "expired in
+        // queue" must mean it really queued.
+        let wait_ms = now.saturating_sub(enqueued_at_ms.unwrap_or(now));
         let header = TransactionHeader::new(epoch, task_id);
         let mut inner = self.lock();
 
@@ -3557,16 +3572,21 @@ impl SnubberNode {
                 inner.half_open_probe = false;
             }
 
-            // If the same task polls again, update its registered waker in-place
-            // without inflating the queue length.
-            if let Some(slot) = inner.waiters.iter_mut().find(|w| w.waker.will_wake(waker)) {
-                let flag = Arc::new(AtomicBool::new(false));
-                *evicted_out = Some(Arc::clone(&flag));
-                *slot = ParkedWaiter {
-                    waker: waker.clone(),
-                    evicted: flag,
-                };
-                return core::task::Poll::Pending;
+            // Identity dedup: update THIS future's own queue entry, matched
+            // by its `evicted` flag. Two futures polled by one task share a
+            // waker, so a `will_wake` scan would cross-match and orphan the
+            // sibling's entry (flag minted for B overwrote A's waiter).
+            if let Some(prev) = prior_flag {
+                if let Some(slot) = inner
+                    .waiters
+                    .iter_mut()
+                    .find(|w| Arc::ptr_eq(&w.evicted, prev))
+                {
+                    slot.waker = waker.clone();
+                    *evicted_out = Some(Arc::clone(prev));
+                    *enqueued_at_ms = Some(now);
+                    return core::task::Poll::Pending;
+                }
             }
 
             let q_cap = inner.queue_limit.max(1);
@@ -3611,6 +3631,7 @@ impl SnubberNode {
             }
             let flag = Arc::new(AtomicBool::new(false));
             *evicted_out = Some(Arc::clone(&flag));
+            *enqueued_at_ms = Some(now);
             inner.waiters.push_back(ParkedWaiter {
                 waker: waker.clone(),
                 evicted: flag,

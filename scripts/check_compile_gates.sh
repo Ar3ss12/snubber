@@ -121,7 +121,9 @@ if [ -z "${API_BASELINE}" ]; then
         SKIPS=$((SKIPS + 1))
     fi
 elif command -v cargo-semver-checks > /dev/null 2>&1     || (cd "${REPO_ROOT}" && cargo semver-checks --version > /dev/null 2>&1); then
-    if (cd "${REPO_ROOT}" && bash "${SCRIPT_DIR}/check_api_diff.sh" "${API_BASELINE}" > /dev/null); then
+    # No stdout redirect: check_api_diff.sh prints the baseline==HEAD WARN
+    # on this same path — swallowing it would hide a reduced audit.
+    if (cd "${REPO_ROOT}" && bash "${SCRIPT_DIR}/check_api_diff.sh" "${API_BASELINE}"); then
         echo "OK (no breaking change vs ${API_BASELINE})"
     else
         echo "FAIL (breaking API change vs ${API_BASELINE}: run scripts/check_api_diff.sh)"

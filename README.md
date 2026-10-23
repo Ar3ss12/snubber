@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-370%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-385%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -47,7 +47,7 @@ let receipt = node.scoped_checked(
 
 ## 🔌 Embedded & `no_std`
 
-`std` and `alloc` are additive features. Without `std` the crate is `core`-only (`#![cfg_attr(not(feature = "std"), no_std)]`); CI builds **both** `core` and `core + alloc` for `thumbv7em-none-eabihf`, and `WorkerPulse` drops to a 32-bit atomic on targets without 64-bit CAS. Layers 1–3 and the diagnostics core are fully `no_std`; the supervisor and pool stay `std` because they own OS pipes and reader threads.
+`std` and `alloc` are additive features. Without `std` the crate is `core`-only (`#![cfg_attr(not(feature = "std"), no_std)]`); CI builds **both** `core` and `core + alloc` for `thumbv7em-none-eabihf`, and `WorkerPulse` drops to a 32-bit atomic on targets without 64-bit CAS. The `no_std` surface is the watchdog, ISR bridge, clock, envelope, contract, policy, diagnostics core, memory watch, and protect layers; `SnubberNode` itself and the async engine, supervisor, pool, channel, and harness layers are `std` because they own OS threads, pipes, and process trees.
 
 The supervisor parser does not require a reader thread or stdout. Push bytes from a UART/DMA task and declare EOF yourself:
 

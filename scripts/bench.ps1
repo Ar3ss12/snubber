@@ -93,20 +93,19 @@ foreach ($est in $estimates) {
         Write-Warning "Skipping unparsable estimate: $rel"
         continue
     }
-    $layer = switch -Regex ($group) {
-        "layer1_core"        { "Layer 1 (`core`)" }
-        "layer1_5_hang_isr"  { "Layer 1.5 (`core`)" }
-        "layer2_std"         { "Layer 2 (`std`)" }
-        "layer2_telemetry"   { "Layer 2 (`std`)" }
-        "layer3_alloc"       { "Layer 2 (`alloc`)" }
-        default              { $group }
-    }
     $ns = if ($meanNs -lt 1000) {
         "{0:F1} ns" -f $meanNs
     } else {
         "{0:F2} us" -f ($meanNs / 1000.0)
     }
     $rows.Add("| ``$label`` | **$ns** | $group bench |")
+}
+
+if ($rows.Count -le 2) {
+    # Header-only snapshot means the export saw no estimates: publishing it
+    # would zero out the README table with a green CI. Fail instead.
+    Write-Error "No bench estimates found under $criterionDir — refusing to write an empty snapshot."
+    exit 1
 }
 
 if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }

@@ -58,13 +58,16 @@ fn fallback_serves_degraded_mode_when_open() {
 
 #[test]
 fn token_bucket_caps_admissions_per_second() {
+    // rate_per_sec(1): the second admission inside the same test tick is
+    // refused with zero timing assumptions (refill needs a full second).
+    // The old rate 2 shape assumed both enters landed within 500 ms —
+    // a descheduling between them let the refill fake a third token.
     let node = SnubberNode::builder("bucket")
-        .rate_per_sec(2)
+        .rate_per_sec(1)
         .max_in_flight(16)
         .build();
     node.enter(1, 1, || {}).expect("token 1").commit();
-    node.enter(2, 2, || {}).expect("token 2").commit();
-    match node.enter(3, 3, || {}) {
+    match node.enter(2, 2, || {}) {
         Err(EnterError::RateLimited) => {}
         _ => panic!("bucket empty must rate-limit"),
     }
@@ -107,4 +110,77 @@ fn metric_samples_export_tags() {
     assert_eq!(stale.count, 2);
     assert_eq!(stale.kind, FaultKind::StaleEpoch.index());
     assert_eq!(stale.node, "export");
+}
+
+#[test]
+fn failure_rate_percent_zero_clamps_to_one_and_trips() {
+    // percent 0 would make the `pct >= percent` comparison fire on ANY
+    // filled window — including all-success. The setter clamps to 1: one
+    // failure in a full window (25% >= 1%) must trip.
+    let node = SnubberNode::builder("zero_percent")
+        .trip_after_failures(1000)
+        .failure_rate(4, 0)
+        .build();
+    node.enter(1, 1, || {}).expect("enter").commit();
+    {
+        let _g = node.enter(2, 2, || {}).expect("enter");
+    }
+    node.enter(3, 3, || {}).expect("enter").commit();
+    node.enter(4, 4, || {}).expect("enter").commit();
+    let s = node.stats();
+    assert_eq!(
+        s.breaker_trips, 1,
+        "1/4 = 25% must trip a clamped 1% threshold"
+    );
+    assert_eq!(s.breaker_state, snubber::BreakerState::HalfOpen);
+}
+
+#[test]
+fn failure_rate_percent_over_100_clamps_to_100() {
+    // percent 101 clamps to 100: a window with a single success must NOT
+    // trip, a full-failure window must.
+    let node = SnubberNode::builder("over_percent")
+        .trip_after_failures(1000)
+        .failure_rate(4, 101)
+        .build();
+    for i in 1..4u64 {
+        {
+            let _g = node.enter(i, i, || {}).expect("enter");
+        }
+    }
+    node.enter(4, 4, || {}).expect("enter").commit();
+    let s = node.stats();
+    assert_eq!(
+        s.breaker_trips, 0,
+        "3/4 = 75% must not trip a 100% threshold"
+    );
+    for i in 5..8u64 {
+        {
+            let _g = node.enter(i, i, || {}).expect("enter");
+        }
+    }
+    {
+        let _g = node.enter(8, 8, || {}).expect("enter");
+    }
+    let s = node.stats();
+    assert_eq!(s.breaker_trips, 1, "4/4 = 100% must trip");
+    assert_eq!(s.breaker_state, snubber::BreakerState::HalfOpen);
+}
+
+#[test]
+fn failure_rate_window_zero_disables_the_window() {
+    // window 0 disables the sliding-window breaker: failures accumulate
+    // but the window never fills, so nothing trips from it.
+    let node = SnubberNode::builder("window_zero")
+        .trip_after_failures(1000)
+        .failure_rate(0, 50)
+        .build();
+    for i in 1..=8u64 {
+        {
+            let _g = node.enter(i, i, || {}).expect("enter");
+        }
+    }
+    let s = node.stats();
+    assert_eq!(s.breaker_trips, 0, "window 0 = disabled: must never trip");
+    assert_eq!(s.breaker_state, snubber::BreakerState::Closed);
 }

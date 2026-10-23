@@ -12,6 +12,9 @@
 //! every reap, bumped each lane exactly once per death, and marks the run
 //! `deadlock: true` (the honest bucket, not a lost token).
 
+mod common;
+
+use common::json_num;
 use std::fs;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -107,8 +110,9 @@ fn worker_pool_mixed_storm() {
         content.contains("\"deadlock\":true"),
         "the orphan mode must surface as a deadlock bucket: {content}"
     );
-    assert!(
-        content.contains(&format!("\"reaped\":{expected}")),
+    assert_eq!(
+        json_num(&content, "reaped"),
+        expected,
         "expected {expected} reaps: {content}"
     );
     for (needle, want) in [
@@ -118,8 +122,9 @@ fn worker_pool_mixed_storm() {
         ("deadlocks", want_deadlocked),
         ("rescued", want_ambush),
     ] {
-        assert!(
-            content.contains(&format!("\"{needle}\":{want}")),
+        assert_eq!(
+            json_num(&content, needle),
+            want,
             "expected {needle}={want}: {content}"
         );
     }

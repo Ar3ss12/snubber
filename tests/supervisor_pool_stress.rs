@@ -8,6 +8,9 @@
 //! * `deadlock == false` / `conserved == true` — no pipe was left in flight;
 //! * `final_generation == [kills + 1; lanes]` — one bump per death, per lane.
 
+mod common;
+
+use common::json_num;
 use std::fs;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -91,16 +94,19 @@ fn worker_pool_storm() {
         content.contains("\"conserved\":true"),
         "pool accounting does not conserve: {content}"
     );
-    assert!(
-        content.contains(&format!("\"reaped\":{expected}")),
+    assert_eq!(
+        json_num(&content, "reaped"),
+        expected,
         "expected {expected} reaps: {content}"
     );
-    assert!(
-        content.contains(&format!("\"ambush\":{expected}")),
+    assert_eq!(
+        json_num(&content, "ambush"),
+        expected,
         "every kill must land after the arm proof: {content}"
     );
-    assert!(
-        content.contains(&format!("\"rescued\":{expected}")),
+    assert_eq!(
+        json_num(&content, "rescued"),
+        expected,
         "every armed worker must hand its token back: {content}"
     );
 

@@ -261,11 +261,23 @@ impl PoolLane {
             // declare the grace over up to 1 ms early. `>` costs one poll
             // and guarantees the caller actually got the full window.
             let started = drain.now_ms();
+            // Poll-count backstop: a non-advancing injected clock
+            // (`manual_with_clock(|| 42)`) can never satisfy the grace
+            // comparison and would park this reaper forever. On a healthy
+            // clock each poll costs ~1 ms, so the grace comparison fires
+            // first; the backstop only ends a clock that never advances
+            // (the drain state is then taken as-is, no deadlock verdict —
+            // a verdict needs a clock that can measure).
+            let mut polls = 0u64;
             while !drain.eof() {
                 if drain.now_ms().saturating_sub(started) > self.eof_grace_ms {
                     deadlock = true;
                     break;
                 }
+                if polls >= self.eof_grace_ms.saturating_mul(2).max(2) {
+                    break;
+                }
+                polls += 1;
                 std::thread::sleep(Duration::from_millis(1));
             }
         } else {

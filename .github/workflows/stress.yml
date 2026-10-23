@@ -20,6 +20,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   multi-lineage-posix:
     name: Multi-lineage storm (${{ matrix.os }})
@@ -30,7 +33,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -42,7 +45,7 @@ jobs:
         run: python3 --version
 
       - name: Build Supervisor Example (release)
-        run: cargo build --release --example process_termination_loop
+        run: cargo build --release --locked --example process_termination_loop
 
       - name: Storm - armed hold (true ambush gate)
         run: |
@@ -53,7 +56,7 @@ jobs:
 
       - name: Upload Armed-Hold Artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: multi-lineage-armed-hold-${{ matrix.os }}
           path: |
@@ -73,12 +76,47 @@ jobs:
 
       - name: Upload Free-Running Artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: multi-lineage-free-${{ matrix.os }}
           path: |
             target/multi_lineage_stats_free.json
             target/multi_lineage_report_free.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Windows-only raw Win32 TerminateProcess path: the .py driver never
+  # exercises it, so without this lane the PS harness rots invisibly.
+  # Heavier and flakier than the POSIX storms — scheduled/manual only.
+  multi-lineage-windows:
+    name: Multi-lineage storm (windows, Win32 kill)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Build Supervisor Example (release)
+        run: cargo build --release --locked --example process_termination_loop
+
+      - name: Storm - armed hold (true ambush gate)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 250 -ArmedHold -Aggressive -MinAmbushPct 70
+
+      - name: Upload Armed-Hold Artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: multi-lineage-armed-hold-windows
+          path: |
+            target/multi_lineage_stats.json
+            target/multi_lineage_report.json
+            target/multi_lineage/lane_*/supervisor.out
           if-no-files-found: warn
           retention-days: 14
 
@@ -88,7 +126,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Stable Rust
         uses: dtolnay/rust-toolchain@stable

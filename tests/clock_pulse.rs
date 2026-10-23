@@ -14,9 +14,17 @@ use snubber::{
 fn system_clock_is_monotonic_across_samples() {
     let c = SystemClock;
     let a = c.now_ms();
-    std::thread::sleep(core::time::Duration::from_millis(5));
+    std::thread::sleep(core::time::Duration::from_millis(50));
     let b = c.now_ms();
     assert!(b >= a, "monotonic clock moved backwards: {a} -> {b}");
+    // Upper bound catches a frozen/stalled clock too: a 50 ms sleep must
+    // advance the reading, and wildly so (generous 5 s ceiling absorbs
+    // scheduler hiccups on loaded CI).
+    assert!(
+        b.saturating_sub(a) <= 5_000,
+        "clock frozen or skewed: 50 ms sleep advanced {} ms",
+        b.saturating_sub(a)
+    );
 }
 
 #[test]

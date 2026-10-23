@@ -14,13 +14,21 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # 1. QUALITY GATE: Formatting, clippy, no_std, docs
   quality:
     name: Code Quality & no_std Gate
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history + tags: Gate 6 diffs the public API against the
           # last release tag via `git describe`; a depth-1 checkout makes
@@ -78,12 +86,13 @@ jobs:
     name: Test on ${{ matrix.os }}
     needs: quality
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full tags for the Windows PowerShell gate (Gate 6 needs a tag
           # baseline); the bare-metal target feeds Gate 5 there.
@@ -121,16 +130,16 @@ jobs:
         run: cargo test --release --locked --test concurrency_stress
 
       - name: Run Release Hard Clamp & Bulkhead Capacity
-        run: |
-          cargo test --release --test bulkhead_capacity
+        run: cargo test --release --locked --test bulkhead_capacity
 
   # 3. MIRI VERIFICATION: Formal memory model verification
   miri:
     name: Miri Memory Model Verification
     needs: quality
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Nightly Rust with Miri
         uses: dtolnay/rust-toolchain@nightly
@@ -186,8 +195,9 @@ jobs:
     name: Benchmark Compile Check
     needs: quality
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Stable Rust
         uses: dtolnay/rust-toolchain@stable
