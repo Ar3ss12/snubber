@@ -146,6 +146,12 @@ fn depth_counter_returns_to_zero_after_concurrent_storm() {
 
     let (tx, rx) = snubber::gateway::<u64>(16);
     const PRODUCERS: usize = 4;
+    // Miri interprets every thread on one host core; 4x4096 contended
+    // sends stall the CI miri lane for ~10 min. The lost-decrement race
+    // reproduces well before 4x256 (see frame_fuzz.rs for the same idiom).
+    #[cfg(miri)]
+    const PER_PRODUCER: u64 = 256;
+    #[cfg(not(miri))]
     const PER_PRODUCER: u64 = 4096;
     let sent = Arc::new(AtomicU64::new(0));
 

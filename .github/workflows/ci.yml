@@ -132,12 +132,15 @@ jobs:
       - name: Run Release Hard Clamp & Bulkhead Capacity
         run: cargo test --release --locked --test bulkhead_capacity
 
-  # 3. MIRI VERIFICATION: Formal memory model verification
-  miri:
-    name: Miri Memory Model Verification
+  # 3. MIRI VERIFICATION: Formal memory model verification.
+  # Split into two parallel jobs: Miri interprets all threads on one host
+  # core, so wall time = sum of suites; two runners halve the wall clock
+  # at the same total minute cost.
+  miri-core:
+    name: Miri Memory Model Verification (core)
     needs: quality
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -152,7 +155,7 @@ jobs:
       - name: Run Miri on Core Library
         run: cargo miri test --lib
 
-      - name: Run Miri on Full Memory & Concurrency Suite
+      - name: Run Miri on Core Suites
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks"
         run: |
@@ -171,6 +174,27 @@ jobs:
           cargo miri test --test presets
           cargo miri test --test watchdog
           cargo miri test --test input_boundary
+
+  miri-concurrency:
+    name: Miri Memory Model Verification (concurrency)
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Nightly Rust with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Run Miri on Concurrency Suites
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks"
+        run: |
           cargo miri test --test backpressure
           cargo miri test --test fault_classification
           cargo miri test --test async_gate
