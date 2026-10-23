@@ -39,11 +39,19 @@ fn bench_body(source: &str, marker: &str) -> Option<String> {
 
 /// Split body into (setup, timed) at the first timing call.
 fn split_at_timer(body: &str) -> (String, String) {
-    let pos = match (body.find("b.iter("), body.find("b.iter_custom(")) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+    let pos = match (
+        body.find("b.iter("),
+        body.find("b.iter_custom("),
+        body.find("b.iter_batched("),
+    ) {
+        (Some(a), Some(b), Some(c)) => Some(a.min(b).min(c)),
+        (Some(a), Some(b), None) => Some(a.min(b)),
+        (Some(a), None, Some(c)) => Some(a.min(c)),
+        (None, Some(b), Some(c)) => Some(b.min(c)),
+        (Some(a), None, None) => Some(a),
+        (None, Some(b), None) => Some(b),
+        (None, None, Some(c)) => Some(c),
+        (None, None, None) => None,
     };
     match pos {
         Some(p) => (body[..p].to_string(), body[p..].to_string()),
@@ -63,14 +71,17 @@ const HEAVY: &[&str] = &[
 ];
 
 /// Constructors that ARE the measured API: `drain_sync` performs the
-/// whole scan in its constructor, and `lane.attach` takes ownership of a
-/// drain, so per-sample construction is the honest cost there. Every such
-/// site must be declared here; any undeclared constructor is still a bug.
-const PER_SAMPLE: &[(&str, &str)] = &[
-    ("drain_sync_256_frames", "PipeDrain::drain_sync("),
-    ("lane_attach_reap_ambush", "PipeDrain::drain_sync("),
-    ("lane_attach_reap_escape", "PipeDrain::drain_sync("),
-];
+/// whole scan in its constructor, so per-sample construction is the
+/// honest cost of `drain_sync_256_frames`. Every such site must be
+/// declared here; any undeclared constructor is still a bug.
+const PER_SAMPLE: &[(&str, &str)] = &[("drain_sync_256_frames", "PipeDrain::drain_sync(")];
+
+/// Benches whose argument is BUILT per sample but must be built in the
+/// `iter_batched` setup closure, never inside the timed routine. The
+/// hygiene law here is weaker than text position: the drain is an
+/// argument to `attach`, so `iter_batched` is the only way to time the
+/// attach+reap pair without folding construction into it.
+const BATCHED_SETUP: &[&str] = &["lane_attach_reap_ambush", "lane_attach_reap_escape"];
 
 /// Fixed-name benches; `bench_function(format!(...))` sites are pinned by
 /// their IDEAL markers below instead.
@@ -226,10 +237,22 @@ fn bench_setup_outside_hot_loop() {
             panic!("bench '{name}' missing");
         });
         let (_setup, timed) = split_at_timer(&body);
+        let has_timer = timed.contains("b.iter(")
+            || timed.contains("b.iter_custom(")
+            || timed.contains("b.iter_batched(");
         assert!(
-            timed.contains("b.iter(") || timed.contains("b.iter_custom(") || name.ends_with('_')
+            has_timer || name.ends_with('_'),
+            "bench '{name}' has no timing call"
         );
         let name_s: &str = name;
+        if BATCHED_SETUP.contains(&name_s) {
+            // Construction must live in the setup closure.
+            assert!(
+                timed.contains("b.iter_batched("),
+                "bench '{name}' must time via iter_batched so drain construction is untimed"
+            );
+            continue;
+        }
         for ctor in HEAVY {
             if PER_SAMPLE.iter().any(|(n, c)| *n == name_s && *c == *ctor) {
                 continue;
@@ -240,6 +263,12 @@ fn bench_setup_outside_hot_loop() {
             );
         }
     }
+    // A discarding writer skips the copy the API is being measured on:
+    // `sink()` understates every `write_to` bench. Use a real writer.
+    assert!(
+        !source.contains("std::io::sink()"),
+        "benches must write into a real buffer, not std::io::sink()"
+    );
     for (tag, pin) in [
         ("IDEAL-1", "bench_contended_enter"),
         ("IDEAL-2", "bench_contended_scoped"),

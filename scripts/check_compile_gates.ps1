@@ -209,23 +209,16 @@ if ($GitExit -ne 0 -or -not $ApiBaseline) {
             $Skips++
         }
     } else {
-        $Crate = (Select-String -Path "$RepoRoot\Cargo.toml" -Pattern '^name *= *"([^"]+)"').Matches[0].Groups[1].Value
-        Push-Location $RepoRoot
-        try {
-            $PrevEap = $ErrorActionPreference
-            $ErrorActionPreference = "Continue"
-            $SemverOut = & cargo semver-checks check-release --baseline-rev $ApiBaseline --package $Crate 2>&1
-            $SemverExit = $LASTEXITCODE
-            $ErrorActionPreference = $PrevEap
-            if ($SemverExit -eq 0) {
-                Write-Host " OK (no breaking change vs $ApiBaseline)" -ForegroundColor Green
-            } else {
-                Write-Host " FAIL (breaking API change vs ${ApiBaseline}: run scripts/check_api_diff.ps1)" -ForegroundColor Red
-                $SemverOut | ForEach-Object { Write-Host "   $_" }
-                $Failures++
-            }
-        } finally {
-            Pop-Location
+        # Delegate to the standalone gate (parity with the .sh flavor):
+        # one implementation of the semver rules and the Cargo.lock guard,
+        # so CI exercises check_api_diff.ps1 on every Windows run.
+        $ApiDiffScript = Join-Path $ScriptDir "check_api_diff.ps1"
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $ApiDiffScript $ApiBaseline
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host " OK (no breaking change vs $ApiBaseline)" -ForegroundColor Green
+        } else {
+            Write-Host " FAIL (public API gate vs ${ApiBaseline}: see the API diff output above)" -ForegroundColor Red
+            $Failures++
         }
     }
 }

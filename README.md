@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-386%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-387%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -97,7 +97,7 @@ Measured on AMD Ryzen 5 4600H release build
 | `node.enter_auto + commit` | Layer 2 (`std`) | **~134 ns** | + atomic sequence minting |
 | `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~119 ns** | Priority lane: −2 ns vs plain enter |
 | `node.transition` | Layer 2 (`std`) | **~131 ns** | ONE-enum state machine, zero flag drift |
-| `node.transition_checked` + `LegalMove` | Layer 2 (`std`) | same + 0 ns | Closed state graphs: illegal moves fail at compile time (E0277) |
+| `node.transition_checked` + `LegalMove` | Layer 2 (`std`) | same path, no extra work | Compile-time only: the `LegalMove` proof erases to the same `transition` call; illegal moves fail at compile (E0277) |
 | `enter_erased_auto` | Layer 2 (`alloc`) | **~130 ns** | Boxed rollback for dynamic struct fields |
 | `node_passthrough_enter + commit` | Layer 2 (`std` canary) | **~98.4 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
 | `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~99.6 ns** | Same transit through `scoped()` — work runs, books stay clean |
@@ -117,12 +117,15 @@ Measured on AMD Ryzen 5 4600H release build
 | `PipeDrain::drain_sync` | Layer 4 (`std`) | **~61 ns/frame** | 256 frames: 16.5M frames/s including per-stream drain state |
 | `PipeDrain::feed` (one 44 B frame) | Layer 4 (`std`) | **~97 ns** | Caller-pushed chunk: scanner + lock + dispatch, no reader thread |
 | `PipeDrain::feed` (256 frames/chunk) | Layer 4 (`std`) | **~21.2 µs** (82.7 ns/frame) | Same scanner: one ingest lock per chunk + one short state lock per token |
-| `ProcessToken::write_to(&mut sink)` | Layer 4 (`std`) | **~0.5 ns** | 44 B `write_all` into any `Write`: no env, no stdout lock |
-| `StateDigest::write_to(&mut sink)` | Layer 4 (`std`) | **~616 ns** | Three `OP_STATE` frames + CRC32 seals |
+| `ProcessToken::write_to(&mut sink)` | Layer 4 (`std`) | **~2.1 ns** | 44 B `write_all` into any real `Write` (copy included): no env, no stdout lock |
+| `StateDigest::write_to(&mut sink)` | Layer 4 (`std`) | **~621 ns** | Three `OP_STATE` frames + CRC32 seals |
 | `namespace_task` pack / unpack | Layer 4 (`std`) | **~2.1 / 1.0 ns** | `task = lane << 48 \| local`; two shifts + mask, no branch |
-| `lane.attach` + `note_death` (ambush) | Layer 4 (`std`) | **~338 ns** | Full rescue path: drain EOF, token take, generation bump, restart math, per-class counters |
-| `lane.attach` + `note_death` (escape) | Layer 4 (`std`) | **~407 ns** | Same path when the child settled (commit parsed, no token) |
-| `pool.report()` (4 lanes) | Layer 4 (`std`) | **~112 ns** | Four short lane locks + totals fold, no allocation |
+| `lane.attach` + `note_death` (ambush) → `PoolReap` | Layer 4 (`std`) | **~220 ns** | Full rescue path: drain EOF, token take, generation bump, restart math, per-class counters |
+| `lane.attach` + `note_death` (escape) → `PoolReap` | Layer 4 (`std`) | **~177 ns** | Same path when the child settled (commit parsed, no token) |
+| `pool.report()` (4 lanes) | Layer 4 (`std`) | **~112 ns** | Rows (`LaneSnapshot`) + `PoolTotals::of`: four short lane locks, totals fold, no allocation |
+| `LaneSnapshot` / `PoolTotals` | Layer 4 (`std`) | `Clone` row / `Copy` totals | `conserved()` = `ambush+escape+stillborn+deadlocks == reaps`; no guessed fifth bucket |
+| `run_supervised_guard_with_grace(..)` | Layer 3 (`std`) | one reaped child process | Supervised guard with a configurable terminal EOF grace for slow-flushing children |
+| `DEFAULT_EOF_GRACE_MS` (250 ms) | Layer 3 (`std`) | published const | Default terminal EOF grace; `run_supervised_guard_with_grace` and the pool builder override it |
 | `lane.note_memory_kb` | Layer 4 (`std`, cold) | **~12 ns** | Per-lane watch: one lock + integer compares |
 | `pool.expired_lanes(lease)` (4 lanes) | Layer 4 (`std`, cold) | **~539 ns** | One sweep over four silent pipes: one state lock per lane, no child touched |
 | `run_supervised_guard_with_memory` | Layer 4 (`std`) | structural: 1 sampler call / 10 ms tick | Soft logs `MEMORY_DRAIN`; hard `kill()` without draining (`DeathCause::MemoryLimit`) |
@@ -204,11 +207,11 @@ match reap.decision { /* Restart { delay_ms } | Stop | GiveUp */ }
 
 Measured (`cargo test --test supervisor_pool_stress -- --ignored --nocapture`, 4 lanes × 8 hard kills, debug build): 32/32 reaps, 32/32 true ambush, 0 escape, 0 stillborn, 0 deadlocks, final generation `[9,9,9,9]` (= kills + 1 per lane), 0.34 s storm wall.
 
-The mixed storm cycles `armed → clean → silent → orphan` by `local % 4` inside the same run (`--mixed`, example 19): `cargo test --test supervisor_pool_stress_mixed -- --ignored --nocapture` measured 32/32 conserved reaps, **A/E/S/D = 8/8/8/8**, 8 rescued tokens, `deadlock=true` (the orphan modes hold the pipe open past the 150 ms grace) and `[9,9,9,9]` generations in 0.71 s. A deadlocked lane is reported, never guessed into another bucket.
+The mixed storm cycles `armed → clean → silent → orphan` by `local % 4` inside the same run (`--mixed`, example 19): `cargo test --test supervisor_pool_stress_mixed -- --ignored --nocapture` measured 32/32 conserved reaps, **A/E/S/D = 8/8/8/8**, 8 rescued tokens, `deadlock=true` (the orphan modes hold the pipe open past the 150 ms grace) and `[9,9,9,9]` generations in 0.82 s. A deadlocked lane is reported, never guessed into another bucket.
 
-The lease storm (`--lease-ms`, example 19) is the opposite case: every child emits one heartbeat and then hangs forever, so no `wait()` ever returns on its own. `cargo test --test supervisor_pool_stress_lease -- --ignored --nocapture` measured 24/24 reaps — all **stillborn** (a heartbeat is liveness, not a settlement), 0 ambush, 0 escape, 0 deadlocks, `lease_kills=24`, `conservation_breaks=0` over 98,703 live `report()` samples from the observer thread, `[7,7,7,7]` generations, 0.42 s. A child that hung before its first heartbeat is not expired — a pipe that never parsed a frame is the app's spawn timeout, not a lease breach.
+The lease storm (`--lease-ms`, example 19) is the opposite case: every child emits one heartbeat and then hangs forever, so no `wait()` ever returns on its own. `cargo test --test supervisor_pool_stress_lease -- --ignored --nocapture` measured 24/24 reaps — all **stillborn** (a heartbeat is liveness, not a settlement), 0 ambush, 0 escape, 0 deadlocks, `lease_kills=24`, `conservation_breaks=0` over 99,392 live `report()` samples from the observer thread, `[7,7,7,7]` generations, 0.42 s. A child that hung before its first heartbeat is not expired — a pipe that never parsed a frame is the app's spawn timeout, not a lease breach.
 
-Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~338 ns (ambush) / ~407 ns (escape), a four-lane `report()` is ~112 ns, a four-lane lease sweep is ~539 ns, and `namespace_task` is ~2 ns — each lane locks only its own state.
+Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~220 ns (ambush) / ~177 ns (escape), a four-lane `report()` is ~112 ns, a four-lane lease sweep is ~539 ns, and `namespace_task` is ~2 ns — each lane locks only its own state.
 
 ---
 

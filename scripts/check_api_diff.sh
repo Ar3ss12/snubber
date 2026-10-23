@@ -57,4 +57,17 @@ cd "${REPO_ROOT}"
 # `--package` limits both sides to this crate (one build, not the
 # whole workspace). `--release-type auto` lets the crate version (0.6.x
 # minor) classify the change; explicit breaking removals still fail.
+# `cargo-semver-checks` exposes no `--locked` flag, so a resolve can
+# rewrite Cargo.lock behind the gate's back. Snapshot it and fail if the
+# tool mutated the lockfile (reproducibility hole the CI gate cannot see).
+LOCK_BEFORE="$(git -C "${REPO_ROOT}" hash-object Cargo.lock 2>/dev/null || true)"
+set +e
 cargo semver-checks check-release --baseline-rev "${BASELINE}" --package "${CRATE}"
+SEMVER_RC=$?
+set -e
+LOCK_AFTER="$(git -C "${REPO_ROOT}" hash-object Cargo.lock 2>/dev/null || true)"
+if [ "${LOCK_BEFORE}" != "${LOCK_AFTER}" ]; then
+    echo " FAIL (cargo-semver-checks rewrote Cargo.lock; restore it and pin the toolchain)"
+    exit 1
+fi
+exit "${SEMVER_RC}"

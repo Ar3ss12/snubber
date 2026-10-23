@@ -85,6 +85,44 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # Single-process harness: launches ONE supervisor, kills its workers
+  # through the pid-file handshake and checks the JSON report (kills,
+  # reaps, generation, leak gates). Scheduled/manual only -- it hammers
+  # real processes and is too slow for every push.
+  single-process-harness:
+    name: Single-process harness (${{ matrix.os }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Harness - launch, arm, kill (200 kills)
+        run: bash scripts/stress_harness.sh process_termination_loop 200 --launch --build --aggressive
+
+      - name: Upload Harness Artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stress-harness-${{ matrix.os }}
+          path: |
+            target/stress_stats.json
+            target/termination_report.json
+            target/stress_supervisor.out
+            target/stress_supervisor.err
+          if-no-files-found: warn
+          retention-days: 14
+
   # Windows-only raw Win32 TerminateProcess path: the .py driver never
   # exercises it, so without this lane the PS harness rots invisibly.
   # Heavier and flakier than the POSIX storms — scheduled/manual only.
@@ -107,6 +145,11 @@ jobs:
 
       - name: Storm - armed hold (true ambush gate)
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 250 -ArmedHold -Aggressive -MinAmbushPct 70
+
+      # The .ps1 single-process harness is a separate implementation: the
+      # Python driver never exercises it, so it rots without this step.
+      - name: Single-process harness (PS flavor, 100 kills)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 process_termination_loop 100 -Launch -Build -Aggressive
 
       - name: Upload Armed-Hold Artifacts
         if: always()

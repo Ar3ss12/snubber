@@ -431,17 +431,25 @@ fn bench_drain_feed(c: &mut Criterion) {
     });
     g.finish();
 
-    // Transport-agnostic token sink: 44 bytes into a discarding writer.
+    // Transport-agnostic token sink: 44 bytes into a real writer that
+    // copies. A reusable `Vec` (capacity reserved, cleared per iteration)
+    // keeps the timed window allocation-free — a discarding writer skips
+    // the copy entirely and understated the cost.
     let mut g = c.benchmark_group("layer4_token_sink");
     let token = ProcessToken::simple(1, 9, 7);
     let digest = StateDigest::new([7u8; 64]);
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
     g.bench_function("token_write_to", |b| {
-        let mut sink = std::io::sink();
-        b.iter(|| black_box(token.write_to(&mut sink)));
+        b.iter(|| {
+            buf.clear();
+            black_box(token.write_to(&mut buf))
+        });
     });
     g.bench_function("state_digest_write_to", |b| {
-        let mut sink = std::io::sink();
-        b.iter(|| black_box(digest.write_to(&mut sink)));
+        b.iter(|| {
+            buf.clear();
+            black_box(digest.write_to(&mut buf))
+        });
     });
     g.finish();
 }
@@ -471,36 +479,37 @@ fn bench_pool(c: &mut Criterion) {
     });
 
     // Attach + reap with an un-settled arm frame in the pipe: the rescue
-    // path (drain construction, EOF check, token take, generation bump,
-    // restart math, per-class counters).
+    // path (EOF check, token take, generation bump, restart math,
+    // per-class counters). The drain is built in the batched setup so its
+    // construction stays OUT of the timed window.
     let armed_wire = ProcessToken::simple(namespace_task(0, 7), 9, 1)
         .to_bytes()
         .to_vec();
     let pool = WorkerPool::new(PoolConfig::new(1).with_eof_grace(0)).expect("lane");
     let lane = pool.lane(0).expect("lane 0");
     g.bench_function("lane_attach_reap_ambush", |b| {
-        b.iter(|| {
-            lane.attach(
-                black_box(1_001),
-                PipeDrain::drain_sync(Cursor::new(black_box(&armed_wire[..]))),
-            )
-            .expect("idle lane");
-            let _ = black_box(lane.note_death(None, 0).expect("attached child"));
-        });
+        b.iter_batched(
+            || PipeDrain::drain_sync(Cursor::new(&armed_wire[..])),
+            |drain| {
+                lane.attach(black_box(1_001), drain).expect("idle lane");
+                let _ = black_box(lane.note_death(None, 0).expect("attached child"));
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     // Same path when the child settled cleanly (no token to hand back).
     let mut escaped_wire = armed_wire.clone();
     escaped_wire.extend_from_slice(&ProcessToken::commit(namespace_task(0, 7)).to_bytes());
     g.bench_function("lane_attach_reap_escape", |b| {
-        b.iter(|| {
-            lane.attach(
-                black_box(1_002),
-                PipeDrain::drain_sync(Cursor::new(black_box(&escaped_wire[..]))),
-            )
-            .expect("idle lane");
-            let _ = black_box(lane.note_death(Some(0), 0).expect("attached child"));
-        });
+        b.iter_batched(
+            || PipeDrain::drain_sync(Cursor::new(&escaped_wire[..])),
+            |drain| {
+                lane.attach(black_box(1_002), drain).expect("idle lane");
+                let _ = black_box(lane.note_death(Some(0), 0).expect("attached child"));
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     // Aggregate report: four short lane locks + totals folding.
@@ -784,9 +793,13 @@ fn bench_contended(c: &mut Criterion) {
                         thread::yield_now();
                     }
                 }
+                // The push side is what this bench measures; the consumer
+                // join happens after the clock stops so its teardown is
+                // not folded into the per-push latency.
+                let elapsed = start.elapsed();
                 running.store(false, Ordering::Relaxed);
                 let _ = pop_handle.join();
-                start.elapsed()
+                elapsed
             });
         });
     }

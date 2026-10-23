@@ -343,7 +343,8 @@ impl SnubberStats {
         (pending.saturating_mul(255) / max).min(255) as u8
     }
 
-    /// Snapshot-local depth gauge (committed vs started proxy).
+    /// Snapshot-local depth gauge: started minus committed, explicit
+    /// aborts and implicit drops (the same terms as the live gauge).
     /// The node fills the exact gauge at the call site; this keeps the
     /// frame formatter `Copy`-pure without a second lock.
     #[must_use]
@@ -2183,7 +2184,8 @@ impl SnubberNode {
     ///   never commits cannot inflate the success rate.
     /// * `Drop` without `commit` runs the user's rollback — the hardware
     ///   is still protected; the slot was already released at admission,
-    ///   and the node books no phantom implicit-drop.
+    ///   the node books one planned abort (`explicit_aborts += 1`, so the
+    ///   depth gauge balances) and no phantom implicit-drop.
     /// * If the admission landed while the breaker was HalfOpen, the
     ///   probe settles with the ERASED guard's outcome: `commit()` →
     ///   Closed, drop/abort → Open (a failed probe re-opens — the
@@ -2247,7 +2249,7 @@ impl SnubberNode {
                 // until a manual reset. The panic still reaches the caller
                 // — only the books are guaranteed first.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
-                node.settle_erased_probe(was_probe);
+                node.settle_erased_rollback(was_probe);
                 if let Err(payload) = outcome {
                     std::panic::resume_unwind(payload);
                 }
@@ -2759,7 +2761,7 @@ impl SnubberNode {
                 // Same panic-boundary as `enter_erased`: settle the probe
                 // before any rollback panic resumes.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
-                node.settle_erased_probe(was_probe);
+                node.settle_erased_rollback(was_probe);
                 if let Err(payload) = outcome {
                     std::panic::resume_unwind(payload);
                 }
@@ -3406,18 +3408,21 @@ impl SnubberNode {
     }
 
     /// Failure settlement for the erased admissions: a rollback (drop or
-    /// panic) re-opens a HalfOpen probe — the downstream was NOT healthy.
-    /// Planned aborts do not feed the failure streak, matching the sync
-    /// `abort()` path.
+    /// panic) books one planned abort and re-opens a HalfOpen probe — the
+    /// downstream was NOT healthy. The slot was already released at
+    /// admission, so `explicit_aborts` is the counter that balances the
+    /// `total_started` the admission booked (no phantom `implicit_drops`,
+    /// no permanently drifting depth gauge). Planned aborts do not feed
+    /// the failure streak, matching the sync `abort()` path.
     #[cfg(feature = "alloc")]
-    fn settle_erased_probe(&self, was_probe: bool) {
-        if !was_probe {
-            return;
-        }
+    fn settle_erased_rollback(&self, was_probe: bool) {
         let mut inner = self.lock();
-        inner.half_open_probe = false;
-        inner.breaker = BreakerState::Open;
-        inner.stats.breaker_state = BreakerState::Open;
+        inner.stats.explicit_aborts = inner.stats.explicit_aborts.saturating_add(1);
+        if was_probe {
+            inner.half_open_probe = false;
+            inner.breaker = BreakerState::Open;
+            inner.stats.breaker_state = BreakerState::Open;
+        }
     }
 
     /// Compile-time error budget: bake `MAX_ERRORS` into the call site.

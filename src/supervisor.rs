@@ -755,7 +755,8 @@ pub fn now_ms() -> u64 {
 /// `arms > commits` means it was armed more often than it settled.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DrainCounters {
-    /// Total parsed 40-byte frames (arms, commits, heartbeats, state chunks).
+    /// Total parsed 44-byte wire frames (40 B token body + 4 B `SNUB`
+    /// magic) — arms, commits, heartbeats, state chunks.
     pub frames: u64,
     /// Arm-class frames (any opcode outside commit/heartbeat/state/
     /// snapshot — `OP_SNAPSHOT` is diagnostics and never counted here).

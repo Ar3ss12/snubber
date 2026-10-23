@@ -469,5 +469,12 @@ cat > "$STATS" <<EOF
 }
 EOF
 
+# The report is the evidence for a PASS: a failed or truncated write
+# (disk full, read-only target) must not fall through to exit 0.
+if [ ! -s "$STATS" ]; then
+    echo "[FAIL] stats report $STATS is missing or empty" >&2
+    exit 1
+fi
+
 rm -f "$LAT_FILE"
 case "$VERDICT" in PASS*) exit 0 ;; *) exit 1 ;; esac

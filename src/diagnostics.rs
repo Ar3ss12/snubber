@@ -62,6 +62,13 @@ const _: () = {
         8 + 8 * (26 + crate::FaultKind::COUNT) + 2 <= SNAPSHOT_CRC_RANGE,
         "CRITICAL: snapshot flag bytes would collide with the CRC region — extend SNAPSHOT_LEN contract first"
     );
+    // The struct layout is NOT the wire contract (only `encode()`'s 512 B
+    // output is), but a struct that outgrew the payload means a field was
+    // added without touching the frame math above.
+    assert!(
+        core::mem::size_of::<SnapshotV1>() <= SNAPSHOT_CRC_RANGE,
+        "CRITICAL: SnapshotV1 outgrew the 508 B payload — bump SNAPSHOT_LEN and SNAPSHOT_VERSION"
+    );
 };
 
 /// Fixed-shape cold snapshot of one node. `#[repr(C)]`, `Copy`, no

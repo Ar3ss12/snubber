@@ -136,6 +136,15 @@ fn frame_parser_fuzzer() {
         "unrecognized frames stream never promotes"
     );
 
+    // Coverage guard: an empty sweep would print a green line and prove
+    // nothing. Every mutant must land in exactly one bucket.
+    assert!(checked > 0, "bit-flip sweep ran zero mutants");
+    assert_eq!(
+        rejected + identical,
+        checked,
+        "mutant accounting lost a case"
+    );
+
     println!(
         "\n[FUZZ]: corpus={NOISE_LEN}B bitmutants={checked}(rejected={rejected} identical={identical}) alien={ALIEN_FRAMES}frames corrupt=0(control=1) panics=0"
     );

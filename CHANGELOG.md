@@ -27,7 +27,9 @@ examples and gate teeth). Details: USER_GUIDE "Fixed in 0.6.8".
 - `enter_erased` / `enter_supervised_erased` book the success when the
   erased guard's `commit()` runs, never at admission: `committed += 1`,
   one window outcome, streak reset; a guard that never commits cannot
-  inflate `success_rate_per_mille`. Rollback still re-opens a HalfOpen
+  inflate `success_rate_per_mille`. Rollback books one planned abort
+  (`explicit_aborts += 1`, keeping the depth gauge balanced against the
+  `total_started` booked at admission) and still re-opens a HalfOpen
   probe.
 - Poison recovery: gateway books, conduit drafts and the cancel-reason
   guard recover `into_inner` instead of silently dropping the update
@@ -50,18 +52,26 @@ examples and gate teeth). Details: USER_GUIDE "Fixed in 0.6.8".
   bulkhead-ceiling and industrial suites; rollback effects are observable
   state (DB handles, iron energization, laser latch, real advised sleep)
   instead of counters that can be faked; fake wakers use
-  `Waker::from(Arc<dyn Wake>)` (Miri strict provenance); bench hygiene
-  covers `TaskConduit::pair` and `PipeDrain::drain_sync`.
+  `Waker::from(Arc<dyn Wake>)` (Miri strict provenance); the bit-flip
+  fuzzer asserts a non-zero, fully accounted mutant sweep; bench hygiene
+  covers `TaskConduit::pair` / `PipeDrain::drain_sync`, rejects
+  `std::io::sink()` (a discarding writer understates `write_to`), and
+  requires `iter_batched` for per-sample drains so construction stays
+  untimed.
 - Scripts/CI: a grep error (rc=2), a missing report, a skipped check
   (missing tool or thumb target) and a baseline equal to `HEAD` all FAIL;
   `--locked` on every cargo invocation (thumb gates, publish dry-run);
-  harnesses fail on zero samples; deadlock literals removed from
-  termination reports.
+  `cargo-semver-checks` exposes no `--locked`, so both API gates hash
+  `Cargo.lock` around the run and FAIL if it was rewritten; the stress
+  harness refuses to publish a verdict when its stats report is missing
+  or empty; harnesses fail on zero samples; deadlock literals removed
+  from termination reports.
 - Miri runs with `-Zmiri-strict-provenance` in both CI lanes.
 - Docs: README saturation claim is measured (~1.1M admissions/sec on six
   contending threads), `WorkerPulse` footprint is arch-conditional,
-  pool numbers re-measured (attach/reap ~338/~407 ns, report ~112 ns,
-  lease sweep ~539 ns), storm timings re-measured, and the API table
+  pool numbers re-measured (attach/reap ~220/~177 ns with the drain built
+  outside the timed window, `write_to` ~2.1 ns into a real writer, report
+  ~112 ns, lease sweep ~539 ns), storm timings re-measured, and the API table
   gains `PoolReap` / `LaneSnapshot` / `PoolTotals` / `expired_lanes` /
   `DEFAULT_EOF_GRACE_MS` / argv-twin rows.
 

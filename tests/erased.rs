@@ -245,6 +245,24 @@ fn erased_drop_reopens_breaker_like_a_failed_probe() {
     node.enter(4, 4, || {}).expect("recovers").commit();
 }
 
+// Regression (0.6.8): an erased rollback booked NO settle counter, so the
+// `total_started` it booked at admission stayed unmatched and the depth
+// gauge reported a ghost in-flight transaction forever. The rollback now
+// books one planned abort (the slot was already released at admission).
+#[test]
+fn erased_rollback_books_an_abort_and_clears_the_depth_gauge() {
+    let node = SnubberNode::builder("erased/rollback-books").build();
+    {
+        let _g = node.enter_erased(1, 1, || {}).expect("admitted");
+    } // rollback without commit
+    let stats = node.stats();
+    assert_eq!(stats.total_started, 1, "admission was booked");
+    assert_eq!(stats.explicit_aborts, 1, "rollback is a planned abort");
+    assert_eq!(stats.committed, 0, "nothing is booked as a success");
+    assert_eq!(stats.implicit_drops, 0, "no phantom implicit drop");
+    assert_eq!(stats.depth_at(4), 0, "no ghost pending work");
+}
+
 // Regression (0.6.4): a panicking user rollback in the erased Drop path
 // used to unwind past `settle_erased_probe` — `ErasedGuard::drop`'s
 // catch_unwind swallowed the panic with the probe flag still set, and the

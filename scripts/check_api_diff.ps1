@@ -78,8 +78,18 @@ $Crate = (Select-String -Path "$RepoRoot\Cargo.toml" -Pattern '^name\s*=\s*"(.+)
 Write-Host " baseline=$Baseline package=$Crate"
 Push-Location $RepoRoot
 try {
+    # cargo-semver-checks has no --locked flag: snapshot the lockfile and
+    # fail if the tool rewrote it (the CI gate cannot see this otherwise).
+    $LockPath = Join-Path $RepoRoot "Cargo.lock"
+    $LockBefore = if (Test-Path $LockPath) { (Get-FileHash $LockPath -Algorithm SHA256).Hash } else { "" }
     & cargo semver-checks check-release --baseline-rev $Baseline --package $Crate
-    exit $LASTEXITCODE
+    $SemverExit = $LASTEXITCODE
+    $LockAfter = if (Test-Path $LockPath) { (Get-FileHash $LockPath -Algorithm SHA256).Hash } else { "" }
+    if ($LockBefore -ne $LockAfter) {
+        Write-Host " FAIL (cargo-semver-checks rewrote Cargo.lock; restore it and pin the toolchain)" -ForegroundColor Red
+        exit 1
+    }
+    exit $SemverExit
 } finally {
     Pop-Location
 }
