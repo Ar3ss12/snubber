@@ -254,6 +254,9 @@ fn futures_lite_fake_waker() -> core::task::Waker {
 
 fn futures_lite_fake_waker_id(id: usize) -> core::task::Waker {
     use core::task::{RawWaker, RawWakerVTable};
+    // Data must be real addresses (Miri warns on `id as *const ()`),
+    // but distinct per id so the wakers stay distinguishable by identity.
+    static WAKER_SLOTS: [u8; 8] = [0; 8];
     unsafe fn clone(data: *const ()) -> RawWaker {
         RawWaker::new(data, &VTABLE)
     }
@@ -261,7 +264,8 @@ fn futures_lite_fake_waker_id(id: usize) -> core::task::Waker {
     unsafe fn wake_by_ref(_: *const ()) {}
     unsafe fn drop(_: *const ()) {}
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-    unsafe { core::task::Waker::from_raw(RawWaker::new(id as *const (), &VTABLE)) }
+    let data = &WAKER_SLOTS[id % WAKER_SLOTS.len()] as *const u8 as *const ();
+    unsafe { core::task::Waker::from_raw(RawWaker::new(data, &VTABLE)) }
 }
 
 #[test]
