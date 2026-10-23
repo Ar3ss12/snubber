@@ -505,6 +505,10 @@ foreach ($lane in $lanes) {
         $handleGrowth = $lane.HandleLast - $lane.HandleFirst
         $checks.Add([pscustomobject]@{ Name = ("$tag private growth {0:+0.00;-0.00;0.00} MB <= {1:N1} MB" -f $growth, $MaxGrowthMb); Ok = ($growth -le $MaxGrowthMb) })
         $checks.Add([pscustomobject]@{ Name = ("$tag handle growth {0:+0;-0;0} <= {1}" -f $handleGrowth, $MaxHandleGrowth); Ok = ($handleGrowth -le $MaxHandleGrowth) })
+    } else {
+        # Zero sampling turns the leak gates into silent no-ops (e.g. the
+        # sampler's catch{} swallowed every poll): fail, don't pass.
+        $checks.Add([pscustomobject]@{ Name = "$tag sampler collected samples"; Ok = $false })
     }
 }
 $checks.Add([pscustomobject]@{ Name = ("aggregate reaped {0} == {1}" -f $completed, $totalTarget); Ok = ($completed -eq $totalTarget) })

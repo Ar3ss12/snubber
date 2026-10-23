@@ -11,7 +11,7 @@
 
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
@@ -65,7 +65,17 @@ struct IntercomInner<S, D> {
     draft: Mutex<Option<D>>,
     conflated: AtomicU64,
     condvar: Condvar,
-    wakers: Mutex<Vec<Waker>>,
+    wakers: Mutex<Vec<ParkedResumeWaker>>,
+}
+
+/// A parked `ResumeFuture` waiter: the waker plus an identity flag minted
+/// per future. Identity (`Arc::ptr_eq`) — not `will_wake` — drives dedup
+/// and `Drop` removal: two futures polled by one task share a waker, so a
+/// `will_wake` scan would cross-match and a sibling's cancellation would
+/// erase this entry (same class as the node's waiter queue, node.rs).
+struct ParkedResumeWaker {
+    waker: Waker,
+    identity: Arc<AtomicBool>,
 }
 
 /// The worker's task conduit gateway inside the executing task.
@@ -179,7 +189,7 @@ impl<S, D> TaskConduit<S, D> {
     pub fn wait_for_resume_async(&self) -> ResumeFuture<S, D> {
         ResumeFuture {
             inner: self.inner.clone(),
-            waker: None,
+            identity: None,
         }
     }
 
@@ -360,10 +370,15 @@ impl<S, D> TaskHandle<S, D> {
     }
 
     fn wake_async(&self) {
-        if let Ok(mut wakers) = self.inner.wakers.lock() {
-            for w in wakers.drain(..) {
-                w.wake();
-            }
+        // Wake OUTSIDE the lock: `wake()` runs executor code, and a panic
+        // under the wakers mutex would poison it and strand every later
+        // waiter (drained wakers are plain values — release first).
+        let drained: Vec<Waker> = match self.inner.wakers.lock() {
+            Ok(mut wakers) => wakers.drain(..).map(|p| p.waker).collect(),
+            Err(poisoned) => poisoned.into_inner().drain(..).map(|p| p.waker).collect(),
+        };
+        for w in drained {
+            w.wake();
         }
     }
 }
@@ -378,14 +393,20 @@ impl<S, D> TaskHandle<S, D> {
 /// behind — each later `resume` wakes only live waiters.
 pub struct ResumeFuture<S, D> {
     inner: Arc<IntercomInner<S, D>>,
-    waker: Option<Waker>,
+    identity: Option<Arc<AtomicBool>>,
 }
 
 impl<S, D> Drop for ResumeFuture<S, D> {
     fn drop(&mut self) {
-        if let Some(w) = self.waker.take() {
-            if let Ok(mut wakers) = self.inner.wakers.lock() {
-                wakers.retain(|queued| !queued.will_wake(&w));
+        if let Some(flag) = self.identity.take() {
+            // Identity-matched removal: only THIS future's entry is
+            // retired, never a sibling's (a shared waker would make a
+            // `will_wake`-based retain erase both).
+            match self.inner.wakers.lock() {
+                Ok(mut wakers) => wakers.retain(|q| !Arc::ptr_eq(&q.identity, &flag)),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .retain(|q| !Arc::ptr_eq(&q.identity, &flag)),
             }
         }
     }
@@ -417,26 +438,30 @@ impl<S, D> Future for ResumeFuture<S, D> {
         // and poller would park forever.
         let mut wakers = match this.inner.wakers.lock() {
             Ok(w) => w,
-            Err(_) => return Poll::Ready(Err("wakers lock poisoned")),
+            Err(poisoned) => poisoned.into_inner(),
         };
         let dir = this.inner.directive.load(Ordering::Acquire);
         match dir {
             DIR_PAUSE => {
-                // P1 fix: deduplicate via will_wake — repeated polls from
-                // the same task do not accumulate stale waker copies.
-                let current = cx.waker();
-                if let Some(slot) = wakers.iter_mut().find(|w| w.will_wake(current)) {
-                    *slot = current.clone();
-                } else {
-                    wakers.push(current.clone());
+                // Identity dedup: repeated polls of THIS future update its
+                // own entry (matched by the minted flag), never a sibling's.
+                if let Some(flag) = this.identity.as_ref() {
+                    if let Some(slot) = wakers.iter_mut().find(|q| Arc::ptr_eq(&q.identity, flag)) {
+                        slot.waker = cx.waker().clone();
+                        return Poll::Pending;
+                    }
                 }
-                // Remember the pushed waker so Drop can retire it.
-                this.waker = Some(current.clone());
+                let flag = Arc::new(AtomicBool::new(false));
+                this.identity = Some(Arc::clone(&flag));
+                wakers.push(ParkedResumeWaker {
+                    waker: cx.waker().clone(),
+                    identity: flag,
+                });
+                // Remember the pushed entry so Drop can retire it.
                 Poll::Pending
             }
             DIR_CANCEL | DIR_PREEMPTED => {
                 // The entry is about to resolve; nothing is parked anymore.
-                this.waker = None;
                 let reason = this
                     .inner
                     .cancel_reason
@@ -446,10 +471,7 @@ impl<S, D> Future for ResumeFuture<S, D> {
                     .unwrap_or("cancelled");
                 Poll::Ready(Err(reason))
             }
-            _ => {
-                this.waker = None;
-                Poll::Ready(Ok(()))
-            }
+            _ => Poll::Ready(Ok(())),
         }
     }
 }

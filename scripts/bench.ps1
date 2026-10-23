@@ -27,7 +27,7 @@ if (-not $SkipRun) {
         $PrevEap = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
-            cargo bench --bench admission_bench 2>&1 | ForEach-Object { Write-Host $_ }
+            cargo bench --locked --bench admission_bench 2>&1 | ForEach-Object { Write-Host $_ }
             $CargoExit = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $PrevEap

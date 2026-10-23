@@ -52,6 +52,16 @@ const _: () = {
         SNAPSHOT_CRC_RANGE + 4 == SNAPSHOT_LEN,
         "CRITICAL: snapshot CRC must sit in the last 4 bytes of the frame"
     );
+    // The two flag bytes (`breaker_state`, `memory_pressure`) are written
+    // at the running offset after all w64 fields: 8-byte header + 26
+    // w64 fields outside the `reported` tail (17 before it, 9 after) +
+    // `FaultKind::COUNT` tail entries. Growing the tail must not push the
+    // flags into the CRC region — if a w64 field is added, update BOTH
+    // `encode()` and the `26` here.
+    assert!(
+        8 + 8 * (26 + crate::FaultKind::COUNT) + 2 <= SNAPSHOT_CRC_RANGE,
+        "CRITICAL: snapshot flag bytes would collide with the CRC region — extend SNAPSHOT_LEN contract first"
+    );
 };
 
 /// Fixed-shape cold snapshot of one node. `#[repr(C)]`, `Copy`, no
@@ -87,9 +97,9 @@ pub struct SnapshotV1 {
     pub timeouts_fired: u64,
     /// Token-bucket rate rejections (OWN column, never merged).
     pub rate_rejected: u64,
-    /// Sliding-window outcomes.
+    /// Windowed-batch outcomes.
     pub window_outcomes: u64,
-    /// Sliding-window failures.
+    /// Windowed-batch failures.
     pub window_failures: u64,
     /// Mutex poison recoveries (goal: 0).
     pub poison_recoveries: u64,
@@ -777,9 +787,9 @@ pub struct SnapshotDiff {
     pub timeouts_fired: u64,
     /// New rate rejections.
     pub rate_rejected: u64,
-    /// New sliding-window outcomes.
+    /// New windowed-batch outcomes.
     pub window_outcomes: u64,
-    /// New sliding-window failures.
+    /// New windowed-batch failures.
     pub window_failures: u64,
     /// New poison recoveries.
     pub poison_recoveries: u64,

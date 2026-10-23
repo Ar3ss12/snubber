@@ -269,6 +269,47 @@ fn futures_lite_fake_waker_id(id: usize) -> core::task::Waker {
 }
 
 #[test]
+fn spurious_repolls_do_not_reset_the_ttl_clock() {
+    // Regression: the dedup re-park path re-stamped `enqueued_at_ms`, so a
+    // future parked in the queue never accumulated queue-wait — an
+    // executor spinning re-polls starved `task_ttl` forever. The TTL
+    // origin must stay at the FIRST park.
+    let node = SnubberNode::builder("test_ttl_restamp")
+        .max_in_flight(1)
+        .queue_capacity(4)
+        .task_ttl(Duration::from_millis(100))
+        .build();
+    let g1 = node.enter(1, 1, || {}).expect("first enters bulkhead");
+
+    let mut fut = Box::pin(node.enter_async(2, 2, || {}));
+    let waker = futures_lite_fake_waker();
+    let mut cx = core::task::Context::from_waker(&waker);
+
+    // First park stamps the origin (t = 0).
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
+    // Spurious re-polls with the same waker hit the dedup path; each must
+    // leave the origin untouched (t stays ~60 ms after the two sleeps).
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
+    // Now t >= 110 ms > TTL = 100 ms: the next poll must expire, measured
+    // from the FIRST park — not from the last spurious re-poll.
+    std::thread::sleep(Duration::from_millis(50));
+    drop(g1);
+    match fut.as_mut().poll(&mut cx) {
+        core::task::Poll::Ready(Err(EnterError::QueueTtlExpired)) => {}
+        _ => panic!("spurious re-polls must not reset the TTL clock"),
+    }
+    let fault = node.stats().last_fault.expect("ttl fault recorded");
+    assert!(
+        fault.queue_wait_ms >= 100,
+        "queue_wait_ms must span the whole parked time, got {}",
+        fault.queue_wait_ms
+    );
+}
+
+#[test]
 fn queue_gauges_report_waiter_buffer() {
     let node = SnubberNode::builder("queue_gauge")
         .queue_capacity(8)

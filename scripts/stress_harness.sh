@@ -325,6 +325,11 @@ if [ "$SUP_RSS_N" -gt 0 ]; then
     else
         add_check 0 "supervisor RSS growth $GROWTH_MB MB <= $MAX_GROWTH_MB MB"
     fi
+elif [ "$LAUNCH" = "1" ]; then
+    # Zero sampling turns the leak gate into a silent no-op (e.g. the
+    # sampler could not read /proc): a run with no samples proves
+    # nothing and must fail, not pass.
+    add_check 0 "sampler collected supervisor samples (got 0)"
 fi
 
 VERDICT="FAIL"

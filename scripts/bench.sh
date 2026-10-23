@@ -44,7 +44,7 @@ done
 if [ "$SKIP_RUN" = false ]; then
     echo -e "\033[36m[bench] cargo bench --bench admission_bench (release) ...\033[0m"
     cd "${ROOT_DIR}"
-    cargo bench --bench admission_bench
+    cargo bench --locked --bench admission_bench
 fi
 
 if [ ! -d "${CRITERION_DIR}" ]; then
@@ -70,8 +70,13 @@ else
     exit 1
 fi
 
-# Python or jq/awk parser for Criterion estimates.json
-"$PY" - << 'EOF' > "${OUT_FILE}"
+# Atomic publish: parse into a sibling temp file, validate, then move.
+# A crashed parser must never leave a truncated or empty snapshot at
+# OUT_FILE (the README table is generated from it).
+TMP_OUT="$(mktemp "${OUT_DIR}/snapshot.XXXXXX")"
+trap 'rm -f "${TMP_OUT}"' EXIT
+
+"$PY" - << 'EOF' > "${TMP_OUT}"
 import os
 import json
 import glob
@@ -131,15 +136,16 @@ for path in estimate_files:
             continue
 EOF
 
-if [ ! -s "${OUT_FILE}" ] || [ "$(grep -c '^| `' "${OUT_FILE}" 2>/dev/null)" = "0" ]; then
-    echo -e "\033[33m[bench] WARNING: snapshot produced no benchmark rows — run without --skip-run or check target/criterion\033[0m" >&2
-    if [ "$GITHUB_MODE" = true ]; then
-        # An empty table published to the step summary looks like a clean
-        # run — fail the step instead of publishing a blank report.
-        echo -e "\033[31m[bench] FAIL: empty snapshot in --github mode\033[0m" >&2
-        exit 1
-    fi
+if [ ! -s "${TMP_OUT}" ] || [ "$(grep -c '^| `' "${TMP_OUT}" 2>/dev/null)" = "0" ]; then
+    # Header-only snapshot means the export saw no estimates: publishing
+    # it would zero out the README table with a green run. Fail in every
+    # mode (parity with bench.ps1), not just CI.
+    echo -e "\033[31m[bench] FAIL: no bench estimates found under ${CRITERION_DIR} — refusing to write an empty snapshot (run without --skip-run or check target/criterion)\033[0m" >&2
+    exit 1
 fi
+
+mv -f "${TMP_OUT}" "${OUT_FILE}"
+trap - EXIT
 
 echo ""
 echo -e "\033[32m=== BENCH SNAPSHOT (ns/op mean point estimate) ===\033[0m"

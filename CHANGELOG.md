@@ -4,6 +4,48 @@ All notable changes to `snubber`. Benchmarks live in [README.md](README.md);
 the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 ("Fixed in …" sections) and [docs/INVARIANTS.md](docs/INVARIANTS.md).
 
+## 0.6.7 — 2026-10-23
+
+Sixth-audit batch: conduit waker identity, core-exposed drain, honest
+bookkeeping, CI/script teeth. Details: USER_GUIDE "Fixed in 0.6.7".
+
+- `ResumeFuture` waker identity is an explicit `Arc<AtomicBool>` flag
+  (`Arc::ptr_eq`), not `will_wake`: two futures polled by one task no
+  longer cross-match and orphan a sibling's directive-queue entry. Wakers
+  are drained from the queue under the lock and woken OUTSIDE it —
+  executor code can never run under the conduit's wakers lock.
+- The conduit's wakers lock is poison-tolerant (`into_inner` recovery);
+  the pause/cancel directive path survives a foreign panic under the
+  lock.
+- Async queue TTL origin is preserved across spurious re-polls: a
+  re-parked waiter keeps its FIRST-park stamp, so a re-poll loop can
+  never starve `task_ttl` (regression test:
+  `tests/task_engine.rs::spurious_repolls_do_not_reset_the_ttl_clock`).
+- `memory_pressure` verdict loads pair with the `Release` store
+  (`Acquire`): a pressure refusal can no longer be decided from a stale
+  verdict.
+- New `drain` module in core: `ProcessToken` / `SnubScanner` /
+  `OP_*` / `TOKEN_*` are available without `std` (feed-driven parsing
+  on bare metal); `supervisor` re-exports keep every historical path.
+- A snapshot const-assert pins the flag region below the CRC region:
+  adding `FaultKind`s beyond the wire contract is a compile error, not
+  a silent collision.
+- Honest refusal buckets in four suites: swallowed `Err(_)` arms are
+  gone; every attempt lands in exactly one counted bucket tied to the
+  node's own books (`stress_breaker_churn`, `priority_preemption`,
+  `transition_orphan`, `industrial`, `bulkhead_capacity`).
+- CI: `--locked` on every cargo invocation; a semver-gate SKIP fails
+  under CI (`check_api_diff` both flavors); `bench.sh` refuses an empty
+  snapshot in every mode and publishes atomically (temp + move).
+- Storm harnesses: zero sampling fails the leak gates instead of
+  silently skipping them; `stress_multi_lineage.py` reports
+  platform-skipped checks as explicit SKIP, not PASS.
+- Docs: `failure_rate` documented as a windowed-batch breaker (the
+  counters reset after every `window` outcomes — not a continuous
+  sliding window); README `no_std`/`alloc` surface list matches the
+  module gates; USER_GUIDE cites the TTL regression test and adds the
+  `run_supervised_guard_with_grace` / core `drain` API rows.
+
 ## 0.6.6 — 2026-10-23
 
 Fifth-audit batch: async liveness, storm-harness hygiene, CI hardening.

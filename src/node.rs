@@ -189,9 +189,9 @@ pub struct SnubberStats {
     pub max_pulse_lag_ms: u64,
     /// Token-bucket rejections (`rate_per_sec` over limit).
     pub rate_rejected: u64,
-    /// Sliding-window position: settled outcomes in the open window.
+    /// Windowed-batch position: settled outcomes in the open batch.
     pub window_outcomes: u64,
-    /// Sliding-window position: failures in the open window.
+    /// Windowed-batch position: failures in the open batch.
     pub window_failures: u64,
     /// Settlements that fell below the execution-envelope floor
     /// (time or payload). Own column forever: a floor miss is a signal,
@@ -624,7 +624,7 @@ impl SnubberNodeBuilder {
     /// the `1 >= 0` trap; `u32::MAX` also works as "never", `0` is the
     /// documented OFF switch).
     /// Kept for desktop nodes; cloud nodes prefer
-    /// [`SnubberNodeBuilder::failure_rate`] (sliding window %).
+    /// [`SnubberNodeBuilder::failure_rate`] (windowed-batch failure %).
     #[must_use]
     pub fn trip_after_failures(mut self, n: u32) -> Self {
         self.trip_after_failures = n;
@@ -643,15 +643,20 @@ impl SnubberNodeBuilder {
         self
     }
 
-    /// Sliding-window trip: open the breaker when `percent`% of the last
-    /// `window` settled outcomes failed (implicit drops + supervisor
-    /// failures). `window = 0` disables (default — streak mode governs).
+    /// Windowed-batch trip: after every `window` settled outcomes, the
+    /// batch is evaluated — if `percent`% of it failed (implicit drops +
+    /// supervisor failures), the breaker opens, then the counters reset
+    /// for the next batch. This is a filled-batch window, NOT a
+    /// continuous sliding window: the last `window` outcomes are judged
+    /// as one group and a failure pattern spanning a batch boundary is
+    /// judged by whichever batch it lands in. `window = 0` disables
+    /// (default — streak mode governs).
     /// `percent` is clamped to `1..=100`: `0` would make the `>= 0%`
     /// comparison fire on ANY filled window (even an all-success one), so
     /// it is raised to 1 — "any failure in the window trips".
-    /// Cloud-grade: `failure_rate(100, 50)` trips at "50 of last 100 died",
-    /// catching the intermittently failing node that streak mode misses
-    /// (fail-ok-fail-ok-… never trips a consecutive counter).
+    /// Cloud-grade: `failure_rate(100, 50)` trips at "50 of the batch of
+    /// 100 died", catching the intermittently failing node that streak
+    /// mode misses (fail-ok-fail-ok-… never trips a consecutive counter).
     #[must_use]
     pub fn failure_rate(mut self, window: u32, percent: u8) -> Self {
         self.failure_window = window;
@@ -1438,7 +1443,7 @@ impl SnubberNode {
     }
 
     /// Preset: server / high-throughput service.
-    /// Wide bulkhead, sliding-window breaker (50 of last 100 failed),
+    /// Wide bulkhead, windowed-batch breaker (50 of a batch of 100 failed),
     /// fail-fast overflow, no console (exporters poll `stats()`).
     #[must_use]
     pub fn server(name: impl Into<NodeName>) -> SnubberNode {
@@ -2892,7 +2897,7 @@ impl SnubberNode {
         // Memory pressure refuses BEFORE the mutex: one relaxed flag bump,
         // no lock contention with a watchdog that may be snapshotting.
         // Counted in the lock-free `memory_rejections` column.
-        if self.memory_pressure.load(Ordering::Relaxed) {
+        if self.memory_pressure.load(Ordering::Acquire) {
             self.memory_rejections.fetch_add(1, Ordering::Relaxed);
             return Err(EnterError::MemoryPressure);
         }
@@ -3452,7 +3457,7 @@ impl SnubberNode {
         }
         // Memory pressure: never park a waker behind a draining node.
         // The rollback stays in `Option`; the future drop frees it.
-        if self.memory_pressure.load(Ordering::Relaxed) {
+        if self.memory_pressure.load(Ordering::Acquire) {
             self.memory_rejections.fetch_add(1, Ordering::Relaxed);
             return core::task::Poll::Ready(Err(EnterError::MemoryPressure));
         }
@@ -3584,7 +3589,10 @@ impl SnubberNode {
                 {
                     slot.waker = waker.clone();
                     *evicted_out = Some(Arc::clone(prev));
-                    *enqueued_at_ms = Some(now);
+                    // TTL origin stays at the FIRST park: `enqueued_at_ms`
+                    // was stamped when this entry was pushed. Re-stamping
+                    // here would let a spurious re-poll loop starve the
+                    // `task_ttl` check forever.
                     return core::task::Poll::Pending;
                 }
             }
@@ -5085,10 +5093,10 @@ impl<F: FnOnce()> TrackedGuard<F> {
     }
 
     /// Feed BOTH breaker modes from one settled outcome: reset the
-    /// consecutive streak on success, advance it + the sliding window
+    /// consecutive streak on success, advance it + the windowed batch
     /// on failure, trip by whichever mode fires first.
     fn note_outcome(inner: &mut NodeInner, failed: bool) {
-        // Sliding window always observes (when armed).
+        // Windowed batch always observes (when armed).
         if inner.failure_window > 0 {
             inner.window_outcomes = inner.window_outcomes.saturating_add(1);
             if failed {
@@ -5115,8 +5123,8 @@ impl<F: FnOnce()> TrackedGuard<F> {
         }
     }
 
-    /// Sliding-window position for dashboards: `(outcomes, failures)` in
-    /// the current open window. Mirrored into `SnubberStats` on settle.
+    /// Windowed-batch position for dashboards: `(outcomes, failures)` in
+    /// the currently open batch. Mirrored into `SnubberStats` on settle.
     /// Planned failure path: rollback NOW, no breaker trip.
     /// Pass-through dummy: no-op — mark settled, return Aborted, touch nothing.
     pub fn abort(mut self, reason: &'static str) -> SnubberEvent<()> {

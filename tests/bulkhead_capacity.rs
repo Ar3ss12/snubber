@@ -65,9 +65,11 @@ fn bulkhead_pushes_back_and_counts_every_bounce() {
                             Err(EnterError::StaleEpoch) => {
                                 STALE.fetch_add(1, Ordering::SeqCst);
                             }
-                            Err(_) => {
-                                BULK.fetch_add(1, Ordering::SeqCst);
-                            }
+                            // This node config (no TTL, breaker closed, queue
+                            // 65536) can produce ONLY BulkheadFull/StaleEpoch;
+                            // any other kind must be a loud failure, not a
+                            // bulkhead-shaped lie in the conservation formula.
+                            Err(other) => panic!("unexpected refusal: {other:?}"),
                         }
                     }
                     Err(other) => panic!("unexpected refusal: {other:?}"),

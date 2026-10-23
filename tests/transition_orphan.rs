@@ -47,13 +47,27 @@ fn orphan_contract_is_typed_and_honest() {
 }
 #[test]
 fn preempt_storm_on_critical_flood() {
-    use snubber::{find_anomalies, AnomalyKind, AnomalyPolicy, Priority, SnubberNode};
+    use snubber::{find_anomalies, AnomalyKind, AnomalyPolicy, EnterError, Priority, SnubberNode};
     let node = SnubberNode::builder("preempt/storm").build();
-    // Simulate: 200 admissions, 150 of them filed preempt requests.
-    // (Direct: report Preempted is counted; admission math via stats.)
+    // 200 admissions against a default breaker (trip_after_failures = 3):
+    // the first guards arm and drop (sickness), the breaker opens, one
+    // HalfOpen probe arms, the rest are BreakerOpen refusals. The old
+    // swallowed `let _ =` shape hid all of that; every outcome is now
+    // counted and tied to the node's own books.
+    let mut started = 0u64;
+    let mut refused = 0u64;
     for i in 1..=200u64 {
-        let _ = node.enter_with_priority(Priority::Normal, i, i, || {});
+        match node.enter_with_priority(Priority::Normal, i, i, || {}) {
+            Ok(g) => {
+                drop(g);
+                started += 1;
+            }
+            Err(EnterError::BreakerOpen) => refused += 1,
+            Err(other) => panic!("unexpected refusal: {other:?}"),
+        }
     }
+    // Simulate: 150 of them filed preempt requests.
+    // (Direct: report Preempted is counted; admission math via stats.)
     for _ in 0..150 {
         node.report(snubber::FaultKind::Preempted, 1, 1);
     }
@@ -62,4 +76,17 @@ fn preempt_storm_on_critical_flood() {
         hits.iter().any(|h| h.kind == AnomalyKind::PreemptStorm),
         "critical preemption flood must trigger anomaly verdict, got {hits:?}"
     );
+    // Conservation: every attempt lands in exactly one bucket, local
+    // counts agree with the node, and every dropped guard is honestly
+    // booked as an implicit drop.
+    let s = node.stats();
+    assert_eq!(started + refused, 200, "no attempt vanished");
+    assert_eq!(started, s.total_started, "armed guards match the node");
+    assert_eq!(refused, s.breaker_rejections, "refusals match the node");
+    assert_eq!(
+        s.implicit_drops, started,
+        "each dropped guard is an implicit drop"
+    );
+    assert_eq!(s.committed, 0, "nothing committed in the flood");
+    assert!(started >= 1, "the flood must arm at least once");
 }

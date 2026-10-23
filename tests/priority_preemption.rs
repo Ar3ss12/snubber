@@ -21,10 +21,6 @@ fn critical_preempts_pure_background_cooperatively() {
     for s in [&ATTEMPTS, &STARTED, &BULK, &SETTLED, &ROLLBACKS, &ABORTS] {
         s.store(0, Ordering::SeqCst);
     }
-    fn counted_rollback() {
-        // Real rollback body is per-guard below (closure per admission);
-        // this marker exists so `cargo clippy` sees no `|| {}` hollow.
-    }
 
     let node = Arc::new(
         SnubberNode::builder("preempt/wall")
@@ -100,7 +96,6 @@ fn critical_preempts_pure_background_cooperatively() {
         }
         Err(other) => panic!("unexpected refusal: {other:?}"),
     }
-    let _ = counted_rollback;
 
     let s = node.stats();
     let attempts = ATTEMPTS.load(Ordering::SeqCst);
@@ -199,8 +194,10 @@ fn critical_never_preempts_normal_no_inversion() {
 fn critical_never_forces_uncooperative_worker() {
     static ROLLBACKS: AtomicU64 = AtomicU64::new(0);
     static ABORTS: AtomicU64 = AtomicU64::new(0);
+    static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
     ROLLBACKS.store(0, Ordering::SeqCst);
     ABORTS.store(0, Ordering::SeqCst);
+    ATTEMPTS.store(0, Ordering::SeqCst);
 
     let node = Arc::new(
         SnubberNode::builder("iron/uncooperative-bg")
@@ -214,6 +211,7 @@ fn critical_never_forces_uncooperative_worker() {
     // a conduit, then commits. No checkpoint — R5: the node never forces.
     let n_bg = Arc::clone(&node);
     let bg = std::thread::spawn(move || {
+        ATTEMPTS.fetch_add(1, Ordering::SeqCst);
         let guard = n_bg
             .enter_with_priority(Priority::Background, 1, 1, || {
                 ROLLBACKS.fetch_add(1, Ordering::SeqCst);
@@ -237,6 +235,7 @@ fn critical_never_forces_uncooperative_worker() {
     // exactly ONE Preempted filed, flag stays UP (task channel unpolled).
     let mut bulk = 0u64;
     for epoch in 2..=6u64 {
+        ATTEMPTS.fetch_add(1, Ordering::SeqCst);
         match node.enter_with_priority(Priority::Critical, epoch, epoch, || {
             ROLLBACKS.fetch_add(1, Ordering::SeqCst);
         }) {
@@ -262,6 +261,7 @@ fn critical_never_forces_uncooperative_worker() {
     assert_eq!(node.lane_in_flight(), [0, 0, 0]);
 
     // Retry after the yield: admitted, committed, books balance.
+    ATTEMPTS.fetch_add(1, Ordering::SeqCst);
     let g = node
         .enter_with_priority(Priority::Critical, 7, 7, || {
             ROLLBACKS.fetch_add(1, Ordering::SeqCst);
@@ -272,6 +272,14 @@ fn critical_never_forces_uncooperative_worker() {
 
     let s = node.stats();
     assert_eq!(s.total_started, 2, "bg + critical retry, nothing else");
+    // Conservation: 1 background + 5 knocks + 1 retry — every attempt
+    // lands in exactly one of the two buckets, local and node agree.
+    let attempts = ATTEMPTS.load(Ordering::SeqCst);
+    assert_eq!(
+        attempts,
+        s.total_started + s.bulkhead_rejections,
+        "no attempt vanished"
+    );
     assert_eq!(s.bulkhead_rejections, 5);
     assert_eq!(s.preempted, 1, "no duplicate filing while flag was up");
     assert_eq!(ROLLBACKS.load(Ordering::SeqCst), 0, "clean, no rollback");

@@ -7,6 +7,11 @@
 
 set -euo pipefail
 
+# CI mode: GitHub Actions sets CI=true. A SKIP in a controlled
+# environment means the workflow is misconfigured (missing tags or
+# tooling) — that must fail the run, not silently skip the gate.
+in_ci() { [ -n "${CI:-}" ]; }
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
@@ -17,6 +22,10 @@ fi
 
 echo -n "[API] semver diff"
 if [ -z "${BASELINE}" ]; then
+    if in_ci; then
+        echo " FAIL (CI: no git tag baseline — checkout must fetch tags and the repo must be tagged per release)"
+        exit 1
+    fi
     if [ -f "${REPO_ROOT}/.git/shallow" ]; then
         echo " SKIP (no git tag baseline; shallow clone — run: git fetch --tags --unshallow)"
     else
@@ -27,6 +36,10 @@ fi
 
 if ! command -v cargo-semver-checks > /dev/null 2>&1 \
     && ! cargo semver-checks --version > /dev/null 2>&1; then
+    if in_ci; then
+        echo " FAIL (CI: cargo-semver-checks missing — workflow must install it)"
+        exit 1
+    fi
     echo " SKIP (cargo-semver-checks not installed; cargo install cargo-semver-checks)"
     exit 0
 fi

@@ -518,7 +518,9 @@ def run(args: argparse.Namespace, repo: Path) -> int:
                 )
             )
         else:
-            checks.append((f"{tag} handle growth (n/a on macOS)", True, "n/a"))
+            # Explicit SKIP accounting: a platform-unavailable check must
+            # not masquerade as a PASS in the gate table.
+            checks.append((f"{tag} handle growth", None, "SKIP: fd sampling is Linux-only"))
 
     checks.append(("aggregate killed == expected", total_killed == expected, f"{total_killed}/{expected}"))
     checks.append(("aggregate reaped == expected", total_reaped == expected, f"{total_reaped}/{expected}"))
@@ -561,10 +563,15 @@ def run(args: argparse.Namespace, repo: Path) -> int:
             flush=True,
         )
 
-    failed = [name for name, ok, _ in checks if not ok]
+    # ok is bool or None; None = platform-skipped (never counts as a pass).
+    failed = [name for name, ok, _ in checks if ok is False]
+    skipped = [name for name, ok, _ in checks if ok is None]
     print(f"\n[RESULT] {total_killed} killed in {duration_s:.2f} s ({rate:.1f} kills/s)", flush=True)
     for name, ok, detail in checks:
-        print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  ({detail})" if detail else ""))
+        label = "PASS" if ok else ("SKIP" if ok is None else "FAIL")
+        print(f"  {label}  {name}" + (f"  ({detail})" if detail else ""))
+    if skipped:
+        print(f"  [skip accounting] {len(skipped)} check(s) skipped: platform-gated", flush=True)
     verdict = "PASS" if not failed else "FAIL"
     print(f"[VERDICT] {verdict}", flush=True)
 

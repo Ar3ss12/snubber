@@ -136,7 +136,7 @@ jobs:
 
       - name: Run all #[ignore] stress gates
         run: |
-          cargo test --release \
+          cargo test --release --locked \
             --test supervisor_pool_stress \
             --test supervisor_pool_stress_lease \
             --test supervisor_pool_stress_mixed \

@@ -23,8 +23,9 @@
 //! `#![no_std]` (`core` only) and builds for bare-metal targets; `alloc`
 //! adds `String`-backed fault details, `ErasedGuard` and `Vec` helpers.
 //! The supervisor and pool modules require `std` (OS pipes and reader
-//! threads); [`PipeDrain::feed`](crate::PipeDrain::feed) lets embedded
-//! and async callers drive the same parser by pushing chunks, and
+//! threads). The frame parser itself is core-only: [`drain::SnubScanner`]
+//! accepts raw chunks (UART/DMA buffers, sockets, pipes) and delivers
+//! parsed [`ProcessToken`]s with no allocator and no threads, and
 //! [`ProcessToken::write_to`](crate::ProcessToken::write_to) targets any
 //! `Write` sink instead of stdout.
 //!
@@ -138,6 +139,8 @@ pub mod harness;
 
 pub mod clock;
 
+pub mod drain;
+
 pub mod isr;
 
 pub mod policy;
@@ -213,6 +216,11 @@ pub use diagnostics::{
 #[cfg(feature = "alloc")]
 pub use diagnostics::find_anomalies_for_snapshot;
 
+pub use drain::{
+    ProcessToken, SnubScanner, OP_COMMIT, OP_HEARTBEAT, OP_SNAPSHOT, OP_STATE, TOKEN_BODY_LEN,
+    TOKEN_MAGIC, TOKEN_PAYLOAD_LEN,
+};
+
 pub use memory::{MemoryVerdict, MemoryWatch};
 
 pub use protect::Protected;
@@ -223,9 +231,8 @@ pub use protect::SafeLockExt;
 #[cfg(feature = "std")]
 pub use supervisor::{
     now_ms, take_stdin_digest, Backoff, ClockFn, DeathCause, DrainCounters, GenerationClock,
-    MemoryPolicy, NoOrphanGuard, OrphanGuard, PipeDrain, ProcessToken, RestartDecision,
-    RestartPolicy, RestartTracker, RestartWindow, StateDigest, Supervisor, TokenRollback,
-    OP_COMMIT, OP_HEARTBEAT, OP_SNAPSHOT, OP_STATE, STATE_LEN, TOKEN_BODY_LEN, TOKEN_PAYLOAD_LEN,
+    MemoryPolicy, NoOrphanGuard, OrphanGuard, PipeDrain, RestartDecision, RestartPolicy,
+    RestartTracker, RestartWindow, StateDigest, Supervisor, TokenRollback, STATE_LEN,
 };
 
 #[cfg(feature = "std")]

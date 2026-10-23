@@ -9,6 +9,10 @@ param([string]$Baseline = "")
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $RepoRoot = Resolve-Path "$ScriptDir\.."
+# CI mode: GitHub Actions sets CI=true. A SKIP in a controlled
+# environment means the workflow is misconfigured (missing tags or
+# tooling) -- that must fail the run, not silently skip the gate.
+$InCi = [bool]$env:CI
 
 if (-not $Baseline) {
     # PS 5.1 wraps native stderr in ErrorRecords: under Stop, a
@@ -23,6 +27,10 @@ if (-not $Baseline) {
 
 Write-Host "[API] semver diff" -NoNewline
 if (-not $Baseline) {
+    if ($InCi) {
+        Write-Host " FAIL (CI: no git tag baseline -- checkout must fetch tags and the repo must be tagged per release)" -ForegroundColor Red
+        exit 1
+    }
     if (Test-Path "$RepoRoot\.git\shallow") {
         Write-Host " SKIP (no git tag baseline; shallow clone -- run: git fetch --tags --unshallow)"
     } else {
@@ -32,6 +40,10 @@ if (-not $Baseline) {
 }
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    if ($InCi) {
+        Write-Host " FAIL (CI: cargo not installed -- workflow must install the toolchain)" -ForegroundColor Red
+        exit 1
+    }
     Write-Host " SKIP (cargo not installed)"
     exit 0
 }
@@ -41,6 +53,10 @@ $ErrorActionPreference = "Continue"
 $SemverExit = $LASTEXITCODE
 $ErrorActionPreference = $PrevEap
 if ($SemverExit -ne 0) {
+    if ($InCi) {
+        Write-Host " FAIL (CI: cargo-semver-checks missing -- workflow must install it)" -ForegroundColor Red
+        exit 1
+    }
     Write-Host " SKIP (cargo-semver-checks not installed; cargo install cargo-semver-checks)"
     exit 0
 }

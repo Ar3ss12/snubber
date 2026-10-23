@@ -516,6 +516,11 @@ if ($supSamples -gt 0) {
         Name = ("supervisor handle growth {0:+0;-0;0} <= {1}" -f $handleGrowth, $MaxHandleGrowth)
         Ok   = ($handleGrowth -le $MaxHandleGrowth)
     })
+} elseif ($Launch) {
+    # Zero sampling turns the leak gates into silent no-ops (e.g. the
+    # sampler's catch{} swallowed every poll): a run with no samples
+    # proves nothing and must fail, not pass.
+    $checks.Add([pscustomobject]@{ Name = "sampler collected supervisor samples"; Ok = $false })
 }
 
 $failedChecks = @($checks | Where-Object { -not $_.Ok })

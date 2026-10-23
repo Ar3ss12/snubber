@@ -255,7 +255,7 @@ match node.enter_auto(|| release_locks()) {
 ### Presets
 - `SnubberNode::desktop(name)` — single-flight (`max_in_flight: 1`) with breaker, optimized for GUI apps.
 - `SnubberNode::embedded(name)` — tight and quiet, zero noise, for embedded/firmware.
-- `SnubberNode::server(name)` — wide bulkhead plus sliding-window breaker for backend daemons.
+- `SnubberNode::server(name)` — wide bulkhead plus windowed-batch breaker for backend daemons.
 
 ### Selective Pass-Through (Canary Law, Tests-Only)
 
@@ -1637,7 +1637,7 @@ Async liveness, storm-harness hygiene, and CI hardening.
 | `ResumeFuture` waker leak | A future dropped mid-`.await` (e.g. by `tokio::select!`) left its waker in the conduit directive queue: the queue grew per cancellation and stale wakers were woken on the next directive | `Drop` removes the future's own parked waker (identity `will_wake` match under the wakers lock); no leak, no stale wake | `tests/conduit.rs::dropped_resume_future_removes_its_parked_waker` |
 | Zero-wait refusal after re-check | `enter` with `wait_ms == 0` (AdaptiveBlock `max_wait_ms: 0` / zero-friction custom curve) refused with `BulkheadFull` even when the slot freed while the caller was inside PHASE B (friction runs OUTSIDE the lock) | `else if in_flight >= max_in_flight` — the verified-free slot is admitted; a genuinely full bulkhead still refuses | `tests/bulkhead_capacity.rs::zero_wait_caller_admits_a_slot_freed_during_friction` |
 | Async waiter identity | Re-poll dedup used `will_wake`, so two `EnterFuture`s inside one task cross-matched and the sibling's queue entry was orphaned | Identity is the queue entry's own `evicted` flag (`Arc::ptr_eq`); re-park replaces the waker on that entry only | `tests/async_primitives.rs::enter_async_repeated_polls_do_not_bloat_waiter_queue` |
-| Async queue TTL origin | `enqueued_at_ms` never reset on re-parks: TTL/queue-wait measured from construction of the future, not from actual waiting | Stamped at the first park; TTL measures real queue time | `tests/async_primitives.rs::dropped_parked_future_deregisters_its_queue_slot` |
+| Async queue TTL origin | `enqueued_at_ms` never reset on re-parks: TTL/queue-wait measured from construction of the future, not from actual waiting | Stamped at the first park; TTL measures real queue time — and spurious re-polls never re-stamp it | `tests/task_engine.rs::spurious_repolls_do_not_reset_the_ttl_clock`, `tests/async_primitives.rs::dropped_parked_future_deregisters_its_queue_slot` |
 | Conduit poison | `update_state` silently returned on a poisoned state lock — the pause/cancel directive update vanished | Lock is recovered (`into_inner`) and the update applied; poison bookkeeping stays with the poisoner | `tests/conduit.rs` |
 | EOF grace forever-loop | `note_death`'s grace loop compared only against the clock: a non-advancing injected clock (firmware, tests) spun forever without a verdict | Poll-count backstop `polls >= grace*2` breaks without a deadlock verdict (a verdict needs a clock) | `tests/supervisor_pool.rs` grace window |
 | Storm-gate JSON parsing | Three storm gates asserted numbers by substring (`"reaped":32` matches `"reaped":320`): a collision false-passed the gate | Shared `json_num` parses the exact field value; mismatch is a loud FAIL | `tests/common/mod.rs`, three storm tests |
@@ -1651,6 +1651,32 @@ documents the settle wake-window semantics (a wake is a hint, not a
 reservation); the README lists the real `no_std` surface; `PulseTick` is
 documented as internal; the Layer 5 helper exports got a quick-reference
 row.
+
+## Fixed in 0.6.7: sixth-audit batch
+
+Conduit waker identity, core-exposed drain, honest bookkeeping, CI teeth.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| `ResumeFuture` waker identity | Re-poll dedup used `will_wake`: two `ResumeFuture`s polled by one task cross-matched, so a pause directive could update the sibling's queue slot and orphan the other | Identity is a minted `Arc<AtomicBool>` flag per parked future (`Arc::ptr_eq`); re-park replaces the waker on its own slot only; `Drop` removes exactly that slot | `tests/conduit.rs::dropped_resume_future_removes_its_parked_waker` |
+| Wake outside the wakers lock | `wake_async` called `waker.wake()` while holding the conduit's wakers lock: executor code ran under the lock, and a foreign panic poisoned it silently | Wakers are drained under the lock and woken after it; the lock is poison-tolerant (`into_inner`) | `tests/conduit.rs` |
+| Async queue TTL origin (conduit sibling) | The spurious re-poll re-park re-stamped `enqueued_at_ms`, so a task that repeatedly re-polled could starve its own `task_ttl` forever | The TTL clock is stamped at the FIRST park only; re-parks refresh the waker, never the clock | `tests/task_engine.rs::spurious_repolls_do_not_reset_the_ttl_clock` |
+| Memory-pressure pairing | `note_memory_kb` stored the pressure verdict with `Release`, but admission paths loaded it `Relaxed`: a pressure refusal could be decided from a stale verdict | Loads pair with the store (`Acquire`) on both sync and async admission paths | `tests/memory_boundary.rs` |
+| `FaultKind` wire growth | The snapshot flag region grew silently with `FaultKind::COUNT`; a future kind could walk the flag bytes into the CRC region undetected | Compile-time const-assert: flag region + CRC must fit the snapshot contract, or the build fails | `src/diagnostics.rs` const gate |
+| Core drain reachability | `ProcessToken` / `SnubScanner` / `TOKEN_*` / `OP_*` lived in the `std` supervisor module: bare-metal feed-driven parsing was impossible | New always-on `drain` module (core): token wire types, parser, and scanner compile under `no_std`; `supervisor` re-exports keep every historical path; `snubber::ProcessToken` / `snubber::SnubScanner` now resolve at the crate root | `tests/drain_feed.rs`, thumb gate |
+| Honest refusal buckets | Four suites swallowed refusals with `Err(_)` or hand-counted one bucket: a miscounted or vanished attempt passed green | Every attempt lands in exactly one counted bucket and the local counts are tied to the node's own books (started / committed / implicit drops / bulkhead / breaker); unexpected refusal kinds panic | `tests/stress_breaker_churn.rs`, `tests/priority_preemption.rs`, `tests/transition_orphan.rs`, `tests/industrial.rs`, `tests/bulkhead_capacity.rs` |
+| CI `--locked` | Most cargo invocations (clippy, no_std checks, doc, miri, bench compile) resolved the dependency graph unlocked: a stale `Cargo.lock` surfaced at release, not at PR | Every cargo invocation in CI runs `--locked` | `.github/workflows/ci.yml` |
+| Semver-gate SKIP teeth | `check_api_diff` exited 0 on a missing tag baseline or missing tool — a misconfigured workflow skipped Gate 6 silently | Under `CI=true` a SKIP is a FAIL (both `.sh` and `.ps1` flavors); local runs still SKIP | `scripts/check_api_diff.sh`, `scripts/check_api_diff.ps1` |
+| Bench snapshot honesty | `bench.sh` warned on an empty snapshot locally and wrote the output file non-atomically: a crashed parser could leave a truncated README table | Empty snapshot fails in every mode (parity with `bench.ps1`); the snapshot is published atomically (temp file + move) | `scripts/bench.sh` |
+| Zero-sampling leak gates | Storm harnesses skipped the leak gates when the sampler collected 0 samples (e.g. its `catch{}` swallowed every poll): a run with no samples passed | Zero sampling in launch mode is an explicit FAIL check | `scripts/stress_harness.ps1`, `scripts/stress_harness.sh`, `scripts/stress_multi_lineage.ps1` |
+| Explicit SKIP accounting | `stress_multi_lineage.py` booked the macOS-unavailable handle-growth check as a PASS ("n/a") | Platform-gated checks are reported as explicit SKIP rows and never count as passes | `scripts/stress_multi_lineage.py` |
+| Windowed-batch wording | `failure_rate` was documented as a "sliding window", but the counters reset after every `window` outcomes: a failure pattern spanning a batch boundary is judged by its batch, and the docs overpromised | Docs (builder, stats fields, preset, USER_GUIDE) describe the filled-batch window honestly | doc sync (0.6.7) |
+
+Documentation-only: the README `no_std`/`alloc` surface list now matches
+the module gates (core `drain` added, `conduit`/`conflate` listed as
+`std`, `erased`/`name` listed as `alloc`); the USER_GUIDE API table
+gained `run_supervised_guard_with_grace` and the core `drain` rows and
+cites the TTL regression test.
 
 ## API & Cost Quick Reference
 
@@ -1715,3 +1741,5 @@ row.
 | `PulseTick` (type alias) | 1 / core | structural: one atomic | Internal tick storage type behind `WorkerPulse` (a private detail surfaced through `WorkerPulse::observe`): `AtomicU64`, or `AtomicU32` wrapping at 2^32 on targets without 64-bit CAS. Not a public API — drive pulses through `WorkerPulse` |
 | `EnvelopeVerdict`, `crc32_ieee`, `diagnostic_hash`, `scan_anomalies_for_snapshot`, `find_anomalies_for_snapshot`, `write_diagnostic_line`, `write_health` (Layer 5 helpers) | 7 / std (`find_anomalies_for_snapshot`: alloc) | `Copy` verdict / pure fns / `Write` renderers | Frame-envelope verdict types and the anomaly-scan/hash/render helpers the pool and diagnostic layers are built on; exposed for harnesses that reuse the same classification outside the crate |
 | `LeaseEvent { task_id, stage, kind }` | 3 / std | `Copy` event | Reaper mailbox payload fired by `AsyncLease` drop; overflow accounting goes through `LeaseChannel::fire` |
+| `run_supervised_guard_with_grace(worker_flag, lease_ms, eof_grace_ms, on_dead_token)` | 3 / std | one reaped child process | Supervised guard with a configurable terminal EOF grace: a slow-flushing child (big buffered stdout) gets more than the default grace before death classification, so an in-flight rescue token is never misreported CLEAN |
+| `ProcessToken` / `SnubScanner` (core `drain` module) | 1 / core | 44-byte wire frame; zero allocation | Token parser reachable without `std`: `to_bytes` / `from_bytes` / `from_body_bytes` and the streaming `SnubScanner::push` work on bare metal; `feed`/`write_to` drive it without a reader thread |
