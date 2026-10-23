@@ -89,11 +89,19 @@ fn catastrophic_faults_trip_breaker() {
     assert_eq!(s.catastrophic_faults(), 3);
     assert_eq!(
         s.breaker_state,
-        BreakerState::Open,
-        "3 catastrophic reports trip breaker directly to Open state"
+        BreakerState::HalfOpen,
+        "3 catastrophic reports trip the breaker exactly like the guard path: Closed -> HalfOpen (probe on next enter)"
     );
-    assert!(s.breaker_trips >= 1);
+    assert_eq!(s.breaker_trips, 1);
     assert_eq!(s.poison_recoveries, 0);
+
+    // The HalfOpen probe is scheduled on the next enter.
+    node.enter(9, 9, || {}).expect("probe admitted").commit();
+    assert_eq!(
+        node.stats().breaker_state,
+        BreakerState::Closed,
+        "probe success closes the breaker"
+    );
 
     // Implicit drops feed the streak via settle (guard path).
     let node2 = SnubberNode::builder("implicit_catastrophic")

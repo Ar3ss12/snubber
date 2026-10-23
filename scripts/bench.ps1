@@ -22,9 +22,18 @@ if (-not $SkipRun) {
     Write-Host "[bench] cargo bench --bench admission_bench (release) ..." -ForegroundColor Cyan
     Push-Location $root
     try {
-        cargo bench --bench admission_bench 2>&1 | ForEach-Object { Write-Host $_ }
-        if ($LASTEXITCODE -ne 0) {
-            throw "cargo bench failed with exit code $LASTEXITCODE"
+        # PS 5.1 wraps native stderr lines in ErrorRecords; under Stop the
+        # first cargo progress line would be a terminating error.
+        $PrevEap = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            cargo bench --bench admission_bench 2>&1 | ForEach-Object { Write-Host $_ }
+            $CargoExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $PrevEap
+        }
+        if ($CargoExit -ne 0) {
+            throw "cargo bench failed with exit code $CargoExit"
         }
     } finally {
         Pop-Location
@@ -95,7 +104,7 @@ foreach ($est in $estimates) {
     $ns = if ($meanNs -lt 1000) {
         "{0:F1} ns" -f $meanNs
     } else {
-        "{0:F2} µs" -f ($meanNs / 1000.0)
+        "{0:F2} us" -f ($meanNs / 1000.0)
     }
     $rows.Add("| ``$label`` | **$ns** | $group bench |")
 }

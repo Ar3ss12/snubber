@@ -81,7 +81,7 @@ How it works: the guard owns your rollback closure. `commit()` disarms it (succe
 1. **Safe to run twice:** Releasing a button twice is fine; sending money twice is not — put terminal forward actions in `commit()`.
 2. **Fast and non-blocking:** Atomic stores, event flags, non-blocking sends.
 3. **No node re-entrancy:** Never call back into the same node's admission method under the rollback (that deadlocks).
-4. **Memory ordering:** The node's mutex protects node books only. Every guard runs a `SeqCst` fence before the rollback body (free on x86/x64) — but a fence pairs with NOTHING. If your rollback publishes to shared state that another thread reads, pair it yourself: store with `Release`, load with `Acquire` (or guard the state with your own lock). `Relaxed`×2 reads stale data (F13).
+4. **Memory ordering:** The node's mutex protects node books only. Every guard runs a `SeqCst` fence before the rollback body (free on x86/x64) — but a fence pairs with NOTHING. If your rollback publishes to shared state that another thread reads, pair it yourself: store with `Release`, load with `Acquire` (or guard the state with your own lock). `Relaxed`×2 reads stale data.
 5. **Bind resource to guard:** Wrap the handle in `Protected::new(res, guard)` — `commit()` disarms the guard and returns the resource; any other exit executes rollback and drops the resource. Post-crash access becomes a compile error, not a forgotten `if`.
 6. **Seal the scope:** Prefer `node.scoped_sealed(rb, work)` where thread-leakage is the threat — the `!Send` `ScopeToken` makes `spawn` with context a compile error (E0277).
 7. **Never suppress guard drop:** Never use `std::mem::forget` on guards. A guard owns node references and telemetry allocations. Disarming is done strictly through `commit()`. `commit()` marks the transaction settled while allowing the guard's inner fields to cleanly release their allocations upon leaving scope.
@@ -154,7 +154,7 @@ measured from arming, not from boot.
 ```rust
 use snubber::{PulseWatch, WorkerPulse};
 
-let pulse = WorkerPulse::new();          // worker side: 8 B
+let pulse = WorkerPulse::new();          // worker side: 8 B (4 B without 64-bit CAS)
 let mut watch = PulseWatch::new(2000);   // watcher side: 2 s lease
 // worker loop: pulse.kick();            // one Release store / iter
 // watcher tick: watch.observe(pulse.tick(), wall_now_ms)
@@ -216,7 +216,7 @@ Wrap long-lived services, drivers, and background workers in a `SnubberNode`. Th
 use snubber::{EnterError, SnubberNode};
 
 let node = SnubberNode::builder("payment_gateway")
-    .max_in_flight(16)      // at most 16 concurrent executions
+    .max_in_flight(16)      // at most 16 concurrent executions (17 under EvictOldest)
     .trip_after_failures(3) // 3 crashes in a row → open circuit breaker
     .build();
 
@@ -560,7 +560,7 @@ let response = guard.settle_async(async {
 ```
 
 ### 3. Pacing Without Freezing Worker Threads (`enter_paced_async`)
-Never call blocking sleeps (`std::thread::sleep`) in async code (Rule F14). Inject your runtime's timer:
+Never call blocking sleeps (`std::thread::sleep`) in async code. Inject your runtime's timer:
 
 ```rust
 let guard = node.enter_paced_async(epoch, task, rollback, |wait_ms| {
@@ -664,7 +664,7 @@ For web frameworks (Axum, Actix, Tonic) where sleeping in request handlers is fo
 ```rust
 use snubber::{AsyncGate, Refusal};
 
-let gate = AsyncGate::new(&node);
+let gate = AsyncGate::new(node)?;
 match gate.admit_auto(|| rollback()) {
     Ok(guard) => { /* process request */ guard.commit(); }
     Err(Refusal::Backoff) => {
@@ -816,7 +816,7 @@ let mut tracker = RestartTracker::new(
 );
 loop {
     let code = spawn_and_wait(); // caller owns the process
-    match tracker.note_death(code, now_ms()) {
+    match tracker.note_death(Some(code), now_ms()) {
         RestartDecision::Restart { delay_ms, .. } => caller_sleep(delay_ms),
         RestartDecision::GiveUp { .. } => {
             node.report(snubber::FaultKind::ProcessDied, 1, 1);
@@ -1097,7 +1097,7 @@ let pool = WorkerPool::new(config)?;
 let lane = pool.lane(0).unwrap().clone();                 // one Arc per app thread
 let generation = lane.attach(pid, PipeDrain::spawn(stdout))?;
 // Worker emits ProcessToken { task: namespace_task(0, seq), .. }.
-let reap = lane.note_death(exit_code, now_ms)?;
+let reap = lane.note_death(Some(exit_code), now_ms)?;
 match reap.decision {
     RestartDecision::Restart { delay_ms, .. } => app_sleep(delay_ms),
     RestartDecision::Stop | RestartDecision::GiveUp { .. } => app_parks(lane.index()),
@@ -1141,7 +1141,7 @@ from the observer thread, `[7,7,7,7]` generations, 0.42 s.
 
 **Reference:** `examples/19_worker_pool.rs` (supervisor and worker modes,
 `--mixed` four-class storm, `--lease-ms` euthanasia storm, JSON report),
-`tests/supervisor_pool.rs` (18 deterministic tests: lane isolation,
+`tests/supervisor_pool.rs` (21 deterministic tests: lane isolation,
 per-lane generation, conservation, per-lane backoff/window, attach/reap
 errors, EOF-grace and zero-grace deadlock, live-pipe lease expiry, the
 `expired_lanes` sweep naming only the silent lane, Stop/GiveUp delay
@@ -1368,7 +1368,7 @@ for anomaly in set.find_all_anomalies(&AnomalyPolicy::default()) {
 ```
 
 Cold paths only: snapshot rarely and cache; never call `stats()` per
-CPS in a hot loop (F10 — the `last_fault` clone shows up in the
+CPS in a hot loop (the `last_fault` clone shows up in the
 profiler at 160 CPS).
 
 ---
@@ -1553,10 +1553,37 @@ Second audit pass; behavioral fixes, each with a regression test.
 | Harness burst counters | `ProfileHarness` burst/streak counters wrapped on `usize` overflow | Saturating arithmetic | `tests/harness.rs` (unchanged determinism) |
 
 Documentation-only corrections in the same pass: `eof_grace_ms = 0` (poll
-once, instant `Deadlocked`) and `u64::MAX` (unbounded) are now written into
-`PipeDrain` docs; `reap_timeouts` is a documented no-op touch-point (watchdog
+once, instant `Deadlocked`) and `u64::MAX` (unbounded) are documented on `PoolConfig` and
+`PoolLane::note_death`; `reap_timeouts` is a documented no-op touch-point (watchdog
 settlement is cooperative via `check_timeout`); `INVARIANTS.md` tags the
 Windows-only stress command with its POSIX equivalents.
+
+## Fixed in 0.6.3: audit closeout
+
+Third audit pass; every finding fixed in one release.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| `OP_SNAPSHOT` frame | `apply_token` treated the cold-diagnostics opcode as an arm: a lone snapshot frame incremented `arms`, and a snapshot arriving between an arm and its commit looked like a second armed transaction | The opcode is neutral: it arms nothing and clears nothing; the next `OP_COMMIT` or emergency opcode still settles the armed token | `tests/drain_feed.rs::snapshot_marker_neither_arms_nor_clears` |
+| `report()` feeds the streak breaker | Catastrophic `report()` calls incremented `consecutive_failures` but never tripped — an Open breaker stayed welded until `reset` instead of re-arming its probe | `report()` funnels through the same streak trip as the guard settle paths: Closed trips to HalfOpen (trip counter +1), Open re-arms the probe | `tests/circuit_breaker.rs::reported_failures_re_arm_the_probe_from_open` |
+| Ghost async waiter | An `EnterFuture` admitted on a spec-legal spurious re-poll left its queue entry parked forever — the bulkhead permanently lost one slot | The future deregisters its waiter on `Drop` unconditionally (identity-matched, idempotent); a re-park retires the superseded entry first | `tests/async_primitives.rs::admitted_on_spurious_repoll_leaves_no_ghost_waiter` |
+| `take_state` honesty | `take_state` peeked and returned the digest without clearing it — "take" lied, and a stale digest could be re-handed to a second replacement | The call consumes the digest: the next call returns `None`; `last_state` remains the non-consuming peek | existing supervisor tests (peek/consume split) |
+| Gen-0 child stdin | The generation-0 child inherited the supervisor's TTY on stdin while the pipe is one-way child→out | Stdin is `Stdio::null()`: a worker following the `take_stdin_digest` doc reads EOF immediately | behavioral, gen-0 spawn path |
+| Lane `last_exit` after attach | A lane attached to a replacement worker kept the previous worker's exit code until the new one died | `attach` clears `last_exit`: death classification reflects only the current worker | existing `supervisor_pool` coverage |
+| EvictOldest telemetry | The queue-horizon overflow recorded a bulkhead rejection although the call was NOT refused | Recorded as telemetry only (bump 0): counters match what callers actually observe | Gate 3 (record_locked body) covers the table |
+| `admission_total` parity | `SnapshotV1::admission_total` added `evicted` while `SnubberStats::admission_total` did not — two public counters for the same name disagreed | Both exclude `evicted`; the +1 overbooking of an EvictOldest admission is already counted in `total_started` | `src/diagnostics.rs` (in-file parity asserts) |
+| Pending-PASS harness loophole | A supervisor harness that launched a child but died before writing the report still printed PASS | Launch mode requires the report; missing report = FAIL; the deadlock check requires the `deadlock` key in the JSON (a malformed report can no longer false-pass) | `scripts/stress_harness.ps1`, `scripts/stress_harness.sh`, `scripts/stress_multi_lineage.ps1` |
+| Gate 3 empty-body false-pass | The zero-panic-under-lock gate silently passed when `fn record_locked` was renamed or moved (extracted body was empty) | Both the `.sh` and `.ps1` gates FAIL on an empty extraction | `scripts/check_compile_gates.sh`, `scripts/check_compile_gates.ps1` |
+| Attribute-anchor greps | Gate greps matched the veto/no_std attributes anywhere in a line (a commented-out copy would satisfy them) | Anchored to line start (`^#!\[`) in both gate flavors | `scripts/check_compile_gates.sh`, `scripts/check_compile_gates.ps1` |
+| Wedged supervisor harness | The `.sh` harness waited 600×0.1 s for a child that wedged before EOF and then reported the stale state | After the grace window the harness kills the child (`kill -9`) so the verdict reflects the wedged run, not a hung wait | `scripts/stress_harness.sh` |
+
+Documentation-only corrections in the same pass: `AsyncGate` construction
+shown as `AsyncGate::new(node)?`; grace/no-op semantics documented on
+`PoolConfig` and `PoolLane::note_death`; `WorkerPulse` memory comment
+distinguishes 4 B without a 64-bit CAS; EvictOldest sample notes the
+transient `max + 1` admission; `note_death(Some(code), ..)` examples match
+the API; INVARIANTS.md states the EvictOldest `C + 1` exception to
+Invariant 2; README measures `commit` at ~5.4 ns without an allocation.
 
 ## API & Cost Quick Reference
 

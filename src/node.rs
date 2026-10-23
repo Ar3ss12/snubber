@@ -343,7 +343,10 @@ pub enum OverflowPolicy {
     /// Reject the newcomer immediately (`enter` returns `Err`).
     #[default]
     RejectNew,
-    /// Evict the oldest in-flight slot, admit the newcomer.
+    /// Admit the newcomer over capacity: the newest caller gets a slot at
+    /// `max + 1`; the oldest parked async waiter is marked and woken so
+    /// its re-poll resolves to an honest `QueueFull` (sync admission
+    /// overbooks and records `EvictedOldest` on the displaced owner).
     EvictOldest,
 }
 /// Read-only hook fired on every recorded fault.
@@ -1915,16 +1918,11 @@ impl SnubberNode {
         let feeds_streak = kind.is_catastrophic() && !matches!(kind, FaultKind::ImplicitDrop);
         if feeds_streak {
             inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
-            let trips = inner.trip_after_failures;
-            if trips > 0
-                && inner.consecutive_failures >= trips
-                && inner.breaker == BreakerState::Closed
-            {
-                inner.breaker = BreakerState::HalfOpen;
-                inner.half_open_probe = false;
-                inner.stats.breaker_trips = inner.stats.breaker_trips.saturating_add(1);
-                inner.stats.breaker_state = BreakerState::HalfOpen;
-            }
+            // Same single entry point as the guard settle paths: Closed ->
+            // HalfOpen counts the trip; Open re-arms the probe so a
+            // report-fed streak recovers exactly like an implicit-drop
+            // streak instead of welding the breaker until reset.
+            streak_trip_locked(&mut inner);
         }
         Self::bump_reported(&mut inner, kind);
         let mut outcome = Self::record_locked(&mut inner, kind, 0, 0);
@@ -3131,12 +3129,15 @@ impl SnubberNode {
         }
 
         // 4. Queue horizon: backpressure gauge when the buffer is full.
+        // Telemetry record only (bump 0): the call is NOT refused here, so
+        // counting a bulkhead rejection would double-book an admission
+        // that goes on to succeed.
         if inner.queued >= inner.queue_limit {
             let record = FaultRecord {
                 kind: FaultKind::BufferOverflow,
                 ..arming.clone()
             };
-            let mut outcome = Self::record_locked(&mut inner, FaultKind::BufferOverflow, 3, 0);
+            let mut outcome = Self::record_locked(&mut inner, FaultKind::BufferOverflow, 0, 0);
             drop(inner);
             self.publish_fault(&mut outcome, &record);
             Self::emit(outcome, record);
@@ -4298,6 +4299,34 @@ fn to_us(ns: u64) -> u32 {
     (ns / 1_000).min(u32::MAX as u64) as u32
 }
 
+/// Streak trip shared by the settle paths (`TrackedGuard::settle_implicit`,
+/// `TrackedGuard::check_timeout`) and by `SnubberNode::report`: when the
+/// consecutive-failure streak reaches `trip_after_failures`, trip from
+/// Closed (fresh trip — HalfOpen with the probe scheduled on the next
+/// `enter`, trip counter +1) or schedule the probe from Open. A HalfOpen
+/// breaker already has its probe — re-arming here would open a SECOND
+/// probe and inflate `breaker_trips`. Caller holds the node lock.
+fn streak_trip_locked(inner: &mut NodeInner) {
+    let trips = inner.trip_after_failures;
+    if trips == 0 || inner.consecutive_failures < trips {
+        return;
+    }
+    match inner.breaker {
+        BreakerState::Closed => {
+            inner.breaker = BreakerState::HalfOpen;
+            inner.half_open_probe = false;
+            inner.stats.breaker_trips = inner.stats.breaker_trips.saturating_add(1);
+            inner.stats.breaker_state = BreakerState::HalfOpen;
+        }
+        BreakerState::Open => {
+            inner.breaker = BreakerState::HalfOpen;
+            inner.half_open_probe = false;
+            inner.stats.breaker_state = BreakerState::HalfOpen;
+        }
+        BreakerState::HalfOpen => {}
+    }
+}
+
 impl ProfileState {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -4903,7 +4932,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         // above, and a streak trip must not schedule a fresh probe
         // over that verdict.
         if !self.is_probe {
-            Self::streak_trip_locked(&mut inner);
+            streak_trip_locked(&mut inner);
         }
         inner.stats.timeouts_fired = inner.timeouts_fired;
         inner.stats.window_outcomes = inner.window_outcomes;
@@ -4973,34 +5002,6 @@ impl<F: FnOnce()> TrackedGuard<F> {
             inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
         } else {
             inner.consecutive_failures = 0;
-        }
-    }
-
-    /// Streak trip shared by the settle paths (`settle_implicit`,
-    /// `check_timeout`): when the consecutive-failure streak reaches
-    /// `trip_after_failures`, trip from Closed (fresh trip — HalfOpen
-    /// with the probe scheduled on the next `enter`, trip counter +1)
-    /// or schedule the probe from Open. A HalfOpen breaker already has
-    /// its probe — re-arming here would open a SECOND probe and
-    /// inflate `breaker_trips`.
-    fn streak_trip_locked(inner: &mut NodeInner) {
-        let trips = inner.trip_after_failures;
-        if trips == 0 || inner.consecutive_failures < trips {
-            return;
-        }
-        match inner.breaker {
-            BreakerState::Closed => {
-                inner.breaker = BreakerState::HalfOpen;
-                inner.half_open_probe = false;
-                inner.stats.breaker_trips = inner.stats.breaker_trips.saturating_add(1);
-                inner.stats.breaker_state = BreakerState::HalfOpen;
-            }
-            BreakerState::Open => {
-                inner.breaker = BreakerState::HalfOpen;
-                inner.half_open_probe = false;
-                inner.stats.breaker_state = BreakerState::HalfOpen;
-            }
-            BreakerState::HalfOpen => {}
         }
     }
 
@@ -5089,7 +5090,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         Self::note_outcome(&mut inner, true);
         inner.stats.window_outcomes = inner.window_outcomes;
         inner.stats.window_failures = inner.window_failures;
-        Self::streak_trip_locked(&mut inner);
+        streak_trip_locked(&mut inner);
         // Probe that settled implicitly: downstream still degraded → back to Open.
         if self.is_probe {
             inner.breaker = BreakerState::Open;

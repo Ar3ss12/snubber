@@ -639,6 +639,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     repo = Path(__file__).resolve().parent.parent
+    # SIGTERM (CI job cancellation) must unwind into run()'s finally so
+    # the storm leaves no spinning supervisors or workers behind.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     return run(args, repo)
 
 

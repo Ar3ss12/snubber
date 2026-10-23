@@ -473,6 +473,9 @@ if ($wSamples -gt 0) {
 
 $checks = New-Object 'System.Collections.Generic.List[object]'
 $ambush = 0; $escape = 0; $stillborn = 0
+# Launch mode without a report is a failure, not a pending pass: the
+# supervisor was ours, it owed us termination_report.json.
+$checks.Add([pscustomobject]@{ Name = "report present"; Ok = ($report -or -not $Launch) })
 if ($report) {
     if ($report.PSObject.Properties['ambush_kills']) {
         $ambush = [int]$report.ambush_kills
@@ -494,8 +497,13 @@ if ($report) {
         $checks.Add([pscustomobject]@{ Name = ("true ambush rate {0:N1}% >= {1}%" -f $ambushPct, $minAmbush); Ok = ($ambushPct -ge $minAmbush) })
     }
     $checks.Add([pscustomobject]@{ Name = "final_generation == kills + 1"; Ok = ([int]$report.final_generation -eq $completed + 1) })
-    $checks.Add([pscustomobject]@{ Name = "deadlock == false"; Ok = (-not [bool]$report.deadlock) })
-    if ($Launch) { $checks.Add([pscustomobject]@{ Name = "supervisor exit == 0"; Ok = ($supExit -eq 0) }) }
+    # A missing key must fail, not pass ([bool]$null is $false).
+    $checks.Add([pscustomobject]@{ Name = "deadlock == false"; Ok = ($report.PSObject.Properties['deadlock'] -and -not [bool]$report.deadlock) })
+}
+if ($Launch) {
+    # Kept outside the report block: a wedged supervisor must fail the run
+    # even when no report was written.
+    $checks.Add([pscustomobject]@{ Name = "supervisor exit == 0"; Ok = ($supExit -eq 0) })
 }
 if ($supSamples -gt 0) {
     $privGrowth = $supPrivLast - $supPrivFirst
@@ -511,8 +519,10 @@ if ($supSamples -gt 0) {
 }
 
 $failedChecks = @($checks | Where-Object { -not $_.Ok })
+# Pending pass only makes sense in external mode (we never owned the
+# supervisor, so no report contract exists); launch mode owes a report.
 $verdict = if ($completed -eq $Kills -and $failedChecks.Count -eq 0) {
-    if ($report) { "PASS" } else { "PASS (harness only, report pending)" }
+    if ($report) { "PASS" } elseif (-not $Launch) { "PASS (harness only, report pending)" } else { "FAIL" }
 } else { "FAIL" }
 
 Write-Host "==========================================================" -ForegroundColor Cyan

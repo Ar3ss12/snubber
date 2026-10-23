@@ -125,6 +125,10 @@ for path in estimate_files:
             continue
 EOF
 
+if [ ! -s "${OUT_FILE}" ] || [ "$(grep -c '^| `' "${OUT_FILE}" 2>/dev/null)" = "0" ]; then
+    echo -e "\033[33m[bench] WARNING: snapshot produced no benchmark rows — run without --skip-run or check target/criterion\033[0m" >&2
+fi
+
 echo ""
 echo -e "\033[32m=== BENCH SNAPSHOT (ns/op mean point estimate) ===\033[0m"
 cat "${OUT_FILE}"

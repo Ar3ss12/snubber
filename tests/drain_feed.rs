@@ -9,7 +9,9 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use snubber::{PipeDrain, ProcessToken, StateDigest, OP_COMMIT, OP_HEARTBEAT, OP_STATE};
+use snubber::{
+    PipeDrain, ProcessToken, StateDigest, OP_COMMIT, OP_HEARTBEAT, OP_SNAPSHOT, OP_STATE,
+};
 
 #[test]
 fn byte_by_byte_arm_frame_is_one_arm() {
@@ -282,4 +284,35 @@ fn opcodes_stay_distinct_for_feed_dispatch() {
     assert_ne!(OP_COMMIT, OP_HEARTBEAT);
     assert_ne!(OP_COMMIT, OP_STATE);
     assert_ne!(OP_HEARTBEAT, OP_STATE);
+}
+
+#[test]
+fn snapshot_marker_neither_arms_nor_clears() {
+    let drain = PipeDrain::manual();
+
+    assert!(
+        drain.take_armed().is_none(),
+        "a lone snapshot marker is diagnostics, not an armed token"
+    );
+    assert_eq!(
+        drain.feed(&ProcessToken::simple(7, OP_SNAPSHOT, 0).to_bytes()),
+        1
+    );
+    assert_eq!(drain.counters().arms, 0, "OP_SNAPSHOT arms nothing");
+    assert!(drain.take_armed().is_none());
+
+    // It must not clear an existing armed transaction either.
+    assert_eq!(drain.feed(&ProcessToken::simple(11, 5, 9).to_bytes()), 1);
+    assert_eq!(
+        drain.feed(&ProcessToken::simple(3, OP_SNAPSHOT, 0).to_bytes()),
+        1
+    );
+    let armed = drain
+        .take_armed()
+        .expect("emergency token survives a snapshot marker");
+    assert_eq!(
+        armed.task, 11,
+        "the snapshot frame must not replace the armed token"
+    );
+    assert_eq!(drain.counters().arms, 1);
 }

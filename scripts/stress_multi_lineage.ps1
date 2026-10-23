@@ -493,7 +493,8 @@ foreach ($lane in $lanes) {
             $checks.Add([pscustomobject]@{ Name = ("$tag true ambush rate {0:N1}% >= {1}%" -f $lane.AmbushPct, $minAmbush); Ok = ($lane.AmbushPct -ge $minAmbush) })
         }
         $checks.Add([pscustomobject]@{ Name = "$tag final_generation == kills + 1"; Ok = ([int]$lane.ReportObj.final_generation -eq $KillsPerLine + 1) })
-        $checks.Add([pscustomobject]@{ Name = "$tag deadlock == false"; Ok = (-not [bool]$lane.ReportObj.deadlock) })
+        # A missing key must fail, not pass ([bool]$null is $false).
+        $checks.Add([pscustomobject]@{ Name = "$tag deadlock == false"; Ok = ($lane.ReportObj.PSObject.Properties['deadlock'] -and -not [bool]$lane.ReportObj.deadlock) })
     } else {
         $checks.Add([pscustomobject]@{ Name = "$tag report present"; Ok = $false })
     }

@@ -31,6 +31,10 @@ if (-not $Baseline) {
     exit 0
 }
 
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    Write-Host " SKIP (cargo not installed)"
+    exit 0
+}
 $PrevEap = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 & cargo semver-checks --version *> $null

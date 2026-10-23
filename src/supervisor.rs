@@ -629,8 +629,9 @@ impl ProcessToken {
         }
     }
 
-    /// Parse wire bytes. Accepts either a 44-byte framed packet (with `SNUB` magic)
-    /// or a raw legacy 40-byte packet.
+    /// Parse the 40 body bytes of a token (the `SNUB` magic and CRC, if
+    /// present, must be stripped first — see [`Self::to_bytes`] and
+    /// [`Self::from_body_bytes`]).
     #[inline]
     #[must_use]
     pub fn from_bytes(raw: &[u8; 40]) -> Self {
@@ -1112,13 +1113,18 @@ impl PipeDrain {
         }
     }
 
-    /// Take the last verified complete `StateDigest`, if any (Phase 3).
-    /// Call after process exit, hand the bytes to the replacement process at startup (child
-    /// stdin/env/file — the crate delivers, the app injects). `Copy`
-    /// out under one short lock — no alloc, never panics.
+    /// Take the last verified complete `StateDigest`, if any (Phase 3),
+    /// consuming it — the next call returns `None`. Call after process
+    /// exit and hand the bytes to the replacement process at startup
+    /// (child stdin/env/file — the crate delivers, the app injects).
+    /// Copy-out under one short lock — no alloc, never panics.
     #[must_use]
     pub fn take_state(&self) -> Option<StateDigest> {
-        self.inner.state.lock().ok().and_then(|state| state.state)
+        self.inner
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.state.take())
     }
 
     /// Peek without taking (supervisor polls before spawning replacement process).
@@ -1209,6 +1215,10 @@ fn apply_token(state: &mut DrainState, token: ProcessToken, now_ms: u64) {
         }
         // Corrupt or mismatched frame: dropped silently, the replacement
         // process gets the last verified whole state.
+    } else if token.opcode == OP_SNAPSHOT {
+        // Cold diagnostics marker: arms nothing, clears nothing (see
+        // OP_SNAPSHOT). A snapshot must never be mistaken for an armed
+        // transaction; the next OP_COMMIT or emergency opcode does that.
     } else {
         state.arms = state.arms.saturating_add(1);
         state.armed = Some(token);
@@ -1417,6 +1427,12 @@ impl Supervisor {
         child_cmd.env("SNUBBER_SUPERVISED", "1");
         child_cmd.env("SNUBBER_GEN", current_gen.to_string());
         child_cmd.stdout(std::process::Stdio::piped());
+        // The pipe is one-way (child -> out); the gen-1 child never
+        // receives a stdin digest (that is `spawn_with_digest`'s contract
+        // for successors). Null stdin so a worker that follows the
+        // `take_stdin_digest` doc reads EOF immediately instead of
+        // blocking on the supervisor's inherited TTY forever.
+        child_cmd.stdin(std::process::Stdio::null());
 
         let mut child = match child_cmd.spawn() {
             Ok(c) => c,

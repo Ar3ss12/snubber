@@ -11,14 +11,16 @@ The state machine of `snubber` guarantees that the following four properties hol
 ### Invariant 1: Conservation of Admissions
 At any point in time, the sum of all terminal and active states equals the total number of attempted admissions:
 
-$$\text{Attempts} = \text{Admitted} + \text{BulkheadFull} + \text{BreakerOpen} + \text{StaleEpoch} + \text{RateLimited}$$
+$$\text{Attempts} = \text{Admitted} + \text{BulkheadFull} + \text{BreakerOpen} + \text{StaleEpoch} + \text{RateLimited} + \text{InvariantBreach}$$
 
-No request is silently dropped, double-counted, or lost during state transitions, even under high-concurrency races.
+where `BulkheadFull` folds the async `QueueFull` verdict in (the queue is part of the bulkhead), and async `QueueTtlExpired` attempts settle as `Timeout` (a timed-out attempt, not a shed one). Memory-pressure refusals are counted **before** the perimeter in their own lock-free column and are therefore not part of the perimeter equation. No request is silently dropped, double-counted, or lost during state transitions, even under high-concurrency races.
 
 ### Invariant 2: Strict Slot Containment (Zero Leaks)
 For any `SnubberNode` configured with capacity $C$:
 
 $$0 \le \text{in\_flight}(t) \le C \quad \forall t$$
+
+with one deliberate, documented exception: under `OverflowPolicy::EvictOldest` a saturated node overbooks by one ($C + 1$) to admit the newest caller; the displaced owner's slot is released by its own settlement (implicit drop → `EvictedOldest` column), so the overbooking is transient and never stacks.
 
 When all caller threads or async tasks complete (whether through `commit()`, explicit `abort()`, implicit RAII drop, or panic unwinding), the active lease count strictly returns to zero:
 

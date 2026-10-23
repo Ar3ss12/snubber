@@ -26,9 +26,11 @@ pub enum ReapClass {
     Escape,
     /// Neither an arm nor a commit: the worker died before settling anything.
     Stillborn,
-    /// The drain did not reach EOF inside the grace window. Nothing is
+    /// The drain did not reach EOF inside the grace window. No token is
     /// claimed and no class is guessed; the app must treat the lane as
-    /// unverifiable (a healthy storm reports zero of these).
+    /// unverifiable (a healthy storm reports zero of these). The last
+    /// verified `StateDigest`, if any, is still returned — it passed the
+    /// full-frame CRC but may be stale.
     Deadlocked,
 }
 
@@ -161,6 +163,7 @@ impl PoolLane {
         state.drain = Some(drain);
         state.memory = self.base_memory;
         state.last_class = None;
+        state.last_exit = None;
         Ok(state.clock.generation())
     }
 

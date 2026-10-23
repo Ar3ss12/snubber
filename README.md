@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-355%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-367%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -64,7 +64,7 @@ drain.finish();                                        // EOF → rescue classif
 ## 🛡️ Architecture & Guarantees
 
 * **Zero-Boilerplate RAII Rollback:** No manual token tracking. Scoped executions auto-commit on success and guarantee resource release via `Drop` on panics, errors, or early returns.
-* **Single-Digit-Nanosecond Overhead:** Base stack guard costs **~5.4 ns** with full field drop (no `mem::forget` leak) and adds **+0 bytes** to executable size. Concurrency-limited nodes process over **8.2M ops/sec** (`core`-only / `std`).
+* **Single-Digit-Nanosecond Overhead:** Base stack guard costs **~5.4 ns**; commit takes the rollback and forgets an allocation-free `Copy` shell and adds **+0 bytes** to executable size. Concurrency-limited nodes process over **8.2M ops/sec** (`core`-only / `std`).
 * **Strict Determinism:** `#![forbid(unsafe_code)]`, zero external dependencies. Predictable behavior across bare-metal microcontrollers and multi-socket servers alike.
 * **Runtime-Agnostic Async:** Bounded waker queue built on `core::task::Waker` consuming **0% CPU** without depending on Tokio, async-std, or background threads.
 * **Adaptive Backpressure & Pacing:** Refusals carry physical telemetry (`retry_after_ms`, queue depth 0..255) allowing clients to pace incoming traffic instead of overwhelming dead hardware.
@@ -196,7 +196,7 @@ use snubber::pool::{namespace_task, PoolConfig, WorkerPool};
 let pool = WorkerPool::new(PoolConfig::new(4))?;          // 4 lanes, OnCrash, 50→1000 ms
 let lane = pool.lane(0).unwrap().clone();                 // one Arc per app thread
 let generation = lane.attach(pid, PipeDrain::spawn(stdout))?;
-let reap = lane.note_death(exit_code, now_ms)?;           // waits ≤ 250 ms for EOF
+let reap = lane.note_death(Some(exit_code), now_ms)?;           // waits ≤ 250 ms for EOF
 match reap.decision { /* Restart { delay_ms } | Stop | GiveUp */ }
 ```
 

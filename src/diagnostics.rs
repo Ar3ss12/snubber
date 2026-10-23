@@ -158,7 +158,12 @@ impl SnapshotV1 {
         self.stale_epochs_rejected
     }
 
-    /// Total admission attempts observed.
+    /// Total admission attempts observed. Parity with
+    /// [`crate::SnubberStats::admission_total`]: `evicted` is excluded —
+    /// a sync `EvictOldest` overbooking is already counted in
+    /// `total_started` (adding it would double-count), while an async
+    /// evicted victim's own attempt is the one admission the crate
+    /// reports as started in its place.
     #[must_use]
     pub fn admission_total(&self) -> u64 {
         self.total_started
@@ -167,7 +172,6 @@ impl SnapshotV1 {
             .saturating_add(self.breaker_rejections)
             .saturating_add(self.rate_rejected)
             .saturating_add(self.poisoned_rejected)
-            .saturating_add(self.evicted)
     }
 
     /// Encode to exactly 512 bytes: magic + version + LE fields, zero

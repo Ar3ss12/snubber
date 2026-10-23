@@ -33,10 +33,9 @@ pub struct EnterFuture<F: FnOnce()> {
     /// Identity of this future's parked queue entry (`Arc` pointer
     /// equality with the node's `ParkedWaiter.evicted`). `None` until the
     /// future actually parks — the ready admission path stays alloc-free.
+    /// `Drop` and every re-park deregister through this flag, so one
+    /// future owns at most one queue entry at any moment.
     evicted: Option<Arc<AtomicBool>>,
-    /// `true` while this future owns a parked queue entry: only then does
-    /// `Drop` pay for the node lock to deregister it.
-    parked: bool,
 }
 
 impl<F: FnOnce()> EnterFuture<F> {
@@ -55,16 +54,17 @@ impl<F: FnOnce()> EnterFuture<F> {
             loc,
             enqueued_at_ms: node::now_ms(),
             evicted: None,
-            parked: false,
         }
     }
 }
 
 impl<F: FnOnce()> Drop for EnterFuture<F> {
     fn drop(&mut self) {
-        if !self.parked {
-            return;
-        }
+        // Deregister unconditionally: a spec-legal spurious re-poll can
+        // admit this future while its queue entry is still parked, so a
+        // `parked`-gated drop would leak a ghost waiter that consumes
+        // queue capacity forever. `deregister_waiter` is identity-matched
+        // and idempotent — the normal wake -> pop path pays a no-op scan.
         if let Some(flag) = &self.evicted {
             self.node.deregister_waiter(flag);
         }
@@ -93,9 +93,20 @@ impl<F: FnOnce() + Unpin> Future for EnterFuture<F> {
             &mut evicted_slot,
             this.enqueued_at_ms,
         );
-        this.parked = attempt.is_pending();
-        if this.parked {
-            this.evicted = evicted_slot.take();
+        if attempt.is_pending() {
+            let new_flag = evicted_slot.take();
+            if let Some(new) = &new_flag {
+                // An executor whose waker differs per poll never matches
+                // `will_wake`, so each full re-park pushes a second queue
+                // entry. Retire our previous entry: one future owns
+                // exactly one waiter slot at any moment.
+                if let Some(old) = &this.evicted {
+                    if !Arc::ptr_eq(old, new) {
+                        this.node.deregister_waiter(old);
+                    }
+                }
+            }
+            this.evicted = new_flag;
         }
         attempt
     }

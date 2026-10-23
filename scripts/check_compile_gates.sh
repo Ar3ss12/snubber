@@ -12,7 +12,7 @@ FAILURES=0
 
 # Gate 1: Check #![forbid(unsafe_code)] in src/lib.rs
 echo -n "[1/6] Auditing unsafe code veto... "
-if grep -q '#!\[forbid(unsafe_code)\]' "${REPO_ROOT}/src/lib.rs"; then
+if grep -q '^#!\[forbid(unsafe_code)\]' "${REPO_ROOT}/src/lib.rs"; then
     echo "OK (forbid(unsafe_code) active)"
 else
     echo "FAIL (missing #![forbid(unsafe_code)] in src/lib.rs)"
@@ -41,8 +41,11 @@ echo -n "[3/6] Auditing zero-panic mutex discipline in src/node.rs... "
 # method-indent closing brace) and forbid panicking/allocating calls
 # inside it. The previous grep only ever saw the signature line, so the
 # gate passed unconditionally.
-GATE3_BODY="$(awk '/fn record_locked/{flag=1} flag{print; if ($0 ~ /^    \}$/) exit}' "${REPO_ROOT}/src/node.rs")"
-if printf '%s\n' "${GATE3_BODY}" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\(' > /dev/null 2>&1; then
+GATE3_BODY="$(awk '/^[[:space:]]*fn record_locked\(/{flag=1} flag{print; if ($0 ~ /^    \}$/) exit}' "${REPO_ROOT}/src/node.rs")"
+if [ -z "${GATE3_BODY}" ] || ! printf '%s\n' "${GATE3_BODY}" | head -1 | grep -q 'fn record_locked('; then
+    echo "FAIL: could not extract the fn record_locked body from src/node.rs (renamed or moved?)"
+    FAILURES=$((FAILURES + 1))
+elif printf '%s\n' "${GATE3_BODY}" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\(' > /dev/null 2>&1; then
     echo "FAIL: panicking/formatting call inside record_locked:"
     printf '%s\n' "${GATE3_BODY}" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
     FAILURES=$((FAILURES + 1))
@@ -63,7 +66,7 @@ fi
 
 # Gate 5: TRUE no_std — crate attribute + bare-metal target compile
 echo -n "[5/6] Auditing true no_std on bare metal... "
-if ! grep -q '#!\[cfg_attr(not(feature = "std"), no_std)\]' "${REPO_ROOT}/src/lib.rs"; then
+if ! grep -q '^#!\[cfg_attr(not(feature = "std"), no_std)\]' "${REPO_ROOT}/src/lib.rs"; then
     echo "FAIL (missing #![cfg_attr(not(feature = \"std\"), no_std)] in src/lib.rs)"
     FAILURES=$((FAILURES + 1))
 elif ! rustup target list --installed 2>/dev/null | grep -qx "thumbv7em-none-eabihf"; then

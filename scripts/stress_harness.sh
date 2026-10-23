@@ -168,9 +168,14 @@ while [ "$EXECUTED" -lt "$KILLS" ]; do
     done
 
     if [ "$TARGET_PID" -eq 0 ]; then
-        CANDIDATE=$(pgrep -n -f "$TARGET_PROCESS" 2>/dev/null)
+        # Anchor on the target/<profile>/examples/ path: a bare -f match on
+        # the process name also hits ancestor shells whose command line
+        # contains the target string (e.g. sh -c './scripts/stress_harness.sh
+        # process_termination_loop ...').
+        CANDIDATE=$(pgrep -n -f "target/[^/ ]*/examples/$TARGET_PROCESS" 2>/dev/null)
         if [ -n "$CANDIDATE" ] && [ "$CANDIDATE" -ne "$LAST_KILLED_PID" ] \
-            && [ "$CANDIDATE" -ne "$$" ] && { [ -z "$SUP_PID" ] || [ "$CANDIDATE" -ne "$SUP_PID" ]; }; then
+            && [ "$CANDIDATE" -ne "$$" ] && [ "$CANDIDATE" -ne "$PPID" ] \
+            && { [ -z "$SUP_PID" ] || [ "$CANDIDATE" -ne "$SUP_PID" ]; }; then
             TARGET_PID="$CANDIDATE"
         fi
     fi
@@ -230,6 +235,12 @@ if [ -n "$SUP_PID" ]; then
         kill -0 "$SUP_PID" 2>/dev/null || break
         sleep 0.1
     done
+    # A wedged supervisor (the very failure this harness gates on) must
+    # fail the run, not hang the harness forever.
+    if kill -0 "$SUP_PID" 2>/dev/null; then
+        echo "[HARNESS] supervisor did not exit within the grace window; killing"
+        kill -9 "$SUP_PID" 2>/dev/null
+    fi
     wait "$SUP_PID" 2>/dev/null
     SUP_EXIT=$?
 fi
@@ -244,7 +255,8 @@ TOKENS=$(read_json_int tokens_rescued)
 CLEAN=$(read_json_int clean_settles)
 FINAL_GEN=$(read_json_int final_generation)
 ELAPSED_MS=$(read_json_int elapsed_ms)
-DEADLOCK=$(sed -n 's/.*"deadlock": *\(true\|false\).*/\1/p' "$REPORT" 2>/dev/null | head -1)
+# -E: portable ERE — BSD sed (macOS) does not support GNU BRE alternation \|.
+DEADLOCK=$(sed -nE 's/.*"deadlock": *(true|false).*/\1/p' "$REPORT" 2>/dev/null | head -1)
 
 CHECKS_FAILED=0
 CHECK_LINES=""
@@ -277,7 +289,12 @@ fi
 
 VERDICT="FAIL"
 if [ "$EXECUTED" -eq "$KILLS" ] && [ "$CHECKS_FAILED" -eq 0 ]; then
-    if [ -n "$REAPED" ]; then VERDICT="PASS"; else VERDICT="PASS (harness only, report pending)"; fi
+    if [ -n "$REAPED" ]; then
+        VERDICT="PASS"
+    elif [ -z "$SUP_PID" ]; then
+        # Pending pass only in external mode; a launched supervisor owes a report.
+        VERDICT="PASS (harness only, report pending)"
+    fi
 fi
 
 RATE=$(awk -v n="$EXECUTED" -v ms="$DUR_MS" 'BEGIN { printf "%.1f", ms > 0 ? 1000*n/ms : n }')

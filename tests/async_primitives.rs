@@ -347,3 +347,50 @@ fn dropped_parked_future_deregisters_its_queue_slot() {
     drop(_slot);
     assert!(WOKEN_A.load(Ordering::SeqCst), "real waiter must be woken");
 }
+
+#[test]
+fn admitted_on_spurious_repoll_leaves_no_ghost_waiter() {
+    use std::task::{Context, Poll};
+
+    let node = SnubberNode::builder("async/ghost")
+        .max_in_flight(1)
+        .queue_limit(2)
+        .overflow(OverflowPolicy::RejectNew)
+        .build();
+    let waker = create_tracked_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let held = node.enter(1, 1, || {}).expect("slot");
+
+    let mut f1 = Box::pin(node.enter_async(2, 2, || {}));
+    assert!(f1.as_mut().poll(&mut cx).is_pending(), "f1 parks");
+    let mut f2 = Box::pin(node.enter_async(3, 3, || {}));
+    assert!(f2.as_mut().poll(&mut cx).is_pending(), "f2 parks");
+
+    // Settles the held guard: pops the front waiter (f1) and frees the slot.
+    held.abort("ghost test abort");
+
+    // Spec-legal spurious re-poll of f2: it is admitted while its own
+    // queue entry is still parked.
+    let guard = match f2.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(g)) => g,
+        _ => panic!("f2 must be admitted on the re-poll"),
+    };
+    // The future object dies here while the guard lives on. A Drop gated
+    // on "currently parked" used to leave f2's entry as a ghost that
+    // consumed queue capacity forever.
+    drop(f2);
+
+    // Two more parkers: with the ghost present the second one was falsely
+    // rejected with QueueFull although no real waiter occupied the queue.
+    let mut f3 = Box::pin(node.enter_async(4, 4, || {}));
+    assert!(f3.as_mut().poll(&mut cx).is_pending());
+    let mut f4 = Box::pin(node.enter_async(5, 5, || {}));
+    match f4.as_mut().poll(&mut cx) {
+        Poll::Pending => {}
+        Poll::Ready(Ok(_)) => panic!("f4 must park, not be admitted"),
+        Poll::Ready(Err(e)) => panic!("ghost waiter consumed queue capacity: {e:?}"),
+    }
+
+    guard.commit();
+}

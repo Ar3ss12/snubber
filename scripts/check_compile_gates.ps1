@@ -11,7 +11,7 @@ $Failures = 0
 # Gate 1: Check #![forbid(unsafe_code)] in src/lib.rs
 Write-Host "[1/6] Auditing unsafe code veto..." -NoNewline
 $LibContent = Get-Content "$RepoRoot\src\lib.rs" -Raw
-if ($LibContent -match '#!\[forbid\(unsafe_code\)\]') {
+if ($LibContent -match '(?m)^#!\[forbid\(unsafe_code\)\]') {
     Write-Host " OK (forbid(unsafe_code) active)" -ForegroundColor Green
 } else {
     Write-Host " FAIL (missing #![forbid(unsafe_code)] in src/lib.rs)" -ForegroundColor Red
@@ -50,19 +50,26 @@ $NodeLines = Get-Content "$RepoRoot\src\node.rs"
 $InFn = $false
 $FnBody = New-Object System.Collections.Generic.List[string]
 foreach ($Line in $NodeLines) {
-    if (-not $InFn -and $Line -match 'fn record_locked') { $InFn = $true }
+    if (-not $InFn -and $Line -match '^\s*fn record_locked\(') { $InFn = $true }
     if ($InFn) {
         $FnBody.Add($Line)
         if ($Line -match '^    \}$') { break }
     }
 }
-$FormatUnderLock = $FnBody | Select-String -Pattern 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
-if ($FormatUnderLock) {
-    Write-Host " FAIL: panicking/formatting call inside record_locked" -ForegroundColor Red
-    $FormatUnderLock | ForEach-Object { Write-Host "   line $($_.LineNumber): $($_.Line.Trim())" }
+# A gate that scans nothing must fail, not pass: a renamed/moved
+# record_locked would otherwise yield an empty body and a silent PASS.
+if ($FnBody.Count -eq 0 -or ($FnBody[0] -notmatch 'fn record_locked\(')) {
+    Write-Host " FAIL: could not extract the fn record_locked body from src\node.rs (renamed or moved?)" -ForegroundColor Red
     $Failures++
 } else {
-    Write-Host " OK (no format! under lock)" -ForegroundColor Green
+    $FormatUnderLock = $FnBody | Select-String -Pattern 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
+    if ($FormatUnderLock) {
+        Write-Host " FAIL: panicking/formatting call inside record_locked" -ForegroundColor Red
+        $FormatUnderLock | ForEach-Object { Write-Host "   body line $($_.LineNumber): $($_.Line.Trim())" }
+        $Failures++
+    } else {
+        Write-Host " OK (no format! under lock)" -ForegroundColor Green
+    }
 }
 
 # Gate 4: Zero-metaphor scan across codebase (AGENTS.md Section 14)
@@ -91,9 +98,11 @@ if ($MetaphorMatches.Count -gt 0) {
 # Gate 5: TRUE no_std - crate attribute + bare-metal target compile
 Write-Host "[5/6] Auditing true no_std on bare metal..." -NoNewline
 $BareMetalTarget = "thumbv7em-none-eabihf"
-if ($LibContent -notmatch '#!\[cfg_attr\(not\(feature = "std"\), no_std\)\]') {
+if ($LibContent -notmatch '(?m)^#!\[cfg_attr\(not\(feature = "std"\), no_std\)\]') {
     Write-Host " FAIL (missing #![cfg_attr(not(feature = `"std`"), no_std)] in src/lib.rs)" -ForegroundColor Red
     $Failures++
+} elseif (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+    Write-Host " SKIP (rustup not installed)" -ForegroundColor Yellow
 } elseif (-not ((rustup target list --installed) -contains $BareMetalTarget)) {
     Write-Host " SKIP (target not installed: rustup target add $BareMetalTarget)" -ForegroundColor Yellow
 } else {
@@ -127,6 +136,13 @@ $ErrorActionPreference = $PrevEap
 if ($GitExit -ne 0 -or -not $ApiBaseline) {
     Write-Host " SKIP (no git tag baseline)" -ForegroundColor Yellow
 } else {
+    # Parity with check_api_diff.ps1: a tag equal to HEAD hides every
+    # committed-but-untagged API change; warn instead of trivially passing.
+    $HeadRev = & git -C "$RepoRoot" rev-parse HEAD 2>$null
+    $TagRev = & git -C "$RepoRoot" rev-parse "$ApiBaseline^{}" 2>$null
+    if ($HeadRev -and $TagRev -and $HeadRev -eq $TagRev) {
+        Write-Host " WARN (baseline $ApiBaseline == HEAD; committed-but-untagged API changes are invisible)" -ForegroundColor Yellow
+    }
     $PrevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     & cargo semver-checks --version *> $null
@@ -135,11 +151,12 @@ if ($GitExit -ne 0 -or -not $ApiBaseline) {
     if (-not $SemverInstalled) {
         Write-Host " SKIP (cargo-semver-checks not installed)" -ForegroundColor Yellow
     } else {
+        $Crate = (Select-String -Path "$RepoRoot\Cargo.toml" -Pattern '^name *= *"([^"]+)"').Matches[0].Groups[1].Value
         Push-Location $RepoRoot
         try {
             $PrevEap = $ErrorActionPreference
             $ErrorActionPreference = "Continue"
-            & cargo semver-checks check-release --baseline-rev $ApiBaseline *> $null
+            & cargo semver-checks check-release --baseline-rev $ApiBaseline --package $Crate *> $null
             $SemverExit = $LASTEXITCODE
             $ErrorActionPreference = $PrevEap
             if ($SemverExit -eq 0) {

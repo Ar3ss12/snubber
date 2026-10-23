@@ -342,3 +342,35 @@ fn watchdog_timeouts_trip_the_streak_breaker() {
     node.enter(3, 3, || {}).expect("probe").commit();
     assert_eq!(node.stats().breaker_state, BreakerState::Closed);
 }
+
+#[test]
+fn reported_failures_re_arm_the_probe_from_open() {
+    // Default policy: Panic -> TripBreaker (immediate Open, not a streak
+    // trip). With the old report()-inline trip block the breaker welded
+    // in Open: report could raise the streak but never schedule the
+    // HalfOpen probe, because that transition existed only in the guard
+    // settle paths.
+    let node = SnubberNode::builder("cb/report-streak")
+        .trip_after_failures(2)
+        .build();
+
+    node.report(FaultKind::Panic, 1, 1);
+    assert_eq!(
+        node.stats().breaker_state,
+        snubber::BreakerState::Open,
+        "TripBreaker opens immediately on the first report"
+    );
+
+    // Two more supervisor-named failures reach the streak threshold; the
+    // Open breaker must re-arm the probe instead of staying welded.
+    node.report(FaultKind::Panic, 2, 2);
+    node.report(FaultKind::Panic, 3, 3);
+    assert_eq!(
+        node.stats().breaker_state,
+        snubber::BreakerState::HalfOpen,
+        "a report-fed streak re-arms the probe from Open"
+    );
+
+    node.enter(4, 4, || {}).expect("probe admitted").commit();
+    assert_eq!(node.stats().breaker_state, BreakerState::Closed);
+}
