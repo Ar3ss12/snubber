@@ -21,7 +21,7 @@
 //! plain `Sender` has NO `try_send`, only `SyncSender` does). Never
 //! blocks the sender.
 use crate::{Backpressure, FaultKind};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
@@ -120,7 +120,15 @@ struct GatewayBooks {
 #[derive(Debug)]
 struct ThrottleState {
     /// Estimated queue depth (`+1` on send-ok, `-1` on recv-ok).
-    depth: AtomicUsize,
+    ///
+    /// SIGNED on purpose: a receiver may take an item before the
+    /// producer's `fetch_add(1)` for it lands, so a plain unsigned
+    /// counter would swallow that decrement forever and drift upward
+    /// until the throttle latch wedged shut on an empty queue.
+    /// `fetch_sub(1)` on an `AtomicIsize` is unconditionally honest;
+    /// transient negative values mean "that many takes not yet counted"
+    /// and are clamped to 0 at the `depth()` reads.
+    depth: AtomicIsize,
     /// Hysteresis latch: set at HWM, cleared at/below LWM.
     throttled: AtomicBool,
     /// Consumer-side mean service time per item, ms (integer EMA).
@@ -135,7 +143,7 @@ impl ThrottleState {
     fn new(capacity: usize) -> Self {
         let (hwm, lwm) = watermarks(capacity);
         Self {
-            depth: AtomicUsize::new(0),
+            depth: AtomicIsize::new(0),
             throttled: AtomicBool::new(false),
             service_ms: AtomicU64::new(DEFAULT_SERVICE_MS),
             hwm,
@@ -272,7 +280,7 @@ impl<T> GatewaySender<T> {
     ///   advised wait instead of retry-spinning. Releases only after
     ///   the queue drains to the 50% low watermark (hysteresis latch).
     pub fn send(&self, cmd: T) -> Result<(), GatewaySendError> {
-        let depth = self.throttle.depth.load(Ordering::Relaxed);
+        let depth = self.throttle.depth.load(Ordering::Relaxed).max(0) as usize;
         if self.throttle.throttled.load(Ordering::Acquire) && depth > self.throttle.lwm {
             if let Ok(mut b) = self.books.lock() {
                 b.throttled = b.throttled.saturating_add(1);
@@ -295,7 +303,7 @@ impl<T> GatewaySender<T> {
         match self.tx.try_send(cmd) {
             Ok(()) => {
                 let depth = self.throttle.depth.fetch_add(1, Ordering::Relaxed) + 1;
-                if depth >= self.throttle.hwm {
+                if depth >= self.throttle.hwm as isize {
                     self.throttle.throttled.store(true, Ordering::Release);
                 }
                 if let Ok(mut b) = self.books.lock() {
@@ -319,10 +327,10 @@ impl<T> GatewaySender<T> {
         self.throttle.throttled.load(Ordering::Acquire)
     }
 
-    /// Estimated queue depth (sender-side counter, saturating).
+    /// Estimated queue depth (sender-side counter, saturating at 0).
     #[must_use]
     pub fn depth(&self) -> usize {
-        self.throttle.depth.load(Ordering::Relaxed)
+        self.throttle.depth.load(Ordering::Relaxed).max(0) as usize
     }
 
     /// Snapshot the counters (`Copy` out, poison-safe default).
@@ -395,18 +403,21 @@ impl<T> GatewayHost<T> {
             .store(next.max(1), Ordering::Relaxed);
     }
 
-    /// Estimated queue depth (receiver-side counter, saturating).
+    /// Estimated queue depth (receiver-side counter, saturating at 0).
     #[must_use]
     pub fn depth(&self) -> usize {
-        self.throttle.depth.load(Ordering::Relaxed)
+        self.throttle.depth.load(Ordering::Relaxed).max(0) as usize
     }
 
     fn on_take(&self) {
-        let prev = self.throttle.depth.load(Ordering::Relaxed);
-        if prev > 0 {
-            self.throttle.depth.store(prev - 1, Ordering::Relaxed);
-        }
-        if prev.saturating_sub(1) <= self.throttle.lwm {
+        // Unconditional fetch_sub: the taken item's `fetch_add(1)` may not
+        // have landed yet (receiver won the race), so a load-then-store
+        // here would drop this decrement — and two concurrent takes race
+        // the same way. Signed arithmetic absorbs the transient negative;
+        // the latch clears whenever the post-decrement depth is at/below
+        // the low watermark, which a negative prev trivially satisfies.
+        let prev = self.throttle.depth.fetch_sub(1, Ordering::Relaxed);
+        if prev - 1 <= self.throttle.lwm as isize {
             self.throttle.throttled.store(false, Ordering::Release);
         }
     }

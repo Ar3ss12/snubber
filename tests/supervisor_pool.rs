@@ -719,3 +719,37 @@ fn four_lanes_fifty_cycles_stay_isolated() {
         report.totals.reaps, report.totals.ambush, report.totals.deadlocks
     );
 }
+
+#[test]
+fn successor_gets_fresh_generation_during_eof_grace() {
+    // Regression: the lane clock was bumped AFTER the EOF grace wait, so a
+    // successor attaching inside the grace window inherited the DEAD
+    // child's generation — two lineages sharing one generation number.
+    // Now `note_death` bumps the clock before waiting for EOF.
+    let pool = Arc::new(WorkerPool::new(PoolConfig::new(1).with_eof_grace(150)).expect("one lane"));
+    let lane = pool.lane(0).expect("lane 0");
+    lane.attach(2_001, stuck()).expect("attach dying child");
+
+    let reaper = {
+        let pool = Arc::clone(&pool);
+        std::thread::spawn(move || pool.lane(0).expect("lane").note_death(None, 1_000))
+    };
+    // `note_death` detaches FIRST (pid -> None), then waits out the grace.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while lane.pid().is_some() {
+        assert!(Instant::now() < deadline, "note_death never detached");
+        std::thread::yield_now();
+    }
+
+    // Successor attaches INSIDE the grace window: it must get the fresh
+    // generation, not the dead child's.
+    let gen = lane.attach(2_002, stuck()).expect("attach successor");
+    assert_eq!(
+        gen, 2,
+        "successor must NOT inherit the dead child's generation"
+    );
+
+    let reap = reaper.join().expect("reaper thread").expect("reap");
+    assert_eq!(reap.generation, 2);
+    assert_eq!(reap.class, ReapClass::Deadlocked);
+}

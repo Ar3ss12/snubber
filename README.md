@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-347%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-355%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -22,7 +22,7 @@ Zero external dependencies. `#![forbid(unsafe_code)]`. Compatible from bare-meta
 Add to `Cargo.toml`:
 ```toml
 [dependencies]
-snubber = "0.5"
+snubber = "0.6"
 ```
 
 Wrap critical work in **`scoped`** — commits on `Ok`, automatically rolls back on `Err` or `panic!`:
@@ -75,6 +75,7 @@ drain.finish();                                        // EOF → rescue classif
 * **Zero-Allocation Telemetry:** 512-byte diagnostic snapshots with CRC32 integrity, zero heap allocations on the hot path, and CI validation via `assert_no_anomalies!()`.
 * **Selective Pass-Through (Canary Law):** Builder-sealed `passthrough(true)` runs open-doors transit for differential proof — naked leaks counted lock-free, guarded rescues; wire frame stays 512 B.
 * **Extensible by Contract:** Public error/classification enums are `#[non_exhaustive]` (0.6.0), so new verdicts are additive — downstream matches must keep a `_` arm, and the crate's own internal matches stay exhaustive. `friction_fn` / `pressure_fn` accept capturing closures stored in `Arc<dyn Fn>` and run outside the node lock; `snub_check_map!` maps invariant breaches into your error type; `NodeName::{Static, Owned}` names nodes at runtime without touching the `Copy` telemetry frames; format ceilings (3 priority lanes, 4 profile stages, 16 ISR slots, 28 B token payload, 512 B snapshot, 250 ms EOF grace) are published constants.
+* **Liveness-Correct Concurrency (0.6.1):** every parked async waiter either gets woken or is deregistered (`EvictOldest` resolves the victim to `QueueFull`, never a zombie); the gateway depth counter balances every send with exactly one take (signed arithmetic — the throttle latch can never wedge on an empty queue); a timed-out half-open probe re-opens the breaker instead of wedging; a new generation re-handshakes even at epoch 0; lane generations bump before the EOF grace window, so successors never inherit a dead child's generation; conduit resume/cancel notifications are issued under the waiter's mutex (no lost wakeups).
 * **Impedance Bridge:** A 10 000 msg/s producer feeding a 60 FPS consumer gets a one-slot `ConflateSender` — latest wins, replacements counted, backlog stays at 0 or 1. A 16-byte `ExecutionEnvelope` also guards the other wall: work that returns too fast (stale cache, skipped loop) ticks `envelope_underflows` without feeding the breaker. `ProfileHarness` measures min/median/max/jitter/burst and derives the envelope from real numbers.
 
 ---
@@ -104,6 +105,8 @@ Measured on AMD Ryzen 5 4600H release build
 | `guard.commit_enveloped(64)` | Layer 2 (`std`) | **~152 ns** | Payload corridor exact; wall corridor only for profiled guards |
 | `enter_async_auto` | Layer 3 (`std`) | **0% CPU** | Pure `core::task::Waker` parking, no runtime deps |
 | `enter_async_auto_profiled` | Layer 3 (`std`, opt-in) | 1 `Box` + 2 clock reads | Same waker parking, profile arms on the admitting poll |
+| `enter_async_auto` (ready poll) | Layer 3 (`std`) | **~202 ns** | Full admission through the future; the ready path allocates nothing |
+| `enter_async_auto` park/wake/admit roundtrip | Layer 3 (`std`) | **~574 ns** | Park (queue push + identity flag) -> slot release wake -> admitting re-poll |
 | `static_node.enter + commit` | Layer 2 (`std`) | **~120 ns** | Compile-time capacity assert + bulkhead + auto-commit |
 | `node.note_pulse_stall(lag_ms)` | Layer 2 (`std`) | **1 atomic max** | Missed heartbeat lands in `SnapshotV1` v3 + `AnomalyKind::PulseStall` |
 | `node.note_memory_kb(used)` | Layer 2 (`std`, cold) | 1 lock + 1 atomic store | External memory sample → soft/hard verdict; admissions refuse lock-free above soft |

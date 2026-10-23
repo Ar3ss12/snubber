@@ -992,6 +992,16 @@ impl SnubberNodeBuilder {
     }
 }
 
+/// One parked `enter_async` admission: the task's waker plus the future's
+/// eviction flag. The flag gives every parked future a unique identity
+/// (`Arc` pointer equality): `EvictOldest` marks it and wakes the task so
+/// it re-polls into an honest `QueueFull` error instead of hanging as a
+/// zombie, and a dropped future deregisters exactly its own entry.
+struct ParkedWaiter {
+    waker: core::task::Waker,
+    evicted: Arc<AtomicBool>,
+}
+
 struct NodeInner {
     name: NodeName,
     max_in_flight: usize,
@@ -1036,7 +1046,7 @@ struct NodeInner {
     friction_fn: Option<Arc<dyn Fn(u32, u32) -> u64 + Send + Sync>>,
     pressure_fn: Option<Arc<dyn Fn(Backpressure) + Send + Sync>>,
     gate: EpochGate,
-    waiters: VecDeque<core::task::Waker>,
+    waiters: VecDeque<ParkedWaiter>,
     in_flight: usize,
     queued: usize,
     /// Live priority histogram: how many armed guards sit in each lane.
@@ -3230,6 +3240,7 @@ impl SnubberNode {
     /// Checks breaker, epoch gate, bulkhead, and token bucket.
     /// If bulkhead is full, parks `waker` in `inner.waiters` and returns `Pending`
     /// WITHOUT consuming `rollback`!
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn enter_async_attempt<F: FnOnce()>(
         &self,
         epoch: u64,
@@ -3237,6 +3248,7 @@ impl SnubberNode {
         loc: &'static core::panic::Location<'static>,
         rollback: &mut Option<F>,
         waker: &core::task::Waker,
+        evicted_out: &mut Option<Arc<AtomicBool>>,
         enqueued_at_ms: u64,
     ) -> core::task::Poll<Result<TrackedGuard<F>, EnterError>> {
         // Pass-through transit: ready dummy NOW, never park a Waker.
@@ -3341,8 +3353,12 @@ impl SnubberNode {
         }
 
         // 2. Epoch: stale packets never touch hardware.
+        // A generation bump is ALWAYS fresh (re-handshake): a rebooted
+        // client's first packet must not be dropped, even at epoch 0 —
+        // it would be retransmitted forever against a gate that already
+        // adopted the generation. Mirrors `EpochGate::observe`.
         let is_fresh = if header.generation > inner.gate.generation() {
-            header.epoch > 0
+            true
         } else if header.generation < inner.gate.generation() {
             false
         } else {
@@ -3380,12 +3396,18 @@ impl SnubberNode {
 
             // If the same task polls again, update its registered waker in-place
             // without inflating the queue length.
-            if let Some(slot) = inner.waiters.iter_mut().find(|w| w.will_wake(waker)) {
-                *slot = waker.clone();
+            if let Some(slot) = inner.waiters.iter_mut().find(|w| w.waker.will_wake(waker)) {
+                let flag = Arc::new(AtomicBool::new(false));
+                *evicted_out = Some(Arc::clone(&flag));
+                *slot = ParkedWaiter {
+                    waker: waker.clone(),
+                    evicted: flag,
+                };
                 return core::task::Poll::Pending;
             }
 
             let q_cap = inner.queue_limit.max(1);
+            let mut evicted_waker: Option<core::task::Waker> = None;
             if inner.waiters.len() >= q_cap {
                 match inner.overflow {
                     OverflowPolicy::RejectNew => {
@@ -3410,12 +3432,28 @@ impl SnubberNode {
                         return core::task::Poll::Ready(Err(EnterError::QueueFull));
                     }
                     OverflowPolicy::EvictOldest => {
-                        inner.waiters.pop_front();
+                        // Evict the oldest waiter WOKEN, never silently: mark
+                        // its future so the woken task's re-poll resolves to
+                        // an honest `QueueFull` instead of hanging as a
+                        // zombie. Wake happens OUTSIDE the lock (PHASE B).
+                        if let Some(old) = inner.waiters.pop_front() {
+                            old.evicted.store(true, Ordering::Release);
+                            evicted_waker = Some(old.waker);
+                        }
                         inner.stats.evicted = inner.stats.evicted.saturating_add(1);
                     }
                 }
             }
-            inner.waiters.push_back(waker.clone());
+            let flag = Arc::new(AtomicBool::new(false));
+            *evicted_out = Some(Arc::clone(&flag));
+            inner.waiters.push_back(ParkedWaiter {
+                waker: waker.clone(),
+                evicted: flag,
+            });
+            drop(inner);
+            if let Some(w) = evicted_waker {
+                w.wake();
+            }
             return core::task::Poll::Pending;
         }
 
@@ -3508,6 +3546,17 @@ impl SnubberNode {
             profile: None,
             envelope,
         }))
+    }
+
+    /// Deregister one parked async waiter by its future's identity flag.
+    ///
+    /// Called from `Drop for EnterFuture` when a parked future is dropped:
+    /// without this its queue entry squats a slot forever and later
+    /// admissions starve behind a waker nobody will wake.
+    pub(crate) fn deregister_waiter(&self, evicted: &Arc<AtomicBool>) {
+        self.lock()
+            .waiters
+            .retain(|w| !Arc::ptr_eq(&w.evicted, evicted));
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, NodeInner> {
@@ -4666,7 +4715,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             inner.waiters.pop_front()
         };
         if let Some(w) = waker {
-            w.wake();
+            w.waker.wake();
         }
         event
     }
@@ -4726,6 +4775,15 @@ impl<F: FnOnce()> TrackedGuard<F> {
             g
         });
         release_slot_inner(&mut inner, lane);
+        // A timed-out probe is a probe FAILURE: without this the
+        // `half_open_probe` flag stayed armed forever and the breaker
+        // wedged in HalfOpen (every admission read "probe in flight").
+        // Matches `abort()`: re-open so the cooling window restarts.
+        if self.is_probe {
+            inner.breaker = BreakerState::Open;
+            inner.half_open_probe = false;
+            inner.stats.breaker_state = BreakerState::Open;
+        }
         inner.timeouts_fired = inner.timeouts_fired.saturating_add(1);
         inner.stats.reported[FaultKind::Timeout.index()] =
             inner.stats.reported[FaultKind::Timeout.index()].saturating_add(1);
@@ -4762,7 +4820,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         publish_fault_arc(&self.node, &mut outcome, &record);
         SnubberNode::emit(outcome, record);
         if let Some(w) = waker {
-            w.wake();
+            w.waker.wake();
         }
         self.release_profile();
         Err(if spin {
@@ -4846,7 +4904,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             inner.waiters.pop_front()
         };
         if let Some(w) = waker {
-            w.wake();
+            w.waker.wake();
         }
         event
     }
@@ -4920,7 +4978,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         publish_fault_arc(&self.node, &mut outcome, &record);
         SnubberNode::emit(outcome, record);
         if let Some(w) = waker {
-            w.wake();
+            w.waker.wake();
         }
     }
 }

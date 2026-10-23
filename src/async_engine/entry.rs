@@ -5,6 +5,11 @@
 //! Any `commit/abort/drop` pops ONE waiter and wakes it OUTSIDE the lock
 //! (PHASE B — foreign wake, never under the mutex).
 //!
+//! Eviction and cancellation are honest: `OverflowPolicy::EvictOldest`
+//! marks the evicted future's flag and WAKES it, so its next poll
+//! resolves to `Err(EnterError::QueueFull)` instead of hanging forever;
+//! dropping a parked future deregisters exactly its own queue entry.
+//!
 //! Works with Tokio, async-std, smol, embassy — anything polling `Future`.
 //! Queue is capped (1024, oldest evicted); atomic admission reserves the slot
 //! and only consumes the rollback on success — no lost wakeup, no burnt `FnOnce`.
@@ -12,7 +17,9 @@
 use crate::node::{self, EnterError, NanoClock, SnubberNode, TrackedGuard};
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
+use std::sync::Arc;
 
 /// Future of one async admission (`node.enter_async(...)`).
 #[must_use = "futures do nothing unless you `.await` or poll them"]
@@ -23,6 +30,13 @@ pub struct EnterFuture<F: FnOnce()> {
     rollback: Option<F>,
     loc: &'static core::panic::Location<'static>,
     enqueued_at_ms: u64,
+    /// Identity of this future's parked queue entry (`Arc` pointer
+    /// equality with the node's `ParkedWaiter.evicted`). `None` until the
+    /// future actually parks — the ready admission path stays alloc-free.
+    evicted: Option<Arc<AtomicBool>>,
+    /// `true` while this future owns a parked queue entry: only then does
+    /// `Drop` pay for the node lock to deregister it.
+    parked: bool,
 }
 
 impl<F: FnOnce()> EnterFuture<F> {
@@ -40,6 +54,19 @@ impl<F: FnOnce()> EnterFuture<F> {
             rollback: Some(rollback),
             loc,
             enqueued_at_ms: node::now_ms(),
+            evicted: None,
+            parked: false,
+        }
+    }
+}
+
+impl<F: FnOnce()> Drop for EnterFuture<F> {
+    fn drop(&mut self) {
+        if !self.parked {
+            return;
+        }
+        if let Some(flag) = &self.evicted {
+            self.node.deregister_waiter(flag);
         }
     }
 }
@@ -49,14 +76,28 @@ impl<F: FnOnce() + Unpin> Future for EnterFuture<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        this.node.enter_async_attempt(
+        if this
+            .evicted
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Acquire))
+        {
+            return Poll::Ready(Err(EnterError::QueueFull));
+        }
+        let mut evicted_slot: Option<Arc<AtomicBool>> = None;
+        let attempt = this.node.enter_async_attempt(
             this.epoch,
             this.task_id,
             this.loc,
             &mut this.rollback,
             cx.waker(),
+            &mut evicted_slot,
             this.enqueued_at_ms,
-        )
+        );
+        this.parked = attempt.is_pending();
+        if this.parked {
+            this.evicted = evicted_slot.take();
+        }
+        attempt
     }
 }
 

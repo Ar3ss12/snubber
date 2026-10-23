@@ -289,26 +289,34 @@ impl<S, D> TaskHandle<S, D> {
                 self.inner.directive.store(DIR_PAUSE, Ordering::Release);
             }
             Directive::Cancel(reason) => {
-                if let Ok(mut lock) = self.inner.cancel_reason.lock() {
-                    *lock = Some(reason);
+                let mut reason_lock = self.inner.cancel_reason.lock();
+                if let Ok(slot) = reason_lock.as_deref_mut() {
+                    *slot = Some(reason);
                 }
                 self.inner.directive.store(DIR_CANCEL, Ordering::Release);
+                // Notify while already holding `cancel_reason` (see
+                // `notify_sync`): same lost-wakeup discipline, no re-lock.
                 self.inner.condvar.notify_all();
+                drop(reason_lock);
                 self.wake_async();
             }
             Directive::SkipStage => {
                 self.inner
                     .directive
                     .store(DIR_SKIP_STAGE, Ordering::Release);
-                self.inner.condvar.notify_all();
+                Self::notify_sync(&self.inner);
                 self.wake_async();
             }
             Directive::Preempted(reason) => {
-                if let Ok(mut lock) = self.inner.cancel_reason.lock() {
-                    *lock = Some(reason);
+                let mut reason_lock = self.inner.cancel_reason.lock();
+                if let Ok(slot) = reason_lock.as_deref_mut() {
+                    *slot = Some(reason);
                 }
-                self.inner.directive.store(DIR_PREEMPTED, Ordering::Release);
+                self.inner
+                    .directive
+                    .store(DIR_PREEMPTED, Ordering::Release);
                 self.inner.condvar.notify_all();
+                drop(reason_lock);
                 self.wake_async();
             }
         }
@@ -317,8 +325,21 @@ impl<S, D> TaskHandle<S, D> {
     /// Resume a paused worker (wakes sync condvar and async wakers).
     pub fn resume(&self) {
         self.inner.directive.store(DIR_PROCEED, Ordering::Release);
-        self.inner.condvar.notify_all();
+        Self::notify_sync(&self.inner);
         self.wake_async();
+    }
+
+    /// Wake the sync condvar while HOLDING the `cancel_reason` mutex.
+    ///
+    /// The sync waiter (`wait_for_resume`) holds that mutex across its
+    /// directive-check → `condvar.wait` window. Notifying under the same
+    /// lock makes "store directive → notify" and "check directive → park"
+    /// mutually exclusive; notifying without it lets the notification land
+    /// in the gap before the waiter actually parks — the classic lost
+    /// wakeup, leaving the worker asleep forever on a resumed conduit.
+    fn notify_sync(inner: &IntercomInner<S, D>) {
+        let _guard = inner.cancel_reason.lock().ok();
+        inner.condvar.notify_all();
     }
 
     /// Take the draft artifact from the shared table.

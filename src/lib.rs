@@ -409,7 +409,8 @@ impl<T> fmt::Display for SnubberEvent<T> {
 /// * SAME generation — classic monotonic check: `epoch > last_seen`.
 ///
 /// Starts at `(0, 0)`; generation `0` is the boot session, epoch `0`
-/// inside any generation is never fresh. Cost: one extra `u64`
+/// inside ONE generation is never fresh (a new generation is always a
+/// fresh re-handshake). Cost: one extra `u64`
 /// comparison per packet (~2 CPU ticks), zero heap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EpochGate {
@@ -431,12 +432,18 @@ impl EpochGate {
     /// Observe one header. `true` + advance on fresh epochs (or on a
     /// newer generation — re-handshake), `false` + keep state on stale
     /// packets or superseded generations.
+    ///
+    /// A NEW generation is accepted unconditionally, epoch 0 included:
+    /// the adopter must not drop the rebooted client's first packet
+    /// (a rejected-but-adopted gate would cut that packet — and every
+    /// retransmission of it — off forever). The "epoch 0 is never
+    /// fresh" rule applies WITHIN one generation only.
     #[inline]
     pub fn observe(&mut self, header: &TransactionHeader) -> bool {
         if header.generation > self.current_generation {
             self.current_generation = header.generation;
             self.last_seen = header.epoch;
-            return header.epoch > 0;
+            return true;
         }
         if header.generation < self.current_generation {
             return false;
@@ -698,6 +705,37 @@ mod unit_tests {
         // Same-generation duplicates still cut.
         assert!(!gate.observe(&reborn), "replay inside generation cut");
         assert!(gate.observe(&TransactionHeader::with_generation(1, 2, 1)));
+    }
+
+    #[test]
+    fn generation_bump_at_epoch_zero_is_a_fresh_handshake() {
+        // Regression: the gate used to ADOPT the new generation and then
+        // reject the epoch-0 packet. The rebooted client's first packet was
+        // dropped and every retransmission of it was dropped forever — the
+        // gate could never be entered from a client whose epoch starts at 0.
+        let mut gate = EpochGate::new();
+        assert!(
+            gate.observe(&TransactionHeader::with_generation(1, 0, 1)),
+            "new generation must re-handshake even at epoch 0"
+        );
+        assert_eq!(gate.generation(), 1);
+        assert_eq!(gate.last_seen(), 0);
+        // Same-generation replay at epoch 0 is still stale.
+        assert!(!gate.observe(&TransactionHeader::with_generation(1, 0, 1)));
+        // Later epochs flow normally.
+        assert!(gate.observe(&TransactionHeader::with_generation(1, 1, 1)));
+        assert!(!gate.observe(&TransactionHeader::with_generation(1, 1, 1)));
+    }
+
+    #[test]
+    fn node_gate_adopts_new_generation_at_epoch_zero() {
+        let node = SnubberNode::builder("gate/gen0").build();
+        assert!(
+            node.observe(&TransactionHeader::with_generation(7, 0, 1)),
+            "node gate must adopt the new generation, not reject gen-0 traffic"
+        );
+        assert!(!node.observe(&TransactionHeader::with_generation(7, 0, 1)));
+        assert!(node.observe(&TransactionHeader::with_generation(7, 1, 2)));
     }
 
     #[test]

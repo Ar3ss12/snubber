@@ -223,9 +223,10 @@ impl PoolLane {
     /// 4. EOF + silence → [`ReapClass::Stillborn`];
     /// 5. no EOF inside the grace → [`ReapClass::Deadlocked`], token `None`.
     ///
-    /// The lane generation is bumped exactly once per reported death, so
-    /// stale packets from the dead child never reach its successor. The
-    /// restart decision is per lane: another lane's crash storm cannot
+    /// The lane generation is bumped exactly once per reported death and
+    /// BEFORE the EOF grace wait, so a successor attaching while the dead
+    /// child's pipe is still draining can never inherit its generation.
+    /// The restart decision is per lane: another lane's crash storm cannot
     /// stop this lineage. `now_ms` is the caller's monotonic clock and
     /// feeds only the tracker (tests inject a fake clock).
     ///
@@ -233,14 +234,17 @@ impl PoolLane {
     /// [`PoolError::NoWorkerAttached`] if the lane has no child to reap
     /// (a double report is a caller bug, not a death).
     pub fn note_death(&self, exit_code: Option<i32>, now_ms: u64) -> Result<PoolReap, PoolError> {
-        let drain = {
+        let (drain, generation) = {
             let mut state = self.state();
             let drain = state
                 .drain
                 .take()
                 .ok_or(PoolError::NoWorkerAttached { lane: self.index })?;
             state.pid = None;
-            drain
+            // Bump BEFORE the grace window: `attach()` during the wait must
+            // hand the successor a fresh generation, not the dead child's.
+            let generation = state.clock.restart();
+            (drain, generation)
         };
 
         let mut deadlock = false;
@@ -277,7 +281,6 @@ impl PoolLane {
         };
 
         let mut state = self.state();
-        let generation = state.clock.restart();
         let decision = state.tracker.note_death(exit_code, now_ms);
         state.reaps = state.reaps.saturating_add(1);
         match class {

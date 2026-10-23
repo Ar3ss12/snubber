@@ -245,3 +245,30 @@ fn intercom_clone_needs_no_payload_bounds() {
     assert!(handle2.take_draft().is_some());
     assert!(handle.take_draft().is_none());
 }
+
+#[test]
+fn resume_never_loses_the_wakeup_under_pause_churn() {
+    // Regression: `resume()`/`send_directive` used to `notify_all` WITHOUT
+    // holding the `cancel_reason` mutex the sync waiter holds across its
+    // check->park window. A resume landing in that gap was lost and the
+    // worker slept forever. Notify now happens under the same lock.
+    let (conduit, handle): (TaskConduit<u8>, _) = TaskConduit::pair(0u8);
+    for round in 0..500u32 {
+        handle.send_directive(Directive::Pause);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_view = conduit.clone();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(worker_view.wait_for_resume());
+        });
+        // No settle sleep on purpose: `resume` may land before the worker
+        // locks, between its lock and its park, or after — every ordering
+        // must wake it (or resolve without parking).
+        handle.send_directive(Directive::Proceed);
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => {}
+            other => panic!("worker wedged on round {round}: {other:?}"),
+        }
+        worker.join().expect("worker thread");
+    }
+    assert_eq!(handle.inspect(), 0, "conduit state untouched by churn");
+}

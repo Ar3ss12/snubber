@@ -113,6 +113,8 @@ const COVERED: &[&str] = &[
     "node_name_clone_static",
     "node_name_clone_owned",
     "node_name_as_str",
+    "async_enter_ready_poll",
+    "async_park_wake_admit_roundtrip",
 ];
 
 /// Extract literal names from `g.bench_function("name"` sites.

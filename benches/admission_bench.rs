@@ -830,9 +830,67 @@ fn bench_extensibility(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_async_waiters(c: &mut Criterion) {
+    use std::future::Future as _;
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn noop_waker() -> Waker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VT)
+        }
+        unsafe fn wake(_: *const ()) {}
+        unsafe fn wake_by_ref(_: *const ()) {}
+        unsafe fn drop(_: *const ()) {}
+        static VT: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) }
+    }
+
+    let mut g = c.benchmark_group("layer2_async_waiters");
+
+    // Ready admission through the async future: future construction
+    // (alloc-free on this path) + one attempt poll + guard commit.
+    let node = SnubberNode::builder("bench/async-ready")
+        .max_in_flight(1024)
+        .build();
+    g.bench_function("async_enter_ready_poll", |b| {
+        b.iter(|| {
+            let mut fut = node.enter_async_auto(|| {});
+            let waker = noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            match core::pin::Pin::new(&mut fut).poll(&mut cx) {
+                std::task::Poll::Ready(Ok(guard)) => guard.commit(),
+                _ => panic!("free slot must admit synchronously"),
+            }
+        });
+    });
+
+    // Park/wake/admit roundtrip: the slot is held, so the future parks
+    // (queue push + identity flag), the slot drops (wake), then the
+    // re-poll admits. Measures the waiter-queue machinery end to end.
+    let parked = SnubberNode::builder("bench/async-park")
+        .max_in_flight(1)
+        .build();
+    g.bench_function("async_park_wake_admit_roundtrip", |b| {
+        b.iter(|| {
+            let slot = parked.enter_auto(|| {}).expect("hold slot");
+            let mut fut = parked.enter_async_auto(|| {});
+            let waker = noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(core::pin::Pin::new(&mut fut).poll(&mut cx).is_pending());
+            drop(slot); // wake
+            match core::pin::Pin::new(&mut fut).poll(&mut cx) {
+                std::task::Poll::Ready(Ok(guard)) => guard.commit(),
+                _ => panic!("woken future must admit"),
+            }
+        });
+    });
+
+    g.finish();
+}
+
 criterion_group!(
     name = benches;
     config = fast();
-    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_impedance, bench_layer4_layer5, bench_pipe_drain, bench_drain_feed, bench_pool, bench_extensibility, bench_contended
+    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_impedance, bench_layer4_layer5, bench_pipe_drain, bench_drain_feed, bench_pool, bench_extensibility, bench_async_waiters, bench_contended
 );
 criterion_main!(benches);

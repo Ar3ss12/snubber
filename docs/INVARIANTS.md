@@ -35,7 +35,7 @@ For any acquired guard or lease:
 
 ### Invariant 4: Bounded Pipe Drain under Process Termination
 In the multi-process supervisor (Layer 4), when a monitored child process terminates abnormally via `SIGKILL` or `TerminateProcess`:
-- The supervisor guarantees reader termination within a strictly bounded window ($t \le 100\text{ ms}$).
+- The supervisor guarantees reader termination within a strictly bounded window (`DEFAULT_EOF_GRACE_MS` = 250 ms; overridable per pool via `PoolConfig::with_eof_grace`).
 - Pipe handles are closed without kernel deadlocks or thread starvation.
 - The external reservation held on behalf of the child is released unconditionally.
 
@@ -239,6 +239,27 @@ The public verdict surface evolves additively and honestly:
 
 ---
 
+### Invariant 13: Parked-Waiter and Probe Liveness (0.6.1)
+Every blocking mechanism in the crate must be WOKEN or DEREGISTERED, never
+silently abandoned:
+- Gateway depth: every successful send adds exactly 1, every take subtracts
+  exactly 1 (signed arithmetic). After a full drain the counter is exactly 0
+  and the throttle latch is clear — drift is impossible by construction.
+- A parked `enter_async` waiter is woken by settlement OR removed by its
+  future's `Drop`. The `EvictOldest` victim is woken and re-polls into
+  `Err(EnterError::QueueFull)` — no zombie tasks, no wake/evict livelock.
+- `check_timeout` on a half-open probe counts the timeout as probe failure:
+  the breaker re-opens and the probe slot is released.
+- `EpochGate` adopts a NEW generation unconditionally (epoch 0 included) —
+  a rebooted client's first packet is never dropped.
+- Conduit sync notifications (`resume`, `send_directive`) are issued while
+  holding the `cancel_reason` mutex the waiter holds across its
+  check-to-park window — a notification cannot land in the gap.
+- A pool lane's generation bumps BEFORE its EOF grace wait: a successor
+  attaching inside the window never inherits the dead child's generation.
+
+Verification: `cargo test --test channel --test async_primitives --test circuit_breaker --test conduit --test supervisor_pool`
+
 ## 2. Verification Protocol
 
 The continuous integration suite validates these invariants under sustained chaos testing:
@@ -322,7 +343,7 @@ python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggres
 
 ## 3. Reporting a Discrepancy
 
-If you identify a scenario where any of the twelve invariants above fails using purely Safe Rust:
+If you identify a scenario where any of the thirteen invariants above fails using purely Safe Rust:
 
 1. **Minimal Reproduction:** Construct an isolated integration test demonstrating the violation (failing an explicit `assert!`).
 2. **Deterministic Trigger:** The test must run and fail within 30 seconds without requiring external infrastructure.

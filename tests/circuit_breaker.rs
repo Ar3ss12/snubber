@@ -7,7 +7,7 @@
 //! - Non-streak accounting for planned aborts and operational noise
 //! - Console cap error budgeting
 
-use snubber::{BreakerState, EnterError, FaultKind, SnubberNode, TransactionHeader};
+use snubber::{BreakerState, EnterError, FaultKind, SnubberNode, TimeoutCheck, TransactionHeader};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -244,4 +244,37 @@ fn compile_time_budget_bakes_cap_into_builder() {
         auto.stats().last_fault.as_ref().map(|f| f.node.as_str()),
         Some("auto")
     );
+}
+
+#[test]
+fn probe_timeout_reopens_breaker_instead_of_wedging_half_open() {
+    let node = SnubberNode::builder("breaker/probe_timeout")
+        .trip_after_failures(2)
+        .timeout_ms(1)
+        .max_in_flight(4)
+        .build();
+    node.report(FaultKind::Timeout, 1, 1);
+    node.report(FaultKind::Timeout, 2, 2);
+    assert_eq!(node.stats().breaker_state, BreakerState::HalfOpen);
+
+    let probe = node.enter(100, 100, || {}).expect("probe admitted");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    match probe.check_timeout() {
+        Err(TimeoutCheck::TimedOut) => {}
+        Err(other) => panic!("unexpected watchdog verdict: {other:?}"),
+        Ok(_) => panic!("1 ms deadline must fire"),
+    }
+    // A timed-out probe is a probe FAILURE: the breaker re-opens (same
+    // contract as an implicit-dropped probe). Before the fix the breaker
+    // stayed HalfOpen with the probe flag armed forever — every later
+    // admission read "probe in flight" and nothing could ever recover.
+    assert_eq!(
+        node.stats().breaker_state,
+        BreakerState::Open,
+        "timed-out probe must re-open, not wedge in HalfOpen"
+    );
+    node.reset_breaker();
+    node.enter(101, 101, || {})
+        .expect("probe slot must be released after timeout")
+        .commit();
 }

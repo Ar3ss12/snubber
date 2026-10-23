@@ -16,7 +16,7 @@
 > Extensibility (v0.6.0): `#[non_exhaustive]` verdict enums,
 > capture-capable `friction_fn` / `pressure_fn` hooks, runtime
 > `NodeName`, mapped invariant gate `snub_check_map!`, explicit-argv
-> supervision. See [Extensibility](#extensibility-v060-hooks-names-gates).
+> supervision. See [Extensibility](#extensibility-060-hooks-names-gates).
 
 ---
 
@@ -173,7 +173,7 @@ its next `check_timeout`.
 On firmware the same `kick()` strokes the hardware WDT (`WdtSink`;
 `NoWdt` is the `std` no-op). See `examples/11_hang_classifier.rs`.
 
-### ISR bridge: `IsrBridge` (66 B SPSC ring, no `unsafe`)
+### ISR bridge: `IsrBridge` (80 B SPSC ring, no `unsafe`)
 
 A hardware ISR cannot take a mutex, sleep, or call `enter()`. It
 pushes a packed `IsrSignal` (`opcode:8 | reason:8 | value:16` in one
@@ -726,12 +726,15 @@ When a process is vaporized instantly (`kill -9`, `Stop-Process -Force`, `std::p
 `snubber` provides a turnkey process supervisor with 44-byte framed pipe intercom:
 
 1. **Generation Clock (`GenerationClock`):** The supervisor starts workers with `gen=N`. If the worker dies, the supervisor increments to `gen=N+1`. Any delayed zombie packets from the dead worker are cut off at the gate.
-2. **Framed Pipe Intercom (`ProcessToken`):** The worker emits framed 44-byte packets (`b"SNUB"` sync magic + 40 bytes payload).
+2. **Framed Pipe Intercom (`ProcessToken`):** The worker emits framed 44-byte packets (`b"SNUB"` sync magic + a 40-byte body: `u64` task, `u32` opcode, 28-byte payload).
 3. **PipeDrain:** The supervisor drains the stream continuously in a background reader with sliding-window sync, filtering out arbitrary `println!` noise. The same parser is reachable without a reader thread — `drain_sync` (blocking `Read`) and `feed` + `finish` (caller-pushed chunks) — and the liveness clock is injectable (`ClockFn`).
 4. **Emergency Rescue on EOF:** If the worker is killed mid-transaction while holding an armed token, the pipe closes (`EOF`), and the supervisor immediately executes the registered emergency hardware release outside the dead process.
 
 ### Single-Line Supervised Wire-Up:
 ```rust
+// Your app owns the opcode vocabulary (u32); the crate never guesses it.
+const OP_HARDWARE_RELEASE: u32 = 1;
+
 // Worker side: one line links token arming, stdout pipe emit, and rollback
 let guard = node.enter_supervised_erased(
     ProcessToken::simple(0, OP_HARDWARE_RELEASE, tag),
@@ -1510,6 +1513,23 @@ impl snubber::OrphanGuard for LinuxPdeathsigGuard {
 | **ARM Cortex-M (no_std)** | `DWT->CYCCNT` | Read cycle counter directly: `DWT::cycle_count() / (CPU_FREQ_HZ / 1000)`. |
 
 ---
+
+## Fixed in 0.6.1: concurrency liveness
+
+Six audit-driven fixes; each has a deterministic regression test.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| Gateway depth drift | A take racing the producer's increment skipped its decrement; the counter crept up until the throttle latch wedged on an empty queue | Signed counter: every send adds exactly 1, every take subtracts exactly 1; `depth()` saturates at 0 | `tests/channel.rs::depth_counter_returns_to_zero_after_concurrent_storm` |
+| HalfOpen probe wedge | `check_timeout` on a probe left `half_open_probe` armed forever — the breaker refused everything | A timed-out probe re-opens the breaker (same contract as an implicit-dropped probe); `reset_breaker()` restores traffic | `tests/circuit_breaker.rs::probe_timeout_reopens_breaker_instead_of_wedging_half_open` |
+| EpochGate gen-0 adoption | A new generation was adopted and its epoch-0 packet rejected — the rebooted client's first packet (and every retransmission) was lost | A new generation is always a fresh re-handshake, epoch 0 included; "epoch 0 is never fresh" applies within one generation only | `src/lib.rs` tests: `generation_bump_at_epoch_zero_is_a_fresh_handshake`, `node_gate_adopts_new_generation_at_epoch_zero` |
+| `EvictOldest` waker loss | The oldest parked async waker was dropped without `wake()` — the task hung as a zombie | The victim is marked and woken; its next poll resolves to `Err(EnterError::QueueFull)` | `tests/async_primitives.rs::evict_oldest_wakes_the_evicted_future_with_queue_full` |
+| Dropped parked future | A future dropped while parked left its waker in the queue forever, starving later admissions | `Drop` deregisters exactly its own queue entry (identity flag, no allocation on the ready path) | `tests/async_primitives.rs::dropped_parked_future_deregisters_its_queue_slot` |
+| Lane generation timing | `note_death` bumped the lane clock AFTER the up-to-250 ms EOF grace — a successor attaching inside the window inherited the dead child's generation | The clock bumps before the grace wait: `attach()` during the window always returns a fresh generation | `tests/supervisor_pool.rs::successor_gets_fresh_generation_during_eof_grace` |
+| Conduit lost wakeup | `resume()` / `send_directive` called `notify_all` without holding the mutex the sync waiter holds across its check-to-park window | Notifications are issued under the same `cancel_reason` mutex — check-then-park and store-then-notify are mutually exclusive | `tests/conduit.rs::resume_never_loses_the_wakeup_under_pause_churn` |
+
+Bench group `layer2_async_waiters` (ready poll ~202 ns, park/wake/admit
+roundtrip ~574 ns) pins the async admission path.
 
 ## API & Cost Quick Reference
 
