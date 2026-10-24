@@ -83,8 +83,15 @@ examples and gate teeth). Details: USER_GUIDE "Fixed in 0.6.8".
   forget was harmless, but it skips drop glue for every field — the
   exact shape that leaked one `NodeInner` per transaction from
   `TrackedGuard` before 0.5.2. `#![deny(clippy::mem_forget)]`, a new
-  script gate (7/7) and a 200k-guard allocation storm (Layer 1 guards
-  owning heap payloads) keep it removed.
+  script gate (7/7) and a 250k-guard allocation storm (Layer 1 guards
+  owning heap payloads plus the node erased path in commit and abort) keep
+  it removed.
+- One allocation per erased admission: `ErasedGuard` now holds a single
+  boxed `ErasedSettle` transaction instead of separate rollback and commit
+  closures, and the node path boxes a transaction that already carries its
+  node clone. `enter_erased_auto + commit` measured 301.6 → 207.75 ns
+  (two filtered Criterion runs: 209.21 / 207.75 ns mean), with none of the
+  settle, abort-bookkeeping or supervisor-token semantics changed.
 - Miri runs with `-Zmiri-strict-provenance` in both CI lanes.
 - The benchmark exporter publishes only `.../new/estimates.json` (a real
   ns latency): it also published `change/` entries, i.e. a relative delta
@@ -98,8 +105,8 @@ examples and gate teeth). Details: USER_GUIDE "Fixed in 0.6.8".
   outside the timed window, `write_to` ~2.1 ns into a real writer, report
   ~111 ns, lease sweep ~517 ns), the drain and async rows re-measured
   (`PipeDrain::feed` 21.2 → 10.8 us per 256 frames, async ready poll
-  ~152 ns, `enter_erased_auto` ~302 ns after the deferred probe settle
-  moved onto the guard's real `commit`), storm timings re-measured, and the API table
+  ~152 ns, `enter_erased_auto` ~208 ns after the single-box transaction
+  replaced two boxes and two `Arc` clones), storm timings re-measured, and the API table
   gains `PoolReap` / `LaneSnapshot` / `PoolTotals` / `expired_lanes` /
   `DEFAULT_EOF_GRACE_MS` / argv-twin rows.
 - The POSIX storm harness gates descriptor growth on macOS too: it counts

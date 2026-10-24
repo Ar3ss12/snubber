@@ -4,8 +4,9 @@
 //! Regression for the `mem::forget(self)` settle-path leak: one
 //! `Arc<Mutex<NodeInner>>` (~2.4 KiB) was stranded per transaction, which
 //! stayed invisible in short tests and surfaced as +24 MB over 10k OS kills.
-//! Both layers are covered: `TrackedGuard` storms and the core guards whose
-//! closures capture a heap payload.
+//! Both layers are covered: `TrackedGuard` storms, the core guards whose
+//! closures capture a heap payload, and the node erased path whose boxed
+//! transaction also carries a node clone.
 //!
 //! The storm runs on a thread this test owns, and the counter is thread-local,
 //! so the measurement sees ONLY bytes the guards allocate on the thread that
@@ -108,8 +109,9 @@ fn settlement_is_byte_neutral_across_100k_transactions() {
 
 /// Layer-1 settle paths. Each guard owns a closure that captured a heap
 /// payload; commit must drop the closure with the guard, abort must run it,
-/// and neither may forget the guard itself. 200k guards per phase.
-fn layer1_storm() {
+/// and neither may forget the guard itself. 250k guards per phase, including
+/// the node erased path whose single boxed transaction also owns a node clone.
+fn layer1_storm(node: &SnubberNode) {
     for _ in 0..50_000 {
         let payload = Box::new(0u64);
         let guard = SnubberGuard::new(1, 1, move || drop(payload));
@@ -128,15 +130,36 @@ fn layer1_storm() {
         let payload = Box::new(0u64);
         ErasedGuard::new(move || drop(payload)).abort("alloc gate");
     }
+    for _ in 0..25_000 {
+        let payload = Box::new(0u64);
+        let guard = node
+            .enter_erased_auto(move || drop(payload))
+            .expect("admit");
+        guard.commit();
+    }
+    for _ in 0..25_000 {
+        let payload = Box::new(0u64);
+        let guard = node
+            .enter_erased_auto(move || drop(payload))
+            .expect("admit");
+        guard.abort("alloc gate");
+    }
 }
 
 #[test]
-fn layer1_settlement_is_byte_neutral_across_200k_guards() {
+fn layer1_settlement_is_byte_neutral_across_250k_guards() {
     let gate = std::thread::spawn(|| {
+        // The node outlives the measurement on purpose: a leaked per-transaction
+        // clone keeps it alive past its own drop, so the counter must see the
+        // growth while the node is still here. Warm its lazy internals first.
+        let node = SnubberNode::builder("alloc/leak-gate/erased").build();
+        for _ in 0..1_000 {
+            node.enter_erased_auto(|| {}).expect("admit").commit();
+        }
         let baseline = net();
-        layer1_storm();
+        layer1_storm(&node);
         let first = net() - baseline;
-        layer1_storm();
+        layer1_storm(&node);
         let second = net() - baseline - first;
         (first, second)
     });
@@ -144,7 +167,7 @@ fn layer1_settlement_is_byte_neutral_across_200k_guards() {
 
     assert_eq!(
         second, 0,
-        "a repeated 200_000-guard settlement storm changed the heap by {second} B \
+        "a repeated 250_000-guard settlement storm changed the heap by {second} B \
          (first storm: {first} B); commit and abort must drop the closure and the \
          guard itself — `mem::forget` on a settle path leaks both"
     );

@@ -1443,6 +1443,50 @@ pub struct SnubberNode {
     auto_seq: Arc<AtomicU64>,
 }
 
+/// Single-allocation settle path for erased admissions: one node clone and
+/// one box holding the user rollback, the probe bit and (supervised path)
+/// the commit token. The previous shape boxed the rollback and the commit
+/// hook separately and cloned the node twice per admission.
+#[cfg(feature = "alloc")]
+struct ErasedTransaction<F> {
+    node: SnubberNode,
+    was_probe: bool,
+    rollback: Option<F>,
+    token: Option<crate::ProcessToken>,
+}
+
+#[cfg(feature = "alloc")]
+impl<F: FnOnce() + Send + 'static> crate::erased::ErasedSettle for ErasedTransaction<F> {
+    fn rollback(mut self: Box<Self>) {
+        if let Some(rollback) = self.rollback.take() {
+            core::sync::atomic::fence(Ordering::SeqCst);
+            // The probe settle must run even if the user's rollback panics:
+            // the guard's own catch_unwind would otherwise swallow the panic
+            // AFTER the hook unwound past the settle, leaving
+            // `half_open_probe` set and the breaker welded shut until a
+            // manual reset. The panic still reaches the caller — only the
+            // books are guaranteed first.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
+            self.node.settle_erased_rollback(self.was_probe);
+            if let Err(payload) = outcome {
+                std::panic::resume_unwind(payload);
+            }
+            if let Some(token) = self.token {
+                crate::ProcessToken::commit(token.task).emit_if_supervised();
+            }
+        }
+    }
+
+    fn commit(mut self: Box<Self>) {
+        let _ = self.rollback.take();
+        core::sync::atomic::fence(Ordering::SeqCst);
+        self.node.settle_erased_commit(self.was_probe);
+        if let Some(token) = self.token {
+            crate::ProcessToken::commit(token.task).emit_if_supervised();
+        }
+    }
+}
+
 impl SnubberNode {
     /// Start a builder: `SnubberNode::builder("win32_mouse_driver")`.
     ///
@@ -2248,25 +2292,14 @@ impl SnubberNode {
             was_probe
         };
         let node = self.clone();
-        let node2 = self.clone();
-        Ok(crate::ErasedGuard::with_commit_hook(
-            move || {
-                // The probe settle must run even if the user's rollback
-                // panics: the guard's own catch_unwind would otherwise
-                // swallow the panic AFTER the hook unwound past the settle,
-                // leaving `half_open_probe` set and the breaker welded shut
-                // until a manual reset. The panic still reaches the caller
-                // — only the books are guaranteed first.
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
-                node.settle_erased_rollback(was_probe);
-                if let Err(payload) = outcome {
-                    std::panic::resume_unwind(payload);
-                }
+        Ok(crate::ErasedGuard::from_settle(Box::new(
+            ErasedTransaction {
+                node,
+                was_probe,
+                rollback: Some(rollback),
+                token: None,
             },
-            move || {
-                node2.settle_erased_commit(was_probe);
-            },
-        ))
+        )))
     }
 
     /// Next monotonically minted sequence ticket for this node (lock-free `AtomicU64`).
@@ -2764,23 +2797,14 @@ impl SnubberNode {
             was_probe
         };
         let node = self.clone();
-        let node2 = self.clone();
-        Ok(crate::ErasedGuard::with_commit_hook(
-            move || {
-                // Same panic-boundary as `enter_erased`: settle the probe
-                // before any rollback panic resumes.
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
-                node.settle_erased_rollback(was_probe);
-                if let Err(payload) = outcome {
-                    std::panic::resume_unwind(payload);
-                }
-                crate::ProcessToken::commit(seq).emit_if_supervised();
+        Ok(crate::ErasedGuard::from_settle(Box::new(
+            ErasedTransaction {
+                node,
+                was_probe,
+                rollback: Some(rollback),
+                token: Some(token),
             },
-            move || {
-                node2.settle_erased_commit(was_probe);
-                crate::ProcessToken::commit(seq).emit_if_supervised();
-            },
-        ))
+        )))
     }
 
     /// ⚠️ *Low-level primitive.* If you are building a background worker or

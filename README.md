@@ -88,7 +88,9 @@ Measured on AMD Ryzen 5 4600H release build
 (`cargo bench --bench admission_bench`, Criterion: 800 ms warmup,
 2 s measurement, 50 samples, isolated node per bench; re-measured
 2026-10-24, values from the second of two full runs — the first differed
-by under 5% outside the contended group, which moves by design).
+by under 5% outside the contended group, which moves by design; the
+`enter_erased_auto` row comes from two filtered A/B reruns after the
+single-box refactor).
 Values are Criterion means from `target/criterion/*/new/estimates.json`;
 differences below ~2 ns are inside run-to-run noise and are not claimed as
 wins.
@@ -103,7 +105,7 @@ wins.
 | `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~126 ns** | Priority lane; same band as plain enter (one measurement) |
 | `node.transition` | Layer 2 (`std`) | **~126 ns** | ONE-enum state machine, zero flag drift |
 | `node.transition_checked` + `LegalMove` | Layer 2 (`std`) | same path, no extra work | Compile-time only: the `LegalMove` proof erases to the same `transition` call; illegal moves fail at compile (E0277) |
-| `enter_erased_auto` | Layer 2 (`alloc`) | **~302 ns** | Boxed rollback + deferred probe-settle hook (two boxes and two `Arc` clones per admission; 0.6.8 moved the breaker outcome onto the guard's real `commit`) |
+| `enter_erased_auto` | Layer 2 (`alloc`) | **~208 ns** | ONE boxed transaction (rollback + commit hook + node clone in a single allocation; 0.6.8 moved the breaker outcome onto the guard's real `commit`). 301.6 → 208 ns after folding two boxes and two `Arc` clones into one |
 | `node_passthrough_enter + commit` | Layer 2 (`std` canary) | **~97.1 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
 | `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~94.8 ns** | Same transit through `scoped()` — work runs, books stay clean |
 | `ConflateSender::publish + take_latest` | Layer 2 (`std`) | **~21.6 ns** | One-slot latest wins, no allocation, no `Clone` bound |

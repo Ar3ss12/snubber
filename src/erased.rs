@@ -89,8 +89,10 @@ impl core::fmt::Debug for ClosurePolicy {
 #[cfg(feature = "alloc")]
 #[must_use = "Dropping an ErasedGuard immediately executes rollback! Bind to a named variable: `let _guard = ...`, NEVER use `let _ = ...`"]
 pub struct ErasedGuard {
-    rollback: Option<Box<dyn FnOnce() + Send + 'static>>,
-    on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
+    /// The whole settle path in one allocation: `new` / `with_commit_hook`
+    /// box a `TwoSlots`, the node boxes one `ErasedTransaction`. Two
+    /// separate boxed closures cost two allocations per erased admission.
+    slots: Option<Box<dyn ErasedSettle>>,
 }
 
 #[cfg(feature = "alloc")]
@@ -101,8 +103,10 @@ impl ErasedGuard {
         F: FnOnce() + Send + 'static,
     {
         Self {
-            rollback: Some(Box::new(rollback)),
-            on_commit: None,
+            slots: Some(Box::new(TwoSlots::<F, fn()> {
+                rollback: Some(rollback),
+                on_commit: None,
+            })),
         }
     }
 
@@ -113,20 +117,123 @@ impl ErasedGuard {
         C: FnOnce() + Send + 'static,
     {
         Self {
-            rollback: Some(Box::new(rollback)),
-            on_commit: Some(Box::new(on_commit)),
+            slots: Some(Box::new(TwoSlots {
+                rollback: Some(rollback),
+                on_commit: Some(on_commit),
+            })),
         }
+    }
+
+    /// Wraps a pre-boxed settle path. Crate-internal: the node's erased
+    /// admissions keep the node handle and the rollback in the same
+    /// allocation instead of boxing two closures.
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn from_settle(slots: Box<dyn ErasedSettle>) -> Self {
+        Self { slots: Some(slots) }
     }
 
     /// Disarms the rollback, executes the optional commit hook, and consumes the guard.
     ///
-    /// Both slots are taken out, so the normal `Drop` below sees `None` and
-    /// does nothing — no `mem::forget` is needed, and forgetting would skip
-    /// drop glue for every field (the `TrackedGuard` leak of 0.5.2).
+    /// The box is taken out and settled, so the normal `Drop` below sees
+    /// `None` and does nothing — no `mem::forget` is needed, and forgetting
+    /// would skip drop glue for every field (the `TrackedGuard` leak of
+    /// 0.5.2).
     ///
     /// Memory ordering: emits a `SeqCst` fence prior to disarming, matching [`crate::SnubberGuard`].
     #[inline]
     pub fn commit(mut self) {
+        if let Some(slots) = self.slots.take() {
+            slots.commit();
+        }
+    }
+
+    /// Immediately triggers the rollback closure and consumes the guard.
+    #[inline]
+    pub fn abort(mut self, _reason: &'static str) {
+        if let Some(slots) = self.slots.take() {
+            slots.rollback();
+        }
+    }
+
+    /// Returns `true` if the guard has been settled.
+    ///
+    /// Always returns `false` on a live instance since settling consumes `self`.
+    /// Maintained for interface symmetry across guard implementations.
+    #[inline]
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        self.slots.is_none()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl Drop for ErasedGuard {
+    fn drop(&mut self) {
+        if let Some(slots) = self.slots.take() {
+            #[cfg(feature = "std")]
+            {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    slots.rollback();
+                }));
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                slots.rollback();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl core::fmt::Debug for ErasedGuard {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "ErasedGuard({})",
+            if self.slots.is_some() {
+                "armed"
+            } else {
+                "disarmed"
+            }
+        )
+    }
+}
+
+/// The whole settle path behind an [`ErasedGuard`]: one allocation instead
+/// of one box per closure.
+#[cfg(feature = "alloc")]
+pub(crate) trait ErasedSettle: Send {
+    /// Failure path: drop the commit hook, run the rollback.
+    fn rollback(self: Box<Self>);
+
+    /// Success path: drop the rollback, run the commit hook / node books.
+    fn commit(self: Box<Self>);
+}
+
+/// Guard whose rollback and commit hook are separate closures
+/// ([`ErasedGuard::new`] / [`ErasedGuard::with_commit_hook`]).
+#[cfg(feature = "alloc")]
+struct TwoSlots<R, C> {
+    rollback: Option<R>,
+    on_commit: Option<C>,
+}
+
+#[cfg(feature = "alloc")]
+impl<R, C> ErasedSettle for TwoSlots<R, C>
+where
+    R: FnOnce() + Send + 'static,
+    C: FnOnce() + Send + 'static,
+{
+    fn rollback(mut self: Box<Self>) {
+        let _ = self.on_commit.take();
+        if let Some(rollback) = self.rollback.take() {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            rollback();
+        }
+    }
+
+    fn commit(mut self: Box<Self>) {
         let _ = self.rollback.take();
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         if let Some(on_commit) = self.on_commit.take() {
@@ -139,59 +246,5 @@ impl ErasedGuard {
                 on_commit();
             }
         }
-    }
-
-    /// Immediately triggers the rollback closure and consumes the guard.
-    #[inline]
-    pub fn abort(mut self, _reason: &'static str) {
-        let _ = self.on_commit.take();
-        if let Some(rollback) = self.rollback.take() {
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            rollback();
-        }
-    }
-
-    /// Returns `true` if the guard has been settled.
-    ///
-    /// Always returns `false` on a live instance since settling consumes `self`.
-    /// Maintained for interface symmetry across guard implementations.
-    #[inline]
-    #[must_use]
-    pub fn is_settled(&self) -> bool {
-        self.rollback.is_none()
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl Drop for ErasedGuard {
-    fn drop(&mut self) {
-        if let Some(rollback) = self.rollback.take() {
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            #[cfg(feature = "std")]
-            {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    rollback();
-                }));
-            }
-            #[cfg(not(feature = "std"))]
-            {
-                rollback();
-            }
-        }
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl core::fmt::Debug for ErasedGuard {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "ErasedGuard({})",
-            if self.rollback.is_some() {
-                "armed"
-            } else {
-                "disarmed"
-            }
-        )
     }
 }
