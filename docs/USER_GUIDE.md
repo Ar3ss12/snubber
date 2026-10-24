@@ -1179,9 +1179,13 @@ handoff, 4 lanes × 25 threaded cycles), `tests/supervisor_pool_stress.rs`
 (`#[ignore]`: armed/clean/silent/orphan cycle, gates the four buckets and
 conservation), `tests/supervisor_pool_stress_lease.rs` (`#[ignore]`:
 heartbeat-then-hang children, gates `lease_kills`, `conservation_breaks`
-and generations). The three pool storms and `stress_breaker_churn` run in
-the `pool-gates` CI job on every push and pull request; the heavier
-supervisor and multi-lineage harnesses are scheduled or dispatch-only.
+and generations). Each storm also gates app-side token receipt
+(`tokens_seen`) and lineage (`token_lane_mismatch`), so the pool's
+`rescued` counter is checked against a witness rather than against
+`ambush`, which it shares an increment with. The three pool storms and
+`stress_breaker_churn` run in the `pool-gates` CI job on every push and
+pull request; the heavier supervisor and multi-lineage harnesses are
+scheduled or dispatch-only.
 
 ### 4.7 Orphan contract (Phase 6: no zombies)
 ```rust

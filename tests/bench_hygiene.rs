@@ -7,6 +7,11 @@
 //! `black_box` payload, and commit/abort may run. This grep-gate keeps
 //! every bench in `benches/admission_bench.rs` honest: heavy constructors
 //! must appear textually before the timing call, never inside it.
+//!
+//! The scan is textual by design: a `fn make_node()` wrapper called inside
+//! a timing closure is invisible to it. It catches the spellings that have
+//! actually been written (constructors, `std::io::sink` and its aliases),
+//! not call graphs.
 
 use std::fs;
 

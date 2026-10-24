@@ -149,6 +149,16 @@ fn worker_pool_lease_storm() {
         checks > 0,
         "the live observer never sampled the pool: {content}"
     );
+    assert_eq!(
+        json_num(&content, "tokens_seen"),
+        0,
+        "a heartbeat-only child has no settlement to rescue: {content}"
+    );
+    assert_eq!(
+        json_num(&content, "token_lane_mismatch"),
+        0,
+        "no token may cross lanes: {content}"
+    );
 
     let generations = std::iter::repeat(kills + 1)
         .take(lanes as usize)

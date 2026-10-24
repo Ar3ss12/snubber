@@ -37,7 +37,7 @@
 //! (heartbeats prove liveness, not settlement), `lease_kills == reaps`
 //! and `conservation_breaks == 0`.
 
-use snubber::pool::{namespace_task, PoolConfig, PoolLane, ReapClass, WorkerPool};
+use snubber::pool::{namespace_task, task_lane, PoolConfig, PoolLane, ReapClass, WorkerPool};
 use snubber::{
     Backoff, PipeDrain, ProcessToken, RestartDecision, RestartPolicy, RestartWindow, OP_HEARTBEAT,
 };
@@ -193,8 +193,13 @@ fn supervisor(
         }));
     }
     let mut lease_kills = 0u64;
+    let mut tokens_seen = 0u64;
+    let mut token_lane_mismatch = 0u64;
     for handle in handles {
-        lease_kills = lease_kills.saturating_add(handle.join().expect("lane thread"));
+        let (lease, seen, mismatch) = handle.join().expect("lane thread");
+        lease_kills = lease_kills.saturating_add(lease);
+        tokens_seen = tokens_seen.saturating_add(seen);
+        token_lane_mismatch = token_lane_mismatch.saturating_add(mismatch);
     }
     stop.store(true, Ordering::Relaxed);
     let (monitor_checks, conservation_breaks) = monitor
@@ -211,7 +216,7 @@ fn supervisor(
         .collect::<Vec<_>>()
         .join(",");
     let json = format!(
-        "{{\"lanes\":{},\"reaped\":{},\"rescued\":{},\"ambush\":{},\"escape\":{},\"stillborn\":{},\"deadlocks\":{},\"deadlock\":{},\"conserved\":{},\"lease_kills\":{},\"monitor_checks\":{},\"conservation_breaks\":{},\"wall_ms\":{},\"final_generation\":[{}]}}",
+        "{{\"lanes\":{},\"reaped\":{},\"rescued\":{},\"ambush\":{},\"escape\":{},\"stillborn\":{},\"deadlocks\":{},\"deadlock\":{},\"conserved\":{},\"lease_kills\":{},\"monitor_checks\":{},\"conservation_breaks\":{},\"tokens_seen\":{},\"token_lane_mismatch\":{},\"wall_ms\":{},\"final_generation\":[{}]}}",
         report.totals.lanes,
         report.totals.reaps,
         report.totals.rescued,
@@ -224,6 +229,8 @@ fn supervisor(
         lease_kills,
         monitor_checks,
         conservation_breaks,
+        tokens_seen,
+        token_lane_mismatch,
         storm_boot.elapsed().as_millis(),
         generations
     );
@@ -242,7 +249,9 @@ fn supervisor(
             && report.totals.deadlocks == 0
             && lease_kills == expected
             && conservation_breaks == 0
-            && monitor_checks > 0;
+            && monitor_checks > 0
+            && tokens_seen == 0
+            && token_lane_mismatch == 0;
         println!(
             "[POOL] lease expected_reaps={expected} lease_kills={lease_kills} stillborn={} deadlocks={} monitor_checks={monitor_checks} conservation_breaks={conservation_breaks}",
             report.totals.stillborn, report.totals.deadlocks
@@ -260,7 +269,9 @@ fn supervisor(
             && report.totals.escape == want_escape
             && report.totals.stillborn == want_stillborn
             && report.totals.deadlocks == want_deadlocked
-            && report.totals.rescued == want_ambush;
+            && report.totals.rescued == want_ambush
+            && tokens_seen == want_ambush
+            && token_lane_mismatch == 0;
         println!(
             "[POOL] mixed expected_reaps={expected} want_A/E/S/D={want_ambush}/{want_escape}/{want_stillborn}/{want_deadlocked} got_A/E/S/D={}/{}/{}/{} conserved={}",
             report.totals.ambush,
@@ -271,7 +282,11 @@ fn supervisor(
         );
         ok
     } else {
-        report.healthy() && report.totals.reaps == expected && report.totals.ambush == expected
+        report.healthy()
+            && report.totals.reaps == expected
+            && report.totals.ambush == expected
+            && tokens_seen == expected
+            && token_lane_mismatch == 0
     };
     println!(
         "[POOL] expected_reaps={expected} actual_reaps={} ambush={} healthy={}",
@@ -284,11 +299,13 @@ fn supervisor(
 
 /// One lane thread: spawn → attach → wait for the mode proof → kill → reap.
 /// Returns how many children were euthanized by a lease breach.
-fn run_lane(lane: Arc<PoolLane>, kills: u64, mixed: bool, lease_ms: u64) -> u64 {
+fn run_lane(lane: Arc<PoolLane>, kills: u64, mixed: bool, lease_ms: u64) -> (u64, u64, u64) {
     let index = lane.index();
     let boot = Instant::now();
     let now_ms = || boot.elapsed().as_millis() as u64;
     let mut lease_kills = 0u64;
+    let mut tokens_seen = 0u64;
+    let mut token_lane_mismatch = 0u64;
 
     for local in 0..kills {
         let mode = if lease_ms > 0 {
@@ -303,7 +320,7 @@ fn run_lane(lane: Arc<PoolLane>, kills: u64, mixed: bool, lease_ms: u64) -> u64 
             Ok(exe) => exe,
             Err(error) => {
                 eprintln!("[POOL:LANE {index}] action=current_exe error=\"{error}\"");
-                return lease_kills;
+                return (lease_kills, tokens_seen, token_lane_mismatch);
             }
         };
         let mut command = std::process::Command::new(exe);
@@ -324,7 +341,7 @@ fn run_lane(lane: Arc<PoolLane>, kills: u64, mixed: bool, lease_ms: u64) -> u64 
             Ok(child) => child,
             Err(error) => {
                 eprintln!("[POOL:LANE {index}] action=spawn error=\"{error}\"");
-                return lease_kills;
+                return (lease_kills, tokens_seen, token_lane_mismatch);
             }
         };
         let pid = child.id();
@@ -332,13 +349,13 @@ fn run_lane(lane: Arc<PoolLane>, kills: u64, mixed: bool, lease_ms: u64) -> u64 
             eprintln!("[POOL:LANE {index}] action=stdout error=\"no pipe\"");
             let _ = child.kill();
             let _ = child.wait();
-            return lease_kills;
+            return (lease_kills, tokens_seen, token_lane_mismatch);
         };
         if let Err(error) = lane.attach(pid, PipeDrain::spawn(stdout)) {
             eprintln!("[POOL:LANE {index}] action=attach error=\"{error}\"");
             let _ = child.kill();
             let _ = child.wait();
-            return lease_kills;
+            return (lease_kills, tokens_seen, token_lane_mismatch);
         }
 
         // Mode proof: kill only after the decisive frame was parsed (or a
@@ -381,7 +398,7 @@ fn run_lane(lane: Arc<PoolLane>, kills: u64, mixed: bool, lease_ms: u64) -> u64 
             Ok(reap) => reap,
             Err(error) => {
                 eprintln!("[POOL:LANE {index}] action=note_death error=\"{error}\"");
-                return lease_kills;
+                return (lease_kills, tokens_seen, token_lane_mismatch);
             }
         };
         let expected_class = match mode {
@@ -396,12 +413,16 @@ fn run_lane(lane: Arc<PoolLane>, kills: u64, mixed: bool, lease_ms: u64) -> u64 
                 reap.class
             );
         }
+        let rescued_task = reap.token.map(|token| token.task);
+        if let Some(task) = rescued_task {
+            tokens_seen = tokens_seen.saturating_add(1);
+            if usize::from(task_lane(task)) != index {
+                token_lane_mismatch = token_lane_mismatch.saturating_add(1);
+            }
+        }
         println!(
             "[POOL:LANE {index}] local={local} mode={mode} gen={generation} pid={pid} class={:?} rescued={:?} next_gen={} decision={:?}",
-            reap.class,
-            reap.token.map(|token| token.task),
-            reap.generation,
-            reap.decision
+            reap.class, rescued_task, reap.generation, reap.decision
         );
 
         match reap.decision {
@@ -412,23 +433,23 @@ fn run_lane(lane: Arc<PoolLane>, kills: u64, mixed: bool, lease_ms: u64) -> u64 
             }
             RestartDecision::Stop => {
                 println!("[POOL:LANE {index}] decision=Stop after local={local}");
-                return lease_kills;
+                return (lease_kills, tokens_seen, token_lane_mismatch);
             }
             RestartDecision::GiveUp { deaths_in_window } => {
                 eprintln!(
                     "[POOL:LANE {index}] decision=GiveUp deaths_in_window={deaths_in_window}"
                 );
-                return lease_kills;
+                return (lease_kills, tokens_seen, token_lane_mismatch);
             }
             // `RestartDecision` is #[non_exhaustive]: a new verdict stops
             // the lane instead of looping on an unknown policy.
             _ => {
                 eprintln!("[POOL:LANE {index}] decision=unknown");
-                return lease_kills;
+                return (lease_kills, tokens_seen, token_lane_mismatch);
             }
         }
     }
-    lease_kills
+    (lease_kills, tokens_seen, token_lane_mismatch)
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {

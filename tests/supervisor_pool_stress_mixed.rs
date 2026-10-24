@@ -128,6 +128,20 @@ fn worker_pool_mixed_storm() {
             "expected {needle}={want}: {content}"
         );
     }
+    // The pool increments `ambush` and `rescued` in the same match arm, so
+    // their equality proves nothing by itself. The app-side receipt is the
+    // independent witness: one delivered token per ambush, each naming its
+    // own lane.
+    assert_eq!(
+        json_num(&content, "tokens_seen"),
+        want_ambush,
+        "app must receive one rescued token per ambush: {content}"
+    );
+    assert_eq!(
+        json_num(&content, "token_lane_mismatch"),
+        0,
+        "a rescued token named the wrong lane: {content}"
+    );
 
     let generations = std::iter::repeat(kills + 1)
         .take(lanes as usize)

@@ -109,6 +109,20 @@ fn worker_pool_storm() {
         expected,
         "every armed worker must hand its token back: {content}"
     );
+    // Independent of the pool's own `rescued` counter: the app thread must
+    // actually RECEIVE one token per ambush, and every token must name its
+    // own lane (a token delivered to the wrong lineage is a routing bug the
+    // counters cannot see).
+    assert_eq!(
+        json_num(&content, "tokens_seen"),
+        expected,
+        "app must receive one rescued token per ambush: {content}"
+    );
+    assert_eq!(
+        json_num(&content, "token_lane_mismatch"),
+        0,
+        "a rescued token named the wrong lane: {content}"
+    );
     // Bookkeeping cross-check: the per-class buckets must add up to the
     // reap total. A lost or double-counted reap shows here even when every
     // individual field looks plausible on its own.

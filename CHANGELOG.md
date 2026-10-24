@@ -57,7 +57,10 @@ examples and gate teeth). Details: USER_GUIDE "Fixed in 0.6.8".
   `in_flight` after lock recovery, and profile stage slices are clamped
   to `stage_count`.
 - Tests, examples, benches: conservation asserted in the invariants,
-  bulkhead-ceiling and industrial suites; rollback effects are observable
+  bulkhead-ceiling and industrial suites; the pool storms gate app-side
+  token receipt and lane lineage (`tokens_seen`, `token_lane_mismatch`),
+  so `rescued == ambush` is no longer the only witness; rollback effects
+  are observable
   state (DB handles, iron energization, laser latch, real advised sleep)
   instead of counters that can be faked; fake wakers use
   `Waker::from(Arc<dyn Wake>)` (Miri strict provenance); the bit-flip
