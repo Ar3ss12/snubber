@@ -94,9 +94,12 @@ examples and gate teeth). Details: USER_GUIDE "Fixed in 0.6.8".
   the supervisor and multi-lineage harnesses stay scheduled.
 - Docs: README saturation claim is measured (~1.1M admissions/sec on six
   contending threads), `WorkerPulse` footprint is arch-conditional,
-  pool numbers re-measured (attach/reap ~220/~177 ns with the drain built
+  pool numbers re-measured (attach/reap ~192/~173 ns with the drain built
   outside the timed window, `write_to` ~2.1 ns into a real writer, report
-  ~112 ns, lease sweep ~539 ns), storm timings re-measured, and the API table
+  ~111 ns, lease sweep ~517 ns), the drain and async rows re-measured
+  (`PipeDrain::feed` 21.2 → 10.8 us per 256 frames, async ready poll
+  ~152 ns, `enter_erased_auto` ~302 ns after the deferred probe settle
+  moved onto the guard's real `commit`), storm timings re-measured, and the API table
   gains `PoolReap` / `LaneSnapshot` / `PoolTotals` / `expired_lanes` /
   `DEFAULT_EOF_GRACE_MS` / argv-twin rows.
 - The POSIX storm harness gates descriptor growth on macOS too: it counts

@@ -133,10 +133,13 @@ outlives every transaction.
   full drop glue.
 - Net heap delta per settled transaction is exactly **0 bytes**: 100,000
   `enter_auto` → `commit` cycles followed by the node's drop must restore
-  the allocator baseline (`tests/guard_alloc_budget.rs`).
+  the allocator baseline (`tests/guard_alloc_budget.rs`). The same gate
+  covers Layer 1: 200,000 `SnubberGuard` / `ErasedGuard` settle cycles
+  whose closures own a heap payload restore the thread's heap baseline.
 - Reintroducing one `mem::forget(self)` shows up as a stranded
   `NodeInner` allocation (2,288 B in the reference build), not as a
-  statistic drift.
+  statistic drift — and gate 7/7 plus `#![deny(clippy::mem_forget)]`
+  reject the call before it builds.
 - Closure ownership is observable: `Arc::strong_count` on a captured
   handle must return to 1 after commit, abort, timeout and implicit drop,
   and the admission slot must be reusable (`tests/guard_settle_reclaim.rs`).

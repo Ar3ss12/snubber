@@ -64,7 +64,7 @@ drain.finish();                                        // EOF → rescue classif
 ## 🛡️ Architecture & Guarantees
 
 * **Zero-Boilerplate RAII Rollback:** No manual token tracking. Scoped executions auto-commit on success and guarantee resource release via `Drop` on panics, errors, or early returns.
-* **Single-Digit-Nanosecond Overhead:** Base stack guard costs **~5.4 ns**; commit takes the rollback and forgets an allocation-free `Copy` shell (no heap, no extra wire bytes). A saturated node admits **~1.1M admissions/sec** under 6-thread contention (uncontended admission is several times faster; see the latency table).
+* **Single-Digit-Nanosecond Overhead:** Base stack guard costs **~5.4 ns**; commit takes the rollback and drops the disarmed allocation-free `Copy` shell (no heap, no extra wire bytes). A saturated node admits **~1.1M admissions/sec** under 6-thread contention (uncontended admission is several times faster; see the latency table).
 * **Strict Determinism:** `#![forbid(unsafe_code)]`, zero external dependencies. Predictable behavior across bare-metal microcontrollers and multi-socket servers alike.
 * **Runtime-Agnostic Async:** Bounded waker queue built on `core::task::Waker` consuming **0% CPU** without depending on Tokio, async-std, or background threads.
 * **Adaptive Backpressure & Pacing:** Refusals carry physical telemetry (`retry_after_ms`, queue depth 0..255) allowing clients to pace incoming traffic instead of overwhelming dead hardware.
@@ -87,7 +87,8 @@ drain.finish();                                        // EOF → rescue classif
 Measured on AMD Ryzen 5 4600H release build
 (`cargo bench --bench admission_bench`, Criterion: 800 ms warmup,
 2 s measurement, 50 samples, isolated node per bench; re-measured
-2026-10-23 after the drain-feed, token-sink and extensibility groups were added).
+2026-10-24, values from the second of two full runs — the first differed
+by under 5% outside the contended group, which moves by design).
 Values are Criterion means from `target/criterion/*/new/estimates.json`;
 differences below ~2 ns are inside run-to-run noise and are not claimed as
 wins.
@@ -97,48 +98,48 @@ wins.
 | `SnubberGuard::new` + `commit` | Layer 1 (`core`) | **~5.4 ns** | Stack move + owned-field drop, zero heap allocation |
 | `EpochGate::observe` | Layer 1 (`core`) | **~2.6 ns** | 2-D generation + monotonic epoch filter |
 | `classify_stall` / `classify_stall_ceiling` | Layer 1 (`core`) | **~2.1 ns** (const math) | `CpuSpin` / `SleepBlocked` / `DeadlockStall` from one sample pair (the settle verdicts `SpinDetected` / `DeadlockSuspected` come from `guard.check_timeout`) |
-| `node.enter + commit` | Layer 2 (`std`) | **~121 ns** | Full bulkhead, circuit breaker, auto-commit |
-| `node.enter_auto + commit` | Layer 2 (`std`) | **~134 ns** | + atomic sequence minting |
-| `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~119 ns** | Priority lane: −1.4 ns vs plain enter (one measurement; same noise band) |
-| `node.transition` | Layer 2 (`std`) | **~131 ns** | ONE-enum state machine, zero flag drift |
+| `node.enter + commit` | Layer 2 (`std`) | **~125 ns** | Full bulkhead, circuit breaker, auto-commit |
+| `node.enter_auto + commit` | Layer 2 (`std`) | **~130 ns** | + atomic sequence minting |
+| `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~126 ns** | Priority lane; same band as plain enter (one measurement) |
+| `node.transition` | Layer 2 (`std`) | **~126 ns** | ONE-enum state machine, zero flag drift |
 | `node.transition_checked` + `LegalMove` | Layer 2 (`std`) | same path, no extra work | Compile-time only: the `LegalMove` proof erases to the same `transition` call; illegal moves fail at compile (E0277) |
-| `enter_erased_auto` | Layer 2 (`alloc`) | **~130 ns** | Boxed rollback for dynamic struct fields |
-| `node_passthrough_enter + commit` | Layer 2 (`std` canary) | **~98.4 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
-| `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~99.6 ns** | Same transit through `scoped()` — work runs, books stay clean |
-| `ConflateSender::publish + take_latest` | Layer 2 (`std`) | **~22.5 ns** | One-slot latest wins, no allocation, no `Clone` bound |
-| `ConflateSender::publish` (occupied slot) | Layer 2 (`std`) | **~16.3 ns** | Replaced value counted, never queued |
-| `guard.commit_enveloped(64)` | Layer 2 (`std`) | **~148 ns** | Payload corridor exact; wall corridor only for profiled guards |
+| `enter_erased_auto` | Layer 2 (`alloc`) | **~302 ns** | Boxed rollback + deferred probe-settle hook (two boxes and two `Arc` clones per admission; 0.6.8 moved the breaker outcome onto the guard's real `commit`) |
+| `node_passthrough_enter + commit` | Layer 2 (`std` canary) | **~97.1 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
+| `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~94.8 ns** | Same transit through `scoped()` — work runs, books stay clean |
+| `ConflateSender::publish + take_latest` | Layer 2 (`std`) | **~21.6 ns** | One-slot latest wins, no allocation, no `Clone` bound |
+| `ConflateSender::publish` (occupied slot) | Layer 2 (`std`) | **~16.0 ns** | Replaced value counted, never queued |
+| `guard.commit_enveloped(64)` | Layer 2 (`std`) | **~142 ns** | Payload corridor exact; wall corridor only for profiled guards |
 | `enter_async_auto` | Layer 3 (`std`) | **0% CPU** | Pure `core::task::Waker` parking, no runtime deps |
 | `enter_async_auto_profiled` | Layer 3 (`std`, opt-in) | structural: 1 `Box` + 2 clock reads | Same waker parking, profile arms on the admitting poll |
-| `enter_async_auto` (ready poll) | Layer 3 (`std`) | **~202 ns** | Full admission through the future; the ready path allocates nothing |
-| `enter_async_auto` park/wake/admit roundtrip | Layer 3 (`std`) | **~574 ns** | Same-thread park (queue push + identity flag) -> slot release wake -> admitting re-poll; no executor, not a cross-core roundtrip |
-| `static_node.enter + commit` | Layer 2 (`std`) | **~120 ns** | Compile-time capacity assert + bulkhead + auto-commit |
+| `enter_async_auto` (ready poll) | Layer 3 (`std`) | **~152 ns** | Full admission through the future; the ready path allocates nothing |
+| `enter_async_auto` park/wake/admit roundtrip | Layer 3 (`std`) | **~546 ns** | Same-thread park (queue push + identity flag) -> slot release wake -> admitting re-poll; no executor, not a cross-core roundtrip |
+| `static_node.enter + commit` | Layer 2 (`std`) | **~127 ns** | Compile-time capacity assert + bulkhead + auto-commit |
 | `node.note_pulse_stall(lag_ms)` | Layer 2 (`std`) | structural: 1 atomic max | Missed heartbeat lands in `SnapshotV1` (pulse fields since v3; frame is v5) + `AnomalyKind::PulseStall` |
 | `node.note_memory_kb(used)` | Layer 2 (`std`, cold) | structural: 1 lock + 1 atomic store | External memory sample → soft/hard verdict; admissions refuse lock-free above soft |
-| `process_token.to_bytes()` | Layer 4 (`core`) | **~7.7 ns** | 44-byte framed wire serialization (`to_le_bytes`) |
-| `ProcessToken::from_bytes()` | Layer 4 (`core`) | **~7.3 ns** | 40-byte body parse, no allocation |
-| `state_digest.crc()` | Layer 4 (`core`) | **~264.7 ns** | 64-byte hardware cache line digest verification |
-| `PipeDrain::drain_sync` | Layer 4 (`std`) | **~61 ns/frame** | 256 frames: 16.5M frames/s; the per-sample `PipeDrain` construction is included, so this is a pipeline cost, not a steady-state frame cost (see `feed` below) |
-| `PipeDrain::feed` (one 44 B frame) | Layer 4 (`std`) | **~97 ns** | Caller-pushed chunk: scanner + lock + dispatch, no reader thread |
-| `PipeDrain::feed` (256 frames/chunk) | Layer 4 (`std`) | **~21.2 µs** (82.7 ns/frame) | Same scanner: one ingest lock per chunk + one short state lock per token |
+| `process_token.to_bytes()` | Layer 4 (`core`) | **~8.0 ns** | 44-byte framed wire serialization (`to_le_bytes`) |
+| `ProcessToken::from_bytes()` | Layer 4 (`core`) | **~7.4 ns** | 40-byte body parse, no allocation |
+| `state_digest.crc()` | Layer 4 (`core`) | **~262 ns** | 64-byte hardware cache line digest verification |
+| `PipeDrain::drain_sync` | Layer 4 (`std`) | **~44 ns/frame** | 256 frames: 11.2 µs, 22.8M frames/s; the per-sample `PipeDrain` construction is included, so this is a pipeline cost, not a steady-state frame cost (see `feed` below) |
+| `PipeDrain::feed` (one 44 B frame) | Layer 4 (`std`) | **~98 ns** | Caller-pushed chunk: scanner + lock + dispatch, no reader thread |
+| `PipeDrain::feed` (256 frames/chunk) | Layer 4 (`std`) | **~10.8 µs** (42.3 ns/frame) | Same scanner: one ingest lock per chunk + one short state lock per token (0.6.8 took the clock read outside the lock) |
 | `ProcessToken::write_to(&mut sink)` | Layer 4 (`std`) | **~2.1 ns** | 44 B `write_all` into any real `Write` (copy included): no env, no stdout lock |
-| `StateDigest::write_to(&mut sink)` | Layer 4 (`std`) | **~621 ns** | Three `OP_STATE` frames + CRC32 seals |
-| `namespace_task` pack / unpack | Layer 4 (`std`) | **~2.1 / 1.0 ns** | `task = lane << 48 \| local`; two shifts + mask, no branch |
-| `lane.attach` + `note_death` (ambush) → `PoolReap` | Layer 4 (`std`) | **~220 ns** | Full rescue path: drain EOF, token take, generation bump, restart math, per-class counters (drain built in setup; the shared idle lane is re-attached each sample) |
-| `lane.attach` + `note_death` (escape) → `PoolReap` | Layer 4 (`std`) | **~177 ns** | Same path when the child settled (commit parsed, no token) |
-| `pool.report()` (4 lanes) | Layer 4 (`std`) | **~112 ns** | Rows (`LaneSnapshot`) + `PoolTotals::of`: four short lane locks, totals fold, no allocation |
+| `StateDigest::write_to(&mut sink)` | Layer 4 (`std`) | **~625 ns** | Three `OP_STATE` frames + CRC32 seals |
+| `namespace_task` pack / unpack | Layer 4 (`std`) | **~1.0 / 1.0 ns** | `task = lane << 48 \| local`; two shifts + mask, no branch |
+| `lane.attach` + `note_death` (ambush) → `PoolReap` | Layer 4 (`std`) | **~192 ns** | Full rescue path: drain EOF, token take, generation bump, restart math, per-class counters (drain built in setup; the shared idle lane is re-attached each sample) |
+| `lane.attach` + `note_death` (escape) → `PoolReap` | Layer 4 (`std`) | **~173 ns** | Same path when the child settled (commit parsed, no token) |
+| `pool.report()` (4 lanes) | Layer 4 (`std`) | **~111 ns** | Rows (`LaneSnapshot`) + `PoolTotals::of`: four short lane locks, totals fold, no allocation |
 | `LaneSnapshot` / `PoolTotals` | Layer 4 (`std`) | `Clone` row / `Copy` totals | `conserved()` = `ambush+escape+stillborn+deadlocks == reaps`; no guessed fifth bucket |
 | `run_supervised_guard_with_grace(..)` | Layer 3 (`std`) | one reaped child process | Supervised guard with a configurable terminal EOF grace for slow-flushing children |
 | `DEFAULT_EOF_GRACE_MS` (250 ms) | Layer 3 (`std`) | published const | Default terminal EOF grace; `run_supervised_guard_with_grace` and the pool builder override it |
 | `lane.note_memory_kb` | Layer 4 (`std`, cold) | **~12 ns** | Per-lane watch: one lock + integer compares |
-| `pool.expired_lanes(lease)` (4 lanes) | Layer 4 (`std`, cold) | **~539 ns** | One sweep over four silent pipes: one state lock per lane, no child touched |
+| `pool.expired_lanes(lease)` (4 lanes) | Layer 4 (`std`, cold) | **~517 ns** | One sweep over four silent pipes: one state lock per lane, no child touched |
 | `run_supervised_guard_with_memory` | Layer 4 (`std`) | structural: 1 sampler call / 10 ms tick | Soft logs `MEMORY_DRAIN`; hard `kill()` without draining (`DeathCause::MemoryLimit`) |
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | Layer 2 (`std`, opt-in) | structural: 1 `Box` + 1 clock/stage | Stage wall/CPU breakdown; default `enter*` reads no profile clock |
 | `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.13 µs** | 512-byte zero-allocation snapshot CRC32 codec |
 | `friction_fn` handler call (`Arc<dyn Fn>`) | Layer 4 (`std`) | **~1.8 ns** | Capture-capable friction: one dynamic dispatch outside the node lock |
 | `friction_wait_ms` (adaptive, Arc handler) | Layer 4 (`std`) | **~21.5 ns** | Lock + `Arc` clone + handler; identical to the legacy fn-pointer path (~21.5 ns) |
-| `NodeName::Static` clone | Layer 4 (`std`) | **~1.5 ns** | Fat-pointer copy, no allocation |
-| `NodeName::Owned` clone | Layer 4 (`std`) | **~9.9 ns** | One `Arc<str>` increment; `as_str` ~1.0 ns |
+| `NodeName::Static` clone | Layer 4 (`std`) | **~1.6 ns** | Fat-pointer copy, no allocation |
+| `NodeName::Owned` clone | Layer 4 (`std`) | **~10.0 ns** | One `Arc<str>` increment; `as_str` ~1.0 ns |
 | `snapshot_v1()` + `find_anomalies()` | Layer 5 (cold) | structural: 512 B, CRC32 | Zero-allocation telemetry; `assert_no_anomalies!()` CI gate |
 | `before.diff(&after)` + `write_triage` | Layer 5 (cold) | structural: pure `Copy` math + `fmt::Write` | Counter deltas since last sample; one ASCII verdict card |
 | `memory_limits(soft, hard)` + admission | Layer 2 (`std`) | structural: 1 relaxed load | Over soft → `EnterError::MemoryPressure` without taking the mutex |
@@ -217,7 +218,7 @@ The lease storm (`--lease-ms`, example 19) is the opposite case: every child emi
 
 All three storms plus `stress_breaker_churn` run in the `pool-gates` job of `.github/workflows/stress.yml` on every push and pull request (4 lanes × 8 / 6 / 8 kills and 8 threads × 1500 churn ops, ~2 s of test time); the heavier supervisor and multi-lineage harnesses stay scheduled or dispatch-only.
 
-Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~220 ns (ambush) / ~177 ns (escape), a four-lane `report()` is ~112 ns, a four-lane lease sweep is ~539 ns, and `namespace_task` is ~2 ns — each lane locks only its own state.
+Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~192 ns (ambush) / ~173 ns (escape), a four-lane `report()` is ~111 ns, a four-lane lease sweep is ~517 ns, and `namespace_task` is ~1 ns — each lane locks only its own state.
 
 ---
 
