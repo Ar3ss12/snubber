@@ -115,7 +115,25 @@ jobs:
           tool: cargo-semver-checks
 
       - name: Run Full Test Suite
-        run: cargo test --locked
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -o pipefail
+          cargo test --locked 2>&1 | tee target/test-suite.log
+
+      - name: Surface test failures as annotations
+        # Job logs need repository admin rights to download (403 without a
+        # token), but check-run annotations are public. A red matrix job must
+        # name the failing test and its panic without a login.
+        if: failure() && hashFiles('target/test-suite.log') != ''
+        shell: bash
+        run: |
+          grep -E "^(test .* FAILED|failures:)|panicked at" target/test-suite.log \
+            | head -n 12 \
+            | while IFS= read -r line; do
+                printf '::error title=test failure::%s\n' "$line"
+              done
 
       - name: Architectural Invariant Gates (PowerShell 5.1 flavor)
         # The .sh flavor never runs on Windows; without this step the
