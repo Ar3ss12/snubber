@@ -1,18 +1,20 @@
 //! Zero-leak gate: a counting `#[global_allocator]` proves that a settled
-//! `TrackedGuard` returns every allocated byte.
+//! guard returns every allocated byte.
 //!
 //! Regression for the `mem::forget(self)` settle-path leak: one
 //! `Arc<Mutex<NodeInner>>` (~2.4 KiB) was stranded per transaction, which
 //! stayed invisible in short tests and surfaced as +24 MB over 10k OS kills.
+//! Both layers are covered: `TrackedGuard` storms and the core guards whose
+//! closures capture a heap payload.
 //!
 //! The storm runs on a thread this test owns, and the counter is thread-local,
-//! so the measurement sees ONLY bytes the node allocates on the thread that
-//! settles it. A process-wide counter billed libtest's own setup to the node
-//! (900 B on Ubuntu CI); counting on the libtest worker still shares that
-//! thread with the harness. Allocation counting cannot run under Miri, same
-//! as `checkpoint_budget`.
+//! so the measurement sees ONLY bytes the guards allocate on the thread that
+//! settles them. A process-wide counter billed libtest's own setup to the
+//! node (900 B on Ubuntu CI); counting on the libtest worker still shares
+//! that thread with the harness. Allocation counting cannot run under Miri,
+//! same as `checkpoint_budget`.
 
-use snubber::SnubberNode;
+use snubber::{ErasedGuard, SnubberGuard, SnubberNode};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -101,5 +103,53 @@ fn settlement_is_byte_neutral_across_100k_transactions() {
         first < 4096,
         "the first storm grew the heap by {first} B — that is a per-node leak, \
          not one-time startup noise"
+    );
+}
+
+/// Layer-1 settle paths. Each guard owns a closure that captured a heap
+/// payload; commit must drop the closure with the guard, abort must run it,
+/// and neither may forget the guard itself. 200k guards per phase.
+fn layer1_storm() {
+    for _ in 0..50_000 {
+        let payload = Box::new(0u64);
+        let guard = SnubberGuard::new(1, 1, move || drop(payload));
+        let _ = guard.commit();
+    }
+    for _ in 0..50_000 {
+        let payload = Box::new(0u64);
+        let guard = SnubberGuard::new(1, 1, move || drop(payload));
+        let _ = guard.abort("alloc gate");
+    }
+    for _ in 0..50_000 {
+        let payload = Box::new(0u64);
+        ErasedGuard::new(move || drop(payload)).commit();
+    }
+    for _ in 0..50_000 {
+        let payload = Box::new(0u64);
+        ErasedGuard::new(move || drop(payload)).abort("alloc gate");
+    }
+}
+
+#[test]
+fn layer1_settlement_is_byte_neutral_across_200k_guards() {
+    let gate = std::thread::spawn(|| {
+        let baseline = net();
+        layer1_storm();
+        let first = net() - baseline;
+        layer1_storm();
+        let second = net() - baseline - first;
+        (first, second)
+    });
+    let (first, second) = gate.join().expect("layer-1 alloc-gate thread panicked");
+
+    assert_eq!(
+        second, 0,
+        "a repeated 200_000-guard settlement storm changed the heap by {second} B \
+         (first storm: {first} B); commit and abort must drop the closure and the \
+         guard itself — `mem::forget` on a settle path leaks both"
+    );
+    assert!(
+        first < 4096,
+        "the first storm grew the heap by {first} B — that is a per-guard leak"
     );
 }

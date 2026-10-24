@@ -77,6 +77,14 @@ examples and gate teeth). Details: USER_GUIDE "Fixed in 0.6.8".
   harness refuses to publish a verdict when its stats report is missing
   or empty; harnesses fail on zero samples; deadlock literals removed
   from termination reports.
+- Settle paths no longer call `mem::forget`: `SnubberGuard` and
+  `ErasedGuard` `commit`/`abort` construct their events and let the
+  disarmed guard drop normally. The fields were taken first, so the
+  forget was harmless, but it skips drop glue for every field — the
+  exact shape that leaked one `NodeInner` per transaction from
+  `TrackedGuard` before 0.5.2. `#![deny(clippy::mem_forget)]`, a new
+  script gate (7/7) and a 200k-guard allocation storm (Layer 1 guards
+  owning heap payloads) keep it removed.
 - Miri runs with `-Zmiri-strict-provenance` in both CI lanes.
 - The benchmark exporter publishes only `.../new/estimates.json` (a real
   ns latency): it also published `change/` entries, i.e. a relative delta

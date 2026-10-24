@@ -23,7 +23,7 @@ foreach ($Need in @("src\lib.rs", "src\node.rs", "src", "benches", "examples", "
 }
 
 # Gate 1: Check #![forbid(unsafe_code)] in src/lib.rs
-Write-Host "[1/6] Auditing unsafe code veto..." -NoNewline
+Write-Host "[1/7] Auditing unsafe code veto..." -NoNewline
 # TrimStart the BOM: a UTF-8 BOM would otherwise defeat every `(?m)^#!`
 # anchor below (false-FAIL that fails safe, but loud for nothing).
 $LibContent = (Get-Content "$RepoRoot\src\lib.rs" -Raw).TrimStart([char]0xFEFF)
@@ -45,7 +45,7 @@ if ($UnsafeMatches) {
 }
 
 # Gate 2: Saturating arithmetic on counters in src/node.rs
-Write-Host "[2/6] Auditing saturating counters in src/node.rs..." -NoNewline
+Write-Host "[2/7] Auditing saturating counters in src/node.rs..." -NoNewline
 # Counter increment check: flag direct `+= 1` on known counter fields
 $CounterViolations = Select-String -Path "$RepoRoot\src\node.rs" -CaseSensitive -Pattern "\b(in_flight|total_started|committed|bulkhead_rejections|poison_recoveries|stale_epochs_rejected)\s*\+=" |
     Where-Object { $_.Line -notmatch '^\s*//' }
@@ -58,7 +58,7 @@ if ($CounterViolations) {
 }
 
 # Gate 3: Lock-hygiene audit in Phase A/C (no foreign calls / formatting under lock)
-Write-Host "[3/6] Auditing zero-panic mutex discipline in src/node.rs..." -NoNewline
+Write-Host "[3/7] Auditing zero-panic mutex discipline in src/node.rs..." -NoNewline
 # Extract the FULL `fn record_locked` body (signature line to the first
 # method-indent closing brace) and forbid panicking/formatting calls
 # inside it. Select-String is line-based and cannot span lines, so the
@@ -97,7 +97,7 @@ if ($FnBody.Count -eq 0 -or ($FnBody[0] -notmatch 'fn record_locked\(')) {
 }
 
 # Gate 4: Zero-metaphor scan across codebase (AGENTS.md Section 14)
-Write-Host "[4/6] Auditing forbidden metaphors..." -NoNewline
+Write-Host "[4/7] Auditing forbidden metaphors..." -NoNewline
 # Scope: src + benches + examples + tests -- public examples are as
 # user-visible as the docs the rule protects (parity with the .sh gate).
 # Excludes binary header magic terminology ("magic bytes / magic number") which is technical standard.
@@ -129,7 +129,7 @@ if ($MetaphorMatches.Count -gt 0) {
 }
 
 # Gate 5: TRUE no_std - crate attribute + bare-metal target compile
-Write-Host "[5/6] Auditing true no_std on bare metal..." -NoNewline
+Write-Host "[5/7] Auditing true no_std on bare metal..." -NoNewline
 $BareMetalTarget = "thumbv7em-none-eabihf"
 if ($LibContent -cnotmatch '(?m)^#!\[cfg_attr\(not\(feature = "std"\), no_std\)\]') {
     Write-Host " FAIL (missing #![cfg_attr(not(feature = `"std`"), no_std)] in src/lib.rs)" -ForegroundColor Red
@@ -169,7 +169,7 @@ if ($LibContent -cnotmatch '(?m)^#!\[cfg_attr\(not\(feature = "std"\), no_std\)\
 }
 
 # Gate 6: Public API semver diff (cargo-semver-checks when installed)
-Write-Host "[6/6] Auditing public API against the last release..." -NoNewline
+Write-Host "[6/7] Auditing public API against the last release..." -NoNewline
 # PS 5.1 wraps native stderr lines in ErrorRecords: under
 # $ErrorActionPreference = "Stop" a SKIP-path `git describe` writing to
 # stderr would kill the script. Run native calls with Continue locally.
@@ -221,6 +221,23 @@ if ($GitExit -ne 0 -or -not $ApiBaseline) {
             $Failures++
         }
     }
+}
+
+# Gate 7: Settle paths must drop guards, never forget them.
+# `mem::forget(guard)` skips drop glue for EVERY field: on the old
+# `TrackedGuard` settle path it stranded one `Arc<Mutex<NodeInner>>` per
+# transaction (+24 MB over 10k kills; fixed in 0.5.2, commit e890122).
+# A disarmed guard drops cleanly -- its Drop sees settled/None and does
+# nothing -- so forgetting buys nothing and silently rots back into that leak.
+Write-Host "[7/7] Auditing settle paths for mem::forget..." -NoNewline
+$ForgetMatches = Select-String -Path $SrcFiles -CaseSensitive -Pattern 'mem::forget' |
+    Where-Object { $_.Line -notmatch '^\s*//' }
+if ($ForgetMatches) {
+    Write-Host " FAIL: mem::forget in src/ bypasses Drop for every field:" -ForegroundColor Red
+    $ForgetMatches | ForEach-Object { Write-Host "   $($_.Filename):$($_.LineNumber): $($_.Line.Trim())" }
+    $Failures++
+} else {
+    Write-Host " OK (settled guards drop; no mem::forget)" -ForegroundColor Green
 }
 
 Write-Host "---------------------------------------------"

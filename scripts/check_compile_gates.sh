@@ -28,7 +28,7 @@ for need in src/lib.rs src/node.rs src benches examples tests; do
 done
 
 # Gate 1: Check #![forbid(unsafe_code)] in src/lib.rs
-echo -n "[1/6] Auditing unsafe code veto... "
+echo -n "[1/7] Auditing unsafe code veto... "
 if grep -q '^#!\[forbid(unsafe_code)\]' "${REPO_ROOT}/src/lib.rs"; then
     echo "OK (forbid(unsafe_code) active)"
 else
@@ -52,7 +52,7 @@ fi
 # Gate 2: Saturating arithmetic on counters in src/node.rs
 # (scoped to node.rs on purpose: the fields are private to it — tests,
 # benches, and examples define their own unrelated `in_flight`s.)
-echo -n "[2/6] Auditing saturating counters in src/node.rs... "
+echo -n "[2/7] Auditing saturating counters in src/node.rs... "
 # Every monotonic counter the node books, not just the six that existed
 # when this gate was written. A new bucket (rate/breaker/memory/evicted/
 # preempted/implicit drops/trips) must not be writable with a bare `+=`.
@@ -79,7 +79,7 @@ else
 fi
 
 # Gate 3: Lock-hygiene audit in Phase A/C
-echo -n "[3/6] Auditing zero-panic mutex discipline in src/node.rs... "
+echo -n "[3/7] Auditing zero-panic mutex discipline in src/node.rs... "
 # Scan the three functions that run with (or immediately around) the node
 # mutex held, not just `record_locked`: a `format!`/`panic!` introduced in
 # the admission fast path must fail this gate. Bodies are extracted from
@@ -125,7 +125,7 @@ fi
 # spelled with POSIX char classes only: `\b` is shaky on BSD grep and
 # `[[:<:]]` is rejected by GNU grep — `(^|[^_[:alnum:]])...([^_[:alnum:]]|$)`
 # works on both.
-echo -n "[4/6] Auditing forbidden metaphors... "
+echo -n "[4/7] Auditing forbidden metaphors... "
 FORBIDDEN_METAPHORS='(^|[^_[:alnum:]])(wizard|spaceship|bulletproof|panacea)([^_[:alnum:]]|$)|(^|[^_[:alnum:]])silver[[:space:]]+bullet([^_[:alnum:]]|$)'
 if METAPHOR_HITS="$(grep -rEIn "${FORBIDDEN_METAPHORS}" --include='*.rs' "${REPO_ROOT}/src" "${REPO_ROOT}/benches" "${REPO_ROOT}/examples" "${REPO_ROOT}/tests" 2>&1)"; then
     echo "FAIL: Found informal metaphors in src/ benches/ examples/ tests/:"
@@ -143,7 +143,7 @@ else
 fi
 
 # Gate 5: TRUE no_std — crate attribute + bare-metal target compile
-echo -n "[5/6] Auditing true no_std on bare metal... "
+echo -n "[5/7] Auditing true no_std on bare metal... "
 if ! grep -q '^#!\[cfg_attr(not(feature = "std"), no_std)\]' "${REPO_ROOT}/src/lib.rs"; then
     echo "FAIL (missing #![cfg_attr(not(feature = \"std\"), no_std)] in src/lib.rs)"
     FAILURES=$((FAILURES + 1))
@@ -167,7 +167,7 @@ else
 fi
 
 # Gate 6: Public API semver diff (cargo-semver-checks when installed)
-echo -n "[6/6] Auditing public API against the last release... "
+echo -n "[6/7] Auditing public API against the last release... "
 API_BASELINE="$(git -C "${REPO_ROOT}" describe --tags --abbrev=0 2>/dev/null || true)"
 if [ -z "${API_BASELINE}" ]; then
     if in_ci; then
@@ -194,6 +194,35 @@ else
         echo "SKIP (cargo-semver-checks not installed)"
         SKIPS=$((SKIPS + 1))
     fi
+fi
+
+# Gate 7: Settle paths must drop guards, never forget them.
+# `mem::forget(guard)` skips drop glue for EVERY field: on the old
+# `TrackedGuard` settle path it stranded one `Arc<Mutex<NodeInner>>` per
+# transaction (+24 MB over 10k kills; fixed in 0.5.2, commit e890122). A
+# disarmed guard drops cleanly -- its `Drop` sees `settled`/`None` and does
+# nothing -- so forgetting buys nothing and silently rots back into that
+# leak. Scan all of src/: the offending call lived in the guard impls, not
+# only in node.rs helpers.
+echo -n "[7/7] Auditing settle paths for mem::forget... "
+FORGET_HITS="$(grep -rEn 'mem::forget' --include='*.rs' "${REPO_ROOT}/src" 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+    # Comments may name the historical bug; only code may not call it.
+    CODE_HITS="$(printf '%s\n' "${FORGET_HITS}" | grep -vE '^.*:[0-9]+:[[:space:]]*//' || true)"
+    if [ -n "${CODE_HITS}" ]; then
+        echo "FAIL: mem::forget in src/ bypasses Drop for every field:"
+        printf '%s\n' "${CODE_HITS}"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "OK (settled guards drop; no mem::forget)"
+    fi
+elif [ "$rc" -eq 1 ]; then
+    echo "OK (settled guards drop; no mem::forget)"
+else
+    echo "FAIL: mem::forget scan could not run (grep exit ${rc}):"
+    printf '%s\n' "${FORGET_HITS}"
+    FAILURES=$((FAILURES + 1))
 fi
 
 echo "---------------------------------------------"

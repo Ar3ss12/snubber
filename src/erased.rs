@@ -120,6 +120,10 @@ impl ErasedGuard {
 
     /// Disarms the rollback, executes the optional commit hook, and consumes the guard.
     ///
+    /// Both slots are taken out, so the normal `Drop` below sees `None` and
+    /// does nothing — no `mem::forget` is needed, and forgetting would skip
+    /// drop glue for every field (the `TrackedGuard` leak of 0.5.2).
+    ///
     /// Memory ordering: emits a `SeqCst` fence prior to disarming, matching [`crate::SnubberGuard`].
     #[inline]
     pub fn commit(mut self) {
@@ -135,8 +139,6 @@ impl ErasedGuard {
                 on_commit();
             }
         }
-        // Bypass Drop; resources are already explicitly settled
-        core::mem::forget(self);
     }
 
     /// Immediately triggers the rollback closure and consumes the guard.
@@ -147,8 +149,6 @@ impl ErasedGuard {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             rollback();
         }
-        // Bypass Drop; rollback has already executed
-        core::mem::forget(self);
     }
 
     /// Returns `true` if the guard has been settled.

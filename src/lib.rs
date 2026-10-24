@@ -50,6 +50,10 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
+// Settle paths must drop the guard, never forget it: `mem::forget` skips
+// drop glue for every field and once leaked one `NodeInner` per settled
+// transaction. Gate 7 enforces the same rule for every file under src/.
+#![deny(clippy::mem_forget)]
 #![warn(missing_docs)]
 
 #[cfg(feature = "alloc")]
@@ -268,7 +272,6 @@ pub use channel::{
 pub use harness::{run_boundary_harness, FastPrng, HarnessReport, ProfileHarness};
 
 use core::fmt;
-use core::mem;
 
 /// Monotonic session/action correlation header attached to every event.
 ///
@@ -609,8 +612,11 @@ impl<F: FnOnce()> SnubberGuard<F> {
 
     /// Success path: disarm the destructor, report `Committed`.
     ///
-    /// The rollback is taken out and `self` is forgotten so `Drop` never
-    /// runs for a committed transaction. A `SeqCst` fence orders this
+    /// The rollback is taken out and dropped here; `self` then drops
+    /// normally and `Drop` sees an empty slot, so it does nothing. A guard
+    /// must never be `mem::forget`-ten on a settle path: that skips drop
+    /// glue for every field, which once leaked one `NodeInner` per
+    /// transaction from `TrackedGuard`. A `SeqCst` fence orders this
     /// thread's prior writes before any read after `commit` — but foreign
     /// state shared across threads still needs its own `Release`/`Acquire`
     /// pair or lock (see rule 5 below); a lone fence pairs with nothing.
@@ -618,11 +624,9 @@ impl<F: FnOnce()> SnubberGuard<F> {
     pub fn commit(mut self) -> SnubberEvent<()> {
         let _ = self.rollback.take();
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        let event = SnubberEvent::Committed {
+        SnubberEvent::Committed {
             header: self.header,
-        };
-        mem::forget(self);
-        event
+        }
     }
 
     /// Explicit failure path: run the rollback NOW, report `Aborted`.
@@ -641,12 +645,10 @@ impl<F: FnOnce()> SnubberGuard<F> {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             rollback();
         }
-        let event = SnubberEvent::Aborted {
+        SnubberEvent::Aborted {
             header: self.header,
             reason,
-        };
-        mem::forget(self);
-        event
+        }
     }
 }
 
