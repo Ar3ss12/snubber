@@ -1,7 +1,8 @@
 # PLAN.md — виправлення за підсумками ворожого аудиту
 
-> **Стан на 2026-10-25:** HEAD `3664843 perf(erased): fold the settle path into one boxed transaction`,
-> `Cargo.toml` = `0.6.8`, теги `v0.5.0`, `v0.5.3`, `v0.6.3`. Робоче дерево чисте.
+> **Стан на 2026-10-25:** HEAD `67f26b8 test(async): cover settle handoff, half-open cancel, poisoned node path`,
+> `Cargo.toml` = `0.6.8`, теги `v0.5.0`, `v0.5.3`, `v0.6.3`. Етапи 0–7 закриті; suite 404 (378 + 26 doctests),
+> бейдж 404. Етап 8 (реліз) — тільки за окремим наказом; робоче дерево чисте після журнального коміту.
 > **Джерело:** повний звіт аудиту (секції 1–3) + доказова база під-агентів, зібрана в цій сесії.
 > **Правило етапу:** етап не закривається без `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
 > повного suite, скриптових гейтів і оновленого CHANGELOG (якщо поведінка змінилася).
@@ -670,4 +671,5 @@ Push — одразу після зеленого прогону (standing prefe
 | 2026-10-25 | 4 | F-06: contended-бенчі падають на виснаженні retry/нулі допусків; `bench_hygiene` ловить join/send; README contended-рядки переміряно | `fix(bench): fail fast on retry exhaustion and discarded send results` (7c9e6bf) |
 | 2026-10-25 | 5 | F-10..F-14/F-17/F-29..F-34: PARITY-фінгерпринт, строгий CI, release-гейт, ticks, `bench-full`, `miri-leaks`, `termination-smoke`; suite 400 -> 401 | `fix(ci): close skip/parse/parity holes and add full bench artifact lane` (7bf69ee) |
 | 2026-10-25 | 6 | F-15/F-18/F-19/F-20/F-21: core/std split, `lane.*` receivers, чесний `Vec` у `report()`, бенч-ID, provenance + artifact, 24 аксесори, README rationale-анкори, CHANGELOG `Unreleased`; doctests 26; suite 401 | `docs: correct pool API receivers, core/std split, allocations, bench names, accessors` (e1252fb) |
+| 2026-10-25 | 7 | F-27/F-28/F-35..F-39: 3 нові тести (handoff, half-open cancel, poisoned ledger), post-abort assert, TTL/ordering/lane/fence рішення; suite 404 (378+26 doctests) | `test(async): cover settle handoff, half-open cancel, poisoned node path` (67f26b8) |
 |  |  |  |  |
