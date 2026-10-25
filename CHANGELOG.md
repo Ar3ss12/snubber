@@ -4,6 +4,34 @@ All notable changes to `snubber`. Benchmarks live in [README.md](README.md);
 the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 ("Fixed in …" sections) and [docs/INVARIANTS.md](docs/INVARIANTS.md).
 
+## Unreleased
+
+### Tooling / CI
+
+- `scripts/release.sh` (plus the new `justfile`) runs the whole release
+  gate in one command: fmt, clippy, full suite + doctests + badge drift,
+  compile gates, the `#[ignore]` release lanes, the release identity gate
+  and `cargo publish --dry-run`. `--fast` stops after the compile gates
+  for a pre-commit check. The gap was manual: the 0.6.9 CI failure came
+  from a release-only lane that nothing ran before the release.
+- The ignored release lanes (pool storms, breaker churn, termination
+  smoke) moved from the Stress workflow into `ci.yml`, so they gate every
+  push/PR in the main run; the Stress workflow keeps the scheduled storms.
+- Miri jobs pin `nightly-2026-10-09` instead of a floating `@nightly`: the
+  0.6.9 Miri failure was a std change in a newer nightly, not a repository
+  change, so bumping the pin is now a deliberate commit.
+- `.qoder/skills/snubber-release/SKILL.md` records the release checklist
+  and failure playbook; `just check|release-lanes|release|package-dry|publish`
+  wrap the same commands for humans and agents.
+
+### Docs
+
+- `docs/INVARIANTS.md` gains "Test threshold convention: determinism, not
+  percentages": volume floors must be tied to the mechanism under test
+  (`admitted >= breaker_trips`), never to a share of attempts, and
+  best-effort standard-library behavior must not be asserted without
+  `cfg(not(miri))`.
+
 ## 0.6.9 — 2026-10-25
 
 Eighth-audit batch (hook panics, scanner reset order, lock hygiene, honest

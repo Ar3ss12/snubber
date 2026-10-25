@@ -348,6 +348,36 @@ powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines
 python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggressive --armed-hold
 ```
 
+### Test threshold convention: determinism, not percentages
+
+Every volume assertion in a test must be tied to the mechanism the test
+exercises, never to a share of total attempts:
+
+```rust
+// Right: each trip must be backed by real admitted work, and the refusal
+// path the lane exists to prove must have fired.
+assert!(admitted >= stats.breaker_trips.max(1));
+assert!(stats.breaker_rejections > 0);
+
+// Wrong: once a breaker trips, HalfOpen admits exactly one probe and
+// refuses the rest, so admission volume is bounded by probes per trip.
+// A percentage floor measures scheduler speed, not correctness:
+// 0.6.9 shipped `admitted >= attempts / 10`, passed in debug, and failed
+// in release CI (301 admitted of 12000, 75 trips, 11698 refusals).
+```
+
+Two corollaries:
+
+- Release-mode lanes belong to the release gate. `bash scripts/release.sh`
+  runs the `#[ignore]` pool storms, breaker churn and termination storm in
+  `--release`; `.github/workflows/ci.yml` runs them on every push/PR, so a
+  tag is never the first place they execute.
+- Do not assert best-effort standard-library behavior that depends on
+  backend codegen. `Waker::will_wake` compares vtable pointers; std relies
+  on LLVM merging two identical const-promoted `RawWakerVTable`s, which
+  Miri never does, so a cloned std `Arc` waker compares unequal under Miri
+  only. Gate such asserts with `cfg(not(miri))` and say why.
+
 ---
 
 ## 3. Reporting a Discrepancy
