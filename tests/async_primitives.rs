@@ -1,4 +1,6 @@
-use snubber::{AsyncLease, EnterError, FaultKind, LeaseChannel, OverflowPolicy, SnubberNode};
+use snubber::{
+    AsyncLease, BreakerState, EnterError, FaultKind, LeaseChannel, OverflowPolicy, SnubberNode,
+};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{RawWaker, RawWakerVTable, Waker};
@@ -483,6 +485,98 @@ fn admitted_on_spurious_repoll_leaves_no_ghost_waiter() {
     }
 
     guard.commit();
+}
+
+// Cancellation handoff (`async_engine/entry.rs:13-16`): a settle pops ONE
+// winner and wakes it after unlocking. If that task is dropped before it is
+// re-polled, its queue entry is already gone — without a handoff the next
+// waiter sleeps forever on a node that has no further settle to wake it.
+#[test]
+fn future_dropped_after_settle_pop_hands_the_slot_to_the_next_waiter() {
+    WOKEN_A.store(false, Ordering::SeqCst);
+    WOKEN_B.store(false, Ordering::SeqCst);
+    let node = SnubberNode::builder("async/handoff")
+        .max_in_flight(1)
+        .build();
+    let held = node.enter(1, 1, || {}).expect("hold the only slot");
+
+    let wa = waker_a();
+    let wb = waker_b();
+    let mut cx_a = std::task::Context::from_waker(&wa);
+    let mut cx_b = std::task::Context::from_waker(&wb);
+    let mut fut_a = Box::pin(node.enter_async(2, 2, || {}));
+    let mut fut_b = Box::pin(node.enter_async(3, 3, || {}));
+    assert!(fut_a.as_mut().poll(&mut cx_a).is_pending(), "A parks");
+    assert!(fut_b.as_mut().poll(&mut cx_b).is_pending(), "B parks");
+    assert_eq!(node.waiter_len(), 2);
+
+    // Settle pops A (the oldest) and wakes it — exactly one winner.
+    held.commit();
+    assert!(
+        WOKEN_A.load(Ordering::SeqCst),
+        "settle wakes the oldest waiter"
+    );
+    assert!(
+        !WOKEN_B.load(Ordering::SeqCst),
+        "a settle must not wake two waiters"
+    );
+
+    // A's task is cancelled in the gap before re-polling. Its entry was
+    // already popped, so Drop sees the free slot and hands it to B.
+    drop(fut_a);
+    assert!(
+        WOKEN_B.load(Ordering::SeqCst),
+        "a cancelled winner must hand the slot to the next waiter"
+    );
+    match fut_b.as_mut().poll(&mut cx_b) {
+        std::task::Poll::Ready(Ok(g)) => {
+            g.commit();
+        }
+        _ => panic!("B must be admitted after the handoff"),
+    }
+}
+
+// A HalfOpen probe that parks (bulkhead full) releases the probe ROLE
+// before sleeping; cancelling it must not leave the breaker wedged in
+// HalfOpen with no admissible probe.
+#[test]
+fn half_open_async_probe_cancelled_in_queue_does_not_wedge_the_breaker() {
+    use std::task::Context;
+
+    let node = SnubberNode::builder("async/half-open-cancel")
+        .max_in_flight(1)
+        .trip_after_failures(1)
+        .build();
+    let held = node.enter(1, 1, || {}).expect("hold the slot");
+    node.report(FaultKind::Panic, 2, 2); // Closed -> HalfOpen
+    assert_eq!(node.stats().breaker_state, BreakerState::HalfOpen);
+
+    let wa = waker_a();
+    let mut cx = Context::from_waker(&wa);
+    let mut probe = Box::pin(node.enter_async(3, 3, || {}));
+    assert!(
+        probe.as_mut().poll(&mut cx).is_pending(),
+        "the probe parks behind the held slot"
+    );
+    // Cancelled while parked: the probe flag was cleared when it parked.
+    drop(probe);
+    held.commit();
+    assert_eq!(
+        node.stats().breaker_state,
+        BreakerState::HalfOpen,
+        "a non-probe commit must not close the breaker"
+    );
+
+    // A fresh admission must still be able to probe and close the breaker.
+    let guard = node
+        .enter(4, 4, || {})
+        .expect("a fresh half-open probe must be admissible");
+    guard.commit();
+    assert_eq!(
+        node.stats().breaker_state,
+        BreakerState::Closed,
+        "the breaker must close on a successful probe"
+    );
 }
 
 // Regression (0.6.4): async EvictOldest evictions now go through the same

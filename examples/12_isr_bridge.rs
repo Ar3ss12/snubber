@@ -147,6 +147,10 @@ fn main() {
         "latched trip aborts despite full ring"
     );
     guard.abort("hardware_isr_trip");
+    assert!(
+        !laser_on.load(Ordering::SeqCst),
+        "cycle 3 abort must run the laser-off rollback too"
+    );
 
     println!("\nVerification: ISR trip aborted iron without a single lock.");
 }

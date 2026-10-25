@@ -50,6 +50,23 @@ tests and benches, CI teeth). No API removals; `Cargo.toml` still reads
   `classify_stall_ceiling`), and the latency table carries a measurement
   date, the Criterion command, and the CI artifact lane
   (`bench-criterion-<run_id>`, `scripts/bench.sh --skip-run`).
+- Ordering comments now match the code: the gateway depth gauge is
+  Relaxed (the authoritative cap is `try_send`; the throttle latch stays
+  Release/Acquire), the two free-standing `SeqCst` fences in the erased
+  transaction are gone (the ledger mutex is the ordering edge),
+  `next_sequence` explains why a Relaxed ticket is enough, and the lane
+  `pid`/`drain` pair documents the absence of a panic point between the
+  two stores. `task_ttl` is documented as starting at the first park and
+  never re-stamping.
+
+### Tests
+
+- New coverage: a winner dropped between settle-pop and re-poll hands the
+  free slot to the next waiter; a HalfOpen async probe cancelled in the
+  queue does not wedge the breaker; an async admission recovers from a
+  deliberately poisoned ledger (`poison_recoveries`, commit,
+  conservation). The ISR example now asserts the laser is off after the
+  cycle-3 abort as well.
 
 ### Tooling / CI
 

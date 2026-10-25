@@ -295,9 +295,13 @@ impl<T> GatewaySender<T> {
     ///   advised wait instead of retry-spinning. Releases only after
     ///   the queue drains to the 50% low watermark (hysteresis latch).
     pub fn send(&self, cmd: T) -> Result<(), GatewaySendError> {
-        // Acquire, not Relaxed: this depth gates a refusal decision, so it
-        // must not be a stale value that bypasses an armed throttle.
-        let depth = self.throttle.depth.load(Ordering::Acquire).max(0) as usize;
+        // The depth counter is Relaxed by design: writers (fetch_add on
+        // send, fetch_sub on take) are not synchronizing anything. It is an
+        // advisory queue gauge — the authoritative capacity decision is
+        // `try_send` below, so a stale depth can only add or skip a throttle
+        // hint, never admit past the channel cap. The latch it feeds is
+        // paired properly: `throttled` is stored Release, read Acquire.
+        let depth = self.throttle.depth.load(Ordering::Relaxed).max(0) as usize;
         if self.throttle.throttled.load(Ordering::Acquire) && depth > self.throttle.lwm {
             GatewayBooks::update(&self.books, |b| {
                 b.throttled = b.throttled.saturating_add(1);
@@ -347,7 +351,7 @@ impl<T> GatewaySender<T> {
     /// Estimated queue depth (sender-side counter, saturating at 0).
     #[must_use]
     pub fn depth(&self) -> usize {
-        self.throttle.depth.load(Ordering::Acquire).max(0) as usize
+        self.throttle.depth.load(Ordering::Relaxed).max(0) as usize
     }
 
     /// Snapshot the counters (`Copy` out, poison-safe default).
@@ -427,7 +431,7 @@ impl<T> GatewayHost<T> {
     /// Estimated queue depth (receiver-side counter, saturating at 0).
     #[must_use]
     pub fn depth(&self) -> usize {
-        self.throttle.depth.load(Ordering::Acquire).max(0) as usize
+        self.throttle.depth.load(Ordering::Relaxed).max(0) as usize
     }
 
     fn on_take(&self) {

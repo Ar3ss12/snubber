@@ -1461,7 +1461,9 @@ struct ErasedTransaction<F> {
 impl<F: FnOnce() + Send + 'static> crate::erased::ErasedSettle for ErasedTransaction<F> {
     fn rollback(mut self: Box<Self>) {
         if let Some(rollback) = self.rollback.take() {
-            core::sync::atomic::fence(Ordering::SeqCst);
+            // No fence here: the settle below locks the node ledger, and
+            // the mutex lock already provides the acquire/release edge.
+            // A free-standing SeqCst fence paired with nothing was a no-op.
             // The probe settle must run even if the user's rollback panics:
             // the guard's own catch_unwind would otherwise swallow the panic
             // AFTER the hook unwound past the settle, leaving
@@ -1481,7 +1483,8 @@ impl<F: FnOnce() + Send + 'static> crate::erased::ErasedSettle for ErasedTransac
 
     fn commit(mut self: Box<Self>) {
         let _ = self.rollback.take();
-        core::sync::atomic::fence(Ordering::SeqCst);
+        // The node-ledger lock in `settle_erased_commit` is the ordering
+        // edge; a lone SeqCst fence before it synchronized with nothing.
         self.node.settle_erased_commit(self.was_probe);
         if let Some(token) = self.token {
             crate::ProcessToken::commit(token.task).emit_if_supervised();
@@ -2324,6 +2327,13 @@ impl SnubberNode {
     }
 
     /// Next monotonically minted sequence ticket for this node (lock-free `AtomicU64`).
+    ///
+    /// `Relaxed` is deliberate: `fetch_add` still returns a unique value
+    /// from one total modification order, which is all the ticket needs.
+    /// Two threads may call it in a different order than their admissions
+    /// reach the node — no memory ordering can turn a ticket into a
+    /// wall-clock stamp, and `EpochGate` sheds the older coordinates,
+    /// which is the documented contract.
     #[inline]
     pub fn next_sequence(&self) -> u64 {
         self.auto_seq.fetch_add(1, Ordering::Relaxed)
@@ -5474,4 +5484,53 @@ impl<F: FnOnce()> Drop for TrackedGuard<F> {
 fn console_attached() -> bool {
     use std::io::IsTerminal;
     std::io::stderr().is_terminal()
+}
+
+#[cfg(test)]
+mod async_poison_tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    /// A ledger poisoned by an unwinding foreign thread must not take the
+    /// async engine down: `lock()` recovers the guard, counts the recovery
+    /// and clamps slots, and the admission still settles through `commit`.
+    #[test]
+    fn async_admission_recovers_from_a_poisoned_ledger() {
+        let node = SnubberNode::builder("poison/async")
+            .max_in_flight(1)
+            .build();
+        let poisoner = node.clone();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoner.inner.lock().unwrap();
+            panic!("poison the ledger on purpose");
+        }));
+        assert!(poisoned.is_err(), "the poisoner must unwind");
+        assert!(node.inner.is_poisoned(), "the ledger is really poisoned");
+
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(node.enter_async(1, 1, || {}));
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(guard)) => {
+                guard.commit();
+            }
+            _ => panic!("async admission must recover from a poisoned ledger"),
+        }
+        let s = node.stats();
+        assert!(s.poison_recoveries >= 1, "each recovery is counted");
+        assert_eq!(s.committed, 1);
+        assert_eq!(
+            s.admission_total(),
+            s.total_started + s.shed_total(),
+            "conservation survives recovery"
+        );
+    }
 }

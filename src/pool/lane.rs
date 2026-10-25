@@ -71,6 +71,14 @@ impl PoolReap {
 }
 
 #[derive(Debug)]
+/// One lane's mutable state, always read under `PoolLane::state`'s mutex.
+///
+/// `pid` and `drain` are written back-to-back in `attach` with no panic
+/// point between them (`Some(pid)` and `Some(drain)` are moves, and no
+/// allocation or user code runs between the two stores). A poison recovery
+/// therefore cannot observe `pid: Some` with `drain: None`; if either store
+/// is ever moved behind user code or an allocation, make this one
+/// `Option<(u32, PipeDrain)>` atomically.
 struct LaneState {
     clock: GenerationClock,
     tracker: RestartTracker,

@@ -61,19 +61,19 @@
 | F-24 | P2 | `priority_preemption.rs:119` rollback-свідок не мутує стан, лише лічить виклики | `tests/priority_preemption.rs:50,113-119` | 3 | `[x]` |
 | F-25 | P2 | `tests/erased.rs` rollback-свідки без node-stat witness | `tests/erased.rs:39,65` | 3 | `[x]` |
 | F-26 | P2 | Два різні `static ROLLBACKS` з однаковим ім'ям | `tests/guard.rs:234,255` | 7 | `[x]` |
-| F-27 | P2 | Приклад ISR: cycle 3 abort без post-abort assert | `examples/12_isr_bridge.rs` | 7 | `[ ]` |
-| F-28 | P2 | Покриття async-дір: settle-pop→drop, HalfOpen+cancel, poison async | `tests/async_primitives.rs`, `tests/conduit.rs` | 7 | `[ ]` |
+| F-27 | P2 | Приклад ISR: cycle 3 abort без post-abort assert | `examples/12_isr_bridge.rs` | 7 | `[x]` |
+| F-28 | P2 | Покриття async-дір: settle-pop→drop, HalfOpen+cancel, poison async | `tests/async_primitives.rs`, `tests/conduit.rs` | 7 | `[x]` |
 | F-29 | P2 | `stress_harness.ps1`: managed-path без image/creation gate; kill-semantics/verdict розбіжні з py | `scripts/stress_harness.ps1:294,343,360-367` | 5 | `[x]` |
 | F-30 | P2 | `check_api_diff` при недоступному git: `hash-object` → `""` двічі, lock-мутація невидима | `scripts/check_api_diff.sh:63-72` | 5 | `[x]` |
 | F-31 | P2 | `check_compile_gates.sh` pipe/grep failure → `OK`; `CI=false` трактується як CI | `scripts/check_compile_gates.sh:14,110-119` | 5 | `[x]` |
 | F-32 | P2 | `bench.sh:147` при помилці `grep` публікує; `:163` тихо пропускає summary | `scripts/bench.sh:147,163` | 5 | `[x]` |
 | F-33 | P2 | `check_compile_gates.ps1` друкує `OK` після FAIL baseline==HEAD | `scripts/check_compile_gates.ps1:194-197,218` | 5 | `[x]` |
 | F-34 | P2 | Планові/ручні CI-лейни (PS TerminateProcess, raw-kill, euthanasia) не мають PR/push-еквівалента | `.github/workflows/stress.yml:134,171,211` | 5 | `[x]` |
-| F-35 | P3 | TTL re-stamp після settle-wake може нескінченно продовжувати TTL; TTL перевіряється лише на poll | `src/node.rs:3730`, `3679-3684`; `tests/task_engine.rs:272` | 7 | `[ ]` |
-| F-36 | P3 | `auto_seq` Relaxed: епоха, видана «пізніше», може програти гонку `gate.observe` | `src/node.rs:2308` | 7 | `[ ]` |
-| F-37 | P3 | `LaneState` cross-field recovery: теоретично `pid:Some` + `drain:None` | `src/pool/lane.rs:128-168` | 7 | `[ ]` |
-| F-38 | P3 | `channel.rs:300` Acquire на лічильнику без Release-письменника (декоративний) | `src/channel.rs:300` | 7 | `[ ]` |
-| F-39 | P3 | `node.rs:1462/1482` SeqCst fences ні з чим не паряться (no-op) | `src/node.rs:1462,1482` | 7 | `[ ]` |
+| F-35 | P3 | TTL re-stamp після settle-wake може нескінченно продовжувати TTL; TTL перевіряється лише на poll | `src/node.rs:3730`, `3679-3684`; `tests/task_engine.rs:272` | 7 | `[x]` |
+| F-36 | P3 | `auto_seq` Relaxed: епоха, видана «пізніше», може програти гонку `gate.observe` | `src/node.rs:2308` | 7 | `[x]` |
+| F-37 | P3 | `LaneState` cross-field recovery: теоретично `pid:Some` + `drain:None` | `src/pool/lane.rs:128-168` | 7 | `[x]` |
+| F-38 | P3 | `channel.rs:300` Acquire на лічильнику без Release-письменника (декоративний) | `src/channel.rs:300` | 7 | `[x]` |
+| F-39 | P3 | `node.rs:1462/1482` SeqCst fences ні з чим не паряться (no-op) | `src/node.rs:1462,1482` | 7 | `[x]` |
 
 ---
 
@@ -526,19 +526,31 @@ bench `grep` rc 2 → FAIL; `--github` у CI без summary → exit 1; harness 
 `examples/12_isr_bridge.rs`, `src/node.rs`, `src/pool/lane.rs`, `src/channel.rs`.
 
 **Кроки:**
-- [ ] F-28: тест `future_dropped_after_settle_pop_before_repoll` (handoff з `entry.rs:13-16`).
-- [ ] F-28: тест `half_open_cancel_does_not_leak_probe` (async cancel під час HalfOpen).
-- [ ] F-28: тест `async_path_recovers_from_node_mutex_poison` (отруїти замок із тесту, перевірити
-      `poison_recoveries` + відсутність зависання).
-- [ ] F-26: перейменувати статики в `tests/guard.rs`.
-- [ ] F-27: `examples/12_isr_bridge.rs` — після abort у cycle 3 assert, що `laser_on == false`.
-- [ ] F-23: або справжній preemption-тест, або коментар «synthetic feed, not a preemption exercise».
-- [ ] F-35: задокументувати TTL re-stamp (рядок у USER_GUIDE/INVARIANTS) і додати тест, що TTL
-      не продовжується **в межах одного park**; поведінку після settle-wake лишити як є (P3).
-- [ ] F-36/F-37/F-38/F-39: додати по одному короткому коментарю-поясненню в код (чому Relaxed/Acquire
-      безпечний або чому fence no-op), щоб наступний аудит не відкривав те саме.
-- [ ] F-37: якщо легко — зробити `LaneState` атомарною парою (окремий `Option<(u32, PipeDrain)>`)
-      або задокументувати, що panic-point відсутній.
+- [x] F-28: тест `future_dropped_after_settle_pop_hands_the_slot_to_the_next_waiter` (handoff з
+      `async_engine/entry.rs:13-16`; settle будить рівно одного, cancel передає слот наступному).
+- [x] F-28: тест `half_open_async_probe_cancelled_in_queue_does_not_wedge_the_breaker` (async probe
+      паркується, скасовується, новий probe закриває breaker).
+- [x] F-28: тест `async_admission_recovers_from_a_poisoned_ledger` (unit-тест у `src/node.rs`:
+      отруєний ledger, `poison_recoveries >= 1`, `commit`, консервація).
+- [x] F-26: перейменувати статики в `tests/guard.rs` (зроблено в Етапі 3:
+      `ROLLBACKS_ON_COMMIT` / `ROLLBACKS_ON_DROP` / `ROLLBACKS_ON_ABORT`).
+- [x] F-27: `examples/12_isr_bridge.rs` — після abort у cycle 3 assert, що `laser_on == false`
+      (приклад прогнано: `[Guard] laser off`, assert зелений).
+- [x] F-23: синтетичний фід перейменовано в `synthetic_anomaly_feed_triggers_preempt_storm_verdict`
+      (Етап 3); справжнє preemption-покриття живе в `tests/priority_preemption.rs`.
+- [x] F-35: задокументовано TTL re-stamp у USER_GUIDE (`task_ttl` bullet: перший park, без re-stamp,
+      settle-wake edge = залишок lease); тест `spurious_repolls_do_not_reset_the_ttl_clock` уже покриває
+      межу одного park.
+- [x] F-36/F-37/F-38/F-39: рішення в коді —
+      `next_sequence` Relaxed пояснено (unique ticket, не wall-clock);
+      `LaneState` pid/drain задокументовано (panic-point між двома store відсутній);
+      `channel.rs` depth переведено на Relaxed (advisory gauge, авторитет — `try_send`; latch
+      лишається Release/Acquire);
+      два SeqCst fences в `ErasedTransaction` видалено (замок ledger і є ordering edge).
+- [x] F-37: атомарну пару не вводив — comment фіксує умову, за якої це знадобиться.
+
+**Тести:** `cargo test --lib` (25), `cargo test --test async_primitives` (17), `cargo run --example 12_isr_bridge`,
+повний suite 378 passed (+26 doctests = 404).
 
 **Готово:** нові тести зелені; приклад має post-abort assert; P3-пункти мають явне рішення
 (фікс або документований виняток).
@@ -546,11 +558,14 @@ bench `grep` rc 2 → FAIL; `--github` у CI без summary → exit 1; harness 
 **Коміт:** `test(async): cover settle handoff, half-open cancel, poisoned node path`
 
 **Дописи:**
-- Для poison-тесту потрібен спосіб отруїти `NodeInner` ззовні: можливо, через `catch_unwind` навколо
-  тестового hook'а, який панікує під замком (але після Етапу 1 hook не під замком). Якщо публічного
-  способу немає — використати існуючий тестовий модуль або задокументувати, що шлях покритий
-  лише статично.
-- Не додавати нові залежності заради тестів.
+- Poison-тест не потребує публічного API: unit-модуль у `src/node.rs` бачить `inner` і труїть
+  ledger через `catch_unwind` під `MutexGuard`. Waker створено через `std::task::Wake` (без `unsafe`),
+  тож `#![forbid(unsafe_code)]` лишається чинним і для тестів.
+- `Relaxed` на gateway depth — не послаблення: `fetch_add`/`fetch_sub` і раніше були Relaxed, тож
+  Acquire-читач ні з чим не парився; тепер це чесно задокументовано, а latch (`throttled`) зберігає
+  Release/Acquire.
+- Видалені fences нічого не впорядковували: наступний виклик бере `Mutex` ledger, який сам дає
+  acquire/release edge; окремий SeqCst fence був no-op.
 
 ---
 

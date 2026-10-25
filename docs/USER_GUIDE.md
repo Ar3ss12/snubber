@@ -627,7 +627,7 @@ let node = SnubberNode::builder("task_pipeline")
     .build();
 ```
 
-* **`task_ttl`**: Tasks waiting longer than their lease fail fast with `Err(EnterError::QueueTtlExpired)`.
+* **`task_ttl`**: Tasks waiting longer than their lease fail fast with `Err(EnterError::QueueTtlExpired)`. The lease clock starts at the **first park** and is never re-stamped: a spurious re-poll, or a settle-wake that loses the free slot to a newer admission and re-parks, keeps the original stamp. TTL therefore bounds total queue residence, not the time since the last park — a woken-but-scooped waiter only gets the remainder of its lease.
 * **`queue_capacity` & `shed_policy`**: At capacity, `RejectNew` returns `Err(EnterError::QueueFull)`, while `EvictOldest` discards the oldest waiter.
 * **`queue_depth()` / `queue_capacity()`**: Live waiter-queue gauge (`waiters.len()`) and its ceiling. Synchronous nodes have no waiter queue; their pre-admission wait is reported by `TrackedGuard::queue_wait_ms()`.
 * **`payload_budget`**: Rejects oversized inputs before memory allocation (`Err(EnterError::PayloadBudgetExceeded)`).
