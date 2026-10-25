@@ -552,7 +552,7 @@ into any `core::fmt::Write`.
 
 ## Layer 3: Runtime-Agnostic Async (Tokio, Axum, gRPC)
 
-`snubber` is completely runtime-agnostic: it requires **zero external dependencies** and uses pure `core::task::Waker` parking. It works identically in Tokio, async-std, smol, or bare-metal executors.
+`snubber` is completely runtime-agnostic: it requires **zero external dependencies** and uses pure `core::task::Waker` parking. The async engine is `std`-gated (it owns OS threads and an admission queue), so it runs identically in Tokio, async-std, smol, or any other `std` executor; `core`-only firmware uses the pulse, ISR and drain layers instead.
 
 ### 1. Zero-Runtime Waker Queue (`enter_async` / `enter_async_auto`)
 When `max_in_flight` is reached, `enter_async_auto` parks the caller's `core::task::Waker` at **0% CPU** without running background polling threads or spinning:
@@ -1722,6 +1722,11 @@ cites the TTL regression test.
 
 ## API & Cost Quick Reference
 
+Latency figures are Criterion means from `target/criterion/*/new/estimates.json`
+on an AMD Ryzen 5 4600H (`cargo bench --bench admission_bench`). The four
+contended rows were re-measured 2026-10-25; the rest 2026-10-24. Differences
+below ~2 ns are inside run-to-run noise and are not claimed as wins.
+
 | Operation | Layer | Latency / Footprint | When to Use |
 |---|---|---|---|
 | `snub_check!(cond, reason)` | 1 / core | ~0 ns (single branch) | Universal invariant check, returns `Err` |
@@ -1758,20 +1763,21 @@ cites the TTL regression test.
 | `guard.profile_snapshot()` | 2 / std | 1 wall + 1 CPU read | Mid-flight profile without settling |
 | `ConflateSender::pair()` + `publish` / `take_latest` | 2 / std | **~21.6 ns** pair; ~16.0 ns replace | Latest-value channel (queue 0 or 1), coalescing counted, no `Clone` bound on payload |
 | `ExecutionEnvelope::new(..)` + `execution_envelope(env)` + `commit_enveloped(bytes)` | 2 / std | 16 B `Copy` header; **~142 ns** settle with payload judge | Corridor catches too slow/too big and too fast/too small; underflow/overflow in own stats columns, breaker untouched |
-| `ProfileHarness` + `HarnessReport` / `run_boundary_harness` | 2 / std | one `Vec` of samples + sort | Deterministic PRNG, min/median/max/jitter/burst matrix, `report.envelope(headroom)` |
+| `ExecutionEnvelope::{off, is_off, is_inside, has_underflow, has_overflow, time_verdict, payload_verdict}` | 2 / std | `const fn` header math on one `Copy` value | Inspect a corridor without admitting: `off()`/`is_off()` disable it, `is_inside()` answers the four-bound question, `time_verdict(wall_us)` / `payload_verdict(bytes)` classify one measurement into `TimeVerdict` / `PayloadVerdict` |
+| `ProfileHarness` + `HarnessReport` / `run_boundary_harness` | 2 / std | one `Vec` of samples + sort | Deterministic PRNG, min/median/max/jitter/burst matrix, `report.envelope(headroom)`; accessors: `HarnessReport::mean_us()`, `ProfileHarness::{samples, burst_len}`; `FastPrng` is the xorshift32 payload generator behind `run` |
 | `snapshot.diff(&later)` + `write_summary` | 2 / cold | pure `Copy` math | Counter deltas + memory/queue window (`SnapshotDiff`) |
 | `write_triage(&mut out, node, &snap)` | 2 / cold | `fmt::Write`, no alloc | One ASCII verdict card per node |
 | `node_passthrough_enter` | 2 / std canary | **~97.1 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
 | `node_passthrough_scoped` | 2 / std canary | **~94.8 ns** | Same transit through `scoped()` — work runs, books stay clean |
-| `contended_node_enter` (6 threads, shared `enter_auto` allocator) | 2 / std contended | **~915 ns** | MESI cache-line bouncing on node mutex; StaleEpoch losers bounded-retry (cap 64 + yield), same contract as `concurrency_stress` |
-| `contended_node_scoped` (6 threads) | 2 / std contended | **~871 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
-| `contended_gateway_mpsc` (6 producers + drain) | 2 / std contended | **~172 ns** | Bounded multi-producer write under parallel core flood |
-| `cross_thread_isr_bridge` (push core + pop core) | 1 / core inter-core | **~37.2 ns** | Lock-free SPSC ring across physical cores (honest inter-core bus latency, not L1-hot loop) |
+| `contended_node_enter_threads_6` (6 threads, shared `enter_auto` admit counter) | 2 / std contended | **~918 ns** | MESI cache-line bouncing on node mutex; StaleEpoch losers bounded-retry (cap 64 + yield), same contract as `concurrency_stress` |
+| `contended_node_scoped_threads_6` (6 threads) | 2 / std contended | **~911 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
+| `contended_gateway_mpsc_threads_6` (6 producers + drain) | 2 / std contended | **~140 ns** | Bounded multi-producer write under parallel core flood |
+| `cross_thread_isr_bridge_push_pop` (push core + pop core) | 1 / core inter-core | **~35.5 ns** | Lock-free SPSC ring across physical cores (honest inter-core bus latency, not L1-hot loop) |
 | `node.enter_async_auto` | 2 / std | 0% CPU waker park | Async admission under bounded concurrency |
 | `guard.settle_async(fut)` | 2 / std | zero lock during await | Commit across `.await` points |
 | `TaskConduit` / `TaskHandle` | 2 / std | lock-free atomics | 2-way live steering, pause/resume waker, drafts |
 | `PipeDrain` + `ProcessToken` | 2 / std | 44-byte stream; **~44 ns/frame** (256-frame sync drain) | Hardware rollback across process death (`kill -9`) |
-| `ProcessToken::from_bytes` / `to_bytes` | 1 / core | **~7.4 ns** parse / **~8.0 ns** frame | 44-byte wire frame, no allocation |
+| `ProcessToken::commit(task)` / `from_bytes` / `to_bytes` | 1 / core | **~7.4 ns** parse / **~8.0 ns** frame; `commit` is `const` | 44-byte wire frame, no allocation; `commit(task)` builds the settle-clean marker (`OP_COMMIT`, zero payload) without touching the wire codec |
 | `node.snapshot_v1()` + `encode()` | 2 / cold | 512 B, CRC32 | Crash-safe persistence, app-owned flush thread |
 | `find_anomalies()` / `assert_no_anomalies!` | 2 / cold | pure `u128` math | CI gate + diagnostics console + `[DIAG 0x…]` bug reports |
 | `NodeSet` set | 2 / cold | explicit `&Node` list + saturating aggregates | Multi-node pulse, never a `static` |
@@ -1784,8 +1790,12 @@ cites the TTL regression test.
 | `EnvelopeVerdict`, `crc32_ieee`, `diagnostic_hash`, `scan_anomalies_for_snapshot`, `find_anomalies_for_snapshot`, `write_diagnostic_line`, `write_health` (Layer 5 helpers) | 5 / std (`find_anomalies_for_snapshot`: alloc) | `Copy` verdict / pure fns / `Write` renderers | Frame-envelope verdict types and the anomaly-scan/hash/render helpers the pool and diagnostic layers are built on; exposed for harnesses that reuse the same classification outside the crate |
 | `LeaseEvent { task_id, stage, kind }` | 3 / std | `Copy` event | Reaper mailbox payload fired by `AsyncLease` drop; overflow accounting goes through `LeaseChannel::fire` |
 | `run_supervised_guard_with_grace(worker_flag, lease_ms, eof_grace_ms, on_dead_token)` | 3 / std | one reaped child process | Supervised guard with a configurable terminal EOF grace: a slow-flushing child (big buffered stdout) gets more than the default grace before death classification, so an in-flight rescue token is never misreported CLEAN |
-| `ProcessToken` / `SnubScanner` (core `drain` module) | 1 / core | 44-byte wire frame; zero allocation | Token parser reachable without `std`: `to_bytes` / `from_bytes` / `from_body_bytes` and the streaming `SnubScanner::push` work on bare metal; `feed`/`write_to` drive it without a reader thread |
-| `pool.attach(..)` / `pool.note_death(..)` → `PoolReap` | 3 / std | **~192 ns** ambush / **~173 ns** escape (one lane lock each) | One reap: `class` (`Ambush`/`Escape`/`Stillborn`/`Deadlocked`), rescued `token`, next `generation`, last `StateDigest`, per-lane `RestartDecision`; the app owns sleep + spawn |
+| `ProcessToken` / `SnubScanner` (core `drain` module) | 1 / core | 44-byte wire frame; zero allocation | Token parser reachable without `std`: `ProcessToken::commit` / `to_bytes` / `from_bytes` / `from_body_bytes` and the streaming `SnubScanner::push` work on bare metal |
+| `PipeDrain::feed` / `finish` / `write_to` (transport) | 2 / std | `feed`: caller-pushed chunks, no reader thread; `write_to` needs `std::io::Write` | Chunk transport layered ON the core scanner: `feed` takes raw bytes (UART/DMA adapters call it directly), `write_to` requires a `std::io::Write` sink — on bare metal implement the adapter yourself |
+| `lane.attach(..)` / `lane.note_death(..)` → `PoolReap` | 3 / std | **~192 ns** ambush / **~173 ns** escape (one lane lock each) | One reap: `class` (`Ambush`/`Escape`/`Stillborn`/`Deadlocked`), rescued `token`, next `generation`, last `StateDigest`, per-lane `RestartDecision` (`respawn_delay_ms()`); the app owns sleep + spawn |
+| `PoolConfig::{with_memory, with_eof_grace}` + `WorkerPool::new` | 3 / std | `const` builder; one `Vec<Arc<PoolLane>>` | Pool configuration: per-lane soft/hard RSS limits and the terminal EOF grace (default `DEFAULT_EOF_GRACE_MS`); `new` validates capacity and returns `PoolError` |
+| `PoolLane::{next_epoch, pid, counters, idle_ms, expired, memory_verdict, snapshot}` | 3 / std | one short lane lock per call | Lane introspection: next generation ticket (handshake value), current pid, `DrainCounters`, idle time, lease expiry, last `MemoryVerdict`, and a `LaneSnapshot` row |
+| `WorkerPool::total_rescued` / `PoolReport::{deadlocked, conserved, healthy, final_generations}` | 3 / std | saturating fold over lane snapshots; one `Vec<u64>` | Pool-wide rescue count; `deadlocked()` = any lane had an unverifiable pipe; `conserved()` = every lane books its reaps; `healthy()` = both; `final_generations()` = the generation each lane stopped at (`kills + 1` on a clean storm) |
 | `pool.report()` / `PoolTotals::of(&lanes)` | 3 / std | **~111 ns** four lanes | Aggregated row per lineage (`LaneSnapshot`) plus pool-wide sums; `report()` performs one `Vec<LaneSnapshot>` allocation (`lanes.len()` rows), included in the measurement |
 | `pool.expired_lanes(lease_ms)` | 3 / std | **~517 ns** four lanes (~129 ns per lane) | Lease sweep: names only lanes whose parsed heartbeat froze past the lease; the app kills them itself |
 | `LaneSnapshot` / `PoolTotals` | 3 / std | `Clone` row / `Copy` totals | Rows carry `conserved()` (`ambush+escape+stillborn+deadlocks == reaps`); totals fold the same four honest buckets, never a guessed fifth |

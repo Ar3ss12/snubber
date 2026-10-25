@@ -4,6 +4,69 @@ All notable changes to `snubber`. Benchmarks live in [README.md](README.md);
 the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 ("Fixed in …" sections) and [docs/INVARIANTS.md](docs/INVARIANTS.md).
 
+## Unreleased
+
+Eighth-audit batch (hook panics, scanner reset order, lock hygiene, honest
+tests and benches, CI teeth). No API removals; `Cargo.toml` still reads
+0.6.8 until a release is ordered.
+
+### Fixed
+
+- A panicking `friction_fn` / `pressure_fn` / custom backpressure hook no
+  longer leaves `half_open_probe` set forever: the probe flag is cleared
+  under a fresh lock and the panic is resumed to the caller. A wedged
+  breaker used to survive until a manual `reset()`.
+- `SnubScanner::push` resets its frame state before invoking `on_token`,
+  so a caught panic inside the callback can no longer redeliver the same
+  token on the next chunk.
+- `publish_fault` swaps `last_fault` and drops the replaced `FaultRecord`
+  after the node lock is released; an owned `NodeName` no longer runs
+  foreign destructor code inside the critical section. The doc comment
+  now also states the one-time `flight` realloc that follows an external
+  shrink.
+- Re-parking an async waiter replaces its `Waker` with `mem::replace` and
+  drops the old waker outside the node lock; `deregister_waiter` removes
+  the exact parked entry and drops it outside the lock as well. A waker
+  destructor can no longer re-enter or deadlock the node.
+- `Conduit` wakes parked futures via `mem::take` (no allocation under the
+  wakers lock) and drops a replaced `ResumeFuture` waker after unlock.
+- The node reads the clock outside its mutex: rate-limit admission takes
+  the timestamp before locking, and `check_timeout` snapshots the settle
+  time after rollback but before the fault record is written.
+- `PipeDrain::feed` after `finish()` now increments `feeds_after_eof()`
+  and reports zero frames for the discarded chunk; the documented clock
+  rule matches the code (no clock read under a drain lock).
+
+### Changed
+
+- Documentation names the real receivers and layers: `lane.attach` /
+  `lane.note_death` (not `pool.*`), `PipeDrain::{feed, finish, write_to}`
+  as `std` transport on top of the `core` scanner, and `pool.report()` as
+  one included `Vec<LaneSnapshot>` allocation rather than "no
+  allocation". Public accessors for `PoolConfig`, `PoolLane`,
+  `PoolReport`, `ExecutionEnvelope`, `ProfileHarness`, `HarnessReport`
+  and `ProcessToken::commit` are now listed.
+- README bench IDs match the source (`*_threads_6`, `push_pop`,
+  `classify_stall_ceiling`), and the latency table carries a measurement
+  date, the Criterion command, and the CI artifact lane
+  (`bench-criterion-<run_id>`, `scripts/bench.sh --skip-run`).
+
+### Tooling / CI
+
+- Both gate flavors print an identical `PARITY:` fingerprint, and a
+  Windows CI step fails if the `.sh` and `.ps1` counters diverge; CI
+  detection is strict (`CI=true|1` only) in bash and PowerShell.
+- New release-identity gate compares `Cargo.toml`, the latest tag and
+  `CHANGELOG.md` (warns for a documented-but-untagged version, fails for
+  an undocumented one; never creates tags).
+- New `miri-leaks` job runs without `-Zmiri-ignore-leaks` over the lib
+  and 14 suites; the scheduled `bench-full` job archives Criterion
+  output; `termination-smoke` exercises the supervisor kill path on
+  Ubuntu and Windows on every push.
+- Stress harnesses require `--launch` or an explicit
+  `--external-supervisor` under CI; the supervisor test passes the
+  latter because it owns the child itself.
+
 ## 0.6.8 — 2026-10-23
 
 Seventh-audit batch (core accounting, async liveness, erased slots, honest

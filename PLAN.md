@@ -49,13 +49,13 @@
 | F-12 | P1 | PS-гейт вужчий за sh: 6 лічильників vs 15, лише `record_locked` vs 3 функції | `scripts/check_compile_gates.ps1:25-94` vs `.sh:52-120` | 5 | `[x]` |
 | F-13 | P1 | `stress_harness.sh`: SKIP не валить рана; PID-гейт у секундах; JSON — regex; `LAUNCH=0` вимикає гейти | `scripts/stress_harness.sh:108-146`, `370-373`, `396-398`, `420-443` | 5 | `[x]` |
 | F-14 | P1 | Miri: `-Zmiri-ignore-leaks` у всіх лейнах; покрито 33 з ~60 файлів | `.github/workflows/ci.yml:175,180,216` | 5 | `[x]` |
-| F-15 | P1 | `feed`/`finish`/`write_to` — std-only, а таблиця гайда продає їх як core/bare-metal | `src/supervisor.rs:518,678,888,907`; `src/lib.rs:128-129`; `USER_GUIDE.md:1787` | 6 | `[ ]` |
+| F-15 | P1 | `feed`/`finish`/`write_to` — std-only, а таблиця гайда продає їх як core/bare-metal | `src/supervisor.rs:518,678,888,907`; `src/lib.rs:128-129`; `USER_GUIDE.md:1787` | 6 | `[x]` |
 | F-16 | P1 | `PipeDrain::feed` після `finish` тихо відкидає чанк і рапортує `0 frames`; коментар про clock суперечить коду | `src/supervisor.rs:892-918`, `896-901` | 2/7 | `[x]` |
 | F-17 | P1 | FakeWake: мертве поле `usize`, `wake` — no-op, identity-твердження не перевіряється | `tests/task_engine.rs:255-268` | 5 | `[x]` |
-| F-18 | P2 | `USER_GUIDE.md` документує неіснуючі `pool.attach`/`pool.note_death` | `USER_GUIDE.md:1788` vs `src/pool/lane.rs:157,241` | 6 | `[ ]` |
-| F-19 | P2 | Назви бенчів у README не збігаються з джерелом (`_threads_`, `classify_stall`) | `README.md:102,154-156` vs `benches/admission_bench.rs:49,627,679,719` | 6 | `[ ]` |
-| F-20 | P2 | Числа латентності без артефактів; бейдж 394 без дати/команди; «121 ns» не існує | `README.md:7,67,94,108`; `target/` відсутній | 5/6 | `[ ]` |
-| F-21 | P2 | Публічні аксесори не задокументовані (pool/envelope/harness/token) | `src/pool/mod.rs:121,131,277`; `lane.rs:65,145`; `envelope.rs:84-196`; `harness.rs:28-198`; `drain.rs:109` | 6 | `[ ]` |
+| F-18 | P2 | `USER_GUIDE.md` документує неіснуючі `pool.attach`/`pool.note_death` | `USER_GUIDE.md:1788` vs `src/pool/lane.rs:157,241` | 6 | `[x]` |
+| F-19 | P2 | Назви бенчів у README не збігаються з джерелом (`_threads_`, `classify_stall`) | `README.md:102,154-156` vs `benches/admission_bench.rs:49,627,679,719` | 6 | `[x]` |
+| F-20 | P2 | Числа латентності без артефактів; бейдж 394 без дати/команди; «121 ns» не існує | `README.md:7,67,94,108`; `target/` відсутній | 5/6 | `[x]` |
+| F-21 | P2 | Публічні аксесори не задокументовані (pool/envelope/harness/token) | `src/pool/mod.rs:121,131,277`; `lane.rs:65,145`; `envelope.rs:84-196`; `harness.rs:28-198`; `drain.rs:109` | 6 | `[x]` |
 | F-22 | P2 | `supervisor_pool_stress`/`stress_mixed`/`stress_lease`: `env_num` без мінімумів → `KILLS=0` робить усе тривіально зеленим | `tests/supervisor_pool_stress.rs:37-38`; `stress_mixed.rs:45-46`; `stress_lease.rs:64-67` | 3 | `[x]` |
 | F-23 | P2 | `transition_orphan` «preempt storm» синтетичний (`report(Preempted)`), не справжній preemption | `tests/transition_orphan.rs:69-73` | 3 | `[x]` |
 | F-24 | P2 | `priority_preemption.rs:119` rollback-свідок не мутує стан, лише лічить виклики | `tests/priority_preemption.rs:50,113-119` | 3 | `[x]` |
@@ -476,29 +476,29 @@ bench `grep` rc 2 → FAIL; `--github` у CI без summary → exit 1; harness 
 **Файли:** `README.md`, `docs/USER_GUIDE.md`, `CHANGELOG.md`, `docs/INVARIANTS.md` (публічний).
 
 **Кроки:**
-- [ ] F-18: `USER_GUIDE.md:1788` — `lane.attach(..)` / `lane.note_death(..)`; звірити з прикладом
+- [x] F-18: `USER_GUIDE.md:1788` — `lane.attach(..)` / `lane.note_death(..)`; звірити з прикладом
       `USER_GUIDE.md:1123-1130`.
-- [ ] F-15: `USER_GUIDE.md:1787` — розділити рядок: core = `SnubScanner::push` + `ProcessToken::*`;
+- [x] F-15: `USER_GUIDE.md:1787` — розділити рядок: core = `SnubScanner::push` + `ProcessToken::*`;
       `feed`/`finish`/`write_to` — окремий рядок `std`, з приміткою «requires `std::io::Write`; для UART/DMA
       потрібен власний адаптер».
-- [ ] F-04: виправити «no allocation» (див. 1.4).
-- [ ] F-19: назви бенчів — додати `_threads_{N}` у README або явно писати «family `contended_node_enter_threads_*`»;
+- [x] F-04: виправити «no allocation» (див. 1.4).
+- [x] F-19: назви бенчів — додати `_threads_{N}` у README або явно писати «family `contended_node_enter_threads_*`»;
       `classify_stall` → `classify_stall_ceiling` (або позначити, що це API-ім'я).
-- [ ] F-20: біля таблиці латентності — provenance-блок: дата, команда, посилання на артефакт
+- [x] F-20: біля таблиці латентності — provenance-блок: дата, команда, посилання на артефакт
       (або «historical, see CI artifact»); бейдж — команда перевірки.
-- [ ] F-21: додати в API-таблицю публічні аксесори:
+- [x] F-21: додати в API-таблицю публічні аксесори:
       `PoolConfig::with_memory/with_eof_grace`, `PoolLane::respawn_delay_ms/next_epoch`,
       `WorkerPool::total_rescued`, `PoolReport::deadlocked/final_generations`,
       `ExecutionEnvelope::{off,is_inside,has_underflow,has_overflow,is_off,time_verdict,payload_verdict}`,
       `FastPrng`, `HarnessReport::mean_us`, `ProfileHarness::{samples,burst_len}`, `ProcessToken::commit`.
-- [ ] F-20/ratios: додати в README короткі посилання на rationale (50 MB trap, cgroup/fadvise,
+- [x] F-20/ratios: додати в README короткі посилання на rationale (50 MB trap, cgroup/fadvise,
       `max+1`, «Level Budget, Not Time Budget») — зараз вони є лише в USER_GUIDE.
-- [ ] Перевірити, що жоден рядок не обіцяє bare-metal для std-API; grep `core`/`bare metal`/`no_std`
+- [x] Перевірити, що жоден рядок не обіцяє bare-metal для std-API; grep `core`/`bare metal`/`no_std`
       по таблицях.
-- [ ] `CHANGELOG.md`: додати секцію для наступної версії з усіма поведінковими змінами етапів 1–4
+- [x] `CHANGELOG.md`: додати секцію для наступної версії з усіма поведінковими змінами етапів 1–4
       (без version bump, якщо реліз не замовлено).
 
-**Тести:** `cargo test --doc`; `grep`-аудит протиріч; за потреби — doc-test, що імпортує згадані методи.
+**Тести:** `cargo test --doc` (26 passed); `grep`-аудит протиріч; усі 24 згадані аксесори знайдено в `src/`.
 
 **Готово:** жодного неіснуючого методу/бенча в docs; «no allocation» відсутнє там, де є `Vec`;
 кожне число має джерело; усі публічні типи 0.6.x мають хоч один рядок у таблиці.
@@ -508,6 +508,13 @@ bench `grep` rc 2 → FAIL; `--github` у CI без summary → exit 1; harness 
 **Дописи:**
 - Локальні docs не згадувати і не комітити; публічні — README/USER_GUIDE/INVARIANTS/CHANGELOG.
 - Не вигадувати нові числа: якщо бенч не прогнаний — писати «historical» і дату, а не «re-measured».
+- `CHANGELOG.md` секція `## Unreleased`: hook-паніки, порядок reset сканера, lock hygiene, clock поза
+  замком, `feeds_after_eof`, чесні tests/benches, CI-гейти. Версія в `Cargo.toml` не змінена (0.6.8),
+  гейт `check_release_tag.sh` дає OK «ahead of v0.6.3 and marked Unreleased».
+- Виправлено два хибні bare-metal твердження: async engine тепер явно `std`-gated у USER_GUIDE, а
+  README-сніпет `PipeDrain::manual_with_clock`/`feed` позначений як `std`-транспорт поверх core-сканера.
+- Анкори rationale перевірені проти реальних заголовків USER_GUIDE (`4.6c`, `Why a naive serialization…`,
+  `cgroup v2…`, `Fixed in 0.6.4…`).
 
 ---
 

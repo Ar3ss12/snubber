@@ -51,9 +51,10 @@ let receipt = node.scoped_checked(
 
 `std` and `alloc` are additive features. Without `std` the crate is `core`-only (`#![cfg_attr(not(feature = "std"), no_std)]`); CI builds **both** `core` and `core + alloc` for `thumbv7em-none-eabihf`, and `WorkerPulse` drops to a 32-bit atomic on targets without 64-bit CAS. The `no_std` surface is the watchdog, ISR bridge, clock, envelope, contract, policy, diagnostics core, memory watch, drain (token parser + `SnubScanner`), and protect layers; `alloc` adds the erased guard and dynamic node-name layers; `SnubberNode` itself and the async engine, supervisor, pool, channel, conduit, conflate, and harness layers are `std` because they own OS threads, pipes, and process trees.
 
-The supervisor parser does not require a reader thread or stdout. Push bytes from a UART/DMA task and declare EOF yourself:
+The supervisor parser does not require a reader thread or stdout. `PipeDrain` is `std` (it owns the EOF state and counters); push bytes from a UART/DMA task and declare EOF yourself. On `core`-only targets, the same bytes go straight into the `core` `SnubScanner`:
 
 ```rust
+// std transport layered on the core scanner
 let drain = PipeDrain::manual_with_clock(app_tick_ms); // injectable clock
 let frames = drain.feed(uart_chunk);                   // any chunking, any size
 drain.finish();                                        // EOF → rescue classification
@@ -97,13 +98,18 @@ re-measured on 2026-10-25 with the fail-fast pool (the 6-thread gateway
 row moved from ~172 ns as a result).
 Values are Criterion means from `target/criterion/*/new/estimates.json`;
 differences below ~2 ns are inside run-to-run noise and are not claimed as
-wins.
+wins. The scheduled `bench-full` CI lane archives the raw Criterion trees
+plus `target/bench/snapshot.md` as artifact `bench-criterion-<run_id>`
+(`cargo bench --locked --bench admission_bench`, then
+`bash scripts/bench.sh --skip-run --github`). To re-print the table from an
+existing `target/criterion` without running benches again, use
+`bash scripts/bench.sh --skip-run`.
 
 | Operation | Architecture Layer | Average Latency | Notes |
 |---|---|---|---|
 | `SnubberGuard::new` + `commit` | Layer 1 (`core`) | **~5.4 ns** | Stack move + owned-field drop, zero heap allocation |
 | `EpochGate::observe` | Layer 1 (`core`) | **~2.6 ns** | 2-D generation + monotonic epoch filter |
-| `classify_stall` / `classify_stall_ceiling` | Layer 1 (`core`) | **~2.1 ns** (const math) | `CpuSpin` / `SleepBlocked` / `DeadlockStall` from one sample pair (the settle verdicts `SpinDetected` / `DeadlockSuspected` come from `guard.check_timeout`) |
+| `classify_stall_ceiling` (bench; `classify_stall` is the 4-arg wrapper that delegates here) | Layer 1 (`core`) | **~2.1 ns** (const math) | `CpuSpin` / `SleepBlocked` / `DeadlockStall` from one sample pair (the settle verdicts `SpinDetected` / `DeadlockSuspected` come from `guard.check_timeout`) |
 | `node.enter + commit` | Layer 2 (`std`) | **~125 ns** | Full bulkhead, circuit breaker, auto-commit |
 | `node.enter_auto + commit` | Layer 2 (`std`) | **~130 ns** | + atomic sequence minting |
 | `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~126 ns** | Priority lane; same band as plain enter (one measurement) |
@@ -150,15 +156,28 @@ wins.
 | `before.diff(&after)` + `write_triage` | Layer 5 (cold) | structural: pure `Copy` math + `fmt::Write` | Counter deltas since last sample; one ASCII verdict card |
 | `memory_limits(soft, hard)` + admission | Layer 2 (`std`) | structural: 1 relaxed load | Over soft → `EnterError::MemoryPressure` without taking the mutex |
 
+**Why the shape, not just the numbers.** The User Guide argues the four
+ratios this table depends on: the per-layer split is a
+[level budget, not a time budget](docs/USER_GUIDE.md#46c-checkpoint-physics-64-b-is-a-ticket-not-storage)
+(`hard - soft` is allocator headroom, not a countdown); the 512 B snapshot
+is a
+[deliberate lossy checkpoint](docs/USER_GUIDE.md#why-a-naive-serialization-dies-50-mb-state)
+because cloning 50 MB of state crosses the hard limit before the first
+`write_all`; a pre-fork RSS number is not a container number because
+[cgroup v2 counts page cache](docs/USER_GUIDE.md#cgroup-v2-page-cache-counts-against-the-limit);
+and `EvictOldest` admits exactly one transient
+[`max + 1`](docs/USER_GUIDE.md#fixed-in-064-post-release-audit-strike)
+slot — beyond that it sheds like every other caller.
+
 ### ⚡ Contended Multi-Threaded Latencies (Real Thread Saturation)
 Measured with half of available hardware cores active (6 concurrent threads under contention, AMD Ryzen 5 4600H):
 
 | Contended Operation | Concurrency | Measured Latency | Physical Phenomenon |
 |---|---|---|---|
-| `contended_node_enter` | 6 threads | **~918 ns** | Mutex contention: cache-line transfer between threads |
-| `contended_node_scoped` | 6 threads | **~911 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
-| `contended_gateway_mpsc` | 6 threads | **~140 ns** | Bounded multi-producer channel write under parallel thread load |
-| `cross_thread_isr_bridge` | 2 threads | **~35.5 ns** | Lock-free SPSC ring: cache-line handoff between threads |
+| `contended_node_enter_threads_6` | 6 threads | **~918 ns** | Mutex contention: cache-line transfer between threads |
+| `contended_node_scoped_threads_6` | 6 threads | **~911 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
+| `contended_gateway_mpsc_threads_6` | 6 threads | **~140 ns** | Bounded multi-producer channel write under parallel thread load |
+| `cross_thread_isr_bridge_push_pop` | 2 threads | **~35.5 ns** | Lock-free SPSC ring: cache-line handoff between threads |
 
 ### ⚡ Multi-Lineage Termination Storm
 
