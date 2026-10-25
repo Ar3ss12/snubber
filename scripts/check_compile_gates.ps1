@@ -11,8 +11,10 @@ $Skips = 0
 
 # CI mode: GitHub Actions sets CI=true. A SKIP in a controlled
 # environment is a hole in the audit, not a pass (parity with the .sh).
-# Compare the VALUE: [bool]"false" is true for any non-empty string.
-$InCi = ($env:CI -ne $null -and $env:CI -ne "" -and $env:CI -notin @("false", "0"))
+# Strict parity with the .sh `in_ci`: only "true"/"1" count as CI, so an
+# unrecognised value can never silently turn SKIPs into hard failures.
+$CiFlag = if ($env:CI) { $env:CI.ToLowerInvariant() } else { "" }
+$InCi = ($CiFlag -eq "true" -or $CiFlag -eq "1")
 
 # Precondition: a missing scanned path must fail, never yield an empty scan.
 foreach ($Need in @("src\lib.rs", "src\node.rs", "src", "benches", "examples", "tests")) {
@@ -46,8 +48,11 @@ if ($UnsafeMatches) {
 
 # Gate 2: Saturating arithmetic on counters in src/node.rs
 Write-Host "[2/7] Auditing saturating counters in src/node.rs..." -NoNewline
-# Counter increment check: flag direct `+= 1` on known counter fields
-$CounterViolations = Select-String -Path "$RepoRoot\src\node.rs" -CaseSensitive -Pattern "\b(in_flight|total_started|committed|bulkhead_rejections|poison_recoveries|stale_epochs_rejected)\s*\+=" |
+# Every monotonic counter the node books -- parity with the .sh gate. A new
+# bucket (rate/breaker/memory/evicted/preempted/implicit drops/trips) must
+# not be writable with a bare `+=`.
+$CounterPattern = 'in_flight|total_started|committed|explicit_aborts|implicit_drops|bulkhead_rejections|poison_recoveries|stale_epochs_rejected|rate_rejected|breaker_rejections|memory_rejections|evicted|preempted|breaker_trips|reported'
+$CounterViolations = Select-String -Path "$RepoRoot\src\node.rs" -CaseSensitive -Pattern "(^|[^_a-zA-Z0-9])($CounterPattern)\s*\+=" |
     Where-Object { $_.Line -notmatch '^\s*//' }
 if ($CounterViolations) {
     Write-Host " FAIL: Direct += found on counter:" -ForegroundColor Red
@@ -59,40 +64,58 @@ if ($CounterViolations) {
 
 # Gate 3: Lock-hygiene audit in Phase A/C (no foreign calls / formatting under lock)
 Write-Host "[3/7] Auditing zero-panic mutex discipline in src/node.rs..." -NoNewline
-# Extract the FULL `fn record_locked` body (signature line to the first
-# method-indent closing brace) and forbid panicking/formatting calls
-# inside it. Select-String is line-based and cannot span lines, so the
-# previous single-pattern check only ever saw the signature line.
-$NodeLines = Get-Content "$RepoRoot\src\node.rs"
-$InFn = $false
-$SigIndent = 0
-$FnBody = New-Object System.Collections.Generic.List[string]
-foreach ($Line in $NodeLines) {
-    if (-not $InFn -and $Line -match '^(\s*)fn record_locked\(') {
-        $InFn = $true
-        $SigIndent = $Matches[1].Length
+# Extract each lock-path body from its signature line to the closing brace
+# at the SIGNATURE's indent. Parity with the .sh gate: all three functions
+# are scanned, not only record_locked. Select-String is line-based and
+# cannot span lines, so a single-pattern check would only see signatures.
+function Get-FnBody {
+    param([string]$Path, [string]$Needle)
+    $InFn = $false
+    $SigIndent = 0
+    $Body = New-Object System.Collections.Generic.List[string]
+    foreach ($Line in Get-Content $Path) {
+        if (-not $InFn -and $Line.Contains($Needle)) {
+            $InFn = $true
+            if ($Line -match '^(\s*)') { $SigIndent = $Matches[1].Length }
+        }
+        if ($InFn) {
+            $Body.Add($Line)
+            if ($Line -match '^(\s*)\}\s*$' -and $Matches[1].Length -eq $SigIndent) { break }
+        }
     }
-    if ($InFn) {
-        $FnBody.Add($Line)
-        # Closing brace at the SIGNATURE's own indent (survives the fn
-        # moving one indent deeper; the old fixed `^    \}$` anchor ran
-        # to EOF and failed safe but loud).
-        if ($Line -match '^(\s*)\}\s*$' -and $Matches[1].Length -eq $SigIndent) { break }
-    }
+    return ,$Body
 }
-# A gate that scans nothing must fail, not pass: a renamed/moved
-# record_locked would otherwise yield an empty body and a silent PASS.
-if ($FnBody.Count -eq 0 -or ($FnBody[0] -notmatch 'fn record_locked\(')) {
-    Write-Host " FAIL: could not extract the fn record_locked body from src\node.rs (renamed or moved?)" -ForegroundColor Red
+$NodePath = "$RepoRoot\src\node.rs"
+$Gate3Bodies = [ordered]@{
+    enter_inner         = Get-FnBody -Path $NodePath -Needle 'fn enter_inner<'
+    enter_async_attempt = Get-FnBody -Path $NodePath -Needle 'fn enter_async_attempt<'
+    record_locked       = Get-FnBody -Path $NodePath -Needle 'fn record_locked('
+}
+$Gate3Missing = @()
+foreach ($Name in $Gate3Bodies.Keys) {
+    $Body = $Gate3Bodies[$Name]
+    if ($Body.Count -eq 0 -or -not $Body[0].Contains("fn $Name")) { $Gate3Missing += $Name }
+}
+$SyncBodies = @($Gate3Bodies["enter_inner"]) + @($Gate3Bodies["record_locked"])
+$AsyncBody = @($Gate3Bodies["enter_async_attempt"])
+if ($Gate3Missing.Count -gt 0) {
+    Write-Host " FAIL: could not extract lock-path bodies from src\node.rs: $($Gate3Missing -join ', ') (renamed or moved?)" -ForegroundColor Red
     $Failures++
 } else {
-    $FormatUnderLock = $FnBody | Select-String -CaseSensitive -Pattern 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
-    if ($FormatUnderLock) {
-        Write-Host " FAIL: panicking/formatting call inside record_locked" -ForegroundColor Red
-        $FormatUnderLock | ForEach-Object { Write-Host "   body line $($_.LineNumber): $($_.Line.Trim())" }
+    $SyncHits = $SyncBodies | Select-String -CaseSensitive -Pattern 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
+    # enter_async_attempt legitimately uses `expect` for the pre-lock
+    # rollback.take(); everything else must stay non-panicking.
+    $AsyncHits = $AsyncBody | Select-String -CaseSensitive -Pattern 'format!|println!|eprintln!|panic!|\.unwrap\(\)'
+    if ($SyncHits) {
+        Write-Host " FAIL: panicking/formatting call inside the sync lock path:" -ForegroundColor Red
+        $SyncHits | ForEach-Object { Write-Host "   body line $($_.LineNumber): $($_.Line.Trim())" }
+        $Failures++
+    } elseif ($AsyncHits) {
+        Write-Host " FAIL: panicking/formatting call inside the async lock path:" -ForegroundColor Red
+        $AsyncHits | ForEach-Object { Write-Host "   body line $($_.LineNumber): $($_.Line.Trim())" }
         $Failures++
     } else {
-        Write-Host " OK (no format! under lock)" -ForegroundColor Green
+        Write-Host " OK (no format!/panic! in enter_inner, enter_async_attempt, record_locked)" -ForegroundColor Green
     }
 }
 
@@ -194,31 +217,32 @@ if ($GitExit -ne 0 -or -not $ApiBaseline) {
     if ($HeadRev -and $TagRev -and $HeadRev -eq $TagRev) {
         Write-Host " FAIL (baseline $ApiBaseline == HEAD; committed-but-untagged API changes are invisible -- tag the release or pass an older baseline)" -ForegroundColor Red
         $Failures++
-    }
-    $PrevEap = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    & cargo semver-checks --version *> $null
-    $SemverInstalled = ($LASTEXITCODE -eq 0)
-    $ErrorActionPreference = $PrevEap
-    if (-not $SemverInstalled) {
-        if ($InCi) {
-            Write-Host " FAIL (CI: cargo-semver-checks missing -- workflow must install it)" -ForegroundColor Red
-            $Failures++
-        } else {
-            Write-Host " SKIP (cargo-semver-checks not installed)" -ForegroundColor Yellow
-            $Skips++
-        }
     } else {
-        # Delegate to the standalone gate (parity with the .sh flavor):
-        # one implementation of the semver rules and the Cargo.lock guard,
-        # so CI exercises check_api_diff.ps1 on every Windows run.
-        $ApiDiffScript = Join-Path $ScriptDir "check_api_diff.ps1"
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $ApiDiffScript $ApiBaseline
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host " OK (no breaking change vs $ApiBaseline)" -ForegroundColor Green
+        $PrevEap = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        & cargo semver-checks --version *> $null
+        $SemverInstalled = ($LASTEXITCODE -eq 0)
+        $ErrorActionPreference = $PrevEap
+        if (-not $SemverInstalled) {
+            if ($InCi) {
+                Write-Host " FAIL (CI: cargo-semver-checks missing -- workflow must install it)" -ForegroundColor Red
+                $Failures++
+            } else {
+                Write-Host " SKIP (cargo-semver-checks not installed)" -ForegroundColor Yellow
+                $Skips++
+            }
         } else {
-            Write-Host " FAIL (public API gate vs ${ApiBaseline}: see the API diff output above)" -ForegroundColor Red
-            $Failures++
+            # Delegate to the standalone gate (parity with the .sh flavor):
+            # one implementation of the semver rules and the Cargo.lock guard,
+            # so CI exercises check_api_diff.ps1 on every Windows run.
+            $ApiDiffScript = Join-Path $ScriptDir "check_api_diff.ps1"
+            & powershell -NoProfile -ExecutionPolicy Bypass -File $ApiDiffScript $ApiBaseline
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host " OK (no breaking change vs $ApiBaseline)" -ForegroundColor Green
+            } else {
+                Write-Host " FAIL (public API gate vs ${ApiBaseline}: see the API diff output above)" -ForegroundColor Red
+                $Failures++
+            }
         }
     }
 }
@@ -241,6 +265,10 @@ if ($ForgetMatches) {
 }
 
 Write-Host "---------------------------------------------"
+# Cross-language parity fingerprint: CI runs this and check_compile_gates.sh
+# on the same tree and requires both lines to match.
+$CounterCount = $CounterPattern.Split('|').Count
+Write-Host "PARITY: gates=7 counters=$CounterCount functions=$($Gate3Bodies.Count) metaphors=$($ForbiddenPatterns.Count)"
 if ($Skips -gt 0) {
     # A skip is a hole, not a pass: reduced coverage must fail the gate.
     Write-Host "$Skips gate(s) SKIPPED -- coverage reduced, audit NOT complete." -ForegroundColor Yellow

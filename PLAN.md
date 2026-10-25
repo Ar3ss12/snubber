@@ -44,14 +44,14 @@
 | F-07 | P1 | Drop `Waker` під node-локом (`slot.waker = waker`, `retain`) | `src/node.rs:3678`, `3896` | 2 | `[x]` |
 | F-08 | P1 | Алокація `Vec<Waker>` під замком wakers у conduit | `src/conduit.rs:399-402` | 2 | `[x]` |
 | F-09 | P1 | `SystemTime::now()` під node-локом у rate limiter і `check_timeout` | `src/node.rs:3299`, `5277` | 2 | `[x]` |
-| F-10 | P1 | CI міряє лише 1 бенч; решта 51 і перформанс-регресії не гейтяться; артефактів немає | `.github/workflows/ci.yml:259-267` | 5 | `[ ]` |
-| F-11 | P1 | Semver-гейт сліпий до проміжних релізів (baseline = останній тег `v0.6.3`, crate `0.6.8`) | `scripts/check_api_diff.sh:55-65`; `git tag` | 5 | `[ ]` |
-| F-12 | P1 | PS-гейт вужчий за sh: 6 лічильників vs 15, лише `record_locked` vs 3 функції | `scripts/check_compile_gates.ps1:25-94` vs `.sh:52-120` | 5 | `[ ]` |
-| F-13 | P1 | `stress_harness.sh`: SKIP не валить рана; PID-гейт у секундах; JSON — regex; `LAUNCH=0` вимикає гейти | `scripts/stress_harness.sh:108-146`, `370-373`, `396-398`, `420-443` | 5 | `[ ]` |
-| F-14 | P1 | Miri: `-Zmiri-ignore-leaks` у всіх лейнах; покрито 33 з ~60 файлів | `.github/workflows/ci.yml:175,180,216` | 5 | `[ ]` |
+| F-10 | P1 | CI міряє лише 1 бенч; решта 51 і перформанс-регресії не гейтяться; артефактів немає | `.github/workflows/ci.yml:259-267` | 5 | `[x]` |
+| F-11 | P1 | Semver-гейт сліпий до проміжних релізів (baseline = останній тег `v0.6.3`, crate `0.6.8`) | `scripts/check_api_diff.sh:55-65`; `git tag` | 5 | `[x]` |
+| F-12 | P1 | PS-гейт вужчий за sh: 6 лічильників vs 15, лише `record_locked` vs 3 функції | `scripts/check_compile_gates.ps1:25-94` vs `.sh:52-120` | 5 | `[x]` |
+| F-13 | P1 | `stress_harness.sh`: SKIP не валить рана; PID-гейт у секундах; JSON — regex; `LAUNCH=0` вимикає гейти | `scripts/stress_harness.sh:108-146`, `370-373`, `396-398`, `420-443` | 5 | `[x]` |
+| F-14 | P1 | Miri: `-Zmiri-ignore-leaks` у всіх лейнах; покрито 33 з ~60 файлів | `.github/workflows/ci.yml:175,180,216` | 5 | `[x]` |
 | F-15 | P1 | `feed`/`finish`/`write_to` — std-only, а таблиця гайда продає їх як core/bare-metal | `src/supervisor.rs:518,678,888,907`; `src/lib.rs:128-129`; `USER_GUIDE.md:1787` | 6 | `[ ]` |
 | F-16 | P1 | `PipeDrain::feed` після `finish` тихо відкидає чанк і рапортує `0 frames`; коментар про clock суперечить коду | `src/supervisor.rs:892-918`, `896-901` | 2/7 | `[x]` |
-| F-17 | P1 | FakeWake: мертве поле `usize`, `wake` — no-op, identity-твердження не перевіряється | `tests/task_engine.rs:255-268` | 5 | `[ ]` |
+| F-17 | P1 | FakeWake: мертве поле `usize`, `wake` — no-op, identity-твердження не перевіряється | `tests/task_engine.rs:255-268` | 5 | `[x]` |
 | F-18 | P2 | `USER_GUIDE.md` документує неіснуючі `pool.attach`/`pool.note_death` | `USER_GUIDE.md:1788` vs `src/pool/lane.rs:157,241` | 6 | `[ ]` |
 | F-19 | P2 | Назви бенчів у README не збігаються з джерелом (`_threads_`, `classify_stall`) | `README.md:102,154-156` vs `benches/admission_bench.rs:49,627,679,719` | 6 | `[ ]` |
 | F-20 | P2 | Числа латентності без артефактів; бейдж 394 без дати/команди; «121 ns» не існує | `README.md:7,67,94,108`; `target/` відсутній | 5/6 | `[ ]` |
@@ -63,12 +63,12 @@
 | F-26 | P2 | Два різні `static ROLLBACKS` з однаковим ім'ям | `tests/guard.rs:234,255` | 7 | `[x]` |
 | F-27 | P2 | Приклад ISR: cycle 3 abort без post-abort assert | `examples/12_isr_bridge.rs` | 7 | `[ ]` |
 | F-28 | P2 | Покриття async-дір: settle-pop→drop, HalfOpen+cancel, poison async | `tests/async_primitives.rs`, `tests/conduit.rs` | 7 | `[ ]` |
-| F-29 | P2 | `stress_harness.ps1`: managed-path без image/creation gate; kill-semantics/verdict розбіжні з py | `scripts/stress_harness.ps1:294,343,360-367` | 5 | `[ ]` |
-| F-30 | P2 | `check_api_diff` при недоступному git: `hash-object` → `""` двічі, lock-мутація невидима | `scripts/check_api_diff.sh:63-72` | 5 | `[ ]` |
-| F-31 | P2 | `check_compile_gates.sh` pipe/grep failure → `OK`; `CI=false` трактується як CI | `scripts/check_compile_gates.sh:14,110-119` | 5 | `[ ]` |
-| F-32 | P2 | `bench.sh:147` при помилці `grep` публікує; `:163` тихо пропускає summary | `scripts/bench.sh:147,163` | 5 | `[ ]` |
-| F-33 | P2 | `check_compile_gates.ps1` друкує `OK` після FAIL baseline==HEAD | `scripts/check_compile_gates.ps1:194-197,218` | 5 | `[ ]` |
-| F-34 | P2 | Планові/ручні CI-лейни (PS TerminateProcess, raw-kill, euthanasia) не мають PR/push-еквівалента | `.github/workflows/stress.yml:134,171,211` | 5 | `[ ]` |
+| F-29 | P2 | `stress_harness.ps1`: managed-path без image/creation gate; kill-semantics/verdict розбіжні з py | `scripts/stress_harness.ps1:294,343,360-367` | 5 | `[x]` |
+| F-30 | P2 | `check_api_diff` при недоступному git: `hash-object` → `""` двічі, lock-мутація невидима | `scripts/check_api_diff.sh:63-72` | 5 | `[x]` |
+| F-31 | P2 | `check_compile_gates.sh` pipe/grep failure → `OK`; `CI=false` трактується як CI | `scripts/check_compile_gates.sh:14,110-119` | 5 | `[x]` |
+| F-32 | P2 | `bench.sh:147` при помилці `grep` публікує; `:163` тихо пропускає summary | `scripts/bench.sh:147,163` | 5 | `[x]` |
+| F-33 | P2 | `check_compile_gates.ps1` друкує `OK` після FAIL baseline==HEAD | `scripts/check_compile_gates.ps1:194-197,218` | 5 | `[x]` |
+| F-34 | P2 | Планові/ручні CI-лейни (PS TerminateProcess, raw-kill, euthanasia) не мають PR/push-еквівалента | `.github/workflows/stress.yml:134,171,211` | 5 | `[x]` |
 | F-35 | P3 | TTL re-stamp після settle-wake може нескінченно продовжувати TTL; TTL перевіряється лише на poll | `src/node.rs:3730`, `3679-3684`; `tests/task_engine.rs:272` | 7 | `[ ]` |
 | F-36 | P3 | `auto_seq` Relaxed: епоха, видана «пізніше», може програти гонку `gate.observe` | `src/node.rs:2308` | 7 | `[ ]` |
 | F-37 | P3 | `LaneState` cross-field recovery: теоретично `pid:Some` + `drain:None` | `src/pool/lane.rs:128-168` | 7 | `[ ]` |
@@ -386,36 +386,57 @@ clock-читання не в критичній секції; `feed`-після-
 `.github/workflows/ci.yml`, `.github/workflows/stress.yml`, `tests/task_engine.rs`.
 
 **Кроки:**
-- [ ] F-12: портувати в `.ps1` усі 15 лічильників і 3 функції (`enter_inner`, `enter_async_attempt`,
+- [x] F-12: портувати в `.ps1` усі 15 лічильників і 3 функції (`enter_inner`, `enter_async_attempt`,
       `record_locked`); додати Windows CI-крок, який запускає `.ps1` і порівнює кількість перевірок із `.sh`.
-- [ ] F-31: `check_compile_gates.sh` — `in_ci()` строго `CI=true|1`; у `printf | grep` перевіряти `rc`
-      і падати на `rc > 1`/SIGPIPE, а не провалюватися в `OK`.
-- [ ] F-30: `check_api_diff.sh` — якщо `git hash-object` повертає порожньо, це FAIL (lock-мутація невидима).
-- [ ] F-33: `.ps1` — не друкувати `OK`, якщо `rc != 0` (FAIL baseline==HEAD).
-- [ ] F-11: додати `scripts/check_release_tag.sh`: `Cargo.toml` version має дорівнювати останньому тегу
+      **Готово:** обидва flavors друкують `PARITY: gates=7 counters=15 functions=3 metaphors=5`; крок
+      `Gate Flavor Parity (.sh vs .ps1)` на Windows запускає обидва і валить будь-яку розбіжність.
+- [x] F-31: `check_compile_gates.sh` — `in_ci()` строго `CI=true|1`; у `printf | grep` перевіряти `rc`
+      і падати на `rc > 1`/SIGPIPE, а не провалюватися в `OK`. **Готово:** `scan_hits` розрізняє rc 0/1/інші;
+      негатив (підмінений `grep`, exit 2 на `format!`) дав `[3/7] ... FAIL: sync lock-path scan could not run`, exit 1.
+- [x] F-30: `check_api_diff.sh` — якщо `git hash-object` повертає порожньо, це FAIL (lock-мутація невидима).
+      **Готово:** перевірка є в обох flavors (`$LockBefore`/`$LockAfter` у `.ps1`).
+- [x] F-33: `.ps1` — не друкувати `OK`, якщо `rc != 0` (FAIL baseline==HEAD). **Готово:** Gate 6 загорнутий
+      у `else`, тож після FAIL baseline==HEAD жодного `OK` не друкується.
+- [x] F-11: додати `scripts/check_release_tag.sh`: `Cargo.toml` version має дорівнювати останньому тегу
       (після `v`) **або** версія має бути явно позначена як «unreleased» у CHANGELOG; підключити в CI.
-      Теги не створювати без наказу.
-- [ ] F-13 (sh): PID identity — повні ticks (`starttime`), без `/ CLK_TCK`; `LAST_KILLED_START_TICKS`
+      Теги не створювати без наказу. **Готово:** крок у quality; поточне дерево —
+      `WARN: Cargo.toml 0.6.8 is ahead of the latest tag v0.6.3 (documented in CHANGELOG, not tagged)`;
+      негативи: 0.7.0 без секції → FAIL, 0.5.9 (позаду тега) → FAIL.
+- [x] F-13 (sh): PID identity — повні ticks (`starttime`), без `/ CLK_TCK`; `LAST_KILLED_START_TICKS`
       замість секунд; macOS — задокументована секундна межа. JSON — реальний парсер (`python3 -c`)
       з fallback-помилкою, не regex. `add_skip` для fd-growth — FAIL у CI (`in_ci()`); `LAUNCH=0`
-      у CI — FAIL, бо гейти не працювали.
-- [ ] F-29 (ps1): managed-path — точний image + creation time (як `-RawKill`), а не `-like "*name*"`;
+      у CI — FAIL, бо гейти не працювали. **Готово:** `read_json_int` через `python3` JSON; у CI
+      потрібен `--launch` **або** `--external-supervisor` (тестовий раннер сам володіє супервізором).
+- [x] F-29 (ps1): managed-path — точний image + creation time (як `-RawKill`), а не `-like "*name*"`;
       вирівняти kill-semantics і verdict з `stress_multi_lineage.py` (`killed==expected`, `armed_hold`,
-      clamp fd-growth ≥ 0).
-- [ ] F-32: `bench.sh` — перевіряти `rc` від `grep -c`; у `--github` без `GITHUB_STEP_SUMMARY` — FAIL
-      (або явний WARN, але CI-режим має падати).
-- [ ] F-10: додати в `ci.yml` job `bench-full` на `schedule`/`workflow_dispatch`:
+      clamp fd-growth ≥ 0). **Готово:** `Get-StartTicks` + `GetFileNameWithoutExtension`; verdict
+      містить `killed == requested` і `armed_hold`; growth затиснутий у ≥ 0.
+- [x] F-32: `bench.sh` — перевіряти `rc` від `grep -c`; у `--github` без `GITHUB_STEP_SUMMARY` — FAIL
+      (або явний WARN, але CI-режим має падати). **Готово:** rc>1 → FAIL; CI+`--github` без summary →
+      exit 1, поза CI → WARN. Негативи: rc 2 → exit 1, rc 1 → exit 1 (порожній snapshot), CI=true → exit 1,
+      CI=garbage → WARN/exit 0.
+- [x] F-10: додати в `ci.yml` job `bench-full` на `schedule`/`workflow_dispatch`:
       `cargo bench --locked --bench admission_bench`, `bash scripts/bench.sh --skip-run`,
       upload artifacts `target/criterion/**` + `target/bench/snapshot.md`; код `bench.sh` не чіпати.
-- [ ] F-14: додати лейн `miri-leaks` **без** `-Zmiri-ignore-leaks` (спочатку один, щоб зрозуміти обсяг);
+      **Готово:** job `bench-full`, `--locked`, `if-no-files-found: error`, `--github` (summary в CI).
+- [x] F-14: додати лейн `miri-leaks` **без** `-Zmiri-ignore-leaks` (спочатку один, щоб зрозуміти обсяг);
       розширити список Miri-файлів до всіх, що компілюються без wall-clock/sleep; для виключених
       (`channel.rs:13`, `task_engine.rs:271`) — задокументувати причину в CI-коментарі.
-- [ ] F-17: `FakeWake` — прибрати `#[allow(dead_code)]`, використати `self.0` у `wake`; додати
+      **Готово:** lib + 14 core suites; локально lib 24 passed, усі suites green (найдовший
+      `bulkhead_capacity` 107 s). Виключення: `channel.rs:13` (sleep-throttle), `task_engine.rs:271`
+      (TTL-годинник), supervisor-сюїти (реальні процеси).
+- [x] F-17: `FakeWake` — прибрати `#[allow(dead_code)]`, використати `self.0` у `wake`; додати
       `#[cfg(miri)] assert!(!w1.will_wake(&w2))` для різних `Arc` (з застереженням, що `will_wake`
-      може over-approximate; це hardening, не гарантований tripwire).
-- [ ] F-34: додати PR/push-лейн (зменшені counts) для `supervisor_termination` і Windows raw-kill,
+      може over-approximate; це hardening, не гарантований tripwire). **Готово:** поле читається в
+      обох `wake`-методах; тест `fake_waker_identity_matches_allocation` (обидва `Arc` живі, адреси
+      не аліасяться); suite 400 → 401.
+- [x] F-34: додати PR/push-лейн (зменшені counts) для `supervisor_termination` і Windows raw-kill,
       або явно задокументувати, що вони тижневі, і додати `workflow_dispatch`-чеклист.
-- [ ] Перевірити `--locked` на всіх нових кроках; `fmt`/`semver-checks` — задокументовані винятки.
+      **Готово:** job `termination-smoke` (ubuntu + windows, `STRESS_TARGET_KILLS=25`,
+      `cargo test --release --locked ... -- --ignored`) на кожен push/PR.
+- [x] Перевірити `--locked` на всіх нових кроках; `fmt`/`semver-checks` — задокументовані винятки.
+      **Готово:** усі нові кроки `--locked`; `cargo-semver-checks` не має такого прапорця (lock
+      хешується до/після).
 
 **Тести:** локально `bash scripts/check_compile_gates.sh`, `pwsh -File scripts/check_compile_gates.ps1`
 (якщо є pwsh), `bash scripts/check_api_diff.sh`, `bash scripts/bench.sh --skip-run`.
@@ -425,6 +446,12 @@ clock-читання не в критичній секції; `feed`-після-
 двох воркерів у межах секунди (Linux); `bench-full` архівує артефакти; Miri-лейн без `ignore-leaks`
 або явний перелік знайдених витоків із рішенням.
 
+**Стан 2026-10-25:** обидва flavors — `PARITY: gates=7 counters=15 functions=3 metaphors=5`, exit 0
+(локально 1 SKIP: semver-checks не встановлено). `miri-leaks` локально зелений (lib 24 + 14 suites).
+Suite 401 passed / 0 failed, clippy чистий, badge-гейт OK. Негативи: grep exit 2 у Gate 3 → FAIL;
+bench `grep` rc 2 → FAIL; `--github` у CI без summary → exit 1; harness без `--launch`/`--external-supervisor`
+у CI → exit 1; release-гейт 0.7.0/0.5.9 → FAIL.
+
 **Коміт:** `fix(ci): close skip/parse/parity holes and add full bench artifact lane`
 
 **Дописи:**
@@ -433,6 +460,12 @@ clock-читання не в критичній секції; `feed`-після-
 - Miri без `ignore-leaks` може впасти на існуючих тестах; це не привід повертати прапорець —
   спочатку тріаж: справжній витік vs навмисний `Box::leak` у тесті.
 - Повний bench на CI-ранері шумний; тому він **не** гейтить PR, лише архівує й будує тренд.
+- `supervisor_termination` сам запускає супервізор, тож harness у CI отримує `--external-supervisor`;
+  без цього прапорця CI-правило «або `--launch`, або явний external» валить лейн (перевірено).
+- Windows parity-крок запускає **обидва** flavors в одному job: `.sh` у Git Bash, `.ps1` у PS 5.1;
+  порівнюється лише рядок `PARITY:`, тому кількісний дрейф (новий лічильник в одному flavor) червоний.
+- `scripts/stress_harness.ps1` не має CI-правила для `-Launch`: тестовий раннер передає зовнішній
+  супервізор і на Windows, а PS-версія не має окремого прапорця external.
 
 ---
 
@@ -612,5 +645,6 @@ Push — одразу після зеленого прогону (standing prefe
 | 2026-10-25 | 0 | `check_test_count.sh` + CI-гейт; бейдж 397 з provenance | `chore(ci): add reproducible test-count gate and record audit baseline` (d150d64) |
 | 2026-10-25 | 2 | F-07/F-08/F-09/F-16; waker drops і clock поза замками; feed-after-EOF лічильник; suite 397 -> 399 | `fix(concurrency): keep waker drops and clock reads outside mutexes` (7481e9a) |
 | 2026-10-25 | 3 | F-05/F-22/F-23/F-24/F-25/F-26; повний 7-доданковий закон, floor-и, справжній rollback-свідок; suite 399 | `test(conservation): pin full admission law and positive volume floors` (dc12cd4) |
-| 2026-10-25 | 4 | F-06: contended-бенчі падають на виснаженні retry/нулі допусків; `bench_hygiene` ловить join/send; README contended-рядки переміряно | `fix(bench): fail fast on retry exhaustion and discarded send results` |
+| 2026-10-25 | 4 | F-06: contended-бенчі падають на виснаженні retry/нулі допусків; `bench_hygiene` ловить join/send; README contended-рядки переміряно | `fix(bench): fail fast on retry exhaustion and discarded send results` (7c9e6bf) |
+| 2026-10-25 | 5 | F-10..F-14/F-17/F-29..F-34: PARITY-фінгерпринт, строгий CI, release-гейт, ticks, `bench-full`, `miri-leaks`, `termination-smoke`; suite 400 -> 401 | `fix(ci): close skip/parse/parity holes and add full bench artifact lane` |
 |  |  |  |  |

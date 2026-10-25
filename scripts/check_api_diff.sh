@@ -7,10 +7,15 @@
 
 set -euo pipefail
 
-# CI mode: GitHub Actions sets CI=true. A SKIP in a controlled
+# CI mode: GitHub Actions sets CI=true (or 1). A SKIP in a controlled
 # environment means the workflow is misconfigured (missing tags or
 # tooling) — that must fail the run, not silently skip the gate.
-in_ci() { [ -n "${CI:-}" ]; }
+in_ci() {
+    case "$(printf '%s' "${CI:-}" | tr '[:upper:]' '[:lower:]')" in
+        true | 1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -66,6 +71,12 @@ cargo semver-checks check-release --baseline-rev "${BASELINE}" --package "${CRAT
 SEMVER_RC=$?
 set -e
 LOCK_AFTER="$(git -C "${REPO_ROOT}" hash-object Cargo.lock 2>/dev/null || true)"
+# An empty hash means git could not read the lockfile: the before/after
+# comparison would then be `"" == ""` and every mutation would pass unseen.
+if [ -z "${LOCK_BEFORE}" ] || [ -z "${LOCK_AFTER}" ]; then
+    echo " FAIL (could not hash Cargo.lock: it is missing or git cannot read it — lock mutation would be invisible)"
+    exit 1
+fi
 if [ "${LOCK_BEFORE}" != "${LOCK_AFTER}" ]; then
     echo " FAIL (cargo-semver-checks rewrote Cargo.lock; restore it and pin the toolchain)"
     exit 1

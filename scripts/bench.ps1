@@ -139,5 +139,15 @@ if ($GitHub) {
     $summary = $env:GITHUB_STEP_SUMMARY
     if ($summary) {
         $rows | Add-Content -Path $summary -Encoding utf8
+    } else {
+        # Strict parity with bench.sh's in_ci: only "true"/"1" count as CI.
+        $CiFlag = if ($env:CI) { $env:CI.ToLowerInvariant() } else { "" }
+        if ($CiFlag -eq "true" -or $CiFlag -eq "1") {
+            # In CI the whole point of -GitHub is the published summary; a
+            # silent no-op reported a green bench job that showed nothing.
+            Write-Error "-GitHub in CI but GITHUB_STEP_SUMMARY is unset: the snapshot would never reach the step summary"
+            exit 1
+        }
+        Write-Host "[bench] WARN: -GitHub without GITHUB_STEP_SUMMARY (not CI) -- snapshot left at $outFile" -ForegroundColor Yellow
     }
 }

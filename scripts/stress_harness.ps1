@@ -45,6 +45,18 @@ $pidFiles = @(
 )
 $exeName = if ($env:OS -eq "Windows_NT") { "$TargetProcess.exe" } else { $TargetProcess }
 $exe = Join-Path $repoRoot ("target/{0}/examples/{1}" -f $Profile, $exeName)
+# Exact image name for managed-mode identity (ProcessName never carries the
+# extension). The old `-like "*name*"` also matched unrelated images whose
+# name merely contained the target string.
+$exeBase = [System.IO.Path]::GetFileNameWithoutExtension($exeName)
+
+# Creation time in universal ticks, or 0 when it cannot be read. Managed
+# mode rejects a victim whose start time is not strictly newer than the
+# last killed worker, exactly like the raw path's KillChecked.
+function Get-StartTicks($proc) {
+    if (-not $proc) { return [long]0 }
+    try { return $proc.StartTime.ToUniversalTime().Ticks } catch { return [long]0 }
+}
 $isWindows = $env:OS -eq "Windows_NT"
 
 $rawKiller = $null
@@ -138,6 +150,7 @@ $duplicatePolls = 0
 $killRetries = 0
 $lastKilledPid = 0
 $lastKilledCreation = [long]0
+$lastManagedStartTicks = [long]0
 $supPid = 0
 $missStreak = 0
 $overall = New-Object System.Diagnostics.Stopwatch
@@ -291,7 +304,11 @@ try {
                 if ([int]::TryParse($raw, [ref]$parsed) -and $parsed -gt 4 -and $parsed -ne $supPid -and $parsed -ne $PID) {
                     if ($RawKill) { $targetPid = $parsed; break }
                     $p = Get-Process -Id $parsed -ErrorAction SilentlyContinue
-                    if ($p -and $p.ProcessName -like "*$TargetProcess*") { $targetPid = $parsed; break }
+                    $startTicks = Get-StartTicks $p
+                    if ($p -and $p.ProcessName -eq $exeBase -and $startTicks -gt $lastManagedStartTicks) {
+                        $targetPid = $parsed
+                        break
+                    }
                 }
             } catch {}
         }
@@ -304,17 +321,19 @@ try {
                     $missStreak++
                     if ($missStreak -ge 200) {
                         $missStreak = 0
-                        $procs = @(Get-Process -Name $TargetProcess -ErrorAction SilentlyContinue |
+                        $procs = @(Get-Process -Name $exeBase -ErrorAction SilentlyContinue |
                             Sort-Object StartTime -Descending)
                         foreach ($p in $procs) {
-                            if ($p.Id -ne $lastKilledPid -and $p.Id -ne $supPid -and $p.Id -ne $PID) { $targetPid = $p.Id; break }
+                            if ($p.Id -ne $lastKilledPid -and $p.Id -ne $supPid -and $p.Id -ne $PID `
+                                -and (Get-StartTicks $p) -gt $lastManagedStartTicks) { $targetPid = $p.Id; break }
                         }
                     }
                 } else {
-                    $procs = @(Get-Process -Name $TargetProcess -ErrorAction SilentlyContinue |
+                    $procs = @(Get-Process -Name $exeBase -ErrorAction SilentlyContinue |
                         Sort-Object StartTime -Descending)
                     foreach ($p in $procs) {
-                        if ($p.Id -ne $lastKilledPid -and $p.Id -ne $supPid -and $p.Id -ne $PID) { $targetPid = $p.Id; break }
+                        if ($p.Id -ne $lastKilledPid -and $p.Id -ne $supPid -and $p.Id -ne $PID `
+                            -and (Get-StartTicks $p) -gt $lastManagedStartTicks) { $targetPid = $p.Id; break }
                     }
                 }
             } else {
@@ -357,14 +376,22 @@ try {
                 }
             } else {
                 $proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
-                if (-not $proc -or $proc.ProcessName -notlike "*$TargetProcess*") {
+                $startTicks = Get-StartTicks $proc
+                if (-not $proc -or $proc.ProcessName -ne $exeBase -or $startTicks -le $lastManagedStartTicks) {
+                    # Wrong image or a recycled pid: never kill, keep retrying.
+                    if ($proc) { $stalePolls++ }
                     $retry = $true
                 } else {
                     Sample-Worker $proc
                     $proc.Kill()
                     $exited = $proc.WaitForExit(250)
                     $killSw.Stop()
-                    if (-not $exited) { $killRetries++; $retry = $true }
+                    if ($exited) {
+                        $lastManagedStartTicks = $startTicks
+                    } else {
+                        $killRetries++
+                        $retry = $true
+                    }
                 }
             }
             if ($exited) {
@@ -488,7 +515,14 @@ if ($report) {
 }
 $ambushPct = if ($completed -gt 0) { 100.0 * $ambush / $completed } else { 0 }
 if ($report) {
+    $checks.Add([pscustomobject]@{ Name = "killed == requested"; Ok = ($completed -eq $Kills) })
     $checks.Add([pscustomobject]@{ Name = "reaped == kills"; Ok = ([int]$report.total_reaped -eq $completed) })
+    # Parity with stress_multi_lineage.py: a report that disagrees about
+    # armed-hold proves the supervisor ran a different workload.
+    $checks.Add([pscustomobject]@{
+        Name = "armed_hold matches"
+        Ok   = ([bool]$report.armed_hold -eq [bool]$ArmedHold)
+    })
     $checks.Add([pscustomobject]@{ Name = "rescue + clean == reaped"; Ok = (([int]$report.tokens_rescued + [int]$report.clean_settles) -eq [int]$report.total_reaped) })
     if ($report.PSObject.Properties['ambush_kills']) {
         $checks.Add([pscustomobject]@{ Name = "ambush + escape + stillborn == reaped"; Ok = (($ambush + $escape + $stillborn) -eq [int]$report.total_reaped) })
@@ -504,8 +538,11 @@ if ($Launch) {
     $checks.Add([pscustomobject]@{ Name = "supervisor exit == 0"; Ok = ($supExit -eq 0) })
 }
 if ($supSamples -gt 0) {
-    $privGrowth = $supPrivLast - $supPrivFirst
-    $handleGrowth = $supHandleLast - $supHandleFirst
+    # A shrinking measurement is not negative growth: clamp like the
+    # python tracker's growth() so sign noise cannot buy slack on the
+    # leak gate.
+    $privGrowth = [math]::Max(0.0, $supPrivLast - $supPrivFirst)
+    $handleGrowth = [math]::Max(0, $supHandleLast - $supHandleFirst)
     $checks.Add([pscustomobject]@{
         Name = ("supervisor private growth {0:+0.00;-0.00;0.00} MB <= {1:N1} MB" -f $privGrowth, $MaxGrowthMb)
         Ok   = ($privGrowth -le $MaxGrowthMb)

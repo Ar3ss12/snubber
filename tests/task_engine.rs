@@ -259,12 +259,28 @@ fn futures_lite_fake_waker_id(id: usize) -> core::task::Waker {
     /// Each `Arc::new` is a distinct allocation, so the waker data
     /// pointer (which `will_wake` compares) is unique per id — no raw
     /// vtable, no provenance tricks, valid under `-Zmiri-strict-provenance`.
-    struct FakeWake(#[allow(dead_code)] usize);
+    struct FakeWake(usize);
     impl Wake for FakeWake {
-        fn wake(self: Arc<Self>) {}
-        fn wake_by_ref(self: &Arc<Self>) {}
+        fn wake(self: Arc<Self>) {
+            // Reading the id keeps the field live: the payload itself is
+            // irrelevant, the distinct `Arc` allocation is the identity.
+            let _id = self.0;
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _id = self.0;
+        }
     }
     core::task::Waker::from(Arc::new(FakeWake(id)))
+}
+
+#[test]
+fn fake_waker_identity_matches_allocation() {
+    let w1 = futures_lite_fake_waker_id(1);
+    let w2 = futures_lite_fake_waker_id(2);
+    // Both Arcs are live at once, so their addresses cannot alias; the
+    // engine's dedup compares exactly this `will_wake` identity.
+    assert!(!w1.will_wake(&w2), "distinct allocations must not match");
+    assert!(w1.will_wake(&w1.clone()), "a cloned waker keeps identity");
 }
 
 #[test]

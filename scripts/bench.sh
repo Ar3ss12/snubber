@@ -25,6 +25,15 @@ OUT_FILE="${OUT_DIR}/snapshot.md"
 SKIP_RUN=false
 GITHUB_MODE=false
 
+# CI detection is strict on purpose: an unrecognised value must behave like
+# a local run, never like CI (and vice versa) -- see check_compile_gates.sh.
+in_ci() {
+    case "$(printf '%s' "${CI:-}" | tr '[:upper:]' '[:lower:]')" in
+        true | 1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 for arg in "$@"; do
     case "$arg" in
         --skip-run|-s)
@@ -144,10 +153,24 @@ for path in estimate_files:
         sys.exit(1)
 EOF
 
-if [ ! -s "${TMP_OUT}" ] || [ "$(grep -c '^| `' "${TMP_OUT}" 2>/dev/null)" = "0" ]; then
+if [ ! -s "${TMP_OUT}" ]; then
     # Header-only snapshot means the export saw no estimates: publishing
     # it would zero out the README table with a green run. Fail in every
     # mode (parity with bench.ps1), not just CI.
+    echo -e "\033[31m[bench] FAIL: export produced an empty snapshot under ${CRITERION_DIR} — refusing to write it (run without --skip-run or check target/criterion)\033[0m" >&2
+    exit 1
+fi
+
+# `grep -c` is the gate's only evidence that rows exist; its exit status
+# was discarded, so a grep error produced an empty string that compared
+# unequal to "0" and let an empty snapshot through.
+ROWS_RC=0
+ROWS="$(grep -c '^| `' "${TMP_OUT}")" || ROWS_RC=$?
+if [ "${ROWS_RC}" -gt 1 ]; then
+    echo -e "\033[31m[bench] FAIL: cannot scan ${TMP_OUT} for rows (grep exit ${ROWS_RC})\033[0m" >&2
+    exit 1
+fi
+if [ "${ROWS:-0}" -eq 0 ]; then
     echo -e "\033[31m[bench] FAIL: no bench estimates found under ${CRITERION_DIR} — refusing to write an empty snapshot (run without --skip-run or check target/criterion)\033[0m" >&2
     exit 1
 fi
@@ -160,6 +183,15 @@ echo -e "\033[32m=== BENCH SNAPSHOT (ns/op mean point estimate) ===\033[0m"
 cat "${OUT_FILE}"
 echo -e "\033[36mSnapshot written: ${OUT_FILE}\033[0m"
 
-if [ "$GITHUB_MODE" = true ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-    cat "${OUT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+if [ "$GITHUB_MODE" = true ]; then
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        cat "${OUT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+    elif in_ci; then
+        # In CI the whole point of --github is the published summary; a
+        # silent no-op reported a green bench job that showed nothing.
+        echo -e "\033[31m[bench] FAIL: --github in CI but GITHUB_STEP_SUMMARY is unset — the snapshot would never reach the step summary\033[0m" >&2
+        exit 1
+    else
+        echo -e "\033[33m[bench] WARN: --github without GITHUB_STEP_SUMMARY (not CI) — snapshot left at ${OUT_FILE}\033[0m" >&2
+    fi
 fi

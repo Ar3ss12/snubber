@@ -125,6 +125,34 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # Reduced-count termination lane on every push/PR. The scheduled storms
+  # below are otherwise the only coverage of the pid-file handshake, the
+  # harness report conservation and the Windows Win32 kill path -- a PR
+  # could break any of them and stay green until Monday. 25 kills exercises
+  # the full handshake and report checks without turning PRs into a stress
+  # farm.
+  termination-smoke:
+    name: Termination smoke, 25 kills (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      STRESS_TARGET_KILLS: "25"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Termination stress (reduced counts)
+        run: cargo test --release --locked --test supervisor_termination -- --ignored --nocapture
+
   # Single-process harness: launches ONE supervisor, kills its workers
   # through the pid-file handshake and checks the JSON report (kills,
   # reaps, generation, leak gates). Scheduled/manual only -- it hammers

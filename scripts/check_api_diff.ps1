@@ -12,7 +12,9 @@ $RepoRoot = Resolve-Path "$ScriptDir\.."
 # CI mode: GitHub Actions sets CI=true. A SKIP in a controlled
 # environment means the workflow is misconfigured (missing tags or
 # tooling) -- that must fail the run, not silently skip the gate.
-$InCi = ($env:CI -ne $null -and $env:CI -ne "" -and $env:CI -notin @("false", "0"))
+# Strict parity with the .sh `in_ci`: only "true"/"1" count as CI.
+$CiFlag = if ($env:CI) { $env:CI.ToLowerInvariant() } else { "" }
+$InCi = ($CiFlag -eq "true" -or $CiFlag -eq "1")
 
 if (-not $Baseline) {
     # PS 5.1 wraps native stderr in ErrorRecords: under Stop, a
@@ -85,6 +87,12 @@ try {
     & cargo semver-checks check-release --baseline-rev $Baseline --package $Crate
     $SemverExit = $LASTEXITCODE
     $LockAfter = if (Test-Path $LockPath) { (Get-FileHash $LockPath -Algorithm SHA256).Hash } else { "" }
+    # An empty hash means the lockfile vanished: `"" -eq ""` would hide any
+    # rewrite. Parity with check_api_diff.sh.
+    if (-not $LockBefore -or -not $LockAfter) {
+        Write-Host " FAIL (could not hash Cargo.lock: it is missing -- lock mutation would be invisible)" -ForegroundColor Red
+        exit 1
+    }
     if ($LockBefore -ne $LockAfter) {
         Write-Host " FAIL (cargo-semver-checks rewrote Cargo.lock; restore it and pin the toolchain)" -ForegroundColor Red
         exit 1

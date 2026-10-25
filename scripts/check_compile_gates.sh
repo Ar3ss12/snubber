@@ -7,11 +7,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# CI mode: GitHub Actions sets CI=true. A controlled environment has no
-# excuse for a SKIP — the bare-metal target and the semver tool must be
+# CI mode: GitHub Actions sets CI=true (or 1). A controlled environment has
+# no excuse for a SKIP — the bare-metal target and the semver tool must be
 # provisioned by the workflow, and the tag baseline by the release process.
 # A SKIP here is a hole in the audit, not a pass.
-in_ci() { [ -n "${CI:-}" ]; }
+in_ci() {
+    case "$(printf '%s' "${CI:-}" | tr '[:upper:]' '[:lower:]')" in
+        true | 1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 echo "=== Snubber Architectural Invariant Audit ==="
 FAILURES=0
@@ -104,19 +109,41 @@ for body in GATE3_SYNC GATE3_ASYNC GATE3_RECORD; do
 done
 # `enter_async_attempt` legitimately uses `expect` for the pre-lock
 # `rollback.take()`; everything else must stay non-panicking.
+#
+# `grep` exit 2+ means the scan itself failed (unreadable input, bad
+# pattern). Collapsing that into "no match" used to print OK over a scan
+# that never ran, so every pipeline reports its rc explicitly.
+scan_hits() { # $1 = haystack, $2 = pattern; sets SCAN_HITS / SCAN_RC
+    SCAN_HITS="$(printf '%s\n' "$1" | grep -En "$2")" && SCAN_RC=0 || SCAN_RC=$?
+}
 if [ -n "$GATE3_BAD" ]; then
     echo "FAIL: could not extract the lock-path function bodies from src/node.rs: ${GATE3_BAD}(renamed or moved?)"
     FAILURES=$((FAILURES + 1))
-elif printf '%s\n%s\n' "$GATE3_SYNC" "$GATE3_RECORD" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\(' > /dev/null 2>&1; then
-    echo "FAIL: panicking/formatting call inside the sync lock path:"
-    printf '%s\n%s\n' "$GATE3_SYNC" "$GATE3_RECORD" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
-    FAILURES=$((FAILURES + 1))
-elif printf '%s\n' "$GATE3_ASYNC" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)' > /dev/null 2>&1; then
-    echo "FAIL: panicking/formatting call inside the async lock path:"
-    printf '%s\n' "$GATE3_ASYNC" | grep -En 'format!|println!|eprintln!|panic!|\.unwrap\(\)'
-    FAILURES=$((FAILURES + 1))
 else
-    echo "OK (no format!/panic! in enter_inner, enter_async_attempt, record_locked)"
+    scan_hits "$(printf '%s\n%s\n' "$GATE3_SYNC" "$GATE3_RECORD")" \
+        'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
+    if [ "$SCAN_RC" -eq 0 ]; then
+        echo "FAIL: panicking/formatting call inside the sync lock path:"
+        printf '%s\n' "${SCAN_HITS}"
+        FAILURES=$((FAILURES + 1))
+    elif [ "$SCAN_RC" -ne 1 ]; then
+        echo "FAIL: sync lock-path scan could not run (grep exit ${SCAN_RC}):"
+        printf '%s\n' "${SCAN_HITS}"
+        FAILURES=$((FAILURES + 1))
+    else
+        scan_hits "$GATE3_ASYNC" 'format!|println!|eprintln!|panic!|\.unwrap\(\)'
+        if [ "$SCAN_RC" -eq 0 ]; then
+            echo "FAIL: panicking/formatting call inside the async lock path:"
+            printf '%s\n' "${SCAN_HITS}"
+            FAILURES=$((FAILURES + 1))
+        elif [ "$SCAN_RC" -ne 1 ]; then
+            echo "FAIL: async lock-path scan could not run (grep exit ${SCAN_RC}):"
+            printf '%s\n' "${SCAN_HITS}"
+            FAILURES=$((FAILURES + 1))
+        else
+            echo "OK (no format!/panic! in enter_inner, enter_async_attempt, record_locked)"
+        fi
+    fi
 fi
 
 # Gate 4: Zero-metaphor scan across codebase (AGENTS.md Section 14)
@@ -226,6 +253,11 @@ else
 fi
 
 echo "---------------------------------------------"
+# Cross-language parity fingerprint: the Windows CI lane runs this script
+# and check_compile_gates.ps1 on the same tree and requires both lines to
+# match. If the PS flavor scans fewer counters or functions, parity fails.
+COUNTER_COUNT=$(( $(printf '%s' "$COUNTERS" | tr -cd '|' | wc -c) + 1 ))
+printf 'PARITY: gates=7 counters=%s functions=3 metaphors=5\n' "${COUNTER_COUNT}"
 if [ "$SKIPS" -gt 0 ]; then
     # A skip is a hole, not a pass: reduced coverage must fail the gate.
     echo "$SKIPS gate(s) SKIPPED — coverage reduced, audit NOT complete."

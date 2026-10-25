@@ -107,6 +107,9 @@ fn process_kill_stress_test() {
                 "process_termination_loop",
                 &kills.to_string(),
                 "0.001",
+                // The test owns the supervisor; the harness CI gate needs
+                // to know this is deliberate, not a forgotten --launch.
+                "--external-supervisor",
             ])
             .spawn()
             .expect("spawn stress harness");

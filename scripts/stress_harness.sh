@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # snubber process termination stress harness (Linux / macOS).
 # Positional args (backward compatible): [target] [kills] [min_sleep_sec]
-# Flags: --launch (start supervisor too), --build, --debug, --aggressive
+# Flags: --launch (start supervisor too), --build, --debug, --aggressive,
+#        --external-supervisor (the caller launched it; required in CI)
 set -u
 
 TARGET_PROCESS="process_termination_loop"
 KILLS=10000
 MIN_SLEEP=0
 LAUNCH=0
+EXTERNAL_SUPERVISOR=0
 BUILD=0
 AGGRESSIVE=0
 PROFILE="release"
@@ -20,6 +22,7 @@ POS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --launch) LAUNCH=1 ;;
+        --external-supervisor) EXTERNAL_SUPERVISOR=1 ;;
         --build) BUILD=1 ;;
         --debug) PROFILE="debug" ;;
         --aggressive) AGGRESSIVE=1 ;;
@@ -40,6 +43,20 @@ done
 TARGET_PROCESS="${POS[0]:-$TARGET_PROCESS}"
 KILLS="${POS[1]:-$KILLS}"
 MIN_SLEEP="${POS[2]:-$MIN_SLEEP}"
+
+# CI mode: GitHub Actions sets CI=true (or 1). In CI a SKIP is a hole and
+# "kill only" mode means the harness never controlled the supervisor it
+# gates -- both must fail the run instead of reporting a soft verdict.
+in_ci() {
+    case "$(printf '%s' "${CI:-}" | tr '[:upper:]' '[:lower:]')" in
+        true | 1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+if in_ci && [ "$LAUNCH" != 1 ] && [ "$EXTERNAL_SUPERVISOR" != 1 ]; then
+    echo "[HARNESS] FAIL: CI requires --launch (or --external-supervisor when a test runner owns the supervisor); kill-only mode gates nothing" >&2
+    exit 1
+fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
@@ -105,27 +122,31 @@ fds_n() {
     "$LSOF" -nP -p "$1" -F f 2>/dev/null | awk '/^f/ {n++} END {print n + 0}'
 }
 
-LAST_KILLED_START_S=0
-TARGET_START_S=0
+# Full /proc starttime ticks (field 22 of stat, monotonic since boot). The
+# old code divided by CLK_TCK and compared SECONDS: two workers forked in
+# the same second were indistinguishable, so a recycled pid could inherit
+# the previous victim's identity. Ticks never wrap within a run.
+LAST_KILLED_START_TICKS=0
+TARGET_START_TICKS=0
 # Identity gate before SIGKILL (parity with the .ps1 image+creation-time
 # and .py /proc-starttime killers): the victim must BE the worker image,
 # not an unrelated process whose argv merely CONTAINS the target path
 # (a `tail -f` on the supervisor log, an editor, an ancestor shell).
-# Linux: /proc/<pid>/exe image name + monotonic starttime vs the last
+# Linux: /proc/<pid>/exe image name + full starttime ticks vs the last
 # kill (a stale recycled pid or a not-yet-rewritten pid file is skipped).
-# macOS/BSD: no /proc — image-name match only.
+# macOS/BSD: no /proc -- image name plus lstart, whose resolution is one
+# SECOND, so two workers started within the same second are refused
+# rather than guessed (documented platform boundary).
 target_is_worker() {
-    TARGET_START_S=0
+    TARGET_START_TICKS=0
     pid="$1"
     exe=$(basename "$(readlink "/proc/$pid/exe" 2>/dev/null)" 2>/dev/null)
     if [ -n "$exe" ]; then
         [ "$exe" = "$TARGET_PROCESS" ] || return 1
         start_ticks=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
         case "$start_ticks" in ''|*[!0-9]*) return 1 ;; esac
-        clk=$(getconf CLK_TCK 2>/dev/null)
-        [ -n "$clk" ] || clk=100
-        TARGET_START_S=$((start_ticks / clk))
-        [ "$TARGET_START_S" -gt "$LAST_KILLED_START_S" ] || return 1
+        TARGET_START_TICKS=$start_ticks
+        [ "$TARGET_START_TICKS" -gt "$LAST_KILLED_START_TICKS" ] || return 1
         return 0
     fi
     # No /proc (macOS/BSD): image name plus process creation time. Without
@@ -141,8 +162,10 @@ target_is_worker() {
         start_s=$(date -j -f "%a %b %d %T %Y" "$lstart" +%s 2>/dev/null)
     fi
     case "$start_s" in ''|*[!0-9]*) return 1 ;; esac
-    TARGET_START_S=$start_s
-    [ "$TARGET_START_S" -gt "$LAST_KILLED_START_S" ] || return 1
+    # One-second resolution: strictly-greater still rejects a same-second
+    # respawn, which is the safe side of the ambiguity.
+    TARGET_START_TICKS=$start_s
+    [ "$TARGET_START_TICKS" -gt "$LAST_KILLED_START_TICKS" ] || return 1
 }
 cpu_ticks() {
     if [ -r "/proc/$1/stat" ]; then
@@ -306,7 +329,7 @@ while [ "$EXECUTED" -lt "$KILLS" ]; do
         [ "$HAVE_NS" = 1 ] && START_NS=$(date +%s%N)
         sample_worker "$TARGET_PID"
         if kill -9 "$TARGET_PID" 2>/dev/null; then
-            LAST_KILLED_START_S=$TARGET_START_S
+            LAST_KILLED_START_TICKS=$TARGET_START_TICKS
             if [ "$HAVE_NS" = 1 ]; then
                 END_NS=$(date +%s%N)
                 awk -v a="$START_NS" -v b="$END_NS" 'BEGIN { printf "%.3f\n", (b-a)/1000000 }' >> "$LAT_FILE"
@@ -367,9 +390,25 @@ if [ -n "$SUP_PID" ]; then
     SUP_EXIT=$?
 fi
 
+# Real JSON parser (python3), not a regex: a nested or reformatted report
+# must parse or fail. An empty result is the documented fallback -- the
+# four conservation checks below then fail instead of "passing harness-only".
 read_json_int() {
     [ -f "$REPORT" ] || { echo ""; return; }
-    sed -n "s/.*\"$1\": *\([0-9][0-9]*\).*/\1/p" "$REPORT" 2>/dev/null | head -1
+    command -v python3 > /dev/null 2>&1 || { echo ""; return; }
+    python3 - "$REPORT" "$1" 2>/dev/null <<'PYEOF_INNER'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        value = json.load(handle).get(sys.argv[2])
+except (OSError, ValueError, AttributeError):
+    sys.exit(0)
+if isinstance(value, bool) or not isinstance(value, int):
+    sys.exit(0)
+print(value)
+PYEOF_INNER
 }
 
 REAPED=$(read_json_int total_reaped)
@@ -434,7 +473,13 @@ if [ "$FD_SAMPLING" = "1" ]; then
         add_check 0 "sampler collected supervisor fd samples (got 0)"
     fi
 else
-    add_skip "supervisor fd growth (no /proc and no lsof)"
+    if in_ci; then
+        # CI provisions Linux /proc; a missing fd backend means the leak
+        # gate silently stopped existing.
+        add_check 0 "supervisor fd sampling available (CI requires /proc or lsof)"
+    else
+        add_skip "supervisor fd growth (no /proc and no lsof)"
+    fi
 fi
 
 VERDICT="FAIL"
