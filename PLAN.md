@@ -654,4 +654,5 @@ Push — одразу після зеленого прогону (standing prefe
 | 2026-10-25 | 3 | F-05/F-22/F-23/F-24/F-25/F-26; повний 7-доданковий закон, floor-и, справжній rollback-свідок; suite 399 | `test(conservation): pin full admission law and positive volume floors` (dc12cd4) |
 | 2026-10-25 | 4 | F-06: contended-бенчі падають на виснаженні retry/нулі допусків; `bench_hygiene` ловить join/send; README contended-рядки переміряно | `fix(bench): fail fast on retry exhaustion and discarded send results` (7c9e6bf) |
 | 2026-10-25 | 5 | F-10..F-14/F-17/F-29..F-34: PARITY-фінгерпринт, строгий CI, release-гейт, ticks, `bench-full`, `miri-leaks`, `termination-smoke`; suite 400 -> 401 | `fix(ci): close skip/parse/parity holes and add full bench artifact lane` (7bf69ee) |
+| 2026-10-25 | 6 | F-15/F-18/F-19/F-20/F-21: core/std split, `lane.*` receivers, чесний `Vec` у `report()`, бенч-ID, provenance + artifact, 24 аксесори, README rationale-анкори, CHANGELOG `Unreleased`; doctests 26; suite 401 | `docs: correct pool API receivers, core/std split, allocations, bench names, accessors` (e1252fb) |
 |  |  |  |  |
