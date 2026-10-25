@@ -4,11 +4,10 @@ All notable changes to `snubber`. Benchmarks live in [README.md](README.md);
 the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 ("Fixed in …" sections) and [docs/INVARIANTS.md](docs/INVARIANTS.md).
 
-## Unreleased
+## 0.6.9 — 2026-10-25
 
 Eighth-audit batch (hook panics, scanner reset order, lock hygiene, honest
-tests and benches, CI teeth). No API removals; `Cargo.toml` still reads
-0.6.8 until a release is ordered.
+tests and benches, CI teeth). No API removals.
 
 ### Fixed
 
