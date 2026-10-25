@@ -1,8 +1,8 @@
 # PLAN.md — виправлення за підсумками ворожого аудиту
 
-> **Стан на 2026-10-25:** HEAD `67f26b8 test(async): cover settle handoff, half-open cancel, poisoned node path`,
-> `Cargo.toml` = `0.6.8`, теги `v0.5.0`, `v0.5.3`, `v0.6.3`. Етапи 0–7 закриті; suite 404 (378 + 26 doctests),
-> бейдж 404. Етап 8 (реліз) — тільки за окремим наказом; робоче дерево чисте після журнального коміту.
+> **Стан на 2026-10-25:** HEAD `784453c release: 0.6.9 — audit closeout`,
+> `Cargo.toml` = `0.6.9`, теги `v0.5.0`, `v0.5.3`, `v0.6.3` (`v0.6.9` не створено — потрібен окремий наказ).
+> Етапи 0–8 закриті; suite 404 (378 + 26 doctests), бейдж 404.
 > **Джерело:** повний звіт аудиту (секції 1–3) + доказова база під-агентів, зібрана в цій сесії.
 > **Правило етапу:** етап не закривається без `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
 > повного suite, скриптових гейтів і оновленого CHANGELOG (якщо поведінка змінилася).
@@ -575,19 +575,26 @@ bench `grep` rc 2 → FAIL; `--github` у CI без summary → exit 1; harness 
 **Мета:** зафіксувати виправлення у версії та CHANGELOG, не порушивши semver.
 
 **Кроки:**
-- [ ] Переконатися, що Етапи 0–7 закриті; suite/gates/clippy/fmt зелені.
-- [ ] `Cargo.toml` version → `0.6.9` (або що скаже власник); `CHANGELOG.md` — повний список.
-- [ ] `bash scripts/check_release_tag.sh` — очікувано FAIL, поки немає тегу; це нагадування.
-- [ ] **Тег — тільки за окремим наказом.** Без наказу не створювати і не пушити тег.
-- [ ] Commit + push (за standing preference), з measured before→after для кожного перф-пункту.
+- [x] Переконатися, що Етапи 0–7 закриті; suite/gates/clippy/fmt зелені.
+- [x] `Cargo.toml` version → `0.6.9` (або що скаже власник); `CHANGELOG.md` — повний список.
+- [x] `bash scripts/check_release_tag.sh` — `WARN: Cargo.toml 0.6.9 is ahead of the latest tag v0.6.3`
+      (exit 0; версія задокументована, тег — окремо).
+- [x] **Тег — тільки за окремим наказом.** Наказу не було: `v0.6.9` не створено і не запушено;
+      останній тег лишається `v0.6.3`.
+- [x] Commit + push (за standing preference), з measured before→after для кожного перф-пункту.
 
 **Готово:** version і CHANGELOG узгоджені; CI зелений; тег або створений за наказом, або явно
 залишений на потім.
 
 **Коміт:** `release: 0.6.9 — audit closeout`
 
-**Дописи:** semver-гейт не побачить змін, доданих і видалених між тегами; саме тому
-`check_release_tag.sh` + тег на кожен реліз є частиною процесу, а не косметикою.
+**Дописи:**
+- Гейт `check_release_tag.sh` дає WARN, не FAIL: версія попереду тегу, але секція
+  `## 0.6.9 — 2026-10-25` у CHANGELOG існує. FAIL був би лише за відсутньої секції.
+- Локальні гейти: 6 OK, Gate 6 SKIP — `cargo-semver-checks` локально не встановлено, CI його ставить;
+  відсутність гейта в CI = FAIL, тож SKIP не може проскочити в реліз.
+- Тег не створювався: це окремий наказ. Версія в маніфесті від цього не залежить — semver-гейт
+  і далі дериться від `v0.6.3`, і саме тому тег на кожен реліз є частиною процесу.
 
 ---
 
@@ -672,4 +679,5 @@ Push — одразу після зеленого прогону (standing prefe
 | 2026-10-25 | 5 | F-10..F-14/F-17/F-29..F-34: PARITY-фінгерпринт, строгий CI, release-гейт, ticks, `bench-full`, `miri-leaks`, `termination-smoke`; suite 400 -> 401 | `fix(ci): close skip/parse/parity holes and add full bench artifact lane` (7bf69ee) |
 | 2026-10-25 | 6 | F-15/F-18/F-19/F-20/F-21: core/std split, `lane.*` receivers, чесний `Vec` у `report()`, бенч-ID, provenance + artifact, 24 аксесори, README rationale-анкори, CHANGELOG `Unreleased`; doctests 26; suite 401 | `docs: correct pool API receivers, core/std split, allocations, bench names, accessors` (e1252fb) |
 | 2026-10-25 | 7 | F-27/F-28/F-35..F-39: 3 нові тести (handoff, half-open cancel, poisoned ledger), post-abort assert, TTL/ordering/lane/fence рішення; suite 404 (378+26 doctests) | `test(async): cover settle handoff, half-open cancel, poisoned node path` (67f26b8) |
+| 2026-10-25 | 8 | release 0.6.9: `Cargo.toml`+lock+CHANGELOG; гейт `WARN` (документовано, не теговано); fmt/clippy/suite 404 зелені, 6 gates OK (Gate 6 SKIP локально); тег `v0.6.9` не створено — окремий наказ | `release: 0.6.9 — audit closeout` (784453c) |
 |  |  |  |  |
