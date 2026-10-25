@@ -20,9 +20,8 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 - Miri jobs pin `nightly-2026-10-09` instead of a floating `@nightly`: the
   0.6.9 Miri failure was a std change in a newer nightly, not a repository
   change, so bumping the pin is now a deliberate commit.
-- `.qoder/skills/snubber-release/SKILL.md` records the release checklist
-  and failure playbook; `just check|release-lanes|release|package-dry|publish`
-  wrap the same commands for humans and agents.
+- `just check|release-lanes|release|package-dry|publish` wrap the same
+  commands in `scripts/release.sh` for humans and agents.
 
 ### Docs
 
