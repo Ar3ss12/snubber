@@ -1,8 +1,8 @@
 # PLAN.md — виправлення за підсумками ворожого аудиту
 
-> **Стан на 2026-10-25:** HEAD `784453c release: 0.6.9 — audit closeout`,
-> `Cargo.toml` = `0.6.9`, теги `v0.5.0`, `v0.5.3`, `v0.6.3` (`v0.6.9` не створено — потрібен окремий наказ).
-> Етапи 0–8 закриті; suite 404 (378 + 26 doctests), бейдж 404.
+> **Стан на 2026-10-25:** HEAD `424b260 docs(changelog): fold post-release test fixes into 0.6.9`,
+> `Cargo.toml` = `0.6.9`, теги `v0.5.0`, `v0.5.3`, `v0.6.3`, `v0.6.9`. Крейт `snubber 0.6.9`
+> опубліковано на crates.io. Етапи 0–8 закриті; suite 404 (378 + 26 doctests), бейдж 404.
 > **Джерело:** повний звіт аудиту (секції 1–3) + доказова база під-агентів, зібрана в цій сесії.
 > **Правило етапу:** етап не закривається без `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
 > повного suite, скриптових гейтів і оновленого CHANGELOG (якщо поведінка змінилася).
@@ -579,8 +579,8 @@ bench `grep` rc 2 → FAIL; `--github` у CI без summary → exit 1; harness 
 - [x] `Cargo.toml` version → `0.6.9` (або що скаже власник); `CHANGELOG.md` — повний список.
 - [x] `bash scripts/check_release_tag.sh` — `WARN: Cargo.toml 0.6.9 is ahead of the latest tag v0.6.3`
       (exit 0; версія задокументована, тег — окремо).
-- [x] **Тег — тільки за окремим наказом.** Наказу не було: `v0.6.9` не створено і не запушено;
-      останній тег лишається `v0.6.3`.
+- [x] **Тег — тільки за окремим наказом.** Наказ отримано 2026-10-25: `v0.6.9` створено на
+      `424b260` і запушено; крейт `snubber 0.6.9` опубліковано на crates.io.
 - [x] Commit + push (за standing preference), з measured before→after для кожного перф-пункту.
 
 **Готово:** version і CHANGELOG узгоджені; CI зелений; тег або створений за наказом, або явно
@@ -593,8 +593,9 @@ bench `grep` rc 2 → FAIL; `--github` у CI без summary → exit 1; harness 
   `## 0.6.9 — 2026-10-25` у CHANGELOG існує. FAIL був би лише за відсутньої секції.
 - Локальні гейти: 6 OK, Gate 6 SKIP — `cargo-semver-checks` локально не встановлено, CI його ставить;
   відсутність гейта в CI = FAIL, тож SKIP не може проскочити в реліз.
-- Тег не створювався: це окремий наказ. Версія в маніфесті від цього не залежить — semver-гейт
-  і далі дериться від `v0.6.3`, і саме тому тег на кожен реліз є частиною процесу.
+- За наказом власника 2026-10-25: тег `v0.6.9` створено на `424b260` після фінальних тест-фіксів,
+  `check_release_tag.sh` → `OK: Cargo.toml 0.6.9 matches tag v0.6.9`, `cargo publish` залив
+  `snubber 0.6.9` (127 файлів, 413.5 KiB стиснуто). docs.rs збудує документацію з тегу.
 
 ---
 
@@ -680,4 +681,6 @@ Push — одразу після зеленого прогону (standing prefe
 | 2026-10-25 | 6 | F-15/F-18/F-19/F-20/F-21: core/std split, `lane.*` receivers, чесний `Vec` у `report()`, бенч-ID, provenance + artifact, 24 аксесори, README rationale-анкори, CHANGELOG `Unreleased`; doctests 26; suite 401 | `docs: correct pool API receivers, core/std split, allocations, bench names, accessors` (e1252fb) |
 | 2026-10-25 | 7 | F-27/F-28/F-35..F-39: 3 нові тести (handoff, half-open cancel, poisoned ledger), post-abort assert, TTL/ordering/lane/fence рішення; suite 404 (378+26 doctests) | `test(async): cover settle handoff, half-open cancel, poisoned node path` (67f26b8) |
 | 2026-10-25 | 8 | release 0.6.9: `Cargo.toml`+lock+CHANGELOG; гейт `WARN` (документовано, не теговано); fmt/clippy/suite 404 зелені, 6 gates OK (Gate 6 SKIP локально); тег `v0.6.9` не створено — окремий наказ | `release: 0.6.9 — audit closeout` (784453c) |
+| 2026-10-25 | 8 | Пост-релізні CI-фікси: поріг `stress_breaker_churn` прив'язано до churn (`admitted >= breaker_trips`), clone-identity assert під `cfg(not(miri))`; обидва лейни зелені | `9ef250e`, `e0a3c52` |
+| 2026-10-25 | 8 | За наказом: CHANGELOG згорнуто у `0.6.9`; тег `v0.6.9` створено і запушено; `cargo publish` → crates.io `snubber 0.6.9` | `docs(changelog): fold post-release test fixes into 0.6.9` (424b260) |
 |  |  |  |  |
