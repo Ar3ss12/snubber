@@ -797,6 +797,7 @@ struct DrainInner {
 pub struct PipeDrain {
     inner: Arc<DrainInner>,
     done: Arc<AtomicU64>,
+    feeds_after_eof: Arc<AtomicU64>,
     clock: ClockFn,
 }
 
@@ -820,6 +821,7 @@ impl PipeDrain {
                 ingest: Mutex::new(IngestState::default()),
             }),
             done: Arc::new(AtomicU64::new(0)),
+            feeds_after_eof: Arc::new(AtomicU64::new(0)),
             clock,
         }
     }
@@ -884,22 +886,40 @@ impl PipeDrain {
     /// Accepts any chunking: one byte at a time, several frames per chunk,
     /// garbage prefixes, torn tails. Returns the number of complete frames
     /// delivered by THIS call; a partial frame is retained for the next one.
-    /// A finished drain accepts nothing and returns `0`.
+    /// A finished drain accepts nothing, returns `0`, and counts the
+    /// rejected call — see [`PipeDrain::feeds_after_eof`].
     pub fn feed(&self, bytes: &[u8]) -> usize {
-        // Take the ingest lock BEFORE the EOF check: `finish` also takes it,
-        // so a concurrent close either fully precedes this chunk or fully
-        // follows it — a finished drain truly accepts nothing.
+        // Lock-free fast path: a finished drain returns without touching
+        // the mutex or calling the user clock. Advisory only — the
+        // authoritative check below runs under `ingest`.
+        if self.eof() {
+            self.feeds_after_eof.fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
+        // One clock read per chunk, before ANY drain lock. The ClockFn is
+        // caller code; it must never run under a drain mutex.
+        let now = (self.clock)();
+        // Take the ingest lock BEFORE the second EOF check: `finish` also
+        // takes it, so a concurrent close either fully precedes this chunk
+        // or fully follows it — a finished drain truly accepts nothing.
         let mut ingest = match self.inner.ingest.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         if self.eof() {
+            self.feeds_after_eof.fetch_add(1, Ordering::Relaxed);
             return 0;
         }
-        // One clock read per chunk, taken OUTSIDE the state lock. The
-        // ClockFn is caller code; it must never run under a drain mutex.
-        let now = (self.clock)();
         ingest.push(bytes, |token| self.apply_token_at(token, now))
+    }
+
+    /// Chunks refused because the drain had already reached `EOF`.
+    ///
+    /// A non-zero value after `finish` means a producer kept writing into a
+    /// closed pipe: the bytes were dropped, not buffered.
+    #[must_use]
+    pub fn feeds_after_eof(&self) -> u64 {
+        self.feeds_after_eof.load(Ordering::Relaxed)
     }
 
     /// Mark the stream finished (`EOF`). Idempotent, thread-safe; a torn

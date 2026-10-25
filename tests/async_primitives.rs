@@ -100,6 +100,76 @@ fn waker_queue_sleeps_and_wakes_on_commit() {
 }
 
 #[test]
+fn re_park_replaces_waker_once_and_wakes_only_the_new_one() {
+    // Wakers record into caller-owned flags: a re-poll of a parked future
+    // must overwrite its queue entry (not append a second one), and only
+    // the newest waker may fire when the slot frees.
+    static OLD_WOKEN: AtomicBool = AtomicBool::new(false);
+    static NEW_WOKEN: AtomicBool = AtomicBool::new(false);
+    fn flag_waker(flag: &'static AtomicBool) -> Waker {
+        unsafe fn clone(data: *const ()) -> RawWaker {
+            RawWaker::new(data, &VT_FLAG)
+        }
+        unsafe fn wake(data: *const ()) {
+            (*(data as *const AtomicBool)).store(true, Ordering::SeqCst);
+        }
+        unsafe fn wake_by_ref(data: *const ()) {
+            (*(data as *const AtomicBool)).store(true, Ordering::SeqCst);
+        }
+        unsafe fn drop(_: *const ()) {}
+        static VT_FLAG: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                flag as *const AtomicBool as *const (),
+                &VT_FLAG,
+            ))
+        }
+    }
+
+    OLD_WOKEN.store(false, Ordering::SeqCst);
+    NEW_WOKEN.store(false, Ordering::SeqCst);
+    let node = SnubberNode::builder("async/re-park")
+        .max_in_flight(1)
+        .build();
+    let gate = node.enter(1, 1, || {}).expect("slot 1");
+    let mut fut = node.enter_async(2, 2, || {});
+
+    let old = flag_waker(&OLD_WOKEN);
+    let mut old_cx = std::task::Context::from_waker(&old);
+    assert!(core::pin::Pin::new(&mut fut).poll(&mut old_cx).is_pending());
+    assert_eq!(node.waiter_len(), 1);
+
+    let new = flag_waker(&NEW_WOKEN);
+    let mut new_cx = std::task::Context::from_waker(&new);
+    assert!(core::pin::Pin::new(&mut fut).poll(&mut new_cx).is_pending());
+    assert_eq!(
+        node.waiter_len(),
+        1,
+        "a re-poll updates the entry instead of enqueueing a second waker"
+    );
+
+    drop(gate);
+    assert!(
+        NEW_WOKEN.load(Ordering::SeqCst),
+        "the replacement waker must be the one woken"
+    );
+    assert!(
+        !OLD_WOKEN.load(Ordering::SeqCst),
+        "the replaced waker must not be left in the queue"
+    );
+    match core::pin::Pin::new(&mut fut).poll(&mut new_cx) {
+        std::task::Poll::Ready(Ok(guard)) => {
+            guard.commit();
+        }
+        std::task::Poll::Ready(Err(error)) => {
+            panic!("expected Ready(Ok(_)), got Err({error:?})")
+        }
+        std::task::Poll::Pending => panic!("expected Ready(Ok(_)), got Pending"),
+    }
+    assert_eq!(node.waiter_len(), 0);
+}
+
+#[test]
 fn stage_survives_kill_and_lands_in_record() {
     let node = SnubberNode::builder("async/stage")
         .policy(

@@ -395,13 +395,14 @@ impl<S, D> TaskHandle<S, D> {
     fn wake_async(&self) {
         // Wake OUTSIDE the lock: `wake()` runs executor code, and a panic
         // under the wakers mutex would poison it and strand every later
-        // waiter (drained wakers are plain values — release first).
-        let drained: Vec<Waker> = match self.inner.wakers.lock() {
-            Ok(mut wakers) => wakers.drain(..).map(|p| p.waker).collect(),
-            Err(poisoned) => poisoned.into_inner().drain(..).map(|p| p.waker).collect(),
+        // waiter. `mem::take` hands over the existing Vec without
+        // allocating under the lock.
+        let parked = match self.inner.wakers.lock() {
+            Ok(mut wakers) => core::mem::take(&mut *wakers),
+            Err(poisoned) => core::mem::take(&mut *poisoned.into_inner()),
         };
-        for w in drained {
-            w.wake();
+        for p in parked {
+            p.waker.wake();
         }
     }
 }
@@ -473,7 +474,11 @@ impl<S, D> Future for ResumeFuture<S, D> {
                 // own entry (matched by the minted flag), never a sibling's.
                 if let Some(flag) = this.identity.as_ref() {
                     if let Some(slot) = wakers.iter_mut().find(|q| Arc::ptr_eq(&q.identity, flag)) {
-                        slot.waker = waker;
+                        // Drop the replaced waker after the lock: its Drop
+                        // runs executor code and may take executor locks.
+                        let old = core::mem::replace(&mut slot.waker, waker);
+                        drop(wakers);
+                        drop(old);
                         return Poll::Pending;
                     }
                 }

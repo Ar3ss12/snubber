@@ -119,8 +119,14 @@ fn finish_drops_the_torn_tail_and_seals_the_drain() {
         "a finished drain rejects the tail"
     );
     assert_eq!(drain.feed(&frame), 0, "and every later frame");
+    assert_eq!(
+        drain.feeds_after_eof(),
+        2,
+        "every post-EOF chunk is counted, not silently dropped"
+    );
     assert!(drain.take_armed().is_none());
     drain.finish(); // idempotent
+    assert_eq!(drain.feeds_after_eof(), 2, "finish() itself is not a feed");
 }
 
 #[test]

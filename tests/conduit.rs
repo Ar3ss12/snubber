@@ -255,6 +255,52 @@ fn dropped_resume_future_removes_its_parked_waker() {
     );
 }
 
+/// A re-poll of a paused `ResumeFuture` with a different context must update
+/// the parked entry in place: exactly one waker stays queued, and `resume`
+/// fires the newest one only.
+#[test]
+fn re_poll_replaces_parked_waker_and_wakes_only_the_new_one() {
+    fn flag_waker(flag: &'static AtomicBool) -> Waker {
+        unsafe fn clone(data: *const ()) -> RawWaker {
+            RawWaker::new(data, &VT)
+        }
+        unsafe fn wake(data: *const ()) {
+            (*(data as *const AtomicBool)).store(true, Ordering::SeqCst);
+        }
+        unsafe fn wake_by_ref(data: *const ()) {
+            (*(data as *const AtomicBool)).store(true, Ordering::SeqCst);
+        }
+        unsafe fn drop(_: *const ()) {}
+        static VT: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        unsafe { Waker::from_raw(RawWaker::new(flag as *const AtomicBool as *const (), &VT)) }
+    }
+
+    static OLD: AtomicBool = AtomicBool::new(false);
+    static NEW: AtomicBool = AtomicBool::new(false);
+    OLD.store(false, Ordering::SeqCst);
+    NEW.store(false, Ordering::SeqCst);
+
+    let (conduit, handle) = TaskConduit::<WorkerState>::pair(WorkerState::default());
+    handle.send_directive(Directive::Pause);
+    let mut fut = Box::pin(conduit.wait_for_resume_async());
+
+    let old = flag_waker(&OLD);
+    let mut old_cx = Context::from_waker(&old);
+    assert_eq!(fut.as_mut().poll(&mut old_cx), Poll::Pending);
+
+    let new = flag_waker(&NEW);
+    let mut new_cx = Context::from_waker(&new);
+    assert_eq!(fut.as_mut().poll(&mut new_cx), Poll::Pending);
+
+    handle.resume();
+    assert!(NEW.load(Ordering::SeqCst), "the newest waker must fire");
+    assert!(
+        !OLD.load(Ordering::SeqCst),
+        "the replaced waker must not linger in the queue"
+    );
+    assert_eq!(fut.as_mut().poll(&mut new_cx), Poll::Ready(Ok(())));
+}
+
 /// Zero-Bound Clone Invariant: hand-written `Clone` on the intercom pair must
 /// carry NO bounds. `#[derive(Clone)]` would demand `S: Clone, D: Clone`
 /// even though cloning the inner `Arc` never touches the payload — a

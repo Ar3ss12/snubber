@@ -41,16 +41,16 @@
 | F-04 | P0 | `pool.report()` алокує `Vec`, доки двічі обіцяно «no allocation» | `src/pool/mod.rs:252-254`, `src/pool/report.rs:116-121`, `README.md:132`, `USER_GUIDE.md:1789` | 1/6 | `[x]` |
 | F-05 | P0 | Тести консервації перевіряють урізані рівняння; повний 7-доданковий закон не проганяється | `src/node.rs:289-297`; `tests/bulkhead_capacity.rs:97-110`; `tests/transition_orphan.rs:83-85`; `tests/stress_breaker_churn.rs:162-165` | 3 | `[ ]` |
 | F-06 | P0 | Бенчі конкуренції можуть опублікувати ns/op за нуля допусків: retry виснажується, `stale` не читається, `join` ковтається | `benches/admission_bench.rs:625-665`, `679-711`, `730-757` | 4 | `[ ]` |
-| F-07 | P1 | Drop `Waker` під node-локом (`slot.waker = waker`, `retain`) | `src/node.rs:3678`, `3896` | 2 | `[ ]` |
-| F-08 | P1 | Алокація `Vec<Waker>` під замком wakers у conduit | `src/conduit.rs:399-402` | 2 | `[ ]` |
-| F-09 | P1 | `SystemTime::now()` під node-локом у rate limiter і `check_timeout` | `src/node.rs:3299`, `5277` | 2 | `[ ]` |
+| F-07 | P1 | Drop `Waker` під node-локом (`slot.waker = waker`, `retain`) | `src/node.rs:3678`, `3896` | 2 | `[x]` |
+| F-08 | P1 | Алокація `Vec<Waker>` під замком wakers у conduit | `src/conduit.rs:399-402` | 2 | `[x]` |
+| F-09 | P1 | `SystemTime::now()` під node-локом у rate limiter і `check_timeout` | `src/node.rs:3299`, `5277` | 2 | `[x]` |
 | F-10 | P1 | CI міряє лише 1 бенч; решта 51 і перформанс-регресії не гейтяться; артефактів немає | `.github/workflows/ci.yml:259-267` | 5 | `[ ]` |
 | F-11 | P1 | Semver-гейт сліпий до проміжних релізів (baseline = останній тег `v0.6.3`, crate `0.6.8`) | `scripts/check_api_diff.sh:55-65`; `git tag` | 5 | `[ ]` |
 | F-12 | P1 | PS-гейт вужчий за sh: 6 лічильників vs 15, лише `record_locked` vs 3 функції | `scripts/check_compile_gates.ps1:25-94` vs `.sh:52-120` | 5 | `[ ]` |
 | F-13 | P1 | `stress_harness.sh`: SKIP не валить рана; PID-гейт у секундах; JSON — regex; `LAUNCH=0` вимикає гейти | `scripts/stress_harness.sh:108-146`, `370-373`, `396-398`, `420-443` | 5 | `[ ]` |
 | F-14 | P1 | Miri: `-Zmiri-ignore-leaks` у всіх лейнах; покрито 33 з ~60 файлів | `.github/workflows/ci.yml:175,180,216` | 5 | `[ ]` |
 | F-15 | P1 | `feed`/`finish`/`write_to` — std-only, а таблиця гайда продає їх як core/bare-metal | `src/supervisor.rs:518,678,888,907`; `src/lib.rs:128-129`; `USER_GUIDE.md:1787` | 6 | `[ ]` |
-| F-16 | P1 | `PipeDrain::feed` після `finish` тихо відкидає чанк і рапортує `0 frames`; коментар про clock суперечить коду | `src/supervisor.rs:892-918`, `896-901` | 2/7 | `[ ]` |
+| F-16 | P1 | `PipeDrain::feed` після `finish` тихо відкидає чанк і рапортує `0 frames`; коментар про clock суперечить коду | `src/supervisor.rs:892-918`, `896-901` | 2/7 | `[x]` |
 | F-17 | P1 | FakeWake: мертве поле `usize`, `wake` — no-op, identity-твердження не перевіряється | `tests/task_engine.rs:255-268` | 5 | `[ ]` |
 | F-18 | P2 | `USER_GUIDE.md` документує неіснуючі `pool.attach`/`pool.note_death` | `USER_GUIDE.md:1788` vs `src/pool/lane.rs:157,241` | 6 | `[ ]` |
 | F-19 | P2 | Назви бенчів у README не збігаються з джерелом (`_threads_`, `classify_stall`) | `README.md:102,154-156` vs `benches/admission_bench.rs:49,627,679,719` | 6 | `[ ]` |
@@ -206,43 +206,60 @@
 
 #### 2.1 F-07 — `Waker` drop під node-локом
 
-- [ ] `node.rs:3678`: `let old = core::mem::replace(&mut slot.waker, waker);` → відпустити `inner` →
-      `drop(old)` → повернути `Poll::Pending`. Переконатися, що TTL-origin і `evicted_out` не залежать
-      від guard'а після цього.
-- [ ] `node.rs:3896` `retain`: зібрати видалених waiter'ів у локальний `Vec`, зарезервований **до** замка
-      (`Vec::with_capacity(inner.waiters.len())` після першого читання len), або зробити двофазний
-      `mem::take` з перевіркою identity. Drop — після відпускання замка.
-- [ ] `node.rs:3728` `Arc::new(AtomicBool)` для `evicted`: перенести алокацію **до** `self.lock()`;
-      якщо структура функції не дозволяє — задокументувати як єдину неминучу алокацію парку.
-- [ ] `node.rs:3731` `waiters.push_back`: `VecDeque::with_capacity(64)` при побудові + коментар,
-      що ріст — рідкісний cold-path; або зарезервувати наперед.
-- [ ] Регресії: `cancel_after_settle_pop_does_not_drop_waker_under_lock` (структурний тест неможливий —
-      тоді тест на відсутність deadlock/panic під `Drop` + `catch_unwind`), `re_park_replaces_waker_once`.
+- [x] `node.rs` re-park: `let old = core::mem::replace(&mut slot.waker, waker);` → `drop(inner); drop(old);`
+      → `Poll::Pending`. TTL-origin (`enqueued_at_ms`) і `evicted_out` не залежать від guard'а.
+- [x] `deregister_waiter`: замість `retain` (дропає під замком) — `position` + `VecDeque::remove`
+      (флаг ідентифікує рівно один запис), видалений `ParkedWaiter` дропається після unlock.
+      Handoff-`pop_front` лишається під замком, `wake()` — поза ним. Алокацій немає взагалі.
+- [x] `Arc::new(AtomicBool)` для `evicted` лишено під замком і задокументовано: підняти алокацію над
+      `self.lock()` означало б алокувати на кожному допущеному poll'і заради холодного шляху парку.
+- [x] `waiters.push_back`: `VecDeque::new()` лишається; ріст — cold-path, коментар додано разом з
+      F-07 (див. вище). Окремий `with_capacity(64)` відхилено: 64 саркастично більше за типовий
+      `queue_limit`, а пам'ять платилася б завжди.
+- [x] Регресії: `re_park_replaces_waker_once_and_wakes_only_the_new_one` (node) і
+      `re_poll_replaces_parked_waker_and_wakes_only_the_new_one` (conduit). Структурний тест «не під
+      замком» неможливий без інструментації production-коду — поведінковий тест ловить втрату waker'а.
+
+**Дописи:** identity-флаг унікальний на запис, тому `position`+`remove` еквівалентний `retain`, але
+повертає видалене значення назовні. `VecDeque::remove` — O(n) як і `retain`, черга обмежена
+`queue_limit`.
 
 #### 2.2 F-08 — conduit: `mem::take` замість `collect` під замком
 
-- [ ] `conduit.rs:399-402`: замінити `drain(..).collect()` на
-      `let old = { let mut w = lock; core::mem::take(&mut *w) };` → drop guard → wake/drop поза замком.
-- [ ] `conduit.rs:476`: `slot.waker = waker` → `mem::replace` + drop після unlock (як у 2.1).
-- [ ] Регресії: `wake_after_pause_does_not_hold_wakers_lock`, `resume_replaces_waker_without_deadlock`.
+- [x] `wake_async`: `core::mem::take(&mut *wakers)` передає наявний `Vec` без алокації під замком;
+      `wake()` викликається після відпускання guard'а.
+- [x] `ResumeFuture::poll`: `slot.waker = waker` → `mem::replace` + `drop(wakers)` + `drop(old)`.
+- [x] Регресії: `re_poll_replaces_parked_waker_and_wakes_only_the_new_one`; наявні
+      `resume_never_loses_the_wakeup_under_pause_churn` і `dropped_resume_future_removes_its_parked_waker`
+      лишаються зеленими.
 
 #### 2.3 F-09 — clock поза замком
 
-- [ ] `node.rs:3299`: зняти `now_ms()` до взяття замка (або один раз на початку `enter_inner`) і
-      використати знімок у rate-limiter. Перевірити, що `rate_last_ms`/`rate_tokens` не залежать від
-      того, чи замок утримувався безперервно.
-- [ ] `node.rs:5277` (`check_timeout`): зняти `now` до lock-секції, передати значення всередину.
-- [ ] Регресії: rate-limit тест із `rate_per_sec > 0` (детермінований, без реального часу — використати
-      існуючий injectable clock, якщо є; інакше тільки smoke).
+- [x] `enter_armed_with_priority`: `let entered_at_ms = now_ms();` до `self.lock()`; token bucket
+      використовує знімок. Час, витрачений на взяття замка, кредитується **наступним** допуском —
+      токени ніколи не перевипускаються.
+- [x] `check_timeout`: `settled_at_ms` знімається після rollback (тривалість rollback увіходить
+      у `elapsed_ms`) і до `node.lock()`; запис у `FaultRecord` більше не кличе `now_ms()`.
+- [x] Регресії: наявні rate-limit тести (`rate_per_sec > 0`) проходять; детермінованого injectable
+      clock у node немає, тому окремий clock-тест не додано (smoke-покриття збережене).
+
+**Дописи:** `now_ms()` читає OS clock — системний виклик, який не має виконуватися під м'ютексом
+вузла. Консервативний знімок не змінює контракт лімітера, лише зсуває момент обліку.
 
 #### 2.4 F-16 — `feed` після `finish`
 
-- [ ] Додати `DrainCounters::feeds_after_eof` (або окремий лічильник), інкрементувати, коли `feed`
-      бачить `eof()` і повертає `0`.
-- [ ] Експонувати в `counters()`/report; додати тест `feed_after_finish_is_counted_and_returns_zero`.
-- [ ] Виправити коментар `supervisor.rs:899-901`: clock читається під **ingest**, не під state;
-      ClockFn — caller code, тому він не має викликатися під жодним drain-замком; якщо це неможливо —
-      перенести читання до `ingest.lock()`.
+- [x] `PipeDrain::feeds_after_eof()`: окремий `Arc<AtomicU64>` (не поле `DrainCounters` — додавання
+      поля в конструктивний публічний struct зламало б semver). Інкремент на обох EOF-перевірках.
+- [x] `feed`: lock-free fast path `eof()` → лічильник → `0`; повільний шлях читає clock **до**
+      `ingest.lock()` і повторно перевіряє EOF під замком (авторитетна перевірка).
+- [x] Коментар виправлено: clock більше не викликається під жодним drain-замком; `ClockFn` — caller
+      code.
+- [x] Тест `finish_drops_the_torn_tail_and_seals_the_drain` розширено: два post-EOF чанки → рівно
+      `feeds_after_eof() == 2`, `finish()` не рахується.
+
+**Дописи:** `DrainCounters` — публічний struct без `#[non_exhaustive]`, тому нове поле змусило б
+мажорний бамп; окремий аксесор зберігає сумісність 0.6.x. Лічильник означає «байти відкинуто, не
+забуферено» — це telemetry для продюсера, що пише в закритий pipe.
 
 **Готово:** жоден `Waker` не дропається під node/wakers замком; conduit не алокує під замком;
 clock-читання не в критичній секції; `feed`-після-EOF спостережуваний; suite зелений.
@@ -582,5 +599,6 @@ Push — одразу після зеленого прогону (standing prefe
 | 2026-10-25 | Аудит | 39 знахідок, 3 секції; файли не змінювалися | — |
 | 2026-10-25 | 0 | PLAN.md створено; baseline 394 зафіксовано | — |
 | 2026-10-25 | 1 | F-01..F-04 виправлено; +3 регресії; suite 394 -> 397 | `fix(core): panic-safe probe hooks, scanner reset order, publish_fault lock hygiene` (3288b34) |
-| 2026-10-25 | 0 | `check_test_count.sh` + CI-гейт; бейдж 397 з provenance | `chore(ci): add reproducible test-count gate and record audit baseline` |
+| 2026-10-25 | 0 | `check_test_count.sh` + CI-гейт; бейдж 397 з provenance | `chore(ci): add reproducible test-count gate and record audit baseline` (d150d64) |
+| 2026-10-25 | 2 | F-07/F-08/F-09/F-16; waker drops і clock поза замками; feed-after-EOF лічильник; suite 397 -> 399 | `fix(concurrency): keep waker drops and clock reads outside mutexes` |
 |  |  |  |  |

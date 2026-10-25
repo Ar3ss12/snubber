@@ -2998,6 +2998,12 @@ impl SnubberNode {
         let header = arming.header;
         let epoch = header.epoch;
         let task_id = header.task_id;
+        // One clock read at admission entry, outside the lock: `now_ms`
+        // reads the OS clock, and the token bucket below must not call it
+        // while holding the node mutex. Using the entry stamp is
+        // conservative — time spent acquiring the lock is credited on the
+        // NEXT admission, so tokens are never over-issued.
+        let entered_at_ms = now_ms();
         let mut inner = self.lock();
 
         // 1. Breaker: OPEN fails fast; HALF_OPEN admits exactly one probe.
@@ -3319,7 +3325,7 @@ impl SnubberNode {
 
         // 5. Token bucket: at most rate_per_sec admissions per second.
         if inner.rate_per_sec > 0 {
-            let now = now_ms();
+            let now = entered_at_ms;
             let elapsed = now.saturating_sub(inner.rate_last_ms) as f64 / 1000.0;
             inner.rate_last_ms = now;
             inner.rate_tokens = (inner.rate_tokens + elapsed * inner.rate_per_sec as f64)
@@ -3698,12 +3704,17 @@ impl SnubberNode {
                     .iter_mut()
                     .find(|w| Arc::ptr_eq(&w.evicted, prev))
                 {
-                    slot.waker = waker;
+                    // Swap the waker but drop the replaced one AFTER the
+                    // lock: dropping a `Waker` runs executor code, which may
+                    // take its own locks or panic.
+                    let old = core::mem::replace(&mut slot.waker, waker);
                     *evicted_out = Some(Arc::clone(prev));
                     // TTL origin stays at the FIRST park: `enqueued_at_ms`
                     // was stamped when this entry was pushed. Re-stamping
                     // here would let a spurious re-poll loop starve the
                     // `task_ttl` check forever.
+                    drop(inner);
+                    drop(old);
                     return core::task::Poll::Pending;
                 }
             }
@@ -3748,6 +3759,11 @@ impl SnubberNode {
                     }
                 }
             }
+            // The eviction flag is minted here, under the lock. Hoisting it
+            // above `self.lock()` would allocate on every admitted poll to
+            // save one allocation on the cold "bulkhead full" path, so this
+            // is the single unavoidable park allocation. It never runs on
+            // the admitted steady path.
             let flag = Arc::new(AtomicBool::new(false));
             *evicted_out = Some(Arc::clone(&flag));
             *enqueued_at_ms = Some(now);
@@ -3914,16 +3930,26 @@ impl SnubberNode {
     /// quiescent node. Waking one waiter whenever a slot is genuinely free
     /// closes that hole (a loser simply re-parks).
     pub(crate) fn deregister_waiter(&self, evicted: &Arc<AtomicBool>) {
-        let waker = {
+        let (removed, handoff) = {
             let mut inner = self.lock();
-            inner.waiters.retain(|w| !Arc::ptr_eq(&w.evicted, evicted));
-            if inner.in_flight < inner.max_in_flight {
+            // A flag identifies exactly one queue entry (re-parks update in
+            // place), so locating and removing it drops nothing else. The
+            // removed `ParkedWaiter` — and its `Waker` — is returned and
+            // dropped after the lock is released.
+            let removed = inner
+                .waiters
+                .iter()
+                .position(|w| Arc::ptr_eq(&w.evicted, evicted))
+                .and_then(|idx| inner.waiters.remove(idx));
+            let handoff = if inner.in_flight < inner.max_in_flight {
                 inner.waiters.pop_front()
             } else {
                 None
-            }
+            };
+            (removed, handoff)
         };
-        if let Some(w) = waker {
+        drop(removed);
+        if let Some(w) = handoff {
             w.waker.wake();
         }
     }
@@ -5246,6 +5272,10 @@ impl<F: FnOnce()> TrackedGuard<F> {
         if let Some(g) = self.guard.take() {
             drop(g); // hardware rollback runs HERE
         }
+        // Stamp the settle AFTER the rollback (so its duration is billed)
+        // but BEFORE the lock: the clock must not be read under the node
+        // mutex.
+        let settled_at_ms = now_ms();
         let mut inner = self.node.lock().unwrap_or_else(|p| {
             let mut g = p.into_inner();
             g.stats.poison_recoveries = g.stats.poison_recoveries.saturating_add(1);
@@ -5297,7 +5327,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             stage: self.stage,
             stage_label: self.stage_label,
             queue_wait_ms: self.queue_wait_ms,
-            elapsed_ms: now_ms().saturating_sub(self.armed_at_ms),
+            elapsed_ms: settled_at_ms.saturating_sub(self.armed_at_ms),
             retry_count: self.retry_count,
         };
         let mut outcome = SnubberNode::record_locked(&mut inner, FaultKind::Timeout, 0);
