@@ -141,9 +141,23 @@ fn breaker_churn_trips_recovers_and_conserves() {
         attempts,
         "every storm attempt must be admitted or land in exactly one shed bucket"
     );
+    // Volume floor scaled to the breaker's OWN admission contract, not to
+    // the attempt count. Once the window trips, HalfOpen admits exactly one
+    // probe and every other attempt is refused, so this shape produces
+    // roughly four admissions per trip no matter how many attempts spin
+    // through `BreakerOpen`. A percentage-of-attempts floor (`attempts/10`)
+    // asserted the opposite of what the node is configured to do: it passed
+    // only while the storm ran slowly enough to admit work before the first
+    // trip, and failed in release where the loop outruns the window.
     assert!(
-        admitted >= attempts / 10,
-        "the storm must admit a meaningful volume: admitted={admitted} of {attempts}"
+        admitted >= s.breaker_trips.max(1),
+        "every breaker trip must be backed by real admitted work: \
+         admitted={admitted}, trips={} (stats: {s:?})",
+        s.breaker_trips
+    );
+    assert!(
+        s.breaker_rejections > 0,
+        "a tripped breaker must refuse contenders, or this lane proves nothing: {s:?}"
     );
     assert_eq!(
         s.rate_rejected + s.memory_rejections + s.poisoned_rejected,
