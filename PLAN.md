@@ -39,7 +39,7 @@
 | F-02 | P0 | `SnubScanner::push` віддає кадр двічі після перехопленої паніки `on_token` (`take=0` повторно входить у `body_len==40`) | `src/drain.rs:215-218` | 1 | `[x]` |
 | F-03 | P0 | `publish_fault` доккоментар «no allocation, no panic» хибний: `NodeName::Owned` дропається під замком; `flight` може реалокати | `src/node.rs:1937-1954`, `src/name.rs:26-30`, `4264-4271` | 1 | `[x]` |
 | F-04 | P0 | `pool.report()` алокує `Vec`, доки двічі обіцяно «no allocation» | `src/pool/mod.rs:252-254`, `src/pool/report.rs:116-121`, `README.md:132`, `USER_GUIDE.md:1789` | 1/6 | `[x]` |
-| F-05 | P0 | Тести консервації перевіряють урізані рівняння; повний 7-доданковий закон не проганяється | `src/node.rs:289-297`; `tests/bulkhead_capacity.rs:97-110`; `tests/transition_orphan.rs:83-85`; `tests/stress_breaker_churn.rs:162-165` | 3 | `[ ]` |
+| F-05 | P0 | Тести консервації перевіряють урізані рівняння; повний 7-доданковий закон не проганяється | `src/node.rs:289-297`; `tests/bulkhead_capacity.rs:97-110`; `tests/transition_orphan.rs:83-85`; `tests/stress_breaker_churn.rs:162-165` | 3 | `[x]` |
 | F-06 | P0 | Бенчі конкуренції можуть опублікувати ns/op за нуля допусків: retry виснажується, `stale` не читається, `join` ковтається | `benches/admission_bench.rs:625-665`, `679-711`, `730-757` | 4 | `[ ]` |
 | F-07 | P1 | Drop `Waker` під node-локом (`slot.waker = waker`, `retain`) | `src/node.rs:3678`, `3896` | 2 | `[x]` |
 | F-08 | P1 | Алокація `Vec<Waker>` під замком wakers у conduit | `src/conduit.rs:399-402` | 2 | `[x]` |
@@ -56,11 +56,11 @@
 | F-19 | P2 | Назви бенчів у README не збігаються з джерелом (`_threads_`, `classify_stall`) | `README.md:102,154-156` vs `benches/admission_bench.rs:49,627,679,719` | 6 | `[ ]` |
 | F-20 | P2 | Числа латентності без артефактів; бейдж 394 без дати/команди; «121 ns» не існує | `README.md:7,67,94,108`; `target/` відсутній | 5/6 | `[ ]` |
 | F-21 | P2 | Публічні аксесори не задокументовані (pool/envelope/harness/token) | `src/pool/mod.rs:121,131,277`; `lane.rs:65,145`; `envelope.rs:84-196`; `harness.rs:28-198`; `drain.rs:109` | 6 | `[ ]` |
-| F-22 | P2 | `supervisor_pool_stress`/`stress_mixed`/`stress_lease`: `env_num` без мінімумів → `KILLS=0` робить усе тривіально зеленим | `tests/supervisor_pool_stress.rs:37-38`; `stress_mixed.rs:45-46`; `stress_lease.rs:64-67` | 3 | `[ ]` |
-| F-23 | P2 | `transition_orphan` «preempt storm» синтетичний (`report(Preempted)`), не справжній preemption | `tests/transition_orphan.rs:69-73` | 3 | `[ ]` |
-| F-24 | P2 | `priority_preemption.rs:119` rollback-свідок не мутує стан, лише лічить виклики | `tests/priority_preemption.rs:50,113-119` | 3 | `[ ]` |
-| F-25 | P2 | `tests/erased.rs` rollback-свідки без node-stat witness | `tests/erased.rs:39,65` | 3 | `[ ]` |
-| F-26 | P2 | Два різні `static ROLLBACKS` з однаковим ім'ям | `tests/guard.rs:234,255` | 7 | `[ ]` |
+| F-22 | P2 | `supervisor_pool_stress`/`stress_mixed`/`stress_lease`: `env_num` без мінімумів → `KILLS=0` робить усе тривіально зеленим | `tests/supervisor_pool_stress.rs:37-38`; `stress_mixed.rs:45-46`; `stress_lease.rs:64-67` | 3 | `[x]` |
+| F-23 | P2 | `transition_orphan` «preempt storm» синтетичний (`report(Preempted)`), не справжній preemption | `tests/transition_orphan.rs:69-73` | 3 | `[x]` |
+| F-24 | P2 | `priority_preemption.rs:119` rollback-свідок не мутує стан, лише лічить виклики | `tests/priority_preemption.rs:50,113-119` | 3 | `[x]` |
+| F-25 | P2 | `tests/erased.rs` rollback-свідки без node-stat witness | `tests/erased.rs:39,65` | 3 | `[x]` |
+| F-26 | P2 | Два різні `static ROLLBACKS` з однаковим ім'ям | `tests/guard.rs:234,255` | 7 | `[x]` |
 | F-27 | P2 | Приклад ISR: cycle 3 abort без post-abort assert | `examples/12_isr_bridge.rs` | 7 | `[ ]` |
 | F-28 | P2 | Покриття async-дір: settle-pop→drop, HalfOpen+cancel, poison async | `tests/async_primitives.rs`, `tests/conduit.rs` | 7 | `[ ]` |
 | F-29 | P2 | `stress_harness.ps1`: managed-path без image/creation gate; kill-semantics/verdict розбіжні з py | `scripts/stress_harness.ps1:294,343,360-367` | 5 | `[ ]` |
@@ -284,27 +284,27 @@ clock-читання не в критичній секції; `feed`-після-
 `tests/supervisor_pool_stress.rs`, `tests/stress_mixed.rs`, `tests/stress_lease.rs`.
 
 **Кроки:**
-- [ ] `tests/invariants.rs`: додати повний 7-доданковий закон
+- [x] `tests/invariants.rs`: додати повний 7-доданковий закон
       `attempts == total_started + bulkhead + stale + breaker + rate + poisoned + memory`;
       зберегти існуючий bucket-enum; підняти floor для `accepted` (не `> 0`, а, наприклад, `>= attempts/10`
       для стрес-сценарію — підібрати так, щоб не флапало).
-- [ ] `tests/bulkhead_capacity.rs:97-110`: додати `assert!(started > 0)`, повний закон, і перевірку
+- [x] `tests/bulkhead_capacity.rs:97-110`: додати `assert!(started > 0)`, повний закон, і перевірку
       кожного лічильника окремо (не тільки `bulk + stale`).
-- [ ] `tests/bulkhead_capacity.rs:139-176`: замінити `else { refused += 1 }` на розбиття за
+- [x] `tests/bulkhead_capacity.rs:139-176`: замінити `else { refused += 1 }` на розбиття за
       `EnterError::{BulkheadFull, StaleEpoch, RateLimited, BreakerOpen, ...}` і звірити кожен бакет.
-- [ ] `tests/stress_breaker_churn.rs`: додати
+- [x] `tests/stress_breaker_churn.rs`: додати
       `admitted + bulk + breaker + stale == THREADS*OPS_PER_THREAD`; підняти floor
       (`failed > 0 && committed > 0` лишити, але додати `admitted >= N`).
-- [ ] `tests/transition_orphan.rs`: перейменувати коментар «preempt storm» → «synthetic anomaly feed»;
+- [x] `tests/transition_orphan.rs`: перейменувати коментар «preempt storm» → «synthetic anomaly feed»;
       додати `started > 0` floor; якщо можливо — додати справжній preemption-сценарій окремим тестом
       (Critical over Background), інакше явно позначити синтетику.
-- [ ] `tests/priority_preemption.rs`: rollback має мутувати незалежний стан (`AtomicBool`/`AtomicU32`
+- [x] `tests/priority_preemption.rs`: rollback має мутувати незалежний стан (`AtomicBool`/`AtomicU32`
       «resource_restored»), а не лише лічити виклики; assert на стан після abort.
-- [ ] `tests/erased.rs`: додати node-stat witness (`implicit_drops`/`explicit_aborts`), а не тільки
+- [x] `tests/erased.rs`: додати node-stat witness (`implicit_drops`/`explicit_aborts`), а не тільки
       локальний `RELEASES`/`fired`.
-- [ ] `tests/supervisor_pool_stress.rs:37-38`, `stress_mixed.rs:45-46`, `stress_lease.rs:64-67`:
+- [x] `tests/supervisor_pool_stress.rs:37-38`, `stress_mixed.rs:45-46`, `stress_lease.rs:64-67`:
       `env_num(...).max(MIN)` з `MIN >= 2` для lanes/kills; якщо env заданий нижче — `panic!` з поясненням.
-- [ ] `tests/guard.rs:234,255`: перейменувати статики (`ROLLBACKS_COMMIT`, `ROLLBACKS_DROP`), щоб grep
+- [x] `tests/guard.rs:234,255`: перейменувати статики (`ROLLBACKS_COMMIT`, `ROLLBACKS_DROP`), щоб grep
       не подвоював свідчення.
 
 **Тести:** самі змінені тести + повний suite. Додатково: «негативний» прогін — тимчасово зламати
@@ -320,6 +320,10 @@ clock-читання не в критичній секції; `feed`-після-
   інакше CI флапатиме на повільних ранерах.
 - `bulk + stale > started` — не закон, а евристика; після повного закону її можна прибрати або
   залишити як sanity-check.
+- Негативний прогін виконано (локально, без коміту): видалення інкременту `bulkhead_rejections`
+  у `record_locked` валить `bulkhead_capacity` (2 тести), видалення інкременту
+  `stale_epochs_rejected` валить `invariants::verify_slot_containment_and_single_shot_rollback`.
+  Обидва саботажі відкочено через `git checkout -- src/node.rs`.
 
 ---
 
@@ -600,5 +604,6 @@ Push — одразу після зеленого прогону (standing prefe
 | 2026-10-25 | 0 | PLAN.md створено; baseline 394 зафіксовано | — |
 | 2026-10-25 | 1 | F-01..F-04 виправлено; +3 регресії; suite 394 -> 397 | `fix(core): panic-safe probe hooks, scanner reset order, publish_fault lock hygiene` (3288b34) |
 | 2026-10-25 | 0 | `check_test_count.sh` + CI-гейт; бейдж 397 з provenance | `chore(ci): add reproducible test-count gate and record audit baseline` (d150d64) |
-| 2026-10-25 | 2 | F-07/F-08/F-09/F-16; waker drops і clock поза замками; feed-after-EOF лічильник; suite 397 -> 399 | `fix(concurrency): keep waker drops and clock reads outside mutexes` |
+| 2026-10-25 | 2 | F-07/F-08/F-09/F-16; waker drops і clock поза замками; feed-after-EOF лічильник; suite 397 -> 399 | `fix(concurrency): keep waker drops and clock reads outside mutexes` (7481e9a) |
+| 2026-10-25 | 3 | F-05/F-22/F-23/F-24/F-25/F-26; повний 7-доданковий закон, floor-и, справжній rollback-свідок; suite 399 | `test(conservation): pin full admission law and positive volume floors` |
 |  |  |  |  |

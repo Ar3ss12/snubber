@@ -99,14 +99,30 @@ fn bulkhead_pushes_back_and_counts_every_bounce() {
         "tight wall must push back against excess load (rejected: bulk={bulk} + stale={stale} vs started={started})"
     );
     assert!(bulk > 0, "bulkhead must reject at least some calls");
+    assert!(
+        started > 0,
+        "the wall must let a meaningful volume through, otherwise it proves nothing"
+    );
     assert_eq!(started, s.total_started, "test count matches node books");
     assert_eq!(bulk, s.bulkhead_rejections, "every bounce counted");
     assert_eq!(stale, s.stale_epochs_rejected, "every race counted");
-
     assert_eq!(
-        attempts,
-        started + bulk + stale,
-        "no attempt vanished at the wall"
+        s.rate_rejected + s.breaker_rejections + s.memory_rejections + s.poisoned_rejected,
+        0,
+        "this node shape has no other shed bucket: {s:?}"
+    );
+
+    let accounted = s
+        .total_started
+        .saturating_add(s.bulkhead_rejections)
+        .saturating_add(s.stale_epochs_rejected)
+        .saturating_add(s.breaker_rejections)
+        .saturating_add(s.rate_rejected)
+        .saturating_add(s.poisoned_rejected)
+        .saturating_add(s.memory_rejections);
+    assert_eq!(
+        attempts, accounted,
+        "every attempt must land in exactly one of the seven admission terms"
     );
     assert_eq!(settled, started, "every admission settled once");
     assert_eq!(
@@ -133,24 +149,32 @@ fn hard_clamp_slots_guarantees_ceiling_under_evict_oldest_stress() {
     for thread_id in 0..8usize {
         let n = Arc::clone(&node);
         handles.push(std::thread::spawn(move || {
-            let mut refused = 0u64;
+            let mut bulk = 0u64;
+            let mut stale = 0u64;
             for i in 0..200u64 {
                 let task_id = thread_id as u64 * 1000 + i;
-                if let Ok(guard) = n.enter(task_id, task_id, || {}) {
-                    std::thread::yield_now();
-                    guard.commit();
-                } else {
-                    refused += 1;
+                match n.enter(task_id, task_id, || {}) {
+                    Ok(guard) => {
+                        std::thread::yield_now();
+                        guard.commit();
+                    }
+                    Err(EnterError::BulkheadFull) => bulk += 1,
+                    Err(EnterError::StaleEpoch) => stale += 1,
+                    Err(other) => panic!("unexpected refusal: {other:?}"),
                 }
             }
-            refused
+            (bulk, stale)
         }));
     }
 
-    let mut refused = 0u64;
+    let mut bulk = 0u64;
+    let mut stale = 0u64;
     for h in handles {
-        refused += h.join().expect("thread join");
+        let (b, s) = h.join().expect("thread join");
+        bulk += b;
+        stale += s;
     }
+    let refused = bulk + stale;
 
     assert_eq!(
         node.lane_in_flight(),
@@ -168,12 +192,27 @@ fn hard_clamp_slots_guarantees_ceiling_under_evict_oldest_stress() {
         s.committed + s.implicit_drops + s.explicit_aborts,
         "every admitted transaction must settle exactly once"
     );
+    assert!(s.total_started > 0, "the clamp test must admit some work");
+    assert_eq!(bulk, s.bulkhead_rejections, "bulkhead bucket must agree");
+    assert_eq!(stale, s.stale_epochs_rejected, "stale bucket must agree");
     assert_eq!(
         1600,
         s.total_started + refused,
         "every attempt is either admitted or shed"
     );
     assert_eq!(s.shed_total(), refused, "node books must match shed count");
+    let accounted = s
+        .total_started
+        .saturating_add(s.bulkhead_rejections)
+        .saturating_add(s.stale_epochs_rejected)
+        .saturating_add(s.breaker_rejections)
+        .saturating_add(s.rate_rejected)
+        .saturating_add(s.poisoned_rejected)
+        .saturating_add(s.memory_rejections);
+    assert_eq!(
+        accounted, 1600,
+        "every attempt must land in exactly one of the seven admission terms"
+    );
 }
 
 // Regression (0.6.2, bug 14): a BulkheadFull rejection must not burn the

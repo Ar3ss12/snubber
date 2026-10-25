@@ -37,6 +37,14 @@ fn erased_guard_lives_in_struct_field() {
     // Thread death: field dropped without commit → rollback fires.
     drop(app);
     assert_eq!(RELEASES.load(Ordering::SeqCst), 1, "rollback exactly once");
+    // Node-stat witness: the rollback must be booked as a planned abort,
+    // not as a silent slot leak or a phantom implicit drop.
+    let stats = node.stats();
+    assert_eq!(stats.total_started, 1, "admission booked");
+    assert_eq!(stats.explicit_aborts, 1, "rollback is a planned abort");
+    assert_eq!(stats.implicit_drops, 0, "no phantom implicit drop");
+    assert_eq!(stats.committed, 0, "nothing committed");
+    assert_eq!(node.lane_in_flight(), [0, 0, 0], "slot released");
 }
 
 #[test]

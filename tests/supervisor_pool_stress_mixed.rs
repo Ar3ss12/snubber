@@ -26,6 +26,17 @@ fn env_num(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// A storm below the floor proves nothing: zero or one iteration always
+/// "passes" the conservation and reaping gates vacuously.
+fn env_num_min(name: &str, default: u64, min: u64) -> u64 {
+    let value = env_num(name, default);
+    assert!(
+        value >= min,
+        "{name}={value} is below the stress floor {min}: a storm that small proves nothing"
+    );
+    value
+}
+
 fn per_lane(kills: u64, slot: u64) -> u64 {
     (kills + (3 - slot)) / 4
 }
@@ -42,8 +53,8 @@ fn worker_pool_mixed_storm() {
         .expect("cargo build --example 19_worker_pool");
     assert!(status.success(), "failed to build 19_worker_pool");
 
-    let lanes = env_num("POOL_MIXED_LANES", 4);
-    let kills = env_num("POOL_MIXED_KILLS", 8);
+    let lanes = env_num_min("POOL_MIXED_LANES", 4, 2);
+    let kills = env_num_min("POOL_MIXED_KILLS", 8, 2);
     let timeout_secs = (lanes * kills * 2).max(60);
 
     println!(

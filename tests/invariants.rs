@@ -222,14 +222,16 @@ fn verify_slot_containment_and_single_shot_rollback() {
 
     // Invariant 1: every attempt is either admitted or shed — no silent
     // third outcome. The node's own books must agree with the harness.
+    let attempts = (THREADS * ATTEMPTS_PER_THREAD) as u64;
     assert_eq!(
         accepted + refused,
-        (THREADS * ATTEMPTS_PER_THREAD) as u64,
+        attempts,
         "every attempt must be either admitted or counted as shed"
     );
     assert!(
-        accepted > 0,
-        "stress must admit at least one guard, otherwise the books prove nothing"
+        accepted >= attempts / 10,
+        "stress must admit a meaningful volume, not one lucky guard: \
+         accepted={accepted} of {attempts}"
     );
     let s = node.stats();
     assert_eq!(
@@ -237,12 +239,25 @@ fn verify_slot_containment_and_single_shot_rollback() {
         "node books must match admissions"
     );
     assert_eq!(s.shed_total(), refused, "node books must match shed count");
+    // Full seven-term law against the HARNESS count (not against
+    // `admission_total()`, which is the sum of the same terms by
+    // definition). A refusal hiding in an unbucketed counter breaks this.
+    let accounted = s
+        .total_started
+        .saturating_add(s.bulkhead_rejections)
+        .saturating_add(s.stale_epochs_rejected)
+        .saturating_add(s.breaker_rejections)
+        .saturating_add(s.rate_rejected)
+        .saturating_add(s.poisoned_rejected)
+        .saturating_add(s.memory_rejections);
+    assert_eq!(
+        accounted, attempts,
+        "every attempt must land in exactly one of the seven admission terms: {s:?}"
+    );
     // This node has no rate limit, breaker trip or memory ceiling, so a
     // refusal can only be a bulkhead slot shortage or a stale epoch (auto
     // entries race the shared EpochGate by design and the caller retries).
-    // Enumerating the buckets proves no refusal hides in a fifth counter;
-    // comparing admission_total to the sum of the same accessors would be
-    // an algebraic tautology.
+    // Enumerating the buckets proves no refusal hides in a fifth counter.
     assert_eq!(
         s.bulkhead_rejections
             .saturating_add(s.stale_epochs_rejected),
@@ -256,11 +271,6 @@ fn verify_slot_containment_and_single_shot_rollback() {
             .saturating_add(s.poisoned_rejected),
         0,
         "no other shed bucket may fire in this node shape: {s:?}"
-    );
-    assert_eq!(
-        s.admission_total(),
-        (THREADS * ATTEMPTS_PER_THREAD) as u64,
-        "every attempt must be accounted for exactly once"
     );
 
     // Invariant 2: Quiescent state must have zero slots in flight

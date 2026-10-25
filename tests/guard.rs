@@ -231,10 +231,10 @@ fn node_rehandshakes_new_generation() {
 
 #[test]
 fn commit_releases_resource_intact() {
-    static ROLLBACKS: AtomicU32 = AtomicU32::new(0);
-    ROLLBACKS.store(0, Ordering::SeqCst);
+    static ROLLBACKS_ON_COMMIT: AtomicU32 = AtomicU32::new(0);
+    ROLLBACKS_ON_COMMIT.store(0, Ordering::SeqCst);
     let guard = SnubberGuard::new(1, 1, || {
-        ROLLBACKS.fetch_add(1, Ordering::SeqCst);
+        ROLLBACKS_ON_COMMIT.fetch_add(1, Ordering::SeqCst);
     });
     let mut p = Protected::new(42u32, guard);
     // Deref & DerefMut verification
@@ -244,7 +244,7 @@ fn commit_releases_resource_intact() {
     let out = p.commit();
     assert_eq!(out, 50, "commit returns inner resource value intact");
     assert_eq!(
-        ROLLBACKS.load(Ordering::SeqCst),
+        ROLLBACKS_ON_COMMIT.load(Ordering::SeqCst),
         0,
         "no rollback triggered on commit"
     );
@@ -252,8 +252,8 @@ fn commit_releases_resource_intact() {
 
 #[test]
 fn error_drops_resource_and_executes_rollback_once() {
-    static ROLLBACKS: AtomicU32 = AtomicU32::new(0);
-    ROLLBACKS.store(0, Ordering::SeqCst);
+    static ROLLBACKS_ON_DROP: AtomicU32 = AtomicU32::new(0);
+    ROLLBACKS_ON_DROP.store(0, Ordering::SeqCst);
     // Drop order witness: rollback must observe resource alive
     // (guard field drops before wrapped resource field).
     let state_marker = Arc::new(AtomicU32::new(0));
@@ -271,7 +271,7 @@ fn error_drops_resource_and_executes_rollback_once() {
     };
     state_marker.store(1, Ordering::SeqCst); // active during transaction
     let guard = SnubberGuard::new(2, 2, move || {
-        ROLLBACKS.fetch_add(1, Ordering::SeqCst);
+        ROLLBACKS_ON_DROP.fetch_add(1, Ordering::SeqCst);
         // Rollback runs while resource still lives: marker is 1.
         probe.store(probe.load(Ordering::SeqCst), Ordering::SeqCst);
     });
@@ -279,7 +279,7 @@ fn error_drops_resource_and_executes_rollback_once() {
     let _ = p.get_mut();
     drop(p); // implicit abort on drop
     assert_eq!(
-        ROLLBACKS.load(Ordering::SeqCst),
+        ROLLBACKS_ON_DROP.load(Ordering::SeqCst),
         1,
         "exactly one rollback execution"
     );
@@ -292,10 +292,10 @@ fn error_drops_resource_and_executes_rollback_once() {
 
 #[test]
 fn abort_runs_rollback_and_preserves_authentic_header() {
-    static ROLLBACKS: AtomicU32 = AtomicU32::new(0);
-    ROLLBACKS.store(0, Ordering::SeqCst);
+    static ROLLBACKS_ON_ABORT: AtomicU32 = AtomicU32::new(0);
+    ROLLBACKS_ON_ABORT.store(0, Ordering::SeqCst);
     let guard = SnubberGuard::new(3, 42, || {
-        ROLLBACKS.fetch_add(1, Ordering::SeqCst);
+        ROLLBACKS_ON_ABORT.fetch_add(1, Ordering::SeqCst);
     });
     let p = Protected::new(7u32, guard);
     let ev = p.abort("degraded-mode");
@@ -304,7 +304,7 @@ fn abort_runs_rollback_and_preserves_authentic_header() {
     assert_eq!(ev.header().epoch, 3, "preserves authentic epoch");
     assert_eq!(ev.header().task_id, 42, "preserves authentic task_id");
     assert_eq!(
-        ROLLBACKS.load(Ordering::SeqCst),
+        ROLLBACKS_ON_ABORT.load(Ordering::SeqCst),
         1,
         "rollback triggered on abort"
     );

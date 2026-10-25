@@ -129,6 +129,39 @@ fn breaker_churn_trips_recovers_and_conserves() {
         s.stale_epochs_rejected,
         "every monotonic-gate cut must be counted by the node"
     );
+    // Full seven-term law against the HARNESS attempt count. The storm
+    // config has no rate limit, memory ceiling or poison pressure, so the
+    // other three terms must be zero.
+    let attempts = (THREADS * OPS_PER_THREAD) as u64;
+    let bulk = refused_bulk.load(Ordering::Relaxed) as u64;
+    let breaker = refused_breaker.load(Ordering::Relaxed) as u64;
+    let stale = refused_stale.load(Ordering::Relaxed) as u64;
+    assert_eq!(
+        admitted + bulk + breaker + stale,
+        attempts,
+        "every storm attempt must be admitted or land in exactly one shed bucket"
+    );
+    assert!(
+        admitted >= attempts / 10,
+        "the storm must admit a meaningful volume: admitted={admitted} of {attempts}"
+    );
+    assert_eq!(
+        s.rate_rejected + s.memory_rejections + s.poisoned_rejected,
+        0,
+        "no other shed bucket may fire in this node shape: {s:?}"
+    );
+    let accounted = s
+        .total_started
+        .saturating_add(s.bulkhead_rejections)
+        .saturating_add(s.stale_epochs_rejected)
+        .saturating_add(s.breaker_rejections)
+        .saturating_add(s.rate_rejected)
+        .saturating_add(s.poisoned_rejected)
+        .saturating_add(s.memory_rejections);
+    assert_eq!(
+        accounted, attempts,
+        "node books must account for every attempt exactly once"
+    );
     // Conservation: every admitted guard ends committed or dropped (the
     // two shapes below); `lane_in_flight` sums to 0 and the async queue is
     // empty — a leaked slot or a ghost waiter would show here.

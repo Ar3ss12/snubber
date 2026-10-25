@@ -7,7 +7,7 @@
 //! themselves (R5 — never forced, never waited-on under the lock).
 
 use snubber::{Directive, EnterError, Priority, SnubberNode, TaskConduit};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[test]
@@ -18,9 +18,13 @@ fn critical_preempts_pure_background_cooperatively() {
     static SETTLED: AtomicU64 = AtomicU64::new(0);
     static ROLLBACKS: AtomicU64 = AtomicU64::new(0);
     static ABORTS: AtomicU64 = AtomicU64::new(0);
+    // Independent resource state: the rollback must actually restore
+    // something, not merely bump a counter.
+    static BG_RESOURCE_RESTORED: AtomicBool = AtomicBool::new(false);
     for s in [&ATTEMPTS, &STARTED, &BULK, &SETTLED, &ROLLBACKS, &ABORTS] {
         s.store(0, Ordering::SeqCst);
     }
+    BG_RESOURCE_RESTORED.store(false, Ordering::SeqCst);
 
     let node = Arc::new(
         SnubberNode::builder("preempt/wall")
@@ -38,6 +42,7 @@ fn critical_preempts_pure_background_cooperatively() {
         ATTEMPTS.fetch_add(1, Ordering::SeqCst);
         match n_bg.enter_with_priority(Priority::Background, 1, 1, || {
             ROLLBACKS.fetch_add(1, Ordering::SeqCst);
+            BG_RESOURCE_RESTORED.store(true, Ordering::SeqCst);
         }) {
             Ok(guard) => {
                 STARTED.fetch_add(1, Ordering::SeqCst);
@@ -81,6 +86,10 @@ fn critical_preempts_pure_background_cooperatively() {
             assert!(node.preempt_requested(), "knock files a request");
             handle.send_directive(Directive::Preempted("critical over background"));
             bg.join().expect("background yields, never wedges");
+            assert!(
+                BG_RESOURCE_RESTORED.load(Ordering::SeqCst),
+                "the victim's rollback must restore its resource, not just count"
+            );
             assert!(!node.preempt_requested(), "settle clears the flag");
             ATTEMPTS.fetch_add(1, Ordering::SeqCst);
             let g = node

@@ -23,6 +23,17 @@ fn env_num(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// A storm below the floor proves nothing: zero or one iteration always
+/// "passes" the conservation and reaping gates vacuously.
+fn env_num_min(name: &str, default: u64, min: u64) -> u64 {
+    let value = env_num(name, default);
+    assert!(
+        value >= min,
+        "{name}={value} is below the stress floor {min}: a storm that small proves nothing"
+    );
+    value
+}
+
 fn json_num(content: &str, key: &str) -> u64 {
     let needle = format!("\"{key}\":");
     let start = content
@@ -49,9 +60,10 @@ fn worker_pool_lease_storm() {
         .expect("cargo build --example 19_worker_pool");
     assert!(status.success(), "failed to build 19_worker_pool");
 
-    let lanes = env_num("POOL_LEASE_LANES", 4);
-    let kills = env_num("POOL_LEASE_KILLS", 6);
-    let lease_ms = env_num("POOL_LEASE_MS", 25);
+    let lanes = env_num_min("POOL_LEASE_LANES", 4, 2);
+    let kills = env_num_min("POOL_LEASE_KILLS", 6, 2);
+    // A sub-millisecond lease measures scheduler noise, not the sweep.
+    let lease_ms = env_num_min("POOL_LEASE_MS", 25, 2);
     let timeout_secs = (lanes * kills * 2).max(60);
 
     println!("[TEST RUNNER] Lease storm: lanes={lanes} kills_per_lane={kills} lease={lease_ms} ms");

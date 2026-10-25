@@ -46,14 +46,16 @@ fn orphan_contract_is_typed_and_honest() {
     is_send_sync::<NoOrphanGuard>();
 }
 #[test]
-fn preempt_storm_on_critical_flood() {
+fn synthetic_anomaly_feed_triggers_preempt_storm_verdict() {
     use snubber::{find_anomalies, AnomalyKind, AnomalyPolicy, EnterError, Priority, SnubberNode};
     let node = SnubberNode::builder("preempt/storm").build();
-    // 200 admissions against a default breaker (trip_after_failures = 3):
-    // the first guards arm and drop (sickness), the breaker opens, one
-    // HalfOpen probe arms, the rest are BreakerOpen refusals. The old
-    // swallowed `let _ =` shape hid all of that; every outcome is now
-    // counted and tied to the node's own books.
+    // SYNTHETIC feed: this test produces the anomaly-shaped INPUT that the
+    // verdict consumes. It does NOT exercise cooperative preemption — the
+    // real Critical-over-Background handoff lives in
+    // `tests/priority_preemption.rs`. Here 200 admissions against a default
+    // breaker (trip_after_failures = 3) arm and drop (sickness), the
+    // breaker opens, one HalfOpen probe arms, the rest are BreakerOpen
+    // refusals. Every outcome is counted and tied to the node's books.
     let mut started = 0u64;
     let mut refused = 0u64;
     for i in 1..=200u64 {
