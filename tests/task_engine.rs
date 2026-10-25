@@ -280,6 +280,15 @@ fn fake_waker_identity_matches_allocation() {
     // Both Arcs are live at once, so their addresses cannot alias; the
     // engine's dedup compares exactly this `will_wake` identity.
     assert!(!w1.will_wake(&w2), "distinct allocations must not match");
+    // std builds `Waker::from(Arc<W>)` and its clone vtable as two
+    // structurally identical const-promoted `RawWakerVTable`s and relies on
+    // LLVM to merge them, so a clone keeps the same vtable pointer natively.
+    // Miri never runs LLVM: each promotion stays its own allocation, so a
+    // cloned std waker can carry a different vtable and `will_wake`
+    // (documented as best-effort) returns false. That is a Miri artifact,
+    // not engine behavior — the engine dedups on its own `Arc<AtomicBool>`
+    // identity and never assumes cloned wakers compare equal.
+    #[cfg(not(miri))]
     assert!(w1.will_wake(&w1.clone()), "a cloned waker keeps identity");
 }
 

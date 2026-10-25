@@ -16,6 +16,14 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
   prove (`admitted >= breaker_trips`, `breaker_rejections > 0`) instead of
   to a share of attempts that only held while the storm ran slowly enough
   to admit work before the first trip.
+- `fake_waker_identity_matches_allocation` keeps its clone-identity
+  assertion only outside Miri. std builds the `Arc` waker and its clone
+  vtable as two identical const promotions and relies on LLVM merging
+  them, so the clone carries the same vtable pointer natively; Miri never
+  runs LLVM and each promotion stays a separate allocation, making
+  `will_wake` (best-effort by contract) return false. The engine dedups on
+  its own `Arc<AtomicBool>` identity, so no library behavior depended on
+  the assertion.
 
 ## 0.6.9 — 2026-10-25
 
