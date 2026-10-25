@@ -4,27 +4,6 @@ All notable changes to `snubber`. Benchmarks live in [README.md](README.md);
 the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 ("Fixed in …" sections) and [docs/INVARIANTS.md](docs/INVARIANTS.md).
 
-## Unreleased
-
-### Tests
-
-- `stress_breaker_churn` no longer demands that 10% of the storm's attempts
-  be admitted. Once the window trips, HalfOpen admits exactly one probe and
-  refuses every other attempt, so the lane structurally yields about four
-  admissions per trip (release: 301 admitted, 75 trips, 11698 breaker
-  refusals). The volume floor is now tied to the churn the lane exists to
-  prove (`admitted >= breaker_trips`, `breaker_rejections > 0`) instead of
-  to a share of attempts that only held while the storm ran slowly enough
-  to admit work before the first trip.
-- `fake_waker_identity_matches_allocation` keeps its clone-identity
-  assertion only outside Miri. std builds the `Arc` waker and its clone
-  vtable as two identical const promotions and relies on LLVM merging
-  them, so the clone carries the same vtable pointer natively; Miri never
-  runs LLVM and each promotion stays a separate allocation, making
-  `will_wake` (best-effort by contract) return false. The engine dedups on
-  its own `Arc<AtomicBool>` identity, so no library behavior depended on
-  the assertion.
-
 ## 0.6.9 — 2026-10-25
 
 Eighth-audit batch (hook panics, scanner reset order, lock hygiene, honest
@@ -87,6 +66,22 @@ tests and benches, CI teeth). No API removals.
   deliberately poisoned ledger (`poison_recoveries`, commit,
   conservation). The ISR example now asserts the laser is off after the
   cycle-3 abort as well.
+- `stress_breaker_churn` no longer demands that 10% of the storm's attempts
+  be admitted. Once the window trips, HalfOpen admits exactly one probe and
+  refuses every other attempt, so the lane structurally yields about four
+  admissions per trip (release: 301 admitted, 75 trips, 11698 breaker
+  refusals). The volume floor is now tied to the churn the lane exists to
+  prove (`admitted >= breaker_trips`, `breaker_rejections > 0`) instead of
+  to a share of attempts that only held while the storm ran slowly enough
+  to admit work before the first trip.
+- `fake_waker_identity_matches_allocation` keeps its clone-identity
+  assertion only outside Miri. std builds the `Arc` waker and its clone
+  vtable as two identical const promotions and relies on LLVM merging
+  them, so the clone carries the same vtable pointer natively; Miri never
+  runs LLVM and each promotion stays a separate allocation, making
+  `will_wake` (best-effort by contract) return false. The engine dedups on
+  its own `Arc<AtomicBool>` identity, so no library behavior depended on
+  the assertion.
 
 ### Tooling / CI
 
