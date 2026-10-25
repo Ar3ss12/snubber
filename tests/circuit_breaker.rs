@@ -8,7 +8,8 @@
 //! - Console cap error budgeting
 
 use snubber::{BreakerState, EnterError, FaultKind, SnubberNode, TimeoutCheck, TransactionHeader};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 // ============================================================================
@@ -372,5 +373,79 @@ fn reported_failures_re_arm_the_probe_from_open() {
     );
 
     node.enter(4, 4, || {}).expect("probe admitted").commit();
+    assert_eq!(node.stats().breaker_state, BreakerState::Closed);
+}
+
+// ============================================================================
+// 6. Panic-safe admission hooks (audit F-01)
+// ============================================================================
+
+/// A panicking friction hook used to strand `half_open_probe = true`
+/// forever: every later admission returned `BreakerOpen` until
+/// `reset_breaker()`. The hook runs outside the node lock, but the probe
+/// flag is armed before it, so unwind must clear the flag.
+#[test]
+fn panicking_friction_hook_does_not_wedge_half_open_probe() {
+    let armed = Arc::new(AtomicBool::new(true));
+    let arm = Arc::clone(&armed);
+    let node = SnubberNode::builder("probe/panic-friction")
+        .max_in_flight(1)
+        .trip_after_failures(1)
+        .friction_fn(move |_, _| {
+            if arm.swap(false, Ordering::SeqCst) {
+                panic!("friction hook exploded");
+            }
+            1
+        })
+        .build();
+
+    // Hold the only slot while the breaker trips, so the HalfOpen probe
+    // reaches the bulkhead-full branch and invokes the hook.
+    let held = node.enter(1, 1, || {}).expect("hold the slot");
+    node.report(FaultKind::Panic, 2, 2); // Closed -> HalfOpen
+    assert_eq!(node.stats().breaker_state, BreakerState::HalfOpen);
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let _ = node.enter(3, 3, || {});
+    }));
+    assert!(outcome.is_err(), "hook panic must propagate");
+
+    // Pre-fix the probe flag stayed armed and every call below was BreakerOpen.
+    held.commit();
+    let probe = node
+        .enter(4, 4, || {})
+        .expect("half-open probe must not be welded");
+    probe.commit();
+    assert_eq!(node.stats().breaker_state, BreakerState::Closed);
+}
+
+#[test]
+fn panicking_pressure_hook_does_not_wedge_half_open_probe() {
+    let armed = Arc::new(AtomicBool::new(true));
+    let arm = Arc::clone(&armed);
+    let node = SnubberNode::builder("probe/panic-pressure")
+        .max_in_flight(1)
+        .trip_after_failures(1)
+        .pressure_fn(move |_| {
+            if arm.swap(false, Ordering::SeqCst) {
+                panic!("pressure hook exploded");
+            }
+        })
+        .build();
+
+    let held = node.enter(1, 1, || {}).expect("hold the slot");
+    node.report(FaultKind::Panic, 2, 2);
+    assert_eq!(node.stats().breaker_state, BreakerState::HalfOpen);
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let _ = node.enter(3, 3, || {});
+    }));
+    assert!(outcome.is_err(), "hook panic must propagate");
+
+    held.commit();
+    let probe = node
+        .enter(4, 4, || {})
+        .expect("half-open probe must not be welded");
+    probe.commit();
     assert_eq!(node.stats().breaker_state, BreakerState::Closed);
 }

@@ -213,9 +213,14 @@ impl SnubScanner {
                 self.body_len += take;
                 chunk = &chunk[take..];
                 if self.body_len == 40 {
-                    on_token(ProcessToken::from_body_bytes(&self.body));
+                    let token = ProcessToken::from_body_bytes(&self.body);
+                    // Reset BEFORE delivering: a panicking `on_token` caught
+                    // upstream must not leave `body_len == 40`, or the next
+                    // push re-enters this branch with `take == 0` and
+                    // delivers the same frame twice.
                     self.reset();
                     frames += 1;
+                    on_token(token);
                 }
             } else {
                 self.window[0] = self.window[1];

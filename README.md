@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-394%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-397%20passed-brightgreen.svg)]()
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
@@ -129,7 +129,7 @@ wins.
 | `namespace_task` pack / unpack | Layer 4 (`std`) | **~1.0 / 1.0 ns** | `task = lane << 48 \| local`; two shifts + mask, no branch |
 | `lane.attach` + `note_death` (ambush) → `PoolReap` | Layer 4 (`std`) | **~192 ns** | Full rescue path: drain EOF, token take, generation bump, restart math, per-class counters (drain built in setup; the shared idle lane is re-attached each sample) |
 | `lane.attach` + `note_death` (escape) → `PoolReap` | Layer 4 (`std`) | **~173 ns** | Same path when the child settled (commit parsed, no token) |
-| `pool.report()` (4 lanes) | Layer 4 (`std`) | **~111 ns** | Rows (`LaneSnapshot`) + `PoolTotals::of`: four short lane locks, totals fold, no allocation |
+| `pool.report()` (4 lanes) | Layer 4 (`std`) | **~111 ns** | Rows (`LaneSnapshot`) + `PoolTotals::of`: four short lane locks, totals fold, one `Vec<LaneSnapshot>` allocation (`lanes.len()` rows) included in the number |
 | `LaneSnapshot` / `PoolTotals` | Layer 4 (`std`) | `Clone` row / `Copy` totals | `conserved()` = `ambush+escape+stillborn+deadlocks == reaps`; no guessed fifth bucket |
 | `run_supervised_guard_with_grace(..)` | Layer 3 (`std`) | one reaped child process | Supervised guard with a configurable terminal EOF grace for slow-flushing children |
 | `DEFAULT_EOF_GRACE_MS` (250 ms) | Layer 3 (`std`) | published const | Default terminal EOF grace; `run_supervised_guard_with_grace` and the pool builder override it |

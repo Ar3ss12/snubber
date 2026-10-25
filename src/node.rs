@@ -1002,7 +1002,9 @@ impl SnubberNodeBuilder {
                 console: self.console,
                 console_frame: self.console_frame,
                 flight_depth: self.flight_depth,
-                flight: VecDeque::with_capacity(self.flight_depth),
+                // `push_flight_inner` caps at `flight_depth.max(1)`; reserve
+                // that so the first fault never allocates under the lock.
+                flight: VecDeque::with_capacity(self.flight_depth.max(1)),
                 hooks: Arc::new(self.hooks),
                 policies: self.policies,
                 backpressure_policy: self.backpressure_policy,
@@ -1934,10 +1936,27 @@ impl SnubberNode {
     /// without changing `stats()`'s signature.
     fn reap_timeouts(&self) {}
 
+    /// Run a foreign admission hook (friction/pressure) without letting a
+    /// panic strand `half_open_probe`. The hook runs outside the node lock;
+    /// if it unwinds, the probe is cleared under a fresh lock and the panic
+    /// is resumed, so the caller still observes it and the breaker is not
+    /// welded shut.
+    fn run_admission_hook<R>(&self, hook: impl FnOnce() -> R) -> R {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
+            Ok(value) => value,
+            Err(payload) => {
+                self.lock().half_open_probe = false;
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+
     /// Publish `last_fault` WITHOUT allocating under the lock (PHASE B).
     /// Both clones happen BEFORE the second lock is taken (no lock held
-    /// → a panic poisons nothing). Under the lock itself only `Option`
-    /// moves run — pointer swaps, no allocation, no panic.
+    /// → a panic poisons nothing). On the steady path the only work under
+    /// the lock is a pointer swap plus a preallocated flight push; the
+    /// replaced `FaultRecord` (which may own `NodeName::Owned` /
+    /// `FaultDetail::Owned`) is dropped AFTER the guard is released.
     fn publish_fault(&self, outcome: &mut ReportOutcome, record: &FaultRecord) {
         outcome.snapshot.last_fault = Some(record.clone());
         let owned = record.clone();
@@ -1948,11 +1967,13 @@ impl SnubberNode {
             file: record.file,
             line: record.line,
         };
-        {
+        let old = {
             let mut inner = self.lock();
-            inner.stats.last_fault = Some(owned);
+            let old = inner.stats.last_fault.replace(owned);
             push_flight_inner(&mut inner, slot);
-        }
+            old
+        };
+        drop(old);
     }
 
     /// Observe one header through the node's epoch gate.
@@ -3096,7 +3117,9 @@ impl SnubberNode {
                         _ => 1000,
                     };
                     let friction_wait = match snap_friction {
-                        Some(f) => f(snap_in_flight as u32, snap_max as u32),
+                        Some(f) => {
+                            self.run_admission_hook(|| f(snap_in_flight as u32, snap_max as u32))
+                        }
                         None => 1 + depth as u64 * cap / 255,
                     };
                     let legacy_ms = match snap_action {
@@ -3154,9 +3177,9 @@ impl SnubberNode {
                             );
                             drop(inner);
                             if let Some(react) = snap_pressure {
-                                react(bp);
+                                self.run_admission_hook(|| react(bp));
                             } else if let BackpressurePolicy::Custom(react) = snap_policy {
-                                react(bp);
+                                self.run_admission_hook(|| react(bp));
                             }
                             inner = self.lock();
                             if inner.in_flight < inner.max_in_flight {

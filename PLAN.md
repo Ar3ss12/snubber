@@ -1,0 +1,581 @@
+# PLAN.md — виправлення за підсумками ворожого аудиту
+
+> **Стан на 2026-10-25:** HEAD `3664843 perf(erased): fold the settle path into one boxed transaction`,
+> `Cargo.toml` = `0.6.8`, теги `v0.5.0`, `v0.5.3`, `v0.6.3`. Робоче дерево чисте.
+> **Джерело:** повний звіт аудиту (секції 1–3) + доказова база під-агентів, зібрана в цій сесії.
+> **Правило етапу:** етап не закривається без `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+> повного suite, скриптових гейтів і оновленого CHANGELOG (якщо поведінка змінилася).
+> **Обмеження проєкту:** zero dependencies, MSRV 1.70, `no_std` core, `#![forbid(unsafe_code)]`,
+> small-RAM box (`cargo -j 2`, incremental off), `.ps1` — тільки ASCII, локальні docs
+> (`AGENTS.md`, `tech.md`, `docs/DECISION_MATRIX.md`, `FUTURE_node_split.md`, `CODEBASE_REPORT.md`,
+> `scripts/analyze_codebase_full.py`, `RESEARCH_ECOSYSTEM_BINDINGS.md`) не комітяться і не читаються тестами.
+> **Теги:** тільки за окремим наказом. Без наказу — version bump без тегу.
+
+---
+
+## 0. Легенда
+
+| Позначка | Значення |
+|---|---|
+| `[ ]` | не зроблено |
+| `[~]` | у роботі |
+| `[x]` | зроблено й перевірено |
+| `[!]` | заблоковано (вказати причину) |
+| P0 | ламає семантику/облік або дає фальшиво-зелений тест |
+| P1 | небезпека під навантаженням, діра в CI/скриптах |
+| P2 | документація, покриття, косметика |
+| P3 | теоретичне/відкладене, задокументувати |
+
+Кожен етап має: **Мета → Файли → Кроки (чекбокси) → Тести → Готово → Коміт → Дописи**.
+«Готово» — це об'єктивний критерій, а не «код написано».
+
+---
+
+## 1. Зведена таблиця знахідок
+
+| ID | P | Знахідка | Доказ | Етап | Стан |
+|---|---|---|---|---|---|
+| F-01 | P0 | Паніка в `friction_fn`/`pressure_fn` лишає `half_open_probe=true` назавжди; breaker заварено | `src/node.rs:3008`, `3092-3100`, `3154-3159`, `2996-3006`; єдиний `catch_unwind` — `1469` | 1 | `[x]` |
+| F-02 | P0 | `SnubScanner::push` віддає кадр двічі після перехопленої паніки `on_token` (`take=0` повторно входить у `body_len==40`) | `src/drain.rs:215-218` | 1 | `[x]` |
+| F-03 | P0 | `publish_fault` доккоментар «no allocation, no panic» хибний: `NodeName::Owned` дропається під замком; `flight` може реалокати | `src/node.rs:1937-1954`, `src/name.rs:26-30`, `4264-4271` | 1 | `[x]` |
+| F-04 | P0 | `pool.report()` алокує `Vec`, доки двічі обіцяно «no allocation» | `src/pool/mod.rs:252-254`, `src/pool/report.rs:116-121`, `README.md:132`, `USER_GUIDE.md:1789` | 1/6 | `[x]` |
+| F-05 | P0 | Тести консервації перевіряють урізані рівняння; повний 7-доданковий закон не проганяється | `src/node.rs:289-297`; `tests/bulkhead_capacity.rs:97-110`; `tests/transition_orphan.rs:83-85`; `tests/stress_breaker_churn.rs:162-165` | 3 | `[ ]` |
+| F-06 | P0 | Бенчі конкуренції можуть опублікувати ns/op за нуля допусків: retry виснажується, `stale` не читається, `join` ковтається | `benches/admission_bench.rs:625-665`, `679-711`, `730-757` | 4 | `[ ]` |
+| F-07 | P1 | Drop `Waker` під node-локом (`slot.waker = waker`, `retain`) | `src/node.rs:3678`, `3896` | 2 | `[ ]` |
+| F-08 | P1 | Алокація `Vec<Waker>` під замком wakers у conduit | `src/conduit.rs:399-402` | 2 | `[ ]` |
+| F-09 | P1 | `SystemTime::now()` під node-локом у rate limiter і `check_timeout` | `src/node.rs:3299`, `5277` | 2 | `[ ]` |
+| F-10 | P1 | CI міряє лише 1 бенч; решта 51 і перформанс-регресії не гейтяться; артефактів немає | `.github/workflows/ci.yml:259-267` | 5 | `[ ]` |
+| F-11 | P1 | Semver-гейт сліпий до проміжних релізів (baseline = останній тег `v0.6.3`, crate `0.6.8`) | `scripts/check_api_diff.sh:55-65`; `git tag` | 5 | `[ ]` |
+| F-12 | P1 | PS-гейт вужчий за sh: 6 лічильників vs 15, лише `record_locked` vs 3 функції | `scripts/check_compile_gates.ps1:25-94` vs `.sh:52-120` | 5 | `[ ]` |
+| F-13 | P1 | `stress_harness.sh`: SKIP не валить рана; PID-гейт у секундах; JSON — regex; `LAUNCH=0` вимикає гейти | `scripts/stress_harness.sh:108-146`, `370-373`, `396-398`, `420-443` | 5 | `[ ]` |
+| F-14 | P1 | Miri: `-Zmiri-ignore-leaks` у всіх лейнах; покрито 33 з ~60 файлів | `.github/workflows/ci.yml:175,180,216` | 5 | `[ ]` |
+| F-15 | P1 | `feed`/`finish`/`write_to` — std-only, а таблиця гайда продає їх як core/bare-metal | `src/supervisor.rs:518,678,888,907`; `src/lib.rs:128-129`; `USER_GUIDE.md:1787` | 6 | `[ ]` |
+| F-16 | P1 | `PipeDrain::feed` після `finish` тихо відкидає чанк і рапортує `0 frames`; коментар про clock суперечить коду | `src/supervisor.rs:892-918`, `896-901` | 2/7 | `[ ]` |
+| F-17 | P1 | FakeWake: мертве поле `usize`, `wake` — no-op, identity-твердження не перевіряється | `tests/task_engine.rs:255-268` | 5 | `[ ]` |
+| F-18 | P2 | `USER_GUIDE.md` документує неіснуючі `pool.attach`/`pool.note_death` | `USER_GUIDE.md:1788` vs `src/pool/lane.rs:157,241` | 6 | `[ ]` |
+| F-19 | P2 | Назви бенчів у README не збігаються з джерелом (`_threads_`, `classify_stall`) | `README.md:102,154-156` vs `benches/admission_bench.rs:49,627,679,719` | 6 | `[ ]` |
+| F-20 | P2 | Числа латентності без артефактів; бейдж 394 без дати/команди; «121 ns» не існує | `README.md:7,67,94,108`; `target/` відсутній | 5/6 | `[ ]` |
+| F-21 | P2 | Публічні аксесори не задокументовані (pool/envelope/harness/token) | `src/pool/mod.rs:121,131,277`; `lane.rs:65,145`; `envelope.rs:84-196`; `harness.rs:28-198`; `drain.rs:109` | 6 | `[ ]` |
+| F-22 | P2 | `supervisor_pool_stress`/`stress_mixed`/`stress_lease`: `env_num` без мінімумів → `KILLS=0` робить усе тривіально зеленим | `tests/supervisor_pool_stress.rs:37-38`; `stress_mixed.rs:45-46`; `stress_lease.rs:64-67` | 3 | `[ ]` |
+| F-23 | P2 | `transition_orphan` «preempt storm» синтетичний (`report(Preempted)`), не справжній preemption | `tests/transition_orphan.rs:69-73` | 3 | `[ ]` |
+| F-24 | P2 | `priority_preemption.rs:119` rollback-свідок не мутує стан, лише лічить виклики | `tests/priority_preemption.rs:50,113-119` | 3 | `[ ]` |
+| F-25 | P2 | `tests/erased.rs` rollback-свідки без node-stat witness | `tests/erased.rs:39,65` | 3 | `[ ]` |
+| F-26 | P2 | Два різні `static ROLLBACKS` з однаковим ім'ям | `tests/guard.rs:234,255` | 7 | `[ ]` |
+| F-27 | P2 | Приклад ISR: cycle 3 abort без post-abort assert | `examples/12_isr_bridge.rs` | 7 | `[ ]` |
+| F-28 | P2 | Покриття async-дір: settle-pop→drop, HalfOpen+cancel, poison async | `tests/async_primitives.rs`, `tests/conduit.rs` | 7 | `[ ]` |
+| F-29 | P2 | `stress_harness.ps1`: managed-path без image/creation gate; kill-semantics/verdict розбіжні з py | `scripts/stress_harness.ps1:294,343,360-367` | 5 | `[ ]` |
+| F-30 | P2 | `check_api_diff` при недоступному git: `hash-object` → `""` двічі, lock-мутація невидима | `scripts/check_api_diff.sh:63-72` | 5 | `[ ]` |
+| F-31 | P2 | `check_compile_gates.sh` pipe/grep failure → `OK`; `CI=false` трактується як CI | `scripts/check_compile_gates.sh:14,110-119` | 5 | `[ ]` |
+| F-32 | P2 | `bench.sh:147` при помилці `grep` публікує; `:163` тихо пропускає summary | `scripts/bench.sh:147,163` | 5 | `[ ]` |
+| F-33 | P2 | `check_compile_gates.ps1` друкує `OK` після FAIL baseline==HEAD | `scripts/check_compile_gates.ps1:194-197,218` | 5 | `[ ]` |
+| F-34 | P2 | Планові/ручні CI-лейни (PS TerminateProcess, raw-kill, euthanasia) не мають PR/push-еквівалента | `.github/workflows/stress.yml:134,171,211` | 5 | `[ ]` |
+| F-35 | P3 | TTL re-stamp після settle-wake може нескінченно продовжувати TTL; TTL перевіряється лише на poll | `src/node.rs:3730`, `3679-3684`; `tests/task_engine.rs:272` | 7 | `[ ]` |
+| F-36 | P3 | `auto_seq` Relaxed: епоха, видана «пізніше», може програти гонку `gate.observe` | `src/node.rs:2308` | 7 | `[ ]` |
+| F-37 | P3 | `LaneState` cross-field recovery: теоретично `pid:Some` + `drain:None` | `src/pool/lane.rs:128-168` | 7 | `[ ]` |
+| F-38 | P3 | `channel.rs:300` Acquire на лічильнику без Release-письменника (декоративний) | `src/channel.rs:300` | 7 | `[ ]` |
+| F-39 | P3 | `node.rs:1462/1482` SeqCst fences ні з чим не паряться (no-op) | `src/node.rs:1462,1482` | 7 | `[ ]` |
+
+---
+
+## 2. Етапи
+
+### Етап 0 — Baseline і захист від регресій (P0)
+
+**Мета:** зафіксувати відтворюваний baseline, щоб кожен наступний коміт мав доказове «до/після»,
+і щоб бейдж/цифри не розходилися з деревом.
+
+**Файли:** `scripts/` (новий `check_test_count.sh`), `README.md`, `PLAN.md`.
+
+**Кроки:**
+- [ ] `cargo fmt --check` на чистому дереві; зафіксувати результат.
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings`; зафіксувати.
+- [ ] `cargo test --all-targets --all-features -j 2`; зібрати `^test result:` у суму; окремо doctests.
+- [ ] `bash scripts/check_compile_gates.sh`; зафіксувати 7/7 (Gate 6 локально SKIP — це норма).
+- [ ] Додати `scripts/check_test_count.sh`: рахує фактичні passed + doctests і порівнює з числом у бейджі
+      `README.md:7`; exit 1 при розбіжності. Підключити в CI (`.github/workflows/ci.yml`, quality job).
+- [ ] Додати в README поряд з бейджем один рядок provenance: команда + дата останньої перевірки.
+- [ ] Перевірити вільне місце на диску; якщо `target/` зникає — зафіксувати як environmental limit,
+      не «доводити» числами, яких немає.
+
+**Тести:** сам `check_test_count.sh` (позитивний і негативний прогін на тимчасовій копії README).
+
+**Готово:** baseline-числа записані в PLAN.md (нижче), скрипт падає на штучно зміненому бейджі.
+
+**Коміт:** `chore(ci): add reproducible test-count gate and record audit baseline`
+
+**Дописи:**
+- Baseline на 2026-10-25: suite **368 passed / 0 failed / 5 ignored** + **26 doctests** = **394**.
+  Бейдж `394` збігається; «385/387/377» у поточних docs відсутні.
+- `target/criterion` у дереві відсутній, тому жодне опубліковане число латентності зараз не відтворюється;
+  це фіксується як стан, а не «переміряно».
+- Скрипт рахує саме passed, а не «скільки рядків»: інакше `ignored`/`0 passed` дадуть хибний збіг.
+
+---
+
+### Етап 1 — Критична коректність (P0)
+
+**Мета:** прибрати стани, у яких код бреше сам собі: заварена проба, дубль кадру, хибний доккоментар,
+хибна обіцянка «no allocation».
+
+**Файли:** `src/node.rs`, `src/drain.rs`, `src/pool/mod.rs`, `README.md`, `docs/USER_GUIDE.md`,
+`tests/` (нові регресії).
+
+#### 1.1 F-01 — panic-safe probe
+
+- [x] Знайти **всі** виклики `friction`/`pressure`/`fallback`/hook-замикань у sync та async шляхах
+      (grep `snap_friction`, `snap_pressure`, `fallback`, `react(`, `hooks`).
+- [x] Додати один helper (`fn run_admission_hook<R>(&self, f: impl FnOnce() -> R) -> R`):
+      `catch_unwind(AssertUnwindSafe(f))`; на `Err(payload)` — під свіжим замком `half_open_probe = false`,
+      потім `resume_unwind(payload)`. Ніякого settle/книг: транзакція ще не допущена.
+- [x] Замінити **кожен** виклик hook'а на helper. У sync `enter_inner` це два місця: friction
+      (`src/node.rs`, гілка `snap_friction`) і pressure (`react(bp)` для `pressure_fn` та
+      `BackpressurePolicy::Custom`). `friction_wait_ms`/`fallback_value` кличуть handler'и поза замком,
+      але не озброюють `half_open_probe`, тому вони не входять у цей контракт.
+- [x] Перевірити, що helper не ковтає паніку і не змінює `Result`-контракт при `Ok`.
+- [x] Регресії:
+      `panicking_friction_hook_does_not_wedge_half_open_probe` (sync),
+      `panicking_pressure_hook_does_not_wedge_half_open_probe` (sync).
+      Async-версія: **N/A** — async-шлях не викликає `friction_fn`/`pressure_fn`, тому заварювання
+      проби там відтворити неможливо; контракт закритий sync-тестами.
+
+**Дописи:** `catch_unwind` доступний лише в `node` (std-модуль), тому helper живе там; core не чіпаємо.
+`AssertUnwindSafe` виправданий: після паніки ми не довіряємо жодному захопленому стану, лише чистимо прапорець.
+Кожен тест тримає єдиний слот bulkhead, тому проба HalfOpen гарантовано потрапляє в гілку hook'а.
+
+#### 1.2 F-02 — scanner: reset до доставки
+
+- [x] У `SnubScanner::push` замінити порядок на:
+      `let token = ProcessToken::from_body_bytes(&self.body); self.reset(); frames += 1; on_token(token);`
+- [x] Перевірити, що `reset()` очищає `window`, `body`, `body_len`, `in_body` (і що це не ламає
+      частковий кадр у наступному чанку).
+- [x] Регресія `panicking_on_token_does_not_redeliver_frame`: `catch_unwind` навколо `push` з панікуючим
+      `on_token`, потім `push` того самого байтового потоку → рівно один виклик `on_token`, не два.
+
+**Дописи:** `frames` інкрементується до `on_token`, тому при паніці значення все одно втрачається
+(функція розмотується). Головне — стан сканера вже скинутий; повторної доставки немає.
+
+#### 1.3 F-03 — publish_fault: drop поза замком + чесний доккоментар
+
+- [x] Замінити `inner.stats.last_fault = Some(owned);` на
+      `let old = inner.stats.last_fault.replace(owned);` і `drop(old);` після виходу з-під guard'а.
+- [x] Перевірити, що `push_flight_inner` не може реалокати на стабільному шляху: `flight` створюється
+      з `VecDeque::with_capacity(flight_depth.max(1))`; poison-recovery не зменшує його.
+- [x] Виправити доккоментар (`src/node.rs`, `publish_fault`): «no foreign code on the steady path; the
+      replaced `FaultRecord` is freed after unlock; a one-time flight realloc is possible only after an
+      external shrink».
+- [x] Регресія: наявні fault-серії з `NodeName::Owned` покривають коректність `last_fault.node()`;
+      окремий deadlock-тест не додано — drop під замком не спостерігається, бо старого запису під
+      guard'ом більше не існує (структурний доказ + доккоментар).
+- [ ] (Опційно) інструментований тест, що drop `Arc<str>` не відбувається під замком — свідомо
+      відхилено: вимагав би тестового hook'а в production-коді.
+
+**Дописи:** не можна просто «не дропати» старий запис — пам'ять потече. Єдиний коректний варіант —
+`replace` + drop після відпускання guard'а. `flight_depth == 0` більше не дає першу реалокацію на fault.
+
+#### 1.4 F-04 — docs: прибрати «no allocation» у `report()`
+
+- [x] `README.md:132`: замінено на «one `Vec<LaneSnapshot>` allocation (`lanes.len()` rows) included in the number».
+- [x] `docs/USER_GUIDE.md:1789`: те саме; число ~111 ns явно включає алокацію.
+- [x] Перевірено: `expired_lanes` подібної обіцянки не має.
+- [x] Grep `no allocation` по README/USER_GUIDE: решта збігів істинні (conflate, `ProcessToken`, `NodeName::Static`, `fmt::Write`).
+
+**Тести:** doc-гейт не потрібен; достатньо `cargo test --doc` і перевірки grep-ом у Stage 6.
+
+**Готово:** паніка в hook'ах більше не заварює breaker; сканер не дублює кадр; `publish_fault`
+не дропає foreign пам'ять під замком; докси `report()` чесні; усі нові тести зелені, suite не зменшився.
+
+**Коміт:** `fix(core): panic-safe probe hooks, scanner reset order, publish_fault lock hygiene`
+
+**Дописи:**
+- F-01 і F-02 — це семантичні баги, а не «стиль»: перший вічно блокує вузол, другий дублює бізнес-подію.
+- F-03 не є memory-unsafe, але порушує власний контракт критичної секції; виправляється без зміни API.
+- F-04 — тільки docs; код `report()` лишається алокувати, бо це холодний шлях.
+
+---
+
+### Етап 2 — Гігієна замків (P1)
+
+**Мета:** прибрати foreign-код/алокації з-під node/conduit/wakers замків там, де це можливо без
+зміни семантики; решту — задокументувати як свідомий компроміс.
+
+**Файли:** `src/node.rs`, `src/conduit.rs`, `src/supervisor.rs`, `tests/async_primitives.rs`.
+
+#### 2.1 F-07 — `Waker` drop під node-локом
+
+- [ ] `node.rs:3678`: `let old = core::mem::replace(&mut slot.waker, waker);` → відпустити `inner` →
+      `drop(old)` → повернути `Poll::Pending`. Переконатися, що TTL-origin і `evicted_out` не залежать
+      від guard'а після цього.
+- [ ] `node.rs:3896` `retain`: зібрати видалених waiter'ів у локальний `Vec`, зарезервований **до** замка
+      (`Vec::with_capacity(inner.waiters.len())` після першого читання len), або зробити двофазний
+      `mem::take` з перевіркою identity. Drop — після відпускання замка.
+- [ ] `node.rs:3728` `Arc::new(AtomicBool)` для `evicted`: перенести алокацію **до** `self.lock()`;
+      якщо структура функції не дозволяє — задокументувати як єдину неминучу алокацію парку.
+- [ ] `node.rs:3731` `waiters.push_back`: `VecDeque::with_capacity(64)` при побудові + коментар,
+      що ріст — рідкісний cold-path; або зарезервувати наперед.
+- [ ] Регресії: `cancel_after_settle_pop_does_not_drop_waker_under_lock` (структурний тест неможливий —
+      тоді тест на відсутність deadlock/panic під `Drop` + `catch_unwind`), `re_park_replaces_waker_once`.
+
+#### 2.2 F-08 — conduit: `mem::take` замість `collect` під замком
+
+- [ ] `conduit.rs:399-402`: замінити `drain(..).collect()` на
+      `let old = { let mut w = lock; core::mem::take(&mut *w) };` → drop guard → wake/drop поза замком.
+- [ ] `conduit.rs:476`: `slot.waker = waker` → `mem::replace` + drop після unlock (як у 2.1).
+- [ ] Регресії: `wake_after_pause_does_not_hold_wakers_lock`, `resume_replaces_waker_without_deadlock`.
+
+#### 2.3 F-09 — clock поза замком
+
+- [ ] `node.rs:3299`: зняти `now_ms()` до взяття замка (або один раз на початку `enter_inner`) і
+      використати знімок у rate-limiter. Перевірити, що `rate_last_ms`/`rate_tokens` не залежать від
+      того, чи замок утримувався безперервно.
+- [ ] `node.rs:5277` (`check_timeout`): зняти `now` до lock-секції, передати значення всередину.
+- [ ] Регресії: rate-limit тест із `rate_per_sec > 0` (детермінований, без реального часу — використати
+      існуючий injectable clock, якщо є; інакше тільки smoke).
+
+#### 2.4 F-16 — `feed` після `finish`
+
+- [ ] Додати `DrainCounters::feeds_after_eof` (або окремий лічильник), інкрементувати, коли `feed`
+      бачить `eof()` і повертає `0`.
+- [ ] Експонувати в `counters()`/report; додати тест `feed_after_finish_is_counted_and_returns_zero`.
+- [ ] Виправити коментар `supervisor.rs:899-901`: clock читається під **ingest**, не під state;
+      ClockFn — caller code, тому він не має викликатися під жодним drain-замком; якщо це неможливо —
+      перенести читання до `ingest.lock()`.
+
+**Готово:** жоден `Waker` не дропається під node/wakers замком; conduit не алокує під замком;
+clock-читання не в критичній секції; `feed`-після-EOF спостережуваний; suite зелений.
+
+**Коміт:** `fix(concurrency): keep waker drops and clock reads outside mutexes`
+
+**Дописи:**
+- Це не memory-safety, а latency/panic-safety: drop `Waker` може викликати код екзекутора, який
+  панікує або бере власні замки. Ризик deadlock залежить від екзекутора, тому фікс — обов'язковий.
+- Якщо двофазний `retain` виявиться надто складним/race-prone — залишити `retain` під замком,
+  але тоді **явно** задокументувати виняток у доккоментарі й додати це в «Закрито без змін» з причиною.
+  Не робити вигляд, що контракт виконано.
+
+---
+
+### Етап 3 — Консервація та чесні тести (P0/P1)
+
+**Мета:** жоден тест не має проходити на нулі операцій або на урізаному рівнянні.
+
+**Файли:** `tests/invariants.rs`, `tests/bulkhead_capacity.rs`, `tests/stress_breaker_churn.rs`,
+`tests/transition_orphan.rs`, `tests/priority_preemption.rs`, `tests/erased.rs`,
+`tests/supervisor_pool_stress.rs`, `tests/stress_mixed.rs`, `tests/stress_lease.rs`.
+
+**Кроки:**
+- [ ] `tests/invariants.rs`: додати повний 7-доданковий закон
+      `attempts == total_started + bulkhead + stale + breaker + rate + poisoned + memory`;
+      зберегти існуючий bucket-enum; підняти floor для `accepted` (не `> 0`, а, наприклад, `>= attempts/10`
+      для стрес-сценарію — підібрати так, щоб не флапало).
+- [ ] `tests/bulkhead_capacity.rs:97-110`: додати `assert!(started > 0)`, повний закон, і перевірку
+      кожного лічильника окремо (не тільки `bulk + stale`).
+- [ ] `tests/bulkhead_capacity.rs:139-176`: замінити `else { refused += 1 }` на розбиття за
+      `EnterError::{BulkheadFull, StaleEpoch, RateLimited, BreakerOpen, ...}` і звірити кожен бакет.
+- [ ] `tests/stress_breaker_churn.rs`: додати
+      `admitted + bulk + breaker + stale == THREADS*OPS_PER_THREAD`; підняти floor
+      (`failed > 0 && committed > 0` лишити, але додати `admitted >= N`).
+- [ ] `tests/transition_orphan.rs`: перейменувати коментар «preempt storm» → «synthetic anomaly feed»;
+      додати `started > 0` floor; якщо можливо — додати справжній preemption-сценарій окремим тестом
+      (Critical over Background), інакше явно позначити синтетику.
+- [ ] `tests/priority_preemption.rs`: rollback має мутувати незалежний стан (`AtomicBool`/`AtomicU32`
+      «resource_restored»), а не лише лічити виклики; assert на стан після abort.
+- [ ] `tests/erased.rs`: додати node-stat witness (`implicit_drops`/`explicit_aborts`), а не тільки
+      локальний `RELEASES`/`fired`.
+- [ ] `tests/supervisor_pool_stress.rs:37-38`, `stress_mixed.rs:45-46`, `stress_lease.rs:64-67`:
+      `env_num(...).max(MIN)` з `MIN >= 2` для lanes/kills; якщо env заданий нижче — `panic!` з поясненням.
+- [ ] `tests/guard.rs:234,255`: перейменувати статики (`ROLLBACKS_COMMIT`, `ROLLBACKS_DROP`), щоб grep
+      не подвоював свідчення.
+
+**Тести:** самі змінені тести + повний suite. Додатково: «негативний» прогін — тимчасово зламати
+лічильник (локально, не комітити) і переконатися, що кожен новий assert падає.
+
+**Готово:** кожен conservation-тест має позитивний floor і повний набір бакетів; `KILLS=0`/`LANES=0`
+неможливі; suite зелений, кількість тестів не зменшилась.
+
+**Коміт:** `test(conservation): pin full admission law and positive volume floors`
+
+**Дописи:**
+- Floor має бути детермінованим: для стрес-тестів краще `>= some_fraction`, ніж точна рівність,
+  інакше CI флапатиме на повільних ранерах.
+- `bulk + stale > started` — не закон, а евристика; після повного закону її можна прибрати або
+  залишити як sanity-check.
+
+---
+
+### Етап 4 — Чесність бенчів (P1)
+
+**Мета:** бенч не публікує число, якщо вимірював не те, що заявлено.
+
+**Файли:** `benches/admission_bench.rs`, `tests/bench_hygiene.rs`.
+
+**Кроки:**
+- [ ] IDEAL-1 (`625-665`): лічити `admitted` per-thread; після join сумувати й `assert_eq!(admitted,
+      iters_per_thread * concurrency)`; на виснаження 64 retry — `panic!("stale retry exhausted")`.
+- [ ] IDEAL-1: читати `stale` після join і або `assert!(stale < total/2)`, або друкувати в stderr
+      з явним `BENCH WARN`; не залишати мертвий лічильник.
+- [ ] IDEAL-2 (`679-711`): те саме (admitted floor + panic на виснаженні).
+- [ ] IDEAL-3 (`730-757`): лічити успішні `send_critical` (`Ok`) і `Err`; після зупинки drain
+      дочекатися повного дренування і `assert_eq!(received, sent_ok)`; `assert!(sent_ok > 0)`.
+- [ ] Усі `let _ = h.join();` (`663-665`, `709-711`, `755-757`, `808`) → `h.join().expect("bench worker panicked")`.
+- [ ] `tests/bench_hygiene.rs`:
+      - заборонити `let _ = h.join()` (текстовий бан + whitelist, якщо є легітимні місця);
+      - заборонити `let _ = black_box(sender.send` (відкинутий результат send);
+      - додати `PER_SAMPLE_ALLOC` для `report_snapshot_4_lanes` і `expired_lanes_4_lanes` з поясненням,
+        або перенести вимірювання так, щоб алокація була частиною заявленої метрики (і задокументувати);
+      - прибрати wholesale-виняток IDEAL-3 (`286-288`): перевірити, що в IDEAL-3 немає жодного `HEAVY`
+        конструктора, і ганяти загальний чек; якщо є — звузити виняток до конкретного ctor.
+- [ ] Перевірити `drain_sync_256_frames`: у README/коментарі явно «stream + scan per 256-frame sample»,
+      щоб `Throughput::Elements(256)` не читався як чистий per-frame scan.
+- [ ] Прогнати `cargo bench --bench admission_bench -- --sample-size 10` (або вибірково) і зберегти
+      нові числа; оновити README тільки тими числами, які реально виміряні в цьому прогоні.
+
+**Тести:** `cargo test --test bench_hygiene`; самі бенчі компілюються й запускаються (smoke).
+
+**Готово:** жоден contended-бенч не може опублікувати результат із нульовою кількістю допусків;
+`bench_hygiene` ловить відкинутий join/send; README-числа мають свіжий артефакт.
+
+**Коміт:** `fix(bench): fail fast on retry exhaustion and discarded send results`
+
+**Дописи:**
+- `iter_custom` у Criterion множить час на `iters`; якщо фактичних операцій менше — число занижене
+  (виглядає швидше). Assert на кількість — єдиний спосіб це закрити.
+- Для gateway «sent == received» може бути недосяжним, якщо drain зупиняється до повного спорожнення;
+  тому після `draining=false` — `while rx.try_recv().is_some() { count += 1; }` (у коді вже є) і
+  порівнювати після цього.
+
+---
+
+### Етап 5 — Скрипти та CI (P1)
+
+**Мета:** жоден SKIP/помилка парсингу/відсутній тег не мають виглядати як успіх; PS і sh мають
+однакову силу; перформанс і Miri мають реальні лейни.
+
+**Файли:** `scripts/check_compile_gates.{sh,ps1}`, `scripts/check_api_diff.{sh,ps1}`,
+`scripts/stress_harness.{sh,ps1}`, `scripts/stress_multi_lineage.{py,ps1}`, `scripts/bench.{sh,ps1}`,
+`.github/workflows/ci.yml`, `.github/workflows/stress.yml`, `tests/task_engine.rs`.
+
+**Кроки:**
+- [ ] F-12: портувати в `.ps1` усі 15 лічильників і 3 функції (`enter_inner`, `enter_async_attempt`,
+      `record_locked`); додати Windows CI-крок, який запускає `.ps1` і порівнює кількість перевірок із `.sh`.
+- [ ] F-31: `check_compile_gates.sh` — `in_ci()` строго `CI=true|1`; у `printf | grep` перевіряти `rc`
+      і падати на `rc > 1`/SIGPIPE, а не провалюватися в `OK`.
+- [ ] F-30: `check_api_diff.sh` — якщо `git hash-object` повертає порожньо, це FAIL (lock-мутація невидима).
+- [ ] F-33: `.ps1` — не друкувати `OK`, якщо `rc != 0` (FAIL baseline==HEAD).
+- [ ] F-11: додати `scripts/check_release_tag.sh`: `Cargo.toml` version має дорівнювати останньому тегу
+      (після `v`) **або** версія має бути явно позначена як «unreleased» у CHANGELOG; підключити в CI.
+      Теги не створювати без наказу.
+- [ ] F-13 (sh): PID identity — повні ticks (`starttime`), без `/ CLK_TCK`; `LAST_KILLED_START_TICKS`
+      замість секунд; macOS — задокументована секундна межа. JSON — реальний парсер (`python3 -c`)
+      з fallback-помилкою, не regex. `add_skip` для fd-growth — FAIL у CI (`in_ci()`); `LAUNCH=0`
+      у CI — FAIL, бо гейти не працювали.
+- [ ] F-29 (ps1): managed-path — точний image + creation time (як `-RawKill`), а не `-like "*name*"`;
+      вирівняти kill-semantics і verdict з `stress_multi_lineage.py` (`killed==expected`, `armed_hold`,
+      clamp fd-growth ≥ 0).
+- [ ] F-32: `bench.sh` — перевіряти `rc` від `grep -c`; у `--github` без `GITHUB_STEP_SUMMARY` — FAIL
+      (або явний WARN, але CI-режим має падати).
+- [ ] F-10: додати в `ci.yml` job `bench-full` на `schedule`/`workflow_dispatch`:
+      `cargo bench --locked --bench admission_bench`, `bash scripts/bench.sh --skip-run`,
+      upload artifacts `target/criterion/**` + `target/bench/snapshot.md`; код `bench.sh` не чіпати.
+- [ ] F-14: додати лейн `miri-leaks` **без** `-Zmiri-ignore-leaks` (спочатку один, щоб зрозуміти обсяг);
+      розширити список Miri-файлів до всіх, що компілюються без wall-clock/sleep; для виключених
+      (`channel.rs:13`, `task_engine.rs:271`) — задокументувати причину в CI-коментарі.
+- [ ] F-17: `FakeWake` — прибрати `#[allow(dead_code)]`, використати `self.0` у `wake`; додати
+      `#[cfg(miri)] assert!(!w1.will_wake(&w2))` для різних `Arc` (з застереженням, що `will_wake`
+      може over-approximate; це hardening, не гарантований tripwire).
+- [ ] F-34: додати PR/push-лейн (зменшені counts) для `supervisor_termination` і Windows raw-kill,
+      або явно задокументувати, що вони тижневі, і додати `workflow_dispatch`-чеклист.
+- [ ] Перевірити `--locked` на всіх нових кроках; `fmt`/`semver-checks` — задокументовані винятки.
+
+**Тести:** локально `bash scripts/check_compile_gates.sh`, `pwsh -File scripts/check_compile_gates.ps1`
+(якщо є pwsh), `bash scripts/check_api_diff.sh`, `bash scripts/bench.sh --skip-run`.
+Негативні прогони: штучно зламати JSON/тег/лічильник і переконатися, що скрипт падає.
+
+**Готово:** sh/PS дають однаковий verdict на одному дереві; SKIP у CI → FAIL; PID-гейт розрізняє
+двох воркерів у межах секунди (Linux); `bench-full` архівує артефакти; Miri-лейн без `ignore-leaks`
+або явний перелік знайдених витоків із рішенням.
+
+**Коміт:** `fix(ci): close skip/parse/parity holes and add full bench artifact lane`
+
+**Дописи:**
+- PS 5.1: файли лишаються ASCII-only; ем-даш у коментарі ламає парсинг у cp1252 — перевіряти
+  після кожної правки.
+- Miri без `ignore-leaks` може впасти на існуючих тестах; це не привід повертати прапорець —
+  спочатку тріаж: справжній витік vs навмисний `Box::leak` у тесті.
+- Повний bench на CI-ранері шумний; тому він **не** гейтить PR, лише архівує й будує тренд.
+
+---
+
+### Етап 6 — Документація (P2)
+
+**Мета:** кожне твердження в README/USER_GUIDE або істинне, або має дату/джерело.
+
+**Файли:** `README.md`, `docs/USER_GUIDE.md`, `CHANGELOG.md`, `docs/INVARIANTS.md` (публічний).
+
+**Кроки:**
+- [ ] F-18: `USER_GUIDE.md:1788` — `lane.attach(..)` / `lane.note_death(..)`; звірити з прикладом
+      `USER_GUIDE.md:1123-1130`.
+- [ ] F-15: `USER_GUIDE.md:1787` — розділити рядок: core = `SnubScanner::push` + `ProcessToken::*`;
+      `feed`/`finish`/`write_to` — окремий рядок `std`, з приміткою «requires `std::io::Write`; для UART/DMA
+      потрібен власний адаптер».
+- [ ] F-04: виправити «no allocation» (див. 1.4).
+- [ ] F-19: назви бенчів — додати `_threads_{N}` у README або явно писати «family `contended_node_enter_threads_*`»;
+      `classify_stall` → `classify_stall_ceiling` (або позначити, що це API-ім'я).
+- [ ] F-20: біля таблиці латентності — provenance-блок: дата, команда, посилання на артефакт
+      (або «historical, see CI artifact»); бейдж — команда перевірки.
+- [ ] F-21: додати в API-таблицю публічні аксесори:
+      `PoolConfig::with_memory/with_eof_grace`, `PoolLane::respawn_delay_ms/next_epoch`,
+      `WorkerPool::total_rescued`, `PoolReport::deadlocked/final_generations`,
+      `ExecutionEnvelope::{off,is_inside,has_underflow,has_overflow,is_off,time_verdict,payload_verdict}`,
+      `FastPrng`, `HarnessReport::mean_us`, `ProfileHarness::{samples,burst_len}`, `ProcessToken::commit`.
+- [ ] F-20/ratios: додати в README короткі посилання на rationale (50 MB trap, cgroup/fadvise,
+      `max+1`, «Level Budget, Not Time Budget») — зараз вони є лише в USER_GUIDE.
+- [ ] Перевірити, що жоден рядок не обіцяє bare-metal для std-API; grep `core`/`bare metal`/`no_std`
+      по таблицях.
+- [ ] `CHANGELOG.md`: додати секцію для наступної версії з усіма поведінковими змінами етапів 1–4
+      (без version bump, якщо реліз не замовлено).
+
+**Тести:** `cargo test --doc`; `grep`-аудит протиріч; за потреби — doc-test, що імпортує згадані методи.
+
+**Готово:** жодного неіснуючого методу/бенча в docs; «no allocation» відсутнє там, де є `Vec`;
+кожне число має джерело; усі публічні типи 0.6.x мають хоч один рядок у таблиці.
+
+**Коміт:** `docs: correct pool API receivers, core/std split, allocations, bench names, accessors`
+
+**Дописи:**
+- Локальні docs не згадувати і не комітити; публічні — README/USER_GUIDE/INVARIANTS/CHANGELOG.
+- Не вигадувати нові числа: якщо бенч не прогнаний — писати «historical» і дату, а не «re-measured».
+
+---
+
+### Етап 7 — Покриття та дрібні ризики (P2/P3)
+
+**Мета:** закрити тестові діри, які не є критичними, але дозволяють регресіям проходити.
+
+**Файли:** `tests/async_primitives.rs`, `tests/conduit.rs`, `tests/guard.rs`, `tests/erased.rs`,
+`examples/12_isr_bridge.rs`, `src/node.rs`, `src/pool/lane.rs`, `src/channel.rs`.
+
+**Кроки:**
+- [ ] F-28: тест `future_dropped_after_settle_pop_before_repoll` (handoff з `entry.rs:13-16`).
+- [ ] F-28: тест `half_open_cancel_does_not_leak_probe` (async cancel під час HalfOpen).
+- [ ] F-28: тест `async_path_recovers_from_node_mutex_poison` (отруїти замок із тесту, перевірити
+      `poison_recoveries` + відсутність зависання).
+- [ ] F-26: перейменувати статики в `tests/guard.rs`.
+- [ ] F-27: `examples/12_isr_bridge.rs` — після abort у cycle 3 assert, що `laser_on == false`.
+- [ ] F-23: або справжній preemption-тест, або коментар «synthetic feed, not a preemption exercise».
+- [ ] F-35: задокументувати TTL re-stamp (рядок у USER_GUIDE/INVARIANTS) і додати тест, що TTL
+      не продовжується **в межах одного park**; поведінку після settle-wake лишити як є (P3).
+- [ ] F-36/F-37/F-38/F-39: додати по одному короткому коментарю-поясненню в код (чому Relaxed/Acquire
+      безпечний або чому fence no-op), щоб наступний аудит не відкривав те саме.
+- [ ] F-37: якщо легко — зробити `LaneState` атомарною парою (окремий `Option<(u32, PipeDrain)>`)
+      або задокументувати, що panic-point відсутній.
+
+**Готово:** нові тести зелені; приклад має post-abort assert; P3-пункти мають явне рішення
+(фікс або документований виняток).
+
+**Коміт:** `test(async): cover settle handoff, half-open cancel, poisoned node path`
+
+**Дописи:**
+- Для poison-тесту потрібен спосіб отруїти `NodeInner` ззовні: можливо, через `catch_unwind` навколо
+  тестового hook'а, який панікує під замком (але після Етапу 1 hook не під замком). Якщо публічного
+  способу немає — використати існуючий тестовий модуль або задокументувати, що шлях покритий
+  лише статично.
+- Не додавати нові залежності заради тестів.
+
+---
+
+### Етап 8 — Реліз (P2, тільки за наказом)
+
+**Мета:** зафіксувати виправлення у версії та CHANGELOG, не порушивши semver.
+
+**Кроки:**
+- [ ] Переконатися, що Етапи 0–7 закриті; suite/gates/clippy/fmt зелені.
+- [ ] `Cargo.toml` version → `0.6.9` (або що скаже власник); `CHANGELOG.md` — повний список.
+- [ ] `bash scripts/check_release_tag.sh` — очікувано FAIL, поки немає тегу; це нагадування.
+- [ ] **Тег — тільки за окремим наказом.** Без наказу не створювати і не пушити тег.
+- [ ] Commit + push (за standing preference), з measured before→after для кожного перф-пункту.
+
+**Готово:** version і CHANGELOG узгоджені; CI зелений; тег або створений за наказом, або явно
+залишений на потім.
+
+**Коміт:** `release: 0.6.9 — audit closeout`
+
+**Дописи:** semver-гейт не побачить змін, доданих і видалених між тегами; саме тому
+`check_release_tag.sh` + тег на кожен реліз є частиною процесу, а не косметикою.
+
+---
+
+## 3. Закрито без змін (перевірено — не є дефектом)
+
+- [x] **`tests/task_engine.rs:264` int→ptr cast — відсутній.** `Waker::from(Arc::new(FakeWake(id)))`;
+      жодного `as *mut`/`as *const`/`expose_addr`/`transmute` у `src tests benches examples`
+      (єдиний збіг — коментар `src/supervisor.rs:571`). Strict Provenance задоволений.
+- [x] **Отруєння замків.** Немає `.lock().unwrap()/.expect` у `src`; `NodeInner`, `cancel_reason`,
+      `draft`, `wakers`, `state(RwLock)`, `GatewayBooks`, `LaneState`, `DrainInner` — усі через
+      `into_inner` + `hard_clamp_slots`.
+- [x] **Saturating-арифметика та відсутність `unsafe`.** `#![forbid(unsafe_code)]`; Gate 2.
+- [x] **32-bit без 64-bit atomics.** `AtomicU64` лише в std-модулях; core `clock.rs` має
+      `cfg(target_has_atomic = "64")` + `AtomicU32` fallback; `NodeName::Owned` під ptr-atomics.
+- [x] **Розмірні контракти.** 512 B (`src/diagnostics.rs:27-29`), 64 B (`src/supervisor.rs:524,533,537`),
+      44/40/28 B (`src/drain.rs:19,28,89`), lane mask (`src/pool/task.rs`, `src/pool/mod.rs`).
+- [x] **`bench.sh` fail-closed.** Немає `target/criterion` → exit 1 (`:51`); нема python3 → exit 1 (`:69`);
+      порожній snapshot → exit 1 (`:151`).
+- [x] **Memory orderings — коректні.** `memory_pressure` Release/Acquire (`node.rs:1849`, `2973`, `3544`);
+      ISR SPSC — cell Relaxed + head Release/Acquire; решта Relaxed — телеметрія.
+- [x] **Async cancel (select! drop).** Немає stale waker/leased slot/probe leak: `entry.rs:80-82`,
+      `node.rs:3668-3671`, `3826`; probe чиститься до кожного `Pending`/`Err` (`3640,3665,3774,3805`).
+- [x] **`ResumeFuture`.** Identity `Arc<AtomicBool>` лише для `ptr_eq`; Drop deregisters; lost-wakeup
+      закритий порядком замків; TTL немає (N/A).
+- [x] **Fake rollbacks у `examples/`.** `01`, `02`, `03`, `11`, `12`, `13` мають реальний стан/assert
+      (єдине — cycle 3 у `12`, винесено в F-27).
+- [x] **Локальні docs.** Усі сім — gitignored/untracked; жоден тест їх не читає; `tests/doc_sync.rs`
+      читає лише `src/**/*.rs`.
+- [x] **`#[ignore]` мають CI-лейни.** `stress_breaker_churn`, `supervisor_pool_stress*` — `stress.yml:107-114`;
+      `supervisor_termination` — `stress.yml:210-227` (тижнево; див. F-34).
+- [x] **`--locked`.** Усі build/test-виклики locked; винятки `fmt`/`semver-checks` компенсовані
+      lockfile-хешем (діра з git — F-30).
+
+---
+
+## 4. Порядок комітів
+
+1. `chore(ci): add reproducible test-count gate and record audit baseline` — Етап 0.
+2. `fix(core): panic-safe probe hooks, scanner reset order, publish_fault lock hygiene` — Етап 1.
+3. `fix(concurrency): keep waker drops and clock reads outside mutexes` — Етап 2.
+4. `test(conservation): pin full admission law and positive volume floors` — Етап 3.
+5. `fix(bench): fail fast on retry exhaustion and discarded send results` — Етап 4.
+6. `fix(ci): close skip/parse/parity holes and add full bench artifact lane` — Етап 5.
+7. `docs: correct pool API receivers, core/std split, allocations, bench names, accessors` — Етап 6.
+8. `test(async): cover settle handoff, half-open cancel, poisoned node path` — Етап 7.
+9. `release: 0.6.9 — audit closeout` — Етап 8, тільки за наказом.
+
+Після кожного коміту: `cargo fmt --check`, `cargo clippy -D warnings`, suite, `scripts/check_compile_gates.sh`.
+Push — одразу після зеленого прогону (standing preference), без rewrite історії.
+
+---
+
+## 5. Ризики, відкат, критерії зупинки
+
+- **Ризик R1: двофазний `retain` у node.** Може внести race/lost waiter. Якщо тести на cancel/evict
+  нестабільні — відкат до `retain` під замком + явний доккоментар-виняток. Не залишати «напівфікс».
+- **Ризик R2: `catch_unwind` навколо hook'ів.** Може змінити поведінку, якщо hook навмисно панікує
+  для керування потоком (не підтримується). Контракт: паніка = баг користувача, але вузол лишається живим.
+- **Ризик R3: посилення conservation-asserts.** Може виявити реальні десинхронізації, які раніше
+  маскувалися. Це мета, а не привід послаблювати assert; фіксувати root cause.
+- **Ризик R4: Miri без `ignore-leaks`.** Може впасти на навмисних тестових витоках; тріаж, не повернення прапорця.
+- **Ризик R5: PS-гейт.** PS 5.1 + cp1252: тільки ASCII; після кожної правки — прогін `pwsh`/`powershell`.
+- **Ризик R6: повний bench на CI.** Шумний і повільний; не гейтити PR, лише архівувати.
+- **Зупинка:** якщо будь-який етап вимагає зміни публічного API з порушенням semver — зупинитися,
+  описати варіанти (deprecation/additive) і узгодити. Не ламати API мовчки.
+- **Відкат:** кожен етап — окремий коміт; відкат `git revert <sha>` без rewrite. PLAN.md оновлювати
+  статусами після кожного етапу.
+
+---
+
+## 6. Журнал виконання
+
+| Дата | Етап | Результат | Коміт |
+|---|---|---|---|
+| 2026-10-25 | Аудит | 39 знахідок, 3 секції; файли не змінювалися | — |
+| 2026-10-25 | 0 | PLAN.md створено; baseline зафіксовано | — |
+| 2026-10-25 | 1 | F-01..F-04 виправлено; +3 регресії; suite 394 -> 397 | `fix(core): panic-safe probe hooks, scanner reset order, publish_fault lock hygiene` |
+|  |  |  |  |

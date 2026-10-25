@@ -6,11 +6,13 @@
 //! scanner underneath.
 
 use std::io::Cursor;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use snubber::{
-    PipeDrain, ProcessToken, StateDigest, OP_COMMIT, OP_HEARTBEAT, OP_SNAPSHOT, OP_STATE,
+    PipeDrain, ProcessToken, SnubScanner, StateDigest, OP_COMMIT, OP_HEARTBEAT, OP_SNAPSHOT,
+    OP_STATE,
 };
 
 #[test]
@@ -315,4 +317,33 @@ fn snapshot_marker_neither_arms_nor_clears() {
         "the snapshot frame must not replace the armed token"
     );
     assert_eq!(drain.counters().arms, 1);
+}
+
+/// A caught `on_token` panic used to leave `body_len == 40, in_body == true`;
+/// the next push re-entered the completion branch with `take == 0` and
+/// delivered the same frame twice. Reset must happen before delivery.
+#[test]
+fn panicking_on_token_does_not_redeliver_frame() {
+    let mut scanner = SnubScanner::default();
+    let frame = ProcessToken::simple(21, 7, 3).to_bytes();
+    let mut calls = 0usize;
+
+    let first = catch_unwind(AssertUnwindSafe(|| {
+        scanner.push(&frame, |_token| {
+            calls += 1;
+            panic!("consumer exploded");
+        });
+    }));
+    assert!(first.is_err(), "the consumer panic must propagate");
+    assert_eq!(calls, 1);
+
+    // A non-empty chunk that completes no frame must not re-deliver the
+    // frame whose callback panicked.
+    let mut ghost = 0usize;
+    let delivered = scanner.push(&[0u8], |_token| ghost += 1);
+    assert_eq!(delivered, 0);
+    assert_eq!(
+        ghost, 0,
+        "a caught consumer panic must not duplicate the frame"
+    );
 }
