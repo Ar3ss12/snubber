@@ -6,10 +6,10 @@ on:
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
-  # Weekly scheduled lane for the `#[ignore]` pool-stress gates: they
-  # hard-kill real processes and are too heavy (and too flaky on shared
-  # runners) for every push — but they are the ONLY coverage for lane
-  # lease euthanasia and pool hard-kill, so they must not be manual-only.
+  # Weekly scheduled lane for the heavy multi-lineage process storms: they
+  # hard-kill real processes with 200+ kills and are too slow for every
+  # push. The `#[ignore]` test lanes (pool storms, breaker churn,
+  # termination smoke at 25 kills) run on every push/PR in ci.yml.
   schedule:
     - cron: "0 3 * * 1"
 
