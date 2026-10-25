@@ -623,26 +623,33 @@ fn bench_contended(c: &mut Criterion) {
                 .build(),
         );
         let stale = Arc::new(AtomicU64::new(0));
+        let admitted = Arc::new(AtomicU64::new(0));
         let name = format!("contended_node_enter_threads_{concurrency}");
         g.bench_function(name, |b| {
             let node = Arc::clone(&node);
             let stale = Arc::clone(&stale);
+            let admitted = Arc::clone(&admitted);
             b.iter_custom(|iters| {
                 stale.store(0, Ordering::Relaxed);
+                admitted.store(0, Ordering::Relaxed);
                 let iters_per_thread = (iters as usize / concurrency).max(1);
                 let barrier = Arc::new(Barrier::new(concurrency + 1));
                 let mut handles = Vec::with_capacity(concurrency);
                 for _ in 0..concurrency {
                     let n = Arc::clone(&node);
                     let s = Arc::clone(&stale);
+                    let a = Arc::clone(&admitted);
                     let br = Arc::clone(&barrier);
                     handles.push(thread::spawn(move || {
                         br.wait();
                         for _ in 0..iters_per_thread {
+                            let mut entered = false;
                             for _ in 0..64 {
                                 match n.enter_auto(|| {}) {
                                     Ok(guard) => {
                                         black_box(guard.commit());
+                                        a.fetch_add(1, Ordering::Relaxed);
+                                        entered = true;
                                         break;
                                     }
                                     Err(snubber::EnterError::StaleEpoch) => {
@@ -652,6 +659,7 @@ fn bench_contended(c: &mut Criterion) {
                                     Err(_) => thread::yield_now(),
                                 }
                             }
+                            assert!(entered, "stale retry exhausted after 64 attempts");
                         }
                     }));
                 }
@@ -661,9 +669,28 @@ fn bench_contended(c: &mut Criterion) {
                 let start = std::time::Instant::now();
                 barrier.wait();
                 for h in handles {
-                    let _ = h.join();
+                    h.join().expect("bench worker panicked");
                 }
-                start.elapsed()
+                let elapsed = start.elapsed();
+                let expected = (iters_per_thread * concurrency) as u64;
+                assert_eq!(
+                    admitted.load(Ordering::Relaxed),
+                    expected,
+                    "iter_custom multiplies by `iters`; every iteration must admit"
+                );
+                let stale_seen = stale.load(Ordering::Relaxed);
+                // Under 6-thread churn stale retries routinely exceed half
+                // the admissions, so this is a one-shot disclosure — not a
+                // per-sample assert: the published ns/op INCLUDES retry cost.
+                static STALE_WARNED: std::sync::Once = std::sync::Once::new();
+                if stale_seen * 2 >= expected {
+                    STALE_WARNED.call_once(|| {
+                        eprintln!(
+                            "BENCH WARN: contended enter spends a large share of iterations on stale retries; ns/op includes retry cost"
+                        );
+                    });
+                }
+                elapsed
             });
         });
     }
@@ -681,23 +708,31 @@ fn bench_contended(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let iters_per_thread = (iters as usize / concurrency).max(1);
                 let barrier = Arc::new(Barrier::new(concurrency + 1));
+                let admitted = Arc::new(AtomicU64::new(0));
                 let mut handles = Vec::with_capacity(concurrency);
                 for _ in 0..concurrency {
                     let n = Arc::clone(&node);
+                    let a = Arc::clone(&admitted);
                     let br = Arc::clone(&barrier);
                     handles.push(thread::spawn(move || {
                         br.wait();
                         for _ in 0..iters_per_thread {
+                            let mut entered = false;
                             for _ in 0..64 {
                                 let res: Result<
                                     (),
                                     snubber::SnubberError<std::convert::Infallible>,
                                 > = n.scoped(|| {}, || Ok(()));
                                 match res {
-                                    Ok(()) => break,
+                                    Ok(()) => {
+                                        a.fetch_add(1, Ordering::Relaxed);
+                                        entered = true;
+                                        break;
+                                    }
                                     Err(_) => thread::yield_now(),
                                 }
                             }
+                            assert!(entered, "scoped retry exhausted after 64 attempts");
                         }
                     }));
                 }
@@ -707,9 +742,15 @@ fn bench_contended(c: &mut Criterion) {
                 let start = std::time::Instant::now();
                 barrier.wait();
                 for h in handles {
-                    let _ = h.join();
+                    h.join().expect("bench worker panicked");
                 }
-                start.elapsed()
+                let elapsed = start.elapsed();
+                assert_eq!(
+                    admitted.load(Ordering::Relaxed),
+                    (iters_per_thread * concurrency) as u64,
+                    "iter_custom multiplies by `iters`; every iteration must admit"
+                );
+                elapsed
             });
         });
     }
@@ -738,13 +779,24 @@ fn bench_contended(c: &mut Criterion) {
                     count
                 });
                 let mut handles = Vec::with_capacity(concurrency);
+                let sent_ok = Arc::new(AtomicU64::new(0));
+                let send_err = Arc::new(AtomicU64::new(0));
                 for _ in 0..concurrency {
                     let sender = tx.clone();
                     let br = Arc::clone(&barrier);
+                    let ok = Arc::clone(&sent_ok);
+                    let err = Arc::clone(&send_err);
                     handles.push(thread::spawn(move || {
                         br.wait();
                         for i in 0..iters_per_thread {
-                            let _ = black_box(sender.send_critical(black_box(i as u64)));
+                            match black_box(sender.send_critical(black_box(i as u64))) {
+                                Ok(()) => {
+                                    ok.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(_) => {
+                                    err.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                         }
                     }));
                 }
@@ -753,14 +805,26 @@ fn bench_contended(c: &mut Criterion) {
                 let start = std::time::Instant::now();
                 barrier.wait();
                 for h in handles {
-                    let _ = h.join();
+                    h.join().expect("bench worker panicked");
                 }
                 // Stop the clock when the producers finish: the drain
                 // thread's remaining queue sweep and its join are teardown,
                 // not part of the measured contended send path.
                 let elapsed = start.elapsed();
                 draining.store(false, Ordering::Relaxed);
-                let _ = rx_handle.join();
+                let received = rx_handle.join().expect("bench drain panicked");
+                let ok = sent_ok.load(Ordering::Relaxed);
+                let err = send_err.load(Ordering::Relaxed);
+                assert_eq!(
+                    ok + err,
+                    (iters_per_thread * concurrency) as u64,
+                    "every send is either delivered or refused; none vanish"
+                );
+                assert!(ok > 0, "gateway bench delivered nothing");
+                assert_eq!(
+                    received as u64, ok,
+                    "drained frame count must equal successful sends"
+                );
                 elapsed
             });
         });
@@ -804,7 +868,8 @@ fn bench_contended(c: &mut Criterion) {
                 // not folded into the per-push latency.
                 let elapsed = start.elapsed();
                 running.store(false, Ordering::Relaxed);
-                let _ = pop_handle.join();
+                let popped = pop_handle.join().expect("bench pop worker panicked");
+                assert_eq!(popped, iters, "every pushed signal must be popped");
                 elapsed
             });
         });

@@ -40,7 +40,7 @@
 | F-03 | P0 | `publish_fault` доккоментар «no allocation, no panic» хибний: `NodeName::Owned` дропається під замком; `flight` може реалокати | `src/node.rs:1937-1954`, `src/name.rs:26-30`, `4264-4271` | 1 | `[x]` |
 | F-04 | P0 | `pool.report()` алокує `Vec`, доки двічі обіцяно «no allocation» | `src/pool/mod.rs:252-254`, `src/pool/report.rs:116-121`, `README.md:132`, `USER_GUIDE.md:1789` | 1/6 | `[x]` |
 | F-05 | P0 | Тести консервації перевіряють урізані рівняння; повний 7-доданковий закон не проганяється | `src/node.rs:289-297`; `tests/bulkhead_capacity.rs:97-110`; `tests/transition_orphan.rs:83-85`; `tests/stress_breaker_churn.rs:162-165` | 3 | `[x]` |
-| F-06 | P0 | Бенчі конкуренції можуть опублікувати ns/op за нуля допусків: retry виснажується, `stale` не читається, `join` ковтається | `benches/admission_bench.rs:625-665`, `679-711`, `730-757` | 4 | `[ ]` |
+| F-06 | P0 | Бенчі конкуренції можуть опублікувати ns/op за нуля допусків: retry виснажується, `stale` не читається, `join` ковтається | `benches/admission_bench.rs:625-665`, `679-711`, `730-757` | 4 | `[x]` |
 | F-07 | P1 | Drop `Waker` під node-локом (`slot.waker = waker`, `retain`) | `src/node.rs:3678`, `3896` | 2 | `[x]` |
 | F-08 | P1 | Алокація `Vec<Waker>` під замком wakers у conduit | `src/conduit.rs:399-402` | 2 | `[x]` |
 | F-09 | P1 | `SystemTime::now()` під node-локом у rate limiter і `check_timeout` | `src/node.rs:3299`, `5277` | 2 | `[x]` |
@@ -334,24 +334,24 @@ clock-читання не в критичній секції; `feed`-після-
 **Файли:** `benches/admission_bench.rs`, `tests/bench_hygiene.rs`.
 
 **Кроки:**
-- [ ] IDEAL-1 (`625-665`): лічити `admitted` per-thread; після join сумувати й `assert_eq!(admitted,
+- [x] IDEAL-1 (`625-665`): лічити `admitted` per-thread; після join сумувати й `assert_eq!(admitted,
       iters_per_thread * concurrency)`; на виснаження 64 retry — `panic!("stale retry exhausted")`.
-- [ ] IDEAL-1: читати `stale` після join і або `assert!(stale < total/2)`, або друкувати в stderr
+- [x] IDEAL-1: читати `stale` після join і або `assert!(stale < total/2)`, або друкувати в stderr
       з явним `BENCH WARN`; не залишати мертвий лічильник.
-- [ ] IDEAL-2 (`679-711`): те саме (admitted floor + panic на виснаженні).
-- [ ] IDEAL-3 (`730-757`): лічити успішні `send_critical` (`Ok`) і `Err`; після зупинки drain
+- [x] IDEAL-2 (`679-711`): те саме (admitted floor + panic на виснаженні).
+- [x] IDEAL-3 (`730-757`): лічити успішні `send_critical` (`Ok`) і `Err`; після зупинки drain
       дочекатися повного дренування і `assert_eq!(received, sent_ok)`; `assert!(sent_ok > 0)`.
-- [ ] Усі `let _ = h.join();` (`663-665`, `709-711`, `755-757`, `808`) → `h.join().expect("bench worker panicked")`.
-- [ ] `tests/bench_hygiene.rs`:
+- [x] Усі `let _ = h.join();` (`663-665`, `709-711`, `755-757`, `808`) → `h.join().expect("bench worker panicked")`.
+- [x] `tests/bench_hygiene.rs`:
       - заборонити `let _ = h.join()` (текстовий бан + whitelist, якщо є легітимні місця);
       - заборонити `let _ = black_box(sender.send` (відкинутий результат send);
       - додати `PER_SAMPLE_ALLOC` для `report_snapshot_4_lanes` і `expired_lanes_4_lanes` з поясненням,
         або перенести вимірювання так, щоб алокація була частиною заявленої метрики (і задокументувати);
       - прибрати wholesale-виняток IDEAL-3 (`286-288`): перевірити, що в IDEAL-3 немає жодного `HEAVY`
         конструктора, і ганяти загальний чек; якщо є — звузити виняток до конкретного ctor.
-- [ ] Перевірити `drain_sync_256_frames`: у README/коментарі явно «stream + scan per 256-frame sample»,
+- [x] Перевірити `drain_sync_256_frames`: у README/коментарі явно «stream + scan per 256-frame sample»,
       щоб `Throughput::Elements(256)` не читався як чистий per-frame scan.
-- [ ] Прогнати `cargo bench --bench admission_bench -- --sample-size 10` (або вибірково) і зберегти
+- [x] Прогнати `cargo bench --bench admission_bench -- --sample-size 10` (або вибірково) і зберегти
       нові числа; оновити README тільки тими числами, які реально виміряні в цьому прогоні.
 
 **Тести:** `cargo test --test bench_hygiene`; самі бенчі компілюються й запускаються (smoke).
@@ -367,6 +367,12 @@ clock-читання не в критичній секції; `feed`-після-
 - Для gateway «sent == received» може бути недосяжним, якщо drain зупиняється до повного спорожнення;
   тому після `draining=false` — `while rx.try_recv().is_some() { count += 1; }` (у коді вже є) і
   порівнювати після цього.
+- Виконано: IDEAL-1..3 рахують `admitted`/`sent_ok`/`send_err`; retry-виснаження — `assert!`;
+  `stale` після join або `BENCH WARN` у stderr; IDEAL-4 `popped == iters`; усі `join` → `.expect`.
+  `bench_hygiene` отримав два нові тести (текстові бани join/send + `PER_SAMPLE_ALLOC`), виняток
+  IDEAL-3 прибрано. Негативний прогін: доданий `let _ = stray.join();` валить гейт.
+- Свіжий прогін 2026-10-25 (default samples, concurrency=6): enter 918 ns, scoped 911 ns,
+  gateway 140 ns, ISR bridge 35.5 ns; таблиця README оновлена лише цими чотирма рядками.
 
 ---
 
@@ -605,5 +611,6 @@ Push — одразу після зеленого прогону (standing prefe
 | 2026-10-25 | 1 | F-01..F-04 виправлено; +3 регресії; suite 394 -> 397 | `fix(core): panic-safe probe hooks, scanner reset order, publish_fault lock hygiene` (3288b34) |
 | 2026-10-25 | 0 | `check_test_count.sh` + CI-гейт; бейдж 397 з provenance | `chore(ci): add reproducible test-count gate and record audit baseline` (d150d64) |
 | 2026-10-25 | 2 | F-07/F-08/F-09/F-16; waker drops і clock поза замками; feed-after-EOF лічильник; suite 397 -> 399 | `fix(concurrency): keep waker drops and clock reads outside mutexes` (7481e9a) |
-| 2026-10-25 | 3 | F-05/F-22/F-23/F-24/F-25/F-26; повний 7-доданковий закон, floor-и, справжній rollback-свідок; suite 399 | `test(conservation): pin full admission law and positive volume floors` |
+| 2026-10-25 | 3 | F-05/F-22/F-23/F-24/F-25/F-26; повний 7-доданковий закон, floor-и, справжній rollback-свідок; suite 399 | `test(conservation): pin full admission law and positive volume floors` (dc12cd4) |
+| 2026-10-25 | 4 | F-06: contended-бенчі падають на виснаженні retry/нулі допусків; `bench_hygiene` ловить join/send; README contended-рядки переміряно | `fix(bench): fail fast on retry exhaustion and discarded send results` |
 |  |  |  |  |

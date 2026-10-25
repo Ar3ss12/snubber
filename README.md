@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-399%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-400%20passed-brightgreen.svg)]()
 
 <!-- Badge provenance: `bash scripts/check_test_count.sh` (all features, 5 ignored), last verified 2026-10-25. -->
 
@@ -92,7 +92,9 @@ Measured on AMD Ryzen 5 4600H release build
 2026-10-24, values from the second of two full runs — the first differed
 by under 5% outside the contended group, which moves by design; the
 `enter_erased_auto` row comes from two filtered A/B reruns after the
-single-box refactor).
+single-box refactor). The four `contended_multithreaded` rows were
+re-measured on 2026-10-25 with the fail-fast pool (the 6-thread gateway
+row moved from ~172 ns as a result).
 Values are Criterion means from `target/criterion/*/new/estimates.json`;
 differences below ~2 ns are inside run-to-run noise and are not claimed as
 wins.
@@ -153,10 +155,10 @@ Measured with half of available hardware cores active (6 concurrent threads unde
 
 | Contended Operation | Concurrency | Measured Latency | Physical Phenomenon |
 |---|---|---|---|
-| `contended_node_enter` | 6 threads | **~915 ns** | Mutex contention: cache-line transfer between threads |
-| `contended_node_scoped` | 6 threads | **~871 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
-| `contended_gateway_mpsc` | 6 threads | **~172 ns** | Bounded multi-producer channel write under parallel thread load |
-| `cross_thread_isr_bridge` | 2 threads | **~37.2 ns** | Lock-free SPSC ring: cache-line handoff between threads |
+| `contended_node_enter` | 6 threads | **~918 ns** | Mutex contention: cache-line transfer between threads |
+| `contended_node_scoped` | 6 threads | **~911 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
+| `contended_gateway_mpsc` | 6 threads | **~140 ns** | Bounded multi-producer channel write under parallel thread load |
+| `cross_thread_isr_bridge` | 2 threads | **~35.5 ns** | Lock-free SPSC ring: cache-line handoff between threads |
 
 ### ⚡ Multi-Lineage Termination Storm
 

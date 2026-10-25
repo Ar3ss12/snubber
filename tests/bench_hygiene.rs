@@ -81,6 +81,17 @@ const HEAVY: &[&str] = &[
 /// declared here; any undeclared constructor is still a bug.
 const PER_SAMPLE: &[(&str, &str)] = &[("drain_sync_256_frames", "PipeDrain::drain_sync(")];
 
+/// Benches whose measured API allocates by contract. `pool.report()`
+/// snapshots every lane into a fresh `Vec`, and `expired_lanes()` builds
+/// its result vector; hoisting either would time a different function.
+/// The published number therefore INCLUDES that allocation — declared
+/// here so the hygiene gate can tell a documented cost from a leak.
+const PER_SAMPLE_ALLOC: &[(&str, &str)] = &[
+    ("report_snapshot_4_lanes", "pool.report()"),
+    ("report_snapshot_4_lanes", "report()"),
+    ("expired_lanes_4_lanes", "expired_lanes("),
+];
+
 /// Benches whose argument is BUILT per sample but must be built in the
 /// `iter_batched` setup closure, never inside the timed routine. The
 /// hygiene law here is weaker than text position: the drain is an
@@ -276,16 +287,11 @@ fn bench_setup_outside_hot_loop() {
                 }
             }
             // IDEAL-3's own gateway ctor lives in its timed half by design
-            // (per-sample channel lifecycle): the slice check below applies
-            // only to IDEAL-1/2 node builders.
+            // (per-sample channel lifecycle), and `gateway::<` is not a
+            // HEAVY constructor — the common check applies unchanged.
             let block = &rest[..bound];
             let (_setup, timed) = split_at_timer(block);
             for ctor in HEAVY {
-                // IDEAL-3 gateway is per-sample channel lifecycle (own queue
-                // + drain thread per sample), not per-op alloc: allowed.
-                if *name == "contended_gateway_mpsc_threads_" {
-                    continue;
-                }
                 assert!(
                     !timed.contains(ctor),
                     "bench '{name}' builds '{ctor}' inside timer"
@@ -356,12 +362,70 @@ fn bench_setup_outside_hot_loop() {
             "benches must write into a real buffer, found '{needle}'"
         );
     }
+    // A discarded join hides a panicked worker as a fast iteration, and
+    // a discarded `send` hides lost frames. Both must be inspected.
+    for (idx, line) in source.lines().enumerate() {
+        assert!(
+            !(line.contains("let _ =") && line.contains(".join()")),
+            "benches/admission_bench.rs:{}: discarded join — use `.join().expect(..)`",
+            idx + 1
+        );
+        assert!(
+            !(line.contains("let _ =") && line.contains("black_box(sender.send")),
+            "benches/admission_bench.rs:{}: discarded send — count Ok/Err and assert",
+            idx + 1
+        );
+    }
     for (tag, pin) in [
         ("IDEAL-1", "bench_contended_enter"),
         ("IDEAL-2", "bench_contended_scoped"),
         ("IDEAL-4", "IsrBridge::new()"),
     ] {
         assert!(source.contains(pin), "{tag} lost pin '{pin}'");
+    }
+}
+
+/// Every timed allocating call must be declared as the measured API.
+/// Otherwise a bench could publish a number that quietly includes an
+/// allocation it never claimed — or, worse, hoist the allocation out of
+/// the window and publish a different function's cost.
+#[test]
+fn allocating_measured_apis_are_declared() {
+    let source = src("benches/admission_bench.rs");
+    let mut needles: Vec<&str> = PER_SAMPLE_ALLOC.iter().map(|(_, c)| *c).collect();
+    needles.sort_unstable();
+    needles.dedup();
+    for name in COVERED {
+        if name.ends_with('_') {
+            continue;
+        }
+        let body = bench_body(&source, &format!("\"{name}\""))
+            .unwrap_or_else(|| panic!("bench '{name}' missing"));
+        let (_setup, timed) = split_at_timer(&body);
+        for needle in &needles {
+            if !timed.contains(needle) {
+                continue;
+            }
+            assert!(
+                PER_SAMPLE_ALLOC
+                    .iter()
+                    .any(|(n, c)| n == name && c == needle),
+                "bench '{name}' times allocating call '{needle}' without a PER_SAMPLE_ALLOC entry"
+            );
+        }
+    }
+    for (name, needle) in PER_SAMPLE_ALLOC {
+        assert!(
+            COVERED.contains(name),
+            "PER_SAMPLE_ALLOC entry '{name}' is not a registered bench"
+        );
+        let body = bench_body(&source, &format!("\"{name}\""))
+            .unwrap_or_else(|| panic!("bench '{name}' missing"));
+        let (_setup, timed) = split_at_timer(&body);
+        assert!(
+            timed.contains(needle),
+            "PER_SAMPLE_ALLOC entry '{name}'/'{needle}' no longer matches the timed body"
+        );
     }
 }
 
