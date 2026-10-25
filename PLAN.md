@@ -646,5 +646,5 @@ Push — одразу після зеленого прогону (standing prefe
 | 2026-10-25 | 2 | F-07/F-08/F-09/F-16; waker drops і clock поза замками; feed-after-EOF лічильник; suite 397 -> 399 | `fix(concurrency): keep waker drops and clock reads outside mutexes` (7481e9a) |
 | 2026-10-25 | 3 | F-05/F-22/F-23/F-24/F-25/F-26; повний 7-доданковий закон, floor-и, справжній rollback-свідок; suite 399 | `test(conservation): pin full admission law and positive volume floors` (dc12cd4) |
 | 2026-10-25 | 4 | F-06: contended-бенчі падають на виснаженні retry/нулі допусків; `bench_hygiene` ловить join/send; README contended-рядки переміряно | `fix(bench): fail fast on retry exhaustion and discarded send results` (7c9e6bf) |
-| 2026-10-25 | 5 | F-10..F-14/F-17/F-29..F-34: PARITY-фінгерпринт, строгий CI, release-гейт, ticks, `bench-full`, `miri-leaks`, `termination-smoke`; suite 400 -> 401 | `fix(ci): close skip/parse/parity holes and add full bench artifact lane` |
+| 2026-10-25 | 5 | F-10..F-14/F-17/F-29..F-34: PARITY-фінгерпринт, строгий CI, release-гейт, ticks, `bench-full`, `miri-leaks`, `termination-smoke`; suite 400 -> 401 | `fix(ci): close skip/parse/parity holes and add full bench artifact lane` (7bf69ee) |
 |  |  |  |  |
