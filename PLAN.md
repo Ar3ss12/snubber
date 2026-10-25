@@ -87,28 +87,32 @@
 **Файли:** `scripts/` (новий `check_test_count.sh`), `README.md`, `PLAN.md`.
 
 **Кроки:**
-- [ ] `cargo fmt --check` на чистому дереві; зафіксувати результат.
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings`; зафіксувати.
-- [ ] `cargo test --all-targets --all-features -j 2`; зібрати `^test result:` у суму; окремо doctests.
-- [ ] `bash scripts/check_compile_gates.sh`; зафіксувати 7/7 (Gate 6 локально SKIP — це норма).
-- [ ] Додати `scripts/check_test_count.sh`: рахує фактичні passed + doctests і порівнює з числом у бейджі
-      `README.md:7`; exit 1 при розбіжності. Підключити в CI (`.github/workflows/ci.yml`, quality job).
-- [ ] Додати в README поряд з бейджем один рядок provenance: команда + дата останньої перевірки.
-- [ ] Перевірити вільне місце на диску; якщо `target/` зникає — зафіксувати як environmental limit,
-      не «доводити» числами, яких немає.
+- [x] `cargo fmt --check` на чистому дереві; зафіксовано OK.
+- [x] `cargo clippy --all-targets --all-features -- -D warnings`; зафіксовано OK (18.56 s на baseline).
+- [x] `cargo test --all-targets --all-features -j 2`; зібрано `^test result:` у суму; doctests враховані.
+- [x] `bash scripts/check_compile_gates.sh`; зафіксовано 6 OK + Gate 6 SKIP (semver-checks не встановлено локально).
+- [x] Додати `scripts/check_test_count.sh`: рахує фактичні passed + doctests і порівнює з числом у бейджі
+      `README.md:7`; exit 1 при розбіжності, exit 2 якщо suite упав, floor 300 від хибного парсингу.
+      Підключено в CI (`.github/workflows/ci.yml`, job `test-matrix`, Linux): парсить наявний
+      `target/test-suite.log`, тому другий прогін suite не потрібен.
+- [x] Додати в README поряд з бейджем provenance-коментар: команда + дата останньої перевірки.
+- [x] Перевірити вільне місце на диску; `target/` зникав раніше — зафіксовано як environmental limit.
 
-**Тести:** сам `check_test_count.sh` (позитивний і негативний прогін на тимчасовій копії README).
+**Тести:** `check_test_count.sh` — позитивний прогін на реальному лозі (397=397, OK) і негативний на
+копії README з `999` (exit 1).
 
 **Готово:** baseline-числа записані в PLAN.md (нижче), скрипт падає на штучно зміненому бейджі.
 
 **Коміт:** `chore(ci): add reproducible test-count gate and record audit baseline`
 
 **Дописи:**
-- Baseline на 2026-10-25: suite **368 passed / 0 failed / 5 ignored** + **26 doctests** = **394**.
-  Бейдж `394` збігається; «385/387/377» у поточних docs відсутні.
+- Baseline після Етапу 1: suite **397 passed / 0 failed / 5 ignored**, doctests входять у суму = **397**.
+  Бейдж `397` збігається; gate підтверджує це на кожному Linux-прогоні CI.
+- «394» був baseline до трьох нових регресій Етапу 1; число в README оновлено разом із ними.
 - `target/criterion` у дереві відсутній, тому жодне опубліковане число латентності зараз не відтворюється;
   це фіксується як стан, а не «переміряно».
 - Скрипт рахує саме passed, а не «скільки рядків»: інакше `ignored`/`0 passed` дадуть хибний збіг.
+- Проведено в job `test-matrix` замість `quality`, щоб не ганяти suite двічі; лог уже є там.
 
 ---
 
@@ -576,6 +580,7 @@ Push — одразу після зеленого прогону (standing prefe
 | Дата | Етап | Результат | Коміт |
 |---|---|---|---|
 | 2026-10-25 | Аудит | 39 знахідок, 3 секції; файли не змінювалися | — |
-| 2026-10-25 | 0 | PLAN.md створено; baseline зафіксовано | — |
-| 2026-10-25 | 1 | F-01..F-04 виправлено; +3 регресії; suite 394 -> 397 | `fix(core): panic-safe probe hooks, scanner reset order, publish_fault lock hygiene` |
+| 2026-10-25 | 0 | PLAN.md створено; baseline 394 зафіксовано | — |
+| 2026-10-25 | 1 | F-01..F-04 виправлено; +3 регресії; suite 394 -> 397 | `fix(core): panic-safe probe hooks, scanner reset order, publish_fault lock hygiene` (3288b34) |
+| 2026-10-25 | 0 | `check_test_count.sh` + CI-гейт; бейдж 397 з provenance | `chore(ci): add reproducible test-count gate and record audit baseline` |
 |  |  |  |  |
