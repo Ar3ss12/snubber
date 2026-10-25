@@ -100,6 +100,16 @@ fn fault_detail_owned_carries_live_values() {
 
 #[test]
 fn block_caller_parks_then_admits_freed_slot() {
+    // The friction hook doubles as a handshake: it runs only once the
+    // bulkhead is FULL (node lock released) and blocks until the holder has
+    // committed. That removes the wall-clock bet the old version made — it
+    // slept 10 ms and trusted the commit to land inside the 50 ms park
+    // window, which a loaded runner can miss (the parked caller then woke
+    // first and legally reported BulkheadFull). Here the freed slot is a
+    // certainty before the single re-check after the park runs.
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
     let node = SnubberNode::builder("block/admit")
         .max_in_flight(1)
         .policy(
@@ -111,12 +121,22 @@ fn block_caller_parks_then_admits_freed_slot() {
                 "block_parks_total",
             ),
         )
+        .friction_fn(move |_, _| {
+            let _ = reached_tx.send(());
+            if let Ok(rx) = release_rx.lock() {
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+            }
+            0
+        })
         .build();
     let probe = node.enter(1, 1, || {}).expect("first slot");
     let n2 = node.clone();
     let parked = std::thread::spawn(move || n2.enter(2, 2, || {}));
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    reached_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("caller must reach the full bulkhead");
     probe.commit(); // slot frees while the caller is parked
+    release_tx.send(()).expect("hook must still be waiting");
     let guard = parked.join().expect("thread").expect("admitted after park");
     guard.commit();
     assert_eq!(node.stats().committed, 2);

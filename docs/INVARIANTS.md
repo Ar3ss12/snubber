@@ -378,6 +378,30 @@ Two corollaries:
   Miri never does, so a cloned std `Arc` waker compares unequal under Miri
   only. Gate such asserts with `cfg(not(miri))` and say why.
 
+### Test synchronization convention: handshake, not sleep margins
+
+A test that needs another thread to free a resource must synchronize on an
+observable event, never on "sleeping long enough":
+
+```rust
+// Wrong: bets that the commit lands inside the park window. A loaded
+// runner can deschedule the committing thread for longer than the margin,
+// after which the parked caller legally reports BulkheadFull (this is
+// exactly how `block_caller_parks_then_admits_freed_slot` flaked).
+std::thread::sleep(Duration::from_millis(10));
+probe.commit();
+
+// Right: the admission hook runs only when the bulkhead is full, so it
+// proves the caller reached the park branch; blocking it until the holder
+// commits makes the freed slot a certainty before the re-check.
+reached_rx.recv_timeout(Duration::from_secs(5)).expect("parked");
+probe.commit();
+release_tx.send(()).expect("hook still waiting");
+```
+
+Bounded waits (`recv_timeout`, not `recv`) so a broken handshake fails the
+gate instead of hanging the runner.
+
 ---
 
 ## 3. Reporting a Discrepancy

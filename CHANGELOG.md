@@ -23,13 +23,26 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 - `just check|release-lanes|release|package-dry|publish` wrap the same
   commands in `scripts/release.sh` for humans and agents.
 
+### Tests
+
+- `block_caller_parks_then_admits_freed_slot` no longer bets that a 10 ms
+  sleep leaves the freeing commit inside the 50 ms park window. A runner
+  can deschedule the committing thread for longer than that margin, after
+  which the parked caller legally reports `BulkheadFull` (the CI failure
+  was this, not a lost slot: the old shape passed 900 local runs). The
+  friction hook now proves the caller reached the full-bulkhead branch and
+  blocks until the holder commits, so the re-check after the park always
+  sees the freed slot.
+
 ### Docs
 
 - `docs/INVARIANTS.md` gains "Test threshold convention: determinism, not
   percentages": volume floors must be tied to the mechanism under test
   (`admitted >= breaker_trips`), never to a share of attempts, and
   best-effort standard-library behavior must not be asserted without
-  `cfg(not(miri))`.
+  `cfg(not(miri))`. A companion section, "Test synchronization convention:
+  handshake, not sleep margins", forbids sleeping as cross-thread
+  synchronization and requires bounded waits.
 
 ## 0.6.9 — 2026-10-25
 
