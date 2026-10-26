@@ -64,15 +64,28 @@ if ($SemverExit -ne 0) {
 }
 
 # A baseline pointing at HEAD diffs an empty range: the gate would PASS
-# trivially unless the worktree is dirty. Say so instead of passing silently.
+# trivially unless the worktree is dirty. The one legitimate case is the
+# RELEASE COMMIT itself -- the tag was just moved onto HEAD (that is what
+# tagging a release means). There the meaningful diff is against the
+# PREVIOUS tag; fall back to it instead of failing an honest release.
+# Parity with check_api_diff.sh.
 $PrevEap = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 $BaselineCommit = & git -C "$RepoRoot" rev-parse "${Baseline}^{commit}" 2>$null
 $HeadCommit = & git -C "$RepoRoot" rev-parse HEAD 2>$null
+$PreviousTag = ""
+if ($BaselineCommit -and $BaselineCommit -eq $HeadCommit) {
+    $PreviousTag = & git -C "$RepoRoot" describe --tags --abbrev=0 "${Baseline}^" 2>$null
+}
 $ErrorActionPreference = $PrevEap
 if ($BaselineCommit -and $BaselineCommit -eq $HeadCommit) {
-    Write-Host " FAIL (baseline $Baseline is HEAD: committed-but-untagged API changes are invisible to this gate -- tag the release or pass an older baseline)" -ForegroundColor Red
-    exit 1
+    if ($PreviousTag -and $PreviousTag -ne $Baseline) {
+        Write-Host " note: $Baseline is HEAD (release commit) -- diffing against previous tag $PreviousTag"
+        $Baseline = $PreviousTag
+    } else {
+        Write-Host " FAIL (baseline $Baseline is HEAD and no previous tag exists: committed-but-untagged API changes are invisible to this gate -- tag the release or pass an older baseline)" -ForegroundColor Red
+        exit 1
+    }
 }
 
 $Crate = (Select-String -Path "$RepoRoot\Cargo.toml" -Pattern '^name\s*=\s*"(.+)"' |

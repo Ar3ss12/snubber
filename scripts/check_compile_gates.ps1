@@ -210,39 +210,32 @@ if ($GitExit -ne 0 -or -not $ApiBaseline) {
         $Skips++
     }
 } else {
-    # Parity with check_api_diff.ps1: a tag equal to HEAD hides every
-    # committed-but-untagged API change; warn instead of trivially passing.
-    $HeadRev = & git -C "$RepoRoot" rev-parse HEAD 2>$null
-    $TagRev = & git -C "$RepoRoot" rev-parse "$ApiBaseline^{}" 2>$null
-    if ($HeadRev -and $TagRev -and $HeadRev -eq $TagRev) {
-        Write-Host " FAIL (baseline $ApiBaseline == HEAD; committed-but-untagged API changes are invisible -- tag the release or pass an older baseline)" -ForegroundColor Red
-        $Failures++
-    } else {
-        $PrevEap = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        & cargo semver-checks --version *> $null
-        $SemverInstalled = ($LASTEXITCODE -eq 0)
-        $ErrorActionPreference = $PrevEap
-        if (-not $SemverInstalled) {
-            if ($InCi) {
-                Write-Host " FAIL (CI: cargo-semver-checks missing -- workflow must install it)" -ForegroundColor Red
-                $Failures++
-            } else {
-                Write-Host " SKIP (cargo-semver-checks not installed)" -ForegroundColor Yellow
-                $Skips++
-            }
+    $PrevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & cargo semver-checks --version *> $null
+    $SemverInstalled = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = $PrevEap
+    if (-not $SemverInstalled) {
+        if ($InCi) {
+            Write-Host " FAIL (CI: cargo-semver-checks missing -- workflow must install it)" -ForegroundColor Red
+            $Failures++
         } else {
-            # Delegate to the standalone gate (parity with the .sh flavor):
-            # one implementation of the semver rules and the Cargo.lock guard,
-            # so CI exercises check_api_diff.ps1 on every Windows run.
-            $ApiDiffScript = Join-Path $ScriptDir "check_api_diff.ps1"
-            & powershell -NoProfile -ExecutionPolicy Bypass -File $ApiDiffScript $ApiBaseline
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host " OK (no breaking change vs $ApiBaseline)" -ForegroundColor Green
-            } else {
-                Write-Host " FAIL (public API gate vs ${ApiBaseline}: see the API diff output above)" -ForegroundColor Red
-                $Failures++
-            }
+            Write-Host " SKIP (cargo-semver-checks not installed)" -ForegroundColor Yellow
+            $Skips++
+        }
+    } else {
+        # Delegate to the standalone gate (parity with the .sh flavor): one
+        # implementation of the semver rules, the release-commit fallback and
+        # the Cargo.lock guard, so CI exercises check_api_diff.ps1 on every
+        # Windows run. No local baseline==HEAD pre-check: duplicating that
+        # rule here is how the Windows gate drifted from .sh at v0.6.10.
+        $ApiDiffScript = Join-Path $ScriptDir "check_api_diff.ps1"
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $ApiDiffScript $ApiBaseline
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host " OK (no breaking change vs $ApiBaseline)" -ForegroundColor Green
+        } else {
+            Write-Host " FAIL (public API gate vs ${ApiBaseline}: see the API diff output above)" -ForegroundColor Red
+            $Failures++
         }
     }
 }
