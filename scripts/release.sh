@@ -68,23 +68,9 @@ die() {
     exit 1
 }
 
-# The ONLY SKIP line a local release gate may ever print, verbatim.
-# Any other "SKIP (...)" means a gate silently did not run, which must
-# fail the release: the old condition only verified the PRESENCE of the
-# semver SKIP, so a combination like "semver SKIP + Gate 5 SKIP" passed.
-audit_gate_skips() {
-    local skips bad count
-    skips=$(grep -E 'SKIP \(' "${LOG_DIR}/gates.log" || true)
-    [ -n "${skips}" ] || return 0
-    bad=$(printf '%s\n' "${skips}" |
-        grep -v 'SKIP (cargo-semver-checks not installed)' || true)
-    if [ -n "${bad}" ]; then
-        printf '%s\n' "${bad}" >&2
-        die "unexpected SKIP in compile gates; only 'SKIP (cargo-semver-checks not installed)' is tolerated (log: ${LOG_DIR}/gates.log)"
-    fi
-    count=$(printf '%s\n' "${skips}" | grep -c 'SKIP (cargo-semver-checks not installed)')
-    printf 'WARN: %i tolerated gate SKIP line(s): cargo-semver-checks missing locally; CI runs it with teeth.\n' "${count}"
-}
+# Gate-log verdict lives in its own script so it can be exercised against
+# crafted logs: a real `FAIL:` stops the release even when the tolerated
+# local semver SKIP is present, and an unexpected SKIP fails too.
 
 # A green `0 passed` on an ignored lane means the lane never ran (a
 # renamed test, a cfg'd-out module, a target-filter typo) — a silent
@@ -129,21 +115,10 @@ bash scripts/check_test_count.sh "${LOG_DIR}/suite.log" || die "README badge dri
 step "architectural compile gates"
 GATES_EXIT=0
 bash scripts/check_compile_gates.sh >"${LOG_DIR}/gates.log" 2>&1 || GATES_EXIT=1
-audit_gate_skips
-if [ "${GATES_EXIT}" -ne 0 ]; then
-    if grep -q 'SKIP (cargo-semver-checks not installed)' "${LOG_DIR}/gates.log"; then
-        # The non-zero exit is the documented local-only condition: with
-        # cargo-semver-checks missing the audit reports itself NOT
-        # complete. audit_gate_skips already proved this semver SKIP is
-        # the ONLY skip in the log; CI installs the tool and runs the
-        # gate with teeth, so a release can never hide behind this.
-        printf 'WARN: compile-gate audit incomplete locally (cargo-semver-checks missing); CI runs it with teeth.\n'
-    else
-        tail -n 20 "${LOG_DIR}/gates.log"
-        die "compile gates (log: ${LOG_DIR}/gates.log)"
-    fi
-fi
-grep -E '^PARITY:' "${LOG_DIR}/gates.log" || true
+bash scripts/release_gate_verdict.sh "${LOG_DIR}/gates.log" "${GATES_EXIT}" ||
+    die "compile gates (log: ${LOG_DIR}/gates.log)"
+grep -E '^PARITY:' "${LOG_DIR}/gates.log" ||
+    die "compile gates printed no PARITY fingerprint (log: ${LOG_DIR}/gates.log)"
 
 if [ "${MODE}" = "fast" ]; then
     printf '\nFAST GATES GREEN (lanes, identity and publish dry-run skipped)\n'

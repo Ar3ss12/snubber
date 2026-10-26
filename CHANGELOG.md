@@ -60,6 +60,14 @@ surface, wire format and telemetry layout are untouched.
   (`CI=true/1` for `.sh` and `.py`; `.ps1` fails on any skip in every
   environment): without a launched child there is no pid for the
   RSS/fd/exit gates, so the run would report without leak evidence.
+- `scripts/release.sh` no longer lets a tolerated semver SKIP hide a real
+  gate failure. The verdict moved into `scripts/release_gate_verdict.sh`,
+  which fails on any `FAIL:`/`FAILED` line or unexpected SKIP before it
+  considers the local-only semver SKIP; a non-zero gate exit with no
+  tolerated SKIP fails too, and a missing `PARITY:` fingerprint now stops
+  the release instead of being grepped with `|| true`. Proven against
+  crafted logs: semver-SKIP + `FAIL:` → rc 1, foreign SKIP → rc 1,
+  opaque exit 1 → rc 1, tolerated SKIP alone → rc 0 with WARN.
 - Gate 2 and Gate 7 of `scripts/check_compile_gates.sh` no longer abort
   on a clean scan. Both did `HITS="$(grep …)"; rc=$?` under
   `set -euo pipefail`: a zero-hit grep killed the script before `rc=$?`,
