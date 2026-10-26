@@ -12,6 +12,15 @@ surface, wire format and telemetry layout are untouched.
 
 ### Fixed
 
+- The token bucket can no longer be refilled twice for the same wall
+  time. `now_ms()` is read before the node mutex, so two admissions can
+  reach the lock out of order; the old code then wrote the older stamp
+  into `rate_last_ms`, and the next admission counted the interval
+  again, admitting one extra burst of `rate_per_sec`. The refill now
+  lives in one helper that only moves the stamp forward
+  (`src/node.rs::refill_tokens`), shared by the sync and async paths and
+  pinned by `bucket_stamp_never_moves_backwards` (fails on the old
+  formula with `stamp rewound: 900 != 1000`).
 - `EnterFuture` honours the documented eviction verdict: when the waker
   queue entry it owns has already been retired by an `EvictOldest`
   evictor, the next poll returns `Ready(Err(EnterError::QueueFull))`

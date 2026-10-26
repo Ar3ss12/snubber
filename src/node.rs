@@ -3038,9 +3038,10 @@ impl SnubberNode {
         let task_id = header.task_id;
         // One clock read at admission entry, outside the lock: `now_ms`
         // reads the OS clock, and the token bucket below must not call it
-        // while holding the node mutex. Using the entry stamp is
-        // conservative — time spent acquiring the lock is credited on the
-        // NEXT admission, so tokens are never over-issued. The read is
+        // while holding the node mutex. The stamp is read once, so two
+        // admissions can reach the lock out of order; `refill_tokens`
+        // keeps `rate_last_ms` monotonic, which is what stops an older
+        // stamp from crediting the same wall time twice. The read is
         // skipped entirely when the bucket is disarmed (the default):
         // one clock per admission measured ~40 ns, a third of the whole
         // guarded entry.
@@ -3372,11 +3373,11 @@ impl SnubberNode {
 
         // 5. Token bucket: at most rate_per_sec admissions per second.
         if inner.rate_per_sec > 0 {
-            let now = entered_at_ms;
-            let elapsed = now.saturating_sub(inner.rate_last_ms) as f64 / 1000.0;
-            inner.rate_last_ms = now;
-            inner.rate_tokens = (inner.rate_tokens + elapsed * inner.rate_per_sec as f64)
-                .min(inner.rate_per_sec as f64);
+            let rate = inner.rate_per_sec;
+            let (last_ms, tokens) =
+                refill_tokens(inner.rate_last_ms, inner.rate_tokens, entered_at_ms, rate);
+            inner.rate_last_ms = last_ms;
+            inner.rate_tokens = tokens;
             if inner.rate_tokens < 1.0 {
                 if inner.breaker == BreakerState::HalfOpen {
                     inner.half_open_probe = false;
@@ -3862,10 +3863,10 @@ impl SnubberNode {
 
         // 4. Token bucket: at most rate_per_sec admissions per second.
         if inner.rate_per_sec > 0 {
-            let elapsed = now.saturating_sub(inner.rate_last_ms) as f64 / 1000.0;
-            inner.rate_last_ms = now;
-            inner.rate_tokens = (inner.rate_tokens + elapsed * inner.rate_per_sec as f64)
-                .min(inner.rate_per_sec as f64);
+            let rate = inner.rate_per_sec;
+            let (last_ms, tokens) = refill_tokens(inner.rate_last_ms, inner.rate_tokens, now, rate);
+            inner.rate_last_ms = last_ms;
+            inner.rate_tokens = tokens;
             if inner.rate_tokens < 1.0 {
                 if inner.breaker == BreakerState::HalfOpen {
                     inner.half_open_probe = false;
@@ -5595,6 +5596,51 @@ impl<F: FnOnce()> Drop for TrackedGuard<F> {
 fn console_attached() -> bool {
     use std::io::IsTerminal;
     std::io::stderr().is_terminal()
+}
+
+/// Refill the token bucket for one admission stamp.
+///
+/// `now` is read BEFORE the node mutex, so two admissions can reach the
+/// lock out of order and hand this a stamp older than `rate_last_ms`.
+/// Moving the stamp backwards would credit the same wall time twice —
+/// one free burst above `rate_per_sec` — so the stamp only moves forward.
+#[inline]
+fn refill_tokens(rate_last_ms: u64, tokens: f64, now: u64, rate: u32) -> (u64, f64) {
+    if now > rate_last_ms {
+        let elapsed = (now - rate_last_ms) as f64 / 1000.0;
+        (
+            now,
+            (tokens + elapsed * f64::from(rate)).min(f64::from(rate)),
+        )
+    } else {
+        (rate_last_ms, tokens)
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::refill_tokens;
+
+    #[test]
+    fn bucket_stamp_never_moves_backwards() {
+        let (mut last, mut tokens) = (1_000u64, 0.0f64);
+
+        // A stamp older than the last refill must neither rewind the stamp
+        // nor mint tokens; the pre-fix formula did both.
+        (last, tokens) = refill_tokens(last, tokens, 900, 10);
+        assert_eq!(last, 1_000, "stamp rewound");
+        assert_eq!(tokens, 0.0, "out-of-order stamp minted tokens");
+
+        // An in-order stamp refills exactly the elapsed 100 ms at 10/s.
+        (last, tokens) = refill_tokens(last, tokens, 1_100, 10);
+        assert_eq!(last, 1_100);
+        assert!((tokens - 1.0).abs() < 1e-9, "tokens={tokens}");
+
+        // Refill saturates at the one-second burst size.
+        (last, tokens) = refill_tokens(last, tokens, 10_000, 10);
+        assert_eq!(last, 10_000);
+        assert!((tokens - 10.0).abs() < 1e-9, "tokens={tokens}");
+    }
 }
 
 #[cfg(test)]
