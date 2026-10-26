@@ -1698,8 +1698,9 @@ Async eviction verdict, ISR counter saturation, bounds that follow
 Release gates follow the same batch: the three Miri jobs compile with
 `RUSTFLAGS="-D warnings"` on the pinned nightly; `scripts/release.sh`
 passes `--locked` to clippy and to the publish dry-run; the stress
-harness refuses `--external-supervisor` under CI (no worker pid means no
-RSS/fd/exit evidence); and the Windows API-diff gate, like the shell one,
+harness refuses any kill-only run under CI (`--launch` is mandatory:
+without the supervisor pid there is no RSS/fd/exit evidence); and the
+Windows API-diff gate, like the shell one,
 diffs a release commit against the previous tag instead of failing.
 
 ## Fixed in 0.6.8: seventh-audit batch

@@ -60,6 +60,18 @@ surface, wire format and telemetry layout are untouched.
   (`CI=true/1` for `.sh` and `.py`; `.ps1` fails on any skip in every
   environment): without a launched child there is no pid for the
   RSS/fd/exit gates, so the run would report without leak evidence.
+- `termination-smoke` no longer hangs. The test used to launch the
+  supervisor itself and then pass `--external-supervisor` (`.sh`) or
+  nothing (`.ps1`), which tripped the CI `--launch` gate; the harness
+  exited, the supervisor blocked in `child.wait()` waiting for kills that
+  never came, and both matrix jobs burned the 20-minute job timeout. The
+  test now spawns only the harness with `--launch` / `-Launch` (profile
+  debug, matching its own build) and waits on it through a hard deadline,
+  asserting its exit status — a refusing or wedged harness fails the lane
+  in seconds. The dead `--external-supervisor` flag is removed from
+  `stress_harness.sh`; kill-only mode still exists for a locally launched
+  supervisor. Measured locally: 25 kills, verdict PASS, harness 0.9 s,
+  lane 2.3 s (CI=true: 4.3 s) against the old 20-min cancel.
 - The three Miri jobs compile with `RUSTFLAGS="-D warnings"` (on top of
   the existing `-Zmiri-strict-provenance`), so nightly-only lints fail
   the lane instead of scrolling past. `scripts/release.sh` now passes

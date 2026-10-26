@@ -1,7 +1,8 @@
 //! Automated system kill stress test (Hard process termination harness).
-//! Spawns Supervisor and Stress Killer Harness,
-//! verifies that hard process terminations (TerminateProcess on Windows, SIGKILL on Unix)
-//! are survived with 0 pipe deadlocks and 100% token accounting.
+//! Spawns the stress harness, which launches the supervisor and hard-kills
+//! its workers (TerminateProcess on Windows, SIGKILL on Unix), then verifies
+//! that the terminations were survived with 0 pipe deadlocks and 100% token
+//! accounting.
 
 mod common;
 
@@ -9,8 +10,28 @@ use common::json_num;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
+
+/// Wait on a child with a hard deadline. A harness that refuses to run (the
+/// CI `--launch` gate) used to leave the caller blocked on `wait()` until the
+/// job timeout; a wedged child now fails the lane in bounded time.
+fn wait_bounded(child: &mut Child, limit: Duration, what: &str) -> ExitStatus {
+    let start = Instant::now();
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => return status,
+            None if start.elapsed() >= limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "{what} exceeded {limit:?}; killed so the lane fails fast instead of hanging"
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
 
 #[test]
 #[ignore = "Spawns background supervisor & killer and executes hundreds/thousands of hard OS kills. Run explicitly: cargo test --test supervisor_termination -- --ignored --nocapture"]
@@ -20,9 +41,10 @@ fn process_kill_stress_test() {
         let _ = std::fs::remove_file(report_file);
     }
 
-    // Ensure the process_termination_loop example is compiled
+    // Build in the profile the harness is told to launch (debug keeps this
+    // lane cheap; the harness validates the binary exists before killing).
     let status = Command::new("cargo")
-        .args(["build", "--example", "process_termination_loop"])
+        .args(["build", "--locked", "--example", "process_termination_loop"])
         .status()
         .expect("cargo build --example process_termination_loop");
     assert!(
@@ -38,89 +60,61 @@ fn process_kill_stress_test() {
     let timeout_secs = (kills as u64 * 300 / 1000).max(60);
 
     println!(
-        "[TEST RUNNER] Launching supervisor and termination harness (target kills: {})...",
+        "[TEST RUNNER] Launching stress harness (target kills: {})...",
         kills
     );
 
+    // The harness owns the supervisor on EVERY platform: its RSS / handle /
+    // fd / exit gates need the supervisor pid, and the harness refuses a
+    // kill-only run under CI for exactly that reason. Launching the
+    // supervisor here (the old shape) made the harness exit immediately and
+    // left the supervisor waiting for kills that never came.
     #[cfg(windows)]
-    {
-        // 1. Spawn Supervisor Instance in background (headless, no popup window)
-        let mut supervisor = Command::new("cargo")
-            .args([
-                "run",
-                "--example",
-                "process_termination_loop",
-                "--",
-                "--target-kills",
-                &kills.to_string(),
-                "--report-path",
-                report_file,
-            ])
-            .spawn()
-            .expect("spawn supervisor");
-
-        std::thread::sleep(Duration::from_millis(1500));
-
-        // 2. Spawn Process Killer Harness in background
-        let mut killer = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                ".\\scripts\\stress_harness.ps1",
-                "-TargetProcess",
-                "process_termination_loop",
-                "-Kills",
-                &kills.to_string(),
-            ])
-            .spawn()
-            .expect("spawn killer harness");
-
-        let _ = killer.wait();
-        let _ = supervisor.wait();
-    }
+    let mut harness = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            ".\\scripts\\stress_harness.ps1",
+            "-TargetProcess",
+            "process_termination_loop",
+            "-Kills",
+            &kills.to_string(),
+            "-Profile",
+            "debug",
+            "-ReportPath",
+            report_file,
+            "-Launch",
+        ])
+        .spawn()
+        .expect("spawn stress harness");
 
     #[cfg(not(windows))]
-    {
-        // 1. Spawn Supervisor Instance in background
-        let mut supervisor = Command::new("cargo")
-            .args([
-                "run",
-                "--example",
-                "process_termination_loop",
-                "--",
-                "--target-kills",
-                &kills.to_string(),
-                "--report-path",
-                report_file,
-            ])
-            .spawn()
-            .expect("spawn supervisor");
+    let mut harness = Command::new("bash")
+        .args([
+            "scripts/stress_harness.sh",
+            "process_termination_loop",
+            &kills.to_string(),
+            "0.001",
+            "--debug",
+            "--launch",
+        ])
+        .spawn()
+        .expect("spawn stress harness");
 
-        std::thread::sleep(Duration::from_millis(1500));
-
-        // 2. Run stress harness in background
-        let mut killer = Command::new("bash")
-            .args([
-                "scripts/stress_harness.sh",
-                "process_termination_loop",
-                &kills.to_string(),
-                "0.001",
-                // The test owns the supervisor; the harness CI gate needs
-                // to know this is deliberate, not a forgotten --launch.
-                "--external-supervisor",
-            ])
-            .spawn()
-            .expect("spawn stress harness");
-
-        // Wait for processes
-        let _ = killer.wait();
-        let _ = supervisor.wait();
-    }
+    let harness_status = wait_bounded(
+        &mut harness,
+        Duration::from_secs(timeout_secs.max(180)),
+        "stress harness",
+    );
+    assert!(
+        harness_status.success(),
+        "stress harness failed ({harness_status}); see the [HARNESS] verdict above"
+    );
 
     println!(
-        "[TEST RUNNER] Both processes launched! Waiting for report file: {}",
+        "[TEST RUNNER] Harness finished. Waiting for report file: {}",
         report_file
     );
 

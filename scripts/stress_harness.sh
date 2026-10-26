@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
 # snubber process termination stress harness (Linux / macOS).
 # Positional args (backward compatible): [target] [kills] [min_sleep_sec]
-# Flags: --launch (start supervisor too), --build, --debug, --aggressive,
-#        --external-supervisor (the caller launched it; local only — CI
-#        must use --launch so the leak gates have a supervisor to sample)
+# Flags: --launch (start supervisor too), --build, --debug, --aggressive
 set -u
 
 TARGET_PROCESS="process_termination_loop"
 KILLS=10000
 MIN_SLEEP=0
 LAUNCH=0
-EXTERNAL_SUPERVISOR=0
 BUILD=0
 AGGRESSIVE=0
 PROFILE="release"
@@ -23,7 +20,6 @@ POS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --launch) LAUNCH=1 ;;
-        --external-supervisor) EXTERNAL_SUPERVISOR=1 ;;
         --build) BUILD=1 ;;
         --debug) PROFILE="debug" ;;
         --aggressive) AGGRESSIVE=1 ;;
