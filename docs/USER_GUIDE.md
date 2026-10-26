@@ -6,7 +6,11 @@
 > automatically reset to a safe state through the `Drop` destructor.
 >
 > Zero dependencies, no `unsafe`, works from bare-metal firmware
-> (`core`-only) to high-throughput desktop and server daemons (`std`). MSRV 1.70.
+> (`core`-only) to high-throughput desktop and server daemons (`std`). MSRV 1.70
+> for the library; the tests and benches need a newer toolchain, because the
+> dev-dependency `criterion` resolves to a `clap` that requires Rust 1.74. The
+> `msrv` CI lane (`cargo check --lib`, core / core+alloc / std) is what proves
+> the floor — a `cargo test` on 1.70 is not a supported configuration.
 >
 > Hang layer (v0.5): monotonic `Instant` clock (no `SystemTime` jumps),
 > CPU-spin classifier (`TimedOut` vs `SpinDetected` vs `DeadlockSuspected`,

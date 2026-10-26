@@ -60,6 +60,16 @@ surface, wire format and telemetry layout are untouched.
 
 ### CI and release gates
 
+- The declared MSRV is now built. Every lane used `@stable`, so
+  `rust-version = "1.70"` was an unverified claim; a new `msrv` job checks
+  the library on Rust 1.70 in three shapes (core, core + alloc, std).
+  Proven locally with `cargo +1.70 check --locked --lib` (all three
+  green) and a negative probe: a temporary `LazyLock` fails on 1.70 with
+  `E0063` / `lazy_cell` unstable. The guide now states the honest scope —
+  the dev graph (criterion → clap) needs Rust 1.74+, so tests and benches
+  are outside the floor and this lane deliberately does not use
+  `-D warnings` (linting stays in the stable quality job; 1.70's
+  dead-code lint disagrees on cfg-dependent items).
 - `scripts/check_api_diff.ps1` no longer hard-fails when the baseline tag
   is HEAD (the release commit itself): it falls back to the previous tag,
   mirroring the `.sh` gate, and fails only when no previous tag exists.

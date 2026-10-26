@@ -92,6 +92,34 @@ jobs:
       - name: Package Integrity (dry-run publish)
         run: cargo publish --dry-run --locked
 
+  # 1b. MSRV FLOOR: the library must build on the declared `rust-version`.
+  # Deliberately NOT `-D warnings`: linting belongs to the stable quality
+  # job, and rustc 1.70 reports cfg-dependent dead code that newer rustc
+  # does not. `--lib` only — the dev graph (criterion -> clap) requires
+  # Rust 1.74+, so tests and benches are outside this floor by design.
+  msrv:
+    name: MSRV 1.70 (library)
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust 1.70
+        uses: dtolnay/rust-toolchain@1.70
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Core-only library
+        run: cargo check --locked --lib --no-default-features
+
+      - name: Core + alloc library
+        run: cargo check --locked --lib --features alloc
+
+      - name: std library
+        run: cargo check --locked --lib
+
   # 2. CROSS-PLATFORM TEST SUITE: Linux, Windows, macOS
   test-matrix:
     name: Test on ${{ matrix.os }}
