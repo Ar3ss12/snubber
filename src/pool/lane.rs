@@ -317,8 +317,17 @@ impl PoolLane {
             ReapClass::Stillborn => state.stillborn = state.stillborn.saturating_add(1),
             ReapClass::Deadlocked => state.deadlocks = state.deadlocks.saturating_add(1),
         }
-        state.last_exit = exit_code;
-        state.last_class = Some(class);
+        // `last_exit`/`last_class` belong to the generation that died. A
+        // successor attaching while this reaper sat in the EOF grace leaves
+        // `pid` Some again; that successor's own life and reap advance the
+        // generation. Stamping anyway would attribute the predecessor's
+        // death telemetry to the successor. The death itself stays counted
+        // in the lane counters and is returned in the PoolReap above —
+        // only the "latest" fields stay honest.
+        if state.clock.generation() == generation && state.pid.is_none() {
+            state.last_exit = exit_code;
+            state.last_class = Some(class);
+        }
         drop(state);
 
         Ok(PoolReap {

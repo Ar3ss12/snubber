@@ -8,6 +8,11 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 
 ### Fixed
 
+- `PoolLane::note_death` no longer stamps `last_exit`/`last_class` onto a
+  successor that attached while the reaper sat in the EOF grace (or after
+  that successor's own life and reap advanced the generation). The death
+  itself stays counted in the lane counters and returned in `PoolReap`;
+  only the "latest" fields belong to the generation that actually died.
 - The sync queue horizon is telemetry-only. When live admissions reach
   `queue_capacity`, the node records the `BufferOverflow` gauge
   (`buffer_overflow_total`, console line) but no longer executes
@@ -38,6 +43,11 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 
 ### Tests
 
+- New `supervisor_pool` tests: attach-during-grace (thread + attach
+  handshake, no sleep margin) leaves the successor's `last_exit`/
+  `last_class` at `None`; a reaper without a successor still stamps its
+  own telemetry. Negative run verified: removing the generation/pid
+  guard turns the attach test red. README badge 414 → 416.
 - New `tests/queue_horizon.rs`: `TripBreaker` and `RollbackAndAlert`
   armed on `BufferOverflow` do not fire on horizon hits over
   `queue_capacity(0)`; the gauge still exports `buffer_overflow_total`

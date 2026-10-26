@@ -753,3 +753,63 @@ fn successor_gets_fresh_generation_during_eof_grace() {
     assert_eq!(reap.generation, 2);
     assert_eq!(reap.class, ReapClass::Deadlocked);
 }
+
+// F-04 (PLAN_AUDIT2): a successor that attaches while the reaper still
+// sits in the EOF grace must not inherit the dead predecessor's
+// `last_exit`/`last_class`. Handshake, not a sleep margin: `attach` can
+// only succeed after the reaper's first lock cleared `pid`, so a
+// successful spin-attach proves the reaper is inside the grace window.
+#[test]
+fn attach_during_grace_leaves_successor_last_telemetry_clean() {
+    let pool = WorkerPool::new(PoolConfig::new(1).with_eof_grace(150)).expect("one lane");
+    let lane = Arc::clone(pool.lane(0).expect("lane 0"));
+    // Manual drain, never finished: no EOF inside the grace -> Deadlocked.
+    lane.attach(2_001, PipeDrain::manual())
+        .expect("attach dying child");
+
+    let reaper = {
+        let lane = Arc::clone(&lane);
+        std::thread::spawn(move || lane.note_death(Some(7), 1_000))
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let successor_gen = loop {
+        match lane.attach(2_002, PipeDrain::manual()) {
+            Ok(gen) => break gen,
+            Err(PoolError::LaneBusy { .. }) if Instant::now() < deadline => {
+                std::thread::yield_now();
+            }
+            Err(other) => panic!("attach failed: {other:?}"),
+        }
+    };
+
+    let reap = reaper.join().expect("reaper thread").expect("reap");
+    assert_eq!(reap.class, ReapClass::Deadlocked);
+    assert_eq!(reap.generation, successor_gen);
+
+    let snap = lane.snapshot();
+    assert_eq!(
+        snap.last_class, None,
+        "predecessor telemetry must not be stamped onto the successor"
+    );
+    assert_eq!(snap.last_exit, None);
+    assert_eq!(snap.generation, successor_gen);
+    // The death itself is still counted as lane history.
+    assert_eq!(snap.reaps, 1);
+    assert_eq!(snap.deadlocks, 1);
+}
+
+// Without an attach inside the grace, the reaper owns the lane: the
+// predecessor's telemetry lands as before.
+#[test]
+fn reaper_without_successor_still_stamps_last_telemetry() {
+    let pool = WorkerPool::new(PoolConfig::new(1).with_eof_grace(150)).expect("one lane");
+    let lane = Arc::clone(pool.lane(0).expect("lane 0"));
+    lane.attach(2_001, PipeDrain::manual())
+        .expect("attach dying child");
+    let reap = lane.note_death(Some(3), 1_000).expect("reap");
+    assert_eq!(reap.class, ReapClass::Deadlocked);
+    let snap = lane.snapshot();
+    assert_eq!(snap.last_class, Some(ReapClass::Deadlocked));
+    assert_eq!(snap.last_exit, Some(3));
+}
