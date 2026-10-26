@@ -584,14 +584,16 @@ impl SnubberNodeBuilder {
         self
     }
 
-    /// Bounded event buffer size (backpressure horizon).
+    /// Bounded event buffer size (backpressure horizon). Canonical name;
+    /// [`SnubberNodeBuilder::queue_capacity`] sets the same field.
     #[must_use]
     pub fn queue_limit(mut self, n: usize) -> Self {
         self.queue_limit = n;
         self
     }
 
-    /// Maximum capacity of the task wait buffer (waker queue).
+    /// Alias of [`SnubberNodeBuilder::queue_limit`] (the waker-queue
+    /// ceiling); kept for discoverability, sets the same field.
     #[must_use]
     pub fn queue_capacity(mut self, n: usize) -> Self {
         self.queue_limit = n;
@@ -758,7 +760,8 @@ impl SnubberNodeBuilder {
     /// Token-bucket rate limit: at most `n` admissions per second.
     /// `0` = unlimited (default). The bucket refills lazily on `enter`
     /// (no background thread, no timer wheel — one timestamp + float).
-    /// Over-limit entries are rejected as `BulkheadFull` and counted.
+    /// Over-limit entries are rejected as `RateLimited` and counted in
+    /// their own column (`rate_rejected`), never as `BulkheadFull`.
     #[must_use]
     pub fn rate_per_sec(mut self, n: u32) -> Self {
         self.rate_per_sec = n;

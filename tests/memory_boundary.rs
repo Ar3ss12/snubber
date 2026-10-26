@@ -3,7 +3,7 @@
 //! A rollback runs OUTSIDE the lock (Floor-1 owns none at all), so foreign
 //! shared state needs its OWN Release→Acquire edge. `Relaxed`×2 may read
 //! rot — this test proves the pair holds under hammering. Proves the
-//! contract, not the hardware (full proof = loom, see FUTURE_TRAPS Trap 3).
+//! contract, not the hardware (a full proof needs loom; the executable part lives in docs/INVARIANTS.md, Verification Protocol).
 
 use snubber::SnubberGuard;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -6,7 +6,7 @@
 //!   Non-idempotent work belongs ONLY in the `commit()` branch.
 //! * MUST be **time-bounded**: atomics, `SetEvent`, non-blocking sends.
 //!   A rollback that hangs in a driver leaves the process in an unkillable hung state
-//!   (`docs/FUTURE_TRAPS.md` Trap 2) — no userspace crate preempts kernel.
+//!   (`docs/INVARIANTS.md` Invariant 3 (Single-Shot Rollback Guarantee)) — no userspace crate preempts kernel.
 //! * MUST be **lock-free vs the node**: never call back into the same
 //!   `SnubberNode` from inside a rollback (open-call rule — re-entrant
 //!   `enter` from a rollback is a deadlock hazard).

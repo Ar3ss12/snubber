@@ -19,8 +19,10 @@
 //! never leaves a ghost entry squatting `queue_limit`.
 //!
 //! Works with Tokio, async-std, smol, embassy — anything polling `Future`.
-//! Queue is capped (1024, oldest evicted); atomic admission reserves the slot
-//! and only consumes the rollback on success — no lost wakeup, no burnt `FnOnce`.
+//! Queue is capped (`queue_limit`, default 32; the over-limit policy applies —
+//! default `RejectNew`, so a full queue refuses, it never evicts). Atomic
+//! admission reserves the slot and only consumes the rollback on success —
+//! no lost wakeup, no burnt `FnOnce`.
 
 use crate::node::{self, EnterError, NanoClock, SnubberNode, TrackedGuard};
 use core::future::Future;

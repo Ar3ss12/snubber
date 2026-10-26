@@ -49,7 +49,7 @@ let receipt = node.scoped_checked(
 
 ## 🔌 Embedded & `no_std`
 
-`std` and `alloc` are additive features. Without `std` the crate is `core`-only (`#![cfg_attr(not(feature = "std"), no_std)]`); CI builds **both** `core` and `core + alloc` for `thumbv7em-none-eabihf`, and `WorkerPulse` drops to a 32-bit atomic on targets without 64-bit CAS. The `no_std` surface is the watchdog, ISR bridge, clock, envelope, contract, policy, diagnostics core, memory watch, drain (token parser + `SnubScanner`), and protect layers; `alloc` upgrades the same layers with the erased guard and owned node-name types; `SnubberNode` itself and the async engine, supervisor, pool, channel, conduit, conflate, and harness layers are `std` because they own OS threads, pipes, and process trees.
+`std` and `alloc` are additive features. Without `std` the crate is `core`-only (`#![cfg_attr(not(feature = "std"), no_std)]`); CI builds **both** `core` and `core + alloc` for `thumbv7em-none-eabihf`, and `WorkerPulse` drops to a 32-bit atomic on targets without 64-bit CAS. The `no_std` surface is the watchdog, ISR bridge, clock, envelope, contract, policy, diagnostics core, memory watch, drain (token parser + `SnubScanner`), and `Protected`; the protect layer's ergonomic `SafeLockExt` extension is `std`, because the locks it wraps are `std` locks; `alloc` upgrades the same layers with the erased guard and owned node-name types; `SnubberNode` itself and the async engine, supervisor, pool, channel, conduit, conflate, and harness layers are `std` because they own OS threads, pipes, and process trees.
 
 The supervisor parser does not require a reader thread or stdout. `PipeDrain` is `std` (it owns the EOF state and counters); push bytes from a UART/DMA task and declare EOF yourself. On `core`-only targets, the same bytes go straight into the `core` `SnubScanner`:
 
@@ -146,7 +146,7 @@ reads as an operation rather than a Criterion key. Differences below
 | `gateway send` (HWM/LWM throttled) | Layer 2 (`std`) | **~16.8 ns** | Latch fast path while inside the high/low horizon |
 | `node.next_sequence()` | Layer 2 (`std`) | **~4.8 ns** | One atomic `fetch_add` ticket, shared across clones |
 | `node.stats()` snapshot | Layer 2 (`std`) | **~58.4 ns** | One short lock, fold into `SnubberStats` |
-| `SnubberStats::shed_total` + `success_permille` | Layer 2 (`std`) | **~28.4 ns** | Two loads plus integer permille, no lock |
+| `SnubberStats::shed_total` + `success_rate_per_mille` | Layer 2 (`std`) | **~28.4 ns** | Two loads plus integer permille, no lock |
 | `enter_async_auto` | Layer 3 (`std`) | **0% CPU** | Pure `core::task::Waker` parking, no runtime deps |
 | `enter_async_auto_profiled` | Layer 3 (`std`, opt-in) | structural: 1 `Box` + 2 clock reads | Same waker parking, profile arms on the admitting poll |
 | `enter_async_auto` (ready poll) | Layer 3 (`std`) | **~156 ns** | Full admission through the future; the ready path allocates nothing |

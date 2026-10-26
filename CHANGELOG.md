@@ -127,6 +127,17 @@ surface, wire format and telemetry layout are untouched.
 
 ### Documentation
 
+- Public docs no longer name things that do not exist: the bench label
+  map and README use the real `success_rate_per_mille`; `rate_per_sec`
+  documents its own `RateLimited` column instead of `BulkheadFull`;
+  `queue_capacity` is labelled as the alias of the canonical
+  `queue_limit`; the async entry module states the real waker-queue
+  defaults (`queue_limit` 32, `RejectNew` — not "1024, oldest evicted");
+  three dead `docs/FUTURE_TRAPS.md` pointers now cite
+  `docs/INVARIANTS.md` (Invariant 3, Verification Protocol); and the
+  `no_std` surface names `Protected` as core with `SafeLockExt` as
+  `std`. Negative grep (`success_permille`, `FUTURE_TRAPS`,
+  `1024, oldest evicted`) is empty; `cargo doc -D warnings` is clean.
 - The `no_std` drain quickstart in `README.md` now compiles. It passed a
   `u64` tick value to `PipeDrain::manual_with_clock`, whose argument is a
   `ClockFn` (`fn() -> u64`); README fences are not doctested, so nothing

@@ -567,7 +567,7 @@ const _: () = {
 ///
 ///   3. Time-bounded: atomics, `SetEvent`, non-blocking sends. A rollback
 ///      that hangs in a driver leaves the process in an unkillable hung state (see
-///      `docs/FUTURE_TRAPS.md` Trap 2) — no crate can preempt kernel.
+///      `docs/INVARIANTS.md` Invariant 3 (Single-Shot Rollback Guarantee)) — no crate can preempt kernel.
 ///
 ///   4. Lock-free vs the node: never call back into the same `SnubberNode`
 ///      (open-call rule — the node drops its lock first, but re-entrant

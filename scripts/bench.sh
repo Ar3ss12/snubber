@@ -120,7 +120,7 @@ labels = {
     "conduit_check_directive": "TaskConduit::check_directive",
     "node_next_sequence": "node.next_sequence (auto ticket)",
     "node_stats_snapshot": "node.stats() snapshot",
-    "stats_telemetry_math": "SnubberStats::shed_total + success_permille",
+    "stats_telemetry_math": "SnubberStats::shed_total + success_rate_per_mille",
     "erased_enter_auto_commit": "enter_erased_auto",
     "drain_feed_frame": "PipeDrain::feed (one frame)",
     "drain_feed_256_frames": "PipeDrain::feed (256 frames)",
