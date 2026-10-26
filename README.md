@@ -113,14 +113,19 @@ lane runs `cargo bench --locked --bench admission_bench`, then
 `target/` tree, not a file in this repository — and archives that file
 plus the raw Criterion trees as artifact `bench-criterion-<run_id>`. To re-print the table from an
 existing `target/criterion` without running benches again, use
-`bash scripts/bench.sh --skip-run`. Differences below ~2 ns are inside
-run-to-run noise and are not claimed as wins.
+`bash scripts/bench.sh --skip-run`. Both exporters (`bench.sh`,
+`bench.ps1`) carry the same 52-entry label map, so every published row
+reads as an operation rather than a Criterion key. Differences below
+~2 ns are inside run-to-run noise and are not claimed as wins.
 
 | Operation | Architecture Layer | Average Latency | Notes |
 |---|---|---|---|
 | `SnubberGuard::new` + `commit` | Layer 1 (`core`) | **~5.4 ns** | Stack move + owned-field drop, zero heap allocation |
 | `EpochGate::observe` | Layer 1 (`core`) | **~2.6 ns** | 2-D generation + monotonic epoch filter |
 | `classify_stall_ceiling` (bench; `classify_stall` is the 4-arg wrapper that delegates here) | Layer 1 (`core`) | **~2.0 ns** (const math) | `CpuSpin` / `SleepBlocked` / `DeadlockStall` from one sample pair (the settle verdicts `SpinDetected` / `DeadlockSuspected` come from `guard.check_timeout`) |
+| `WorkerPulse::kick` + `PulseWatch::observe` | Layer 1.5 (`core`) | **~5.8 ns** | One-word heartbeat store + observe fold; no lock, no allocation |
+| `IsrBridge::try_push` + `try_pop` | Layer 1.5 (`core`) | **~7.1 ns** | 80 B SPSC ring, lock-free; malformed cells drained on pop |
+| `IsrBridge::trip` + `take_trips` | Layer 1.5 (`core`) | **~9.3 ns** | 32-bit latch swap; trip bypasses a full ring |
 | `node.enter + commit` | Layer 2 (`std`) | **~124 ns** | Full bulkhead, circuit breaker, auto-commit; no clock read when the token bucket is disarmed |
 | `node.enter_auto + commit` | Layer 2 (`std`) | **~131 ns** | + atomic sequence minting |
 | `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~125 ns** | Priority lane; same band as plain enter (one measurement) |
@@ -132,6 +137,12 @@ run-to-run noise and are not claimed as wins.
 | `ConflateSender::publish + take_latest` | Layer 2 (`std`) | **~21.7 ns** | One-slot latest wins, no allocation, no `Clone` bound |
 | `ConflateSender::publish` (occupied slot) | Layer 2 (`std`) | **~15.7 ns** | Replaced value counted, never queued |
 | `guard.commit_enveloped(64)` | Layer 2 (`std`) | **~142 ns** | Payload corridor exact; wall corridor only for profiled guards |
+| `TaskConduit::check_directive` | Layer 2 (`std`) | **~1.0 ns** | One atomic load per poll, no lock |
+| `gateway send -> recv roundtrip` | Layer 2 (`std`) | **~50.8 ns** | Bounded MPSC send plus receiver wake |
+| `gateway send` (HWM/LWM throttled) | Layer 2 (`std`) | **~16.8 ns** | Latch fast path while inside the high/low horizon |
+| `node.next_sequence()` | Layer 2 (`std`) | **~4.8 ns** | One atomic `fetch_add` ticket, shared across clones |
+| `node.stats()` snapshot | Layer 2 (`std`) | **~58.4 ns** | One short lock, fold into `SnubberStats` |
+| `SnubberStats::shed_total` + `success_permille` | Layer 2 (`std`) | **~28.4 ns** | Two loads plus integer permille, no lock |
 | `enter_async_auto` | Layer 3 (`std`) | **0% CPU** | Pure `core::task::Waker` parking, no runtime deps |
 | `enter_async_auto_profiled` | Layer 3 (`std`, opt-in) | structural: 1 `Box` + 2 clock reads | Same waker parking, profile arms on the admitting poll |
 | `enter_async_auto` (ready poll) | Layer 3 (`std`) | **~156 ns** | Full admission through the future; the ready path allocates nothing |

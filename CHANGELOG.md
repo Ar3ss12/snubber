@@ -103,6 +103,10 @@ surface, wire format and telemetry layout are untouched.
   was not reproducible at its own commit (lock-free rows matched, guarded
   admission rows read 30–40% higher — the clock regression) and the
   contended rows quote full-run artifacts instead of a smoke check.
+- The README table now publishes the rows that were measured but never
+  listed (Layer 1.5 pulse/ISR, `TaskConduit`, `gateway`, `next_sequence`,
+  `stats()`), and `scripts/bench.{sh,ps1}` map all 52 Criterion rows to
+  operation labels instead of exporting 34 of them as snake_case names.
 
 ### Tests
 

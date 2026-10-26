@@ -93,6 +93,9 @@ import glob
 
 criterion_dir = os.path.join("target", "criterion")
 
+# Every bench in the suite is mapped: an unmapped key still exports, but
+# under its snake_case function name, which reads as a different operation
+# next to the mapped rows.
 labels = {
     "guard_new_commit": "SnubberGuard::new + commit",
     "epoch_gate_observe": "EpochGate::observe",
@@ -105,6 +108,13 @@ labels = {
     "node_scoped_work_commit": "node.scoped (work + auto-commit)",
     "node_enter_critical_priority": "node.enter_with_priority(Critical)",
     "node_transition": "node.transition",
+    "node_passthrough_enter_commit": "node_passthrough.enter + commit",
+    "node_passthrough_scoped_commit": "node_passthrough.scoped + commit",
+    "conflate_publish_take": "ConflateSender::publish + take_latest",
+    "conflate_publish_replace": "ConflateSender::publish (occupied slot)",
+    "node_commit_enveloped_payload": "guard.commit_enveloped(64 B)",
+    "async_enter_ready_poll": "enter_async_auto (ready poll)",
+    "async_park_wake_admit_roundtrip": "enter_async_auto park/wake/admit",
     "gateway_roundtrip_send_recv": "gateway send -> recv roundtrip",
     "gateway_send_throttled_latch": "gateway send (HWM/LWM throttled)",
     "conduit_check_directive": "TaskConduit::check_directive",
@@ -112,6 +122,33 @@ labels = {
     "node_stats_snapshot": "node.stats() snapshot",
     "stats_telemetry_math": "SnubberStats::shed_total + success_permille",
     "erased_enter_auto_commit": "enter_erased_auto",
+    "drain_feed_frame": "PipeDrain::feed (one frame)",
+    "drain_feed_256_frames": "PipeDrain::feed (256 frames)",
+    "drain_sync_256_frames": "PipeDrain::drain_sync (256 frames)",
+    "token_write_to": "ProcessToken::write_to(&mut sink)",
+    "state_digest_write_to": "StateDigest::write_to(&mut sink)",
+    "friction_handler_arc_call": "friction_fn handler call (Arc<dyn Fn>)",
+    "friction_wait_adaptive_arc": "friction_wait_ms (adaptive, Arc handler)",
+    "friction_wait_adaptive_fn": "friction_wait_ms (adaptive, fn)",
+    "node_name_as_str": "NodeName::as_str",
+    "node_name_clone_static": "NodeName::Static clone",
+    "node_name_clone_owned": "NodeName::Owned clone",
+    "process_token_parse": "ProcessToken::from_bytes",
+    "process_token_to_bytes": "process_token.to_bytes()",
+    "snapshot_v1_encode_crc": "snapshot_v1.encode()",
+    "state_digest_new_crc": "state_digest.crc()",
+    "static_node_enter_commit": "static_node.enter + commit",
+    "expired_lanes_4_lanes": "pool.expired_lanes(lease) (4 lanes)",
+    "lane_attach_reap_ambush": "lane.attach + note_death (ambush) -> PoolReap",
+    "lane_attach_reap_escape": "lane.attach + note_death (escape) -> PoolReap",
+    "namespace_task_pack": "namespace_task::pack",
+    "namespace_task_unpack": "namespace_task::unpack",
+    "note_memory_kb": "lane.note_memory_kb",
+    "report_snapshot_4_lanes": "pool.report() (4 lanes)",
+    "contended_node_enter_threads_6": "node.enter + commit (6 threads)",
+    "contended_node_scoped_threads_6": "node.scoped (6 threads)",
+    "contended_gateway_mpsc_threads_6": "gateway send (6 threads)",
+    "cross_thread_isr_bridge_push_pop": "IsrBridge push/pop (2 threads)",
 }
 
 print("| Operation | Average Latency | Notes |")
