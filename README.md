@@ -67,7 +67,7 @@ drain.finish();                                        // EOF → rescue classif
 ## 🛡️ Architecture & Guarantees
 
 * **Zero-Boilerplate RAII Rollback:** No manual token tracking. Scoped executions auto-commit on success and guarantee resource release via `Drop` on panics, errors, or early returns.
-* **Single-Digit-Nanosecond Overhead:** Base stack guard costs **~5.4 ns**; commit takes the rollback and drops the disarmed allocation-free `Copy` shell (no heap, no extra wire bytes). A saturated node admits **~1.1M admissions/sec** under 6-thread contention (uncontended admission is several times faster; see the latency table).
+* **Single-Digit-Nanosecond Overhead:** Base stack guard costs **~5.4 ns** (reproducible: `cargo bench --bench admission_bench -- layer1_core`, 2026-10-25 artifact); commit takes the rollback and consumes the disarmed, allocation-free guard shell (a plain stack move — no heap, no extra wire bytes). A saturated node admits **~1.1M admissions/sec** under 6-thread contention (uncontended admission is several times faster; see the latency table).
 * **Strict Determinism:** `#![forbid(unsafe_code)]`, zero external dependencies. Predictable behavior across bare-metal microcontrollers and multi-socket servers alike.
 * **Runtime-Agnostic Async:** Bounded waker queue built on `core::task::Waker` consuming **0% CPU** without depending on Tokio, async-std, or background threads.
 * **Adaptive Backpressure & Pacing:** Refusals carry physical telemetry (`retry_after_ms`, queue depth 0..255) allowing clients to pace incoming traffic instead of overwhelming dead hardware.
@@ -96,14 +96,20 @@ by under 5% outside the contended group, which moves by design; the
 single-box refactor). The four `contended_multithreaded` rows were
 re-measured on 2026-10-25 with the fail-fast pool (the 6-thread gateway
 row moved from ~172 ns as a result).
-Values are Criterion means from `target/criterion/*/new/estimates.json`;
-differences below ~2 ns are inside run-to-run noise and are not claimed as
-wins. The scheduled `bench-full` CI lane archives the raw Criterion trees
-plus `target/bench/snapshot.md` as artifact `bench-criterion-<run_id>`
+
+**Provenance.** Both tables are **historical snapshots** from those two
+full 50-sample runs on the listed machine — they are not re-derived on
+every release and move with hardware, compiler and load. The command
+above regenerates the whole table into `target/criterion/*/new/estimates.json`;
+a 2026-10-26 smoke re-run (`--sample-size 10`) reproduced every bench
+group on the same machine. The scheduled `bench-full` CI lane archives
+the raw Criterion trees plus `target/bench/snapshot.md` as artifact
+`bench-criterion-<run_id>`
 (`cargo bench --locked --bench admission_bench`, then
 `bash scripts/bench.sh --skip-run --github`). To re-print the table from an
 existing `target/criterion` without running benches again, use
-`bash scripts/bench.sh --skip-run`.
+`bash scripts/bench.sh --skip-run`. Differences below ~2 ns are inside
+run-to-run noise and are not claimed as wins.
 
 | Operation | Architecture Layer | Average Latency | Notes |
 |---|---|---|---|
@@ -170,14 +176,16 @@ and `EvictOldest` admits exactly one transient
 slot — beyond that it sheds like every other caller.
 
 ### ⚡ Contended Multi-Threaded Latencies (Real Thread Saturation)
-Measured with half of available hardware cores active (6 concurrent threads under contention, AMD Ryzen 5 4600H):
+Measured with half of available hardware cores active (6 concurrent threads under contention, AMD Ryzen 5 4600H), full 50-sample run of 2026-10-25 (`cargo bench --locked --bench admission_bench contended_multithreaded`; archived in `target/bench/snapshot.md` and the CI `bench-criterion` artifact):
 
 | Contended Operation | Concurrency | Measured Latency | Physical Phenomenon |
 |---|---|---|---|
-| `contended_node_enter_threads_6` | 6 threads | **~918 ns** | Mutex contention: cache-line transfer between threads |
-| `contended_node_scoped_threads_6` | 6 threads | **~911 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
-| `contended_gateway_mpsc_threads_6` | 6 threads | **~140 ns** | Bounded multi-producer channel write under parallel thread load |
-| `cross_thread_isr_bridge_push_pop` | 2 threads | **~35.5 ns** | Lock-free SPSC ring: cache-line handoff between threads |
+| `contended_node_enter_threads_6` | 6 threads | **~925 ns** | Mutex contention: cache-line transfer between threads |
+| `contended_node_scoped_threads_6` | 6 threads | **~899 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
+| `contended_gateway_mpsc_threads_6` | 6 threads | **~146 ns** | Bounded multi-producer channel write under parallel thread load |
+| `cross_thread_isr_bridge_push_pop` | 2 threads | **~34 ns** | Lock-free SPSC ring: cache-line handoff between threads |
+
+A 2026-10-26 smoke re-run (`--sample-size 10`, same machine) read 1029.5 / 1011.1 / 159.4 / 37.2 ns for the same four rows — the contended group moves between runs by design; quote full-run artifacts, not smoke checks.
 
 ### ⚡ Multi-Lineage Termination Storm
 
@@ -235,13 +243,13 @@ match reap.decision { /* Restart { delay_ms } | Stop | GiveUp */ }
 
 `note_death` classifies from that lane's own pipe: **ambush** (token handed back), **escape** (commit seen), **stillborn** (neither). A pipe that does not reach EOF inside the grace window becomes a fourth honest bucket — `ReapClass::Deadlocked`; `PoolReport::healthy()` stays false until it is zero, and `ambush + escape + stillborn + deadlocks == reaps` is checked per lane and in the totals. Task ids can carry the lineage (`namespace_task`, `lane << 48 | local`), so a rescued token names its worker. A waiter blocked in `child.wait()` cannot see a *different* lane go silent, so one app-side monitor calls `pool.expired_lanes(lease_ms)` on a tick: it names only lanes that already proved traffic once, and the monitor kills those itself.
 
-Measured (`cargo test --test supervisor_pool_stress -- --ignored --nocapture`, 4 lanes × 8 hard kills, debug build): 32/32 reaps, 32/32 true ambush, 0 escape, 0 stillborn, 0 deadlocks, final generation `[9,9,9,9]` (= kills + 1 per lane), `wall_ms=74` (reported in `target/pool_stress_report.json`).
+Measured (`cargo test --test supervisor_pool_stress -- --ignored --nocapture`, 4 lanes × 8 hard kills, debug build): 32/32 reaps, 32/32 true ambush, 0 escape, 0 stillborn, 0 deadlocks, final generation `[9,9,9,9]` (= kills + 1 per lane), `wall_ms=53` (2026-10-25 artifact `target/pool_stress_report.json`).
 
-The mixed storm cycles `armed → clean → silent → orphan` by `local % 4` inside the same run (`--mixed`, example 19): `cargo test --test supervisor_pool_stress_mixed -- --ignored --nocapture` measured 32/32 conserved reaps, **A/E/S/D = 8/8/8/8**, 8 rescued tokens, `deadlock=true` (the orphan modes hold the pipe open past the 150 ms grace), `[9,9,9,9]` generations, `wall_ms=486`. A deadlocked lane is reported, never guessed into another bucket.
+The mixed storm cycles `armed → clean → silent → orphan` by `local % 4` inside the same run (`--mixed`, example 19): `cargo test --test supervisor_pool_stress_mixed -- --ignored --nocapture` measured 32/32 conserved reaps, **A/E/S/D = 8/8/8/8**, 8 rescued tokens, `deadlock=true` (the orphan modes hold the pipe open past the 150 ms grace), `[9,9,9,9]` generations, `wall_ms=479` (2026-10-25 artifact `target/pool_mixed_stress_report.json`). A deadlocked lane is reported, never guessed into another bucket.
 
-The lease storm (`--lease-ms`, example 19) is the opposite case: every child emits one heartbeat and then hangs forever, so no `wait()` ever returns on its own. `cargo test --test supervisor_pool_stress_lease -- --ignored --nocapture` measured 24/24 reaps — all **stillborn** (a heartbeat is liveness, not a settlement), 0 ambush, 0 escape, 0 deadlocks, `lease_kills=24`, `conservation_breaks=0` over ~90k live `report()` samples from the observer thread, `[7,7,7,7]` generations, `wall_ms=220`. A child that hung before its first heartbeat is not expired — a pipe that never parsed a frame is the app's spawn timeout, not a lease breach.
+The lease storm (`--lease-ms`, example 19) is the opposite case: every child emits one heartbeat and then hangs forever, so no `wait()` ever returns on its own. `cargo test --test supervisor_pool_stress_lease -- --ignored --nocapture` measured 24/24 reaps — all **stillborn** (a heartbeat is liveness, not a settlement), 0 ambush, 0 escape, 0 deadlocks, `lease_kills=24`, `conservation_breaks=0` over 101,290 live `report()` samples from the observer thread (2026-10-25 artifact `target/pool_lease_stress_report.json`, `monitor_checks`), `[7,7,7,7]` generations, `wall_ms=199`. A child that hung before its first heartbeat is not expired — a pipe that never parsed a frame is the app's spawn timeout, not a lease breach.
 
-All three storms plus `stress_breaker_churn` run in the `pool-gates` job of `.github/workflows/stress.yml` on every push and pull request (4 lanes × 8 / 6 / 8 kills and 8 threads × 1500 churn ops, ~2 s of test time); the heavier supervisor and multi-lineage harnesses stay scheduled or dispatch-only.
+All three storms plus `stress_breaker_churn` run in the `release-ignored` job of `.github/workflows/ci.yml` on every push and pull request (4 lanes × 8 / 6 / 8 kills and 8 threads × 1500 churn ops, ~2 s of test time); the heavier supervisor and multi-lineage harnesses stay scheduled or dispatch-only.
 
 Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~192 ns (ambush) / ~173 ns (escape), a four-lane `report()` is ~111 ns, a four-lane lease sweep is ~517 ns, and `namespace_task` is ~1 ns — each lane locks only its own state.
 

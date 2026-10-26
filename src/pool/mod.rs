@@ -58,6 +58,11 @@ use crate::supervisor::{Backoff, MemoryPolicy, RestartPolicy, RestartWindow};
 /// [`PoolConfig::with_eof_grace`], never silently changed.
 pub const DEFAULT_EOF_GRACE_MS: u64 = 250;
 
+const _: () = assert!(
+    DEFAULT_EOF_GRACE_MS == 250,
+    "DEFAULT_EOF_GRACE_MS is a published format contract (250 ms)"
+);
+
 /// Declarative pool configuration, copied into every lane.
 ///
 /// The restart parts are PER LANE: lane 3's crash storm advances only lane

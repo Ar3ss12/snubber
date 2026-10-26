@@ -169,6 +169,13 @@ impl Priority {
     }
 }
 
+// The doc table calls `Priority::COUNT` a compile-asserted format ceiling;
+// this is that assert. Changing COUNT is a snapshot/wire version bump.
+const _: () = assert!(
+    Priority::COUNT == 3,
+    "Priority::COUNT is a published wire contract (3 priority lanes)"
+);
+
 /// Dynamic or static error context accompanying fault events.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FaultDetail {

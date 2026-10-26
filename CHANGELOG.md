@@ -53,6 +53,31 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
   a skipped tick under-reports one recovery; a synchronous re-lock wedged
   the caller forever. The doc comment now says exactly that.
 
+### Documentation
+
+- Every published number now carries a source. The README benchmark
+  tables are marked historical (2026-10-24 / 2026-10-25 full 50-sample
+  runs, command included); the contended table quotes the archived
+  2026-10-25 artifact (925 / 899 / 146 / 34 ns — the previous 918 / 911 /
+  140 / 35.5 values match no artifact) and shows the 2026-10-26 smoke
+  re-run alongside, with the rule "quote full-run artifacts, not smoke
+  checks". Storm numbers now match the 2026-10-25 reports
+  (`wall_ms=53/479/199`, 101,290 lease samples) and name their artifacts.
+- README no longer names `pool-gates` (an artifact name) as the CI job
+  for the pool storms — it is the `release-ignored` job of `ci.yml`; the
+  guard bullet no longer claims a `Copy` shell (`SnubberGuard` is not
+  `Copy`); `src/lib.rs` says five layers, matching README/USER_GUIDE.
+- `docs/INVARIANTS.md`: "four properties" → thirteen invariants (the
+  document lists 13); the `mem::forget` example size is corrected to
+  1,648 B with the measurement command (`-Zprint-type-sizes`, nightly
+  toolchain log) instead of the unsourced 2,288 B.
+- Compile asserts added where the docs claim them: `Priority::COUNT == 3`
+  and `DEFAULT_EOF_GRACE_MS == 250` are now `const`-checked
+  (`src/policy.rs`, `src/pool/mod.rs`).
+- USER_GUIDE storm numbers and contended rows synced to the same
+  artifacts; `queue_capacity` semantics documented in one place (async
+  waker-queue ceiling, sync admission horizon, async `0` → 1 floor).
+
 ### Tests
 
 - New `queue_horizon` test pins the documented async asymmetry of

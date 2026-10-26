@@ -6,7 +6,7 @@
 
 ## 1. Core Invariants
 
-The state machine of `snubber` guarantees that the following four properties hold unconditionally under Safe Rust:
+The state machine of `snubber` guarantees that the following thirteen invariants hold unconditionally under Safe Rust (Invariants 1–4 are the core machine; 5–13 extend the guarantee to clocks, locks, telemetry, impedance, reclaim, parsing, API evolution and async liveness):
 
 ### Invariant 1: Conservation of Admissions
 At any point in time, the sum of all terminal and active states equals the total number of attempted admissions:
@@ -138,7 +138,10 @@ outlives every transaction.
   whose closures own a heap payload, including node erased commit and abort
   cycles, restore the thread's heap baseline.
 - Reintroducing one `mem::forget(self)` shows up as a stranded
-  `NodeInner` allocation (2,288 B in the reference build), not as a
+  `NodeInner` allocation (1,648 B in the reference build; measured with
+  `CARGO_TARGET_DIR=target/sizecheck RUSTFLAGS="-Zprint-type-sizes"
+  cargo +nightly-2026-10-09 rustc --lib --all-features` — the log also
+  reads `Mutex<NodeInner>: 1,656 B`, `ArcInner<…>: 1,672 B`), not as a
   statistic drift — and gate 7/7 plus `#![deny(clippy::mem_forget)]`
   reject the call before it builds.
 - Closure ownership is observable: `Arc::strong_count` on a captured

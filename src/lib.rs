@@ -1,6 +1,6 @@
 //! `snubber` — transactional RAII guard with bulkhead node and failure-recovery engine.
 //!
-//! Three layers:
+//! Five layers:
 //!
 //! * **Layer 1 (core-only, v0.1):** [`SnubberGuard`] (Drop-guaranteed
 //!   rollback) + [`EpochGate`] (monotonic late-packet filter).
@@ -13,6 +13,11 @@
 //!   [`crate::FaultDetail`] (static-or-owned breach reasons —
 //!   `Static` is zero-cost, `Owned` carries live values like
 //!   `interval=359999640000`; no Clone-on-write semantics by design).
+//! * **Layer 4 (`core` wire + `std` supervisor):** [`ProcessToken`]
+//!   framing, [`drain::SnubScanner`] parsing, [`supervisor::PipeDrain`],
+//!   the process pool and supervised entry points.
+//! * **Layer 5 (`core` codec + `std` render):** [`diagnostics`]
+//!   512-byte snapshot, anomaly triage and health export.
 //!
 //! Core stays dependency-free and `unsafe`-free; the node adds only
 //! `std::sync` (shared recorder) — no runtimes, no HTTP, no executor.

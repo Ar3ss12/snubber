@@ -1158,14 +1158,14 @@ Measured costs (release, Criterion `layer4_worker_pool`): `attach +
 note_death` ~192 ns (ambush) / ~173 ns (escape), four-lane `report()`
 ~111 ns, four-lane `expired_lanes(5)` ~517 ns (~129 ns per lane, one
 state lock each), `namespace_task` ~1 ns, `note_memory_kb` ~12 ns. The
-storm gates on this machine (debug): 4 lanes × 8 armed kills = 32/32
-ambush, `wall_ms=74`; the mixed storm produces an equal four-way split (A/E/S/D =
-8/8/8/8, 8 rescued) with `deadlock=true` and `wall_ms=486` — the orphan mode
+storm gates on this machine (debug; 2026-10-25 artifacts): 4 lanes × 8 armed kills = 32/32
+ambush, `wall_ms=53`; the mixed storm produces an equal four-way split (A/E/S/D =
+8/8/8/8, 8 rescued) with `deadlock=true` and `wall_ms=479` — the orphan mode
 keeps its pipe open past the 150 ms grace, so the deadlock bucket is
 proven, not simulated. The lease storm kills 24 workers that beat once
 and then hang (4 lanes × 6, 25 ms lease): 24/24 stillborn, `lease_kills=24`,
-0 deadlocks, 0 conservation breaks over ~90k live `report()` samples
-from the observer thread, `[7,7,7,7]` generations, `wall_ms=220`.
+0 deadlocks, 0 conservation breaks over 101,290 live `report()` samples
+from the observer thread, `[7,7,7,7]` generations, `wall_ms=199`.
 
 **Reference:** `examples/19_worker_pool.rs` (supervisor and worker modes,
 `--mixed` four-class storm, `--lease-ms` euthanasia storm, JSON report),
@@ -1184,8 +1184,8 @@ and generations). Each storm also gates app-side token receipt
 (`tokens_seen`) and lineage (`token_lane_mismatch`), so the pool's
 `rescued` counter is checked against a witness rather than against
 `ambush`, which it shares an increment with. The three pool storms and
-`stress_breaker_churn` run in the `pool-gates` CI job on every push and
-pull request; the heavier supervisor and multi-lineage harnesses are
+`stress_breaker_churn` run in the `release-ignored` CI job of
+`.github/workflows/ci.yml` on every push and pull request; the heavier supervisor and multi-lineage harnesses are
 scheduled or dispatch-only.
 
 ### 4.7 Orphan contract (Phase 6: no zombies)
@@ -1770,10 +1770,10 @@ below ~2 ns are inside run-to-run noise and are not claimed as wins.
 | `write_triage(&mut out, node, &snap)` | 2 / cold | `fmt::Write`, no alloc | One ASCII verdict card per node |
 | `node_passthrough_enter` | 2 / std canary | **~97.1 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
 | `node_passthrough_scoped` | 2 / std canary | **~94.8 ns** | Same transit through `scoped()` — work runs, books stay clean |
-| `contended_node_enter_threads_6` (6 threads, shared `enter_auto` admit counter) | 2 / std contended | **~918 ns** | MESI cache-line bouncing on node mutex; StaleEpoch losers bounded-retry (cap 64 + yield), same contract as `concurrency_stress` |
-| `contended_node_scoped_threads_6` (6 threads) | 2 / std contended | **~911 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
-| `contended_gateway_mpsc_threads_6` (6 producers + drain) | 2 / std contended | **~140 ns** | Bounded multi-producer write under parallel core flood |
-| `cross_thread_isr_bridge_push_pop` (push core + pop core) | 1 / core inter-core | **~35.5 ns** | Lock-free SPSC ring across physical cores (honest inter-core bus latency, not L1-hot loop) |
+| `contended_node_enter_threads_6` (6 threads, shared `enter_auto` admit counter) | 2 / std contended | **~925 ns** | MESI cache-line bouncing on node mutex; StaleEpoch losers bounded-retry (cap 64 + yield), same contract as `concurrency_stress` |
+| `contended_node_scoped_threads_6` (6 threads) | 2 / std contended | **~899 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
+| `contended_gateway_mpsc_threads_6` (6 producers + drain) | 2 / std contended | **~146 ns** | Bounded multi-producer write under parallel core flood |
+| `cross_thread_isr_bridge_push_pop` (push core + pop core) | 1 / core inter-core | **~34 ns** | Lock-free SPSC ring across physical cores (honest inter-core bus latency, not L1-hot loop) |
 | `node.enter_async_auto` | 2 / std | 0% CPU waker park | Async admission under bounded concurrency |
 | `guard.settle_async(fut)` | 2 / std | zero lock during await | Commit across `.await` points |
 | `TaskConduit` / `TaskHandle` | 2 / std | lock-free atomics | 2-way live steering, pause/resume waker, drafts |
