@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-423%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-424%20passed-brightgreen.svg)]()
 
 <!-- Badge provenance: `bash scripts/check_test_count.sh` (all features, 5 ignored), last verified 2026-10-26. -->
 
@@ -49,7 +49,7 @@ let receipt = node.scoped_checked(
 
 ## 🔌 Embedded & `no_std`
 
-`std` and `alloc` are additive features. Without `std` the crate is `core`-only (`#![cfg_attr(not(feature = "std"), no_std)]`); CI builds **both** `core` and `core + alloc` for `thumbv7em-none-eabihf`, and `WorkerPulse` drops to a 32-bit atomic on targets without 64-bit CAS. The `no_std` surface is the watchdog, ISR bridge, clock, envelope, contract, policy, diagnostics core, memory watch, drain (token parser + `SnubScanner`), and protect layers; `alloc` adds the erased guard and dynamic node-name layers; `SnubberNode` itself and the async engine, supervisor, pool, channel, conduit, conflate, and harness layers are `std` because they own OS threads, pipes, and process trees.
+`std` and `alloc` are additive features. Without `std` the crate is `core`-only (`#![cfg_attr(not(feature = "std"), no_std)]`); CI builds **both** `core` and `core + alloc` for `thumbv7em-none-eabihf`, and `WorkerPulse` drops to a 32-bit atomic on targets without 64-bit CAS. The `no_std` surface is the watchdog, ISR bridge, clock, envelope, contract, policy, diagnostics core, memory watch, drain (token parser + `SnubScanner`), and protect layers; `alloc` upgrades the same layers with the erased guard and owned node-name types; `SnubberNode` itself and the async engine, supervisor, pool, channel, conduit, conflate, and harness layers are `std` because they own OS threads, pipes, and process trees.
 
 The supervisor parser does not require a reader thread or stdout. `PipeDrain` is `std` (it owns the EOF state and counters); push bytes from a UART/DMA task and declare EOF yourself. On `core`-only targets, the same bytes go straight into the `core` `SnubScanner`:
 
@@ -148,17 +148,17 @@ run-to-run noise and are not claimed as wins.
 | `lane.attach` + `note_death` (escape) → `PoolReap` | Layer 4 (`std`) | **~173 ns** | Same path when the child settled (commit parsed, no token) |
 | `pool.report()` (4 lanes) | Layer 4 (`std`) | **~111 ns** | Rows (`LaneSnapshot`) + `PoolTotals::of`: four short lane locks, totals fold, one `Vec<LaneSnapshot>` allocation (`lanes.len()` rows) included in the number |
 | `LaneSnapshot` / `PoolTotals` | Layer 4 (`std`) | `Clone` row / `Copy` totals | `conserved()` = `ambush+escape+stillborn+deadlocks == reaps`; no guessed fifth bucket |
-| `run_supervised_guard_with_grace(..)` | Layer 3 (`std`) | one reaped child process | Supervised guard with a configurable terminal EOF grace for slow-flushing children |
-| `DEFAULT_EOF_GRACE_MS` (250 ms) | Layer 3 (`std`) | published const | Default terminal EOF grace; `run_supervised_guard_with_grace` and the pool builder override it |
+| `run_supervised_guard_with_grace(..)` | Layer 4 (`std`) | one reaped child process | Supervised guard with a configurable terminal EOF grace for slow-flushing children |
+| `DEFAULT_EOF_GRACE_MS` (250 ms) | Layer 4 (`std`) | published const | Default terminal EOF grace; `run_supervised_guard_with_grace` and the pool builder override it |
 | `lane.note_memory_kb` | Layer 4 (`std`, cold) | **~12 ns** | Per-lane watch: one lock + integer compares |
 | `pool.expired_lanes(lease)` (4 lanes) | Layer 4 (`std`, cold) | **~517 ns** | One sweep over four silent pipes: one state lock per lane, no child touched |
 | `run_supervised_guard_with_memory` | Layer 4 (`std`) | structural: 1 sampler call / 10 ms tick | Soft logs `MEMORY_DRAIN`; hard `kill()` without draining (`DeathCause::MemoryLimit`) |
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | Layer 2 (`std`, opt-in) | structural: 1 `Box` + 1 clock/stage | Stage wall/CPU breakdown; default `enter*` reads no profile clock |
 | `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.13 µs** | 512-byte zero-allocation snapshot CRC32 codec |
-| `friction_fn` handler call (`Arc<dyn Fn>`) | Layer 4 (`std`) | **~1.8 ns** | Capture-capable friction: one dynamic dispatch outside the node lock |
-| `friction_wait_ms` (adaptive, Arc handler) | Layer 4 (`std`) | **~21.5 ns** | Lock + `Arc` clone + handler; identical to the legacy fn-pointer path (~21.5 ns) |
-| `NodeName::Static` clone | Layer 4 (`std`) | **~1.6 ns** | Fat-pointer copy, no allocation |
-| `NodeName::Owned` clone | Layer 4 (`std`) | **~10.0 ns** | One `Arc<str>` increment; `as_str` ~1.0 ns |
+| `friction_fn` handler call (`Arc<dyn Fn>`) | Layer 2 (`std`) | **~1.8 ns** | Capture-capable friction: one dynamic dispatch outside the node lock |
+| `friction_wait_ms` (adaptive, Arc handler) | Layer 2 (`std`) | **~21.5 ns** | Lock + `Arc` clone + handler; identical to the legacy fn-pointer path (~21.5 ns) |
+| `NodeName::Static` clone | Layer 2 (`alloc`) | **~1.6 ns** | Fat-pointer copy, no allocation |
+| `NodeName::Owned` clone | Layer 2 (`alloc`) | **~10.0 ns** | One `Arc<str>` increment; `as_str` ~1.0 ns |
 | `snapshot_v1()` + `find_anomalies()` | Layer 5 (cold) | structural: 512 B, CRC32 | Zero-allocation telemetry; `assert_no_anomalies!()` CI gate |
 | `before.diff(&after)` + `write_triage` | Layer 5 (cold) | structural: pure `Copy` math + `fmt::Write` | Counter deltas since last sample; one ASCII verdict card |
 | `memory_limits(soft, hard)` + admission | Layer 2 (`std`) | structural: 1 relaxed load | Over soft → `EnterError::MemoryPressure` without taking the mutex |

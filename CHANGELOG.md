@@ -65,12 +65,30 @@ surface, wire format and telemetry layout are untouched.
 - USER_GUIDE states the actual SKIP policies: platform-gated skips print
   and pass locally for `.sh`/`.py` but fail under `CI=true/1`; `.ps1`
   fails on any skip in every environment.
+- The layer map is one document again. `src/lib.rs` now describes the
+  same five layers as README and the User Guide (Layer 3 is the
+  runtime-agnostic async engine, not the `alloc` extensions), states
+  that `alloc` upgrades the existing layers in place rather than adding
+  one, and the README rows for the supervised entry points, friction
+  hooks and `NodeName` carry their real layer (4, 2, 2).
+- `missing_docs` is `deny` instead of `warn`: the documented surface is
+  already complete, so a new undocumented public item now fails the
+  build in every feature combination instead of scrolling past as a
+  warning.
 
 ### Tests
 
 - `tests/state_handoff.rs::out_of_range_state_chunk_is_not_chunk_two`
   (an out-of-range `task` must not promote to chunk 2) and
   `src/isr.rs::shed_saturates_at_the_ceiling_without_wrap`.
+- `tests/conservation_model.rs::mixed_policy_columns_conserve_every_attempt`
+  drives `EvictOldest` overbooking, the `max + 1` bulkhead ceiling, a
+  `Critical`-over-`Background` preemption request, a watchdog timeout,
+  commit, planned abort and implicit drop through one node and compares
+  every column against an explicit ledger:
+  `admission_total() == total_started + shed_total()`, `evicted` and
+  `preempted` excluded from the shed side, and `reported[]` verified as
+  an alert ledger rather than a conservation term.
 
 ## 0.6.10 (2026-10-26)
 

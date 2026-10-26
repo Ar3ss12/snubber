@@ -3,27 +3,34 @@
 //! Five layers:
 //!
 //! * **Layer 1 (core-only, v0.1):** [`SnubberGuard`] (Drop-guaranteed
-//!   rollback) + [`EpochGate`] (monotonic late-packet filter).
+//!   rollback), [`EpochGate`] (monotonic late-packet filter), the hang
+//!   classifier, [`ExecutionEnvelope`], [`MemoryWatch`] and the fault
+//!   policy tables.
 //! * **Layer 2 (`std`, v0.2):** [`SnubberNode`] — bounded bulkhead,
-//!   circuit breaker, flight-recorder stats, `#[track_caller]` fault
-//!   coordinates and a capped console reporter.
-//! * **Layer 3 (`alloc`, in `default` since v0.3):**
-//!   [`crate::ErasedGuard`] (nameable struct-field guard),
-//!   [`crate::ClosurePolicy`] (capturing self-healing commands) and
-//!   [`crate::FaultDetail`] (static-or-owned breach reasons —
-//!   `Static` is zero-cost, `Owned` carries live values like
-//!   `interval=359999640000`; no Clone-on-write semantics by design).
-//! * **Layer 4 (`core` wire + `std` supervisor):** [`ProcessToken`]
+//!   circuit breaker, priority lanes, flight-recorder stats,
+//!   `#[track_caller]` fault coordinates and a capped console reporter;
+//!   plus the channel gateway, watchdog, [`conduit`]/[`conflate`] task
+//!   steering and the boundary harness.
+//! * **Layer 3 (`std`):** runtime-agnostic async entry. [`SnubberNode::enter_async`]
+//!   parks one [`core::task::Waker`] and settles it from the node itself,
+//!   so it runs on any executor (Tokio, async-std, smol, embassy or a
+//!   hand-rolled loop) without pulling in a runtime crate; paced entry,
+//!   leases and settle helpers live here too.
+//! * **Layer 4 (`core` wire + `std` supervisor/pool):** [`ProcessToken`]
 //!   framing, [`drain::SnubScanner`] parsing, [`supervisor::PipeDrain`],
 //!   the process pool and supervised entry points.
 //! * **Layer 5 (`core` codec + `std` render):** [`diagnostics`]
 //!   512-byte snapshot, anomaly triage and health export.
 //!
-//! Core stays dependency-free and `unsafe`-free; the node adds only
-//! `std::sync` (shared recorder) — no runtimes, no HTTP, no executor.
-//! Async entry is opt-in: [`SnubberNode::enter_async`] parks one waker
-//! and settles it from the node itself, so it runs on any executor
-//! (including a hand-rolled one) without pulling in a runtime crate.
+//! `alloc` is not a sixth layer: it upgrades the same five layers in
+//! place — [`crate::FaultDetail`] (owned breach reasons) on Layer 1,
+//! [`crate::ErasedGuard`] (nameable struct-field guard) and
+//! [`crate::ClosurePolicy`] (capturing self-healing commands) on
+//! Layer 2, [`crate::NodeName`] (owned node labels) wherever a node is
+//! named.
+//!
+//! Every layer stays dependency-free and `unsafe`-free; the node adds
+//! only `std::sync` (shared recorder) — no runtimes, no HTTP, no executor.
 //!
 //! # Feature gates
 //!
@@ -59,7 +66,7 @@
 // drop glue for every field and once leaked one `NodeInner` per settled
 // transaction. Gate 7 enforces the same rule for every file under src/.
 #![deny(clippy::mem_forget)]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
