@@ -559,7 +559,12 @@ if ($supSamples -gt 0) {
 }
 
 $failedChecks = @($checks | Where-Object { -not $_.Ok })
-$verdict = if ($completed -eq $Kills -and $failedChecks.Count -eq 0 -and $report) { "PASS" } else { "FAIL" }
+# One verdict formula across all three harnesses (mirrors
+# stress_multi_lineage.py): a SKIP is a hole, not a pass. Checks may
+# carry Ok = $null (platform-gated); a skipped check fails the verdict
+# and is printed as SKIP, never silently promoted to OK.
+$skippedChecks = @($checks | Where-Object { $null -eq $_.Ok })
+$verdict = if ($completed -eq $Kills -and $failedChecks.Count -eq 0 -and $skippedChecks.Count -eq 0 -and $report) { "PASS" } else { "FAIL" }
 
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "   STRESS RESULTS" -ForegroundColor Cyan
@@ -596,8 +601,12 @@ if ($supSamples -gt 0) {
     Write-Host ("Harness CPU     : {0:N1}% avg ({1:N1}s) | timer resolution: {2}" -f $harnessAvgPct, $harnessCpuSeconds, $(if ($timerRes) { "winmm 1 ms" } else { "default" }))
 }
 foreach ($c in $checks) {
-    $color = if ($c.Ok) { "Green" } else { "Red" }
-    Write-Host ("Check           : {0} {1}" -f $(if ($c.Ok) { "OK  " } else { "FAIL" }), $c.Name) -ForegroundColor $color
+    $state = if ($null -ne $c.Ok) { if ($c.Ok) { "OK  " } else { "FAIL" } } else { "SKIP" }
+    $color = if ($null -ne $c.Ok -and $c.Ok) { "Green" } elseif ($null -eq $c.Ok) { "Yellow" } else { "Red" }
+    Write-Host ("Check           : {0} {1}" -f $state, $c.Name) -ForegroundColor $color
+}
+if ($skippedChecks.Count -gt 0) {
+    Write-Host ("[skip accounting] {0} check(s) skipped: platform-gated" -f $skippedChecks.Count) -ForegroundColor Yellow
 }
 $verdictColor = if ($verdict -like "PASS*") { "Green" } else { "Red" }
 Write-Host ("Verdict         : {0}" -f $verdict) -ForegroundColor $verdictColor

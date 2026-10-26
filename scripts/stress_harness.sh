@@ -421,6 +421,7 @@ ESCAPE=$(read_json_int escape_kills)
 STILLBORN=$(read_json_int stillborn_kills)
 
 CHECKS_FAILED=0
+SKIPPED=0
 CHECK_LINES=""
 add_check() {
     if [ "$1" = "1" ]; then
@@ -434,6 +435,7 @@ add_check() {
 # either PASS or FAIL (mirrors stress_multi_lineage.py's SKIP accounting).
 add_skip() {
     CHECK_LINES="${CHECK_LINES}Check           : SKIP $1"$'\n'
+    SKIPPED=$((SKIPPED + 1))
 }
 if [ -n "$REAPED" ]; then
     [ "$REAPED" -eq "$EXECUTED" ] && add_check 1 "reaped == kills" || add_check 0 "reaped == kills"
@@ -482,9 +484,17 @@ else
     fi
 fi
 
+# One verdict formula across all three harnesses (mirrors
+# stress_multi_lineage.py): a SKIP is a hole, not a pass. In CI any
+# skipped check fails the run; locally a platform-gated skip is printed
+# and allowed, never silently promoted to OK.
 VERDICT="FAIL"
-if [ "$EXECUTED" -eq "$KILLS" ] && [ "$CHECKS_FAILED" -eq 0 ] && [ -n "$REAPED" ]; then
+if [ "$EXECUTED" -eq "$KILLS" ] && [ "$CHECKS_FAILED" -eq 0 ] && [ -n "$REAPED" ] \
+    && { ! in_ci || [ "$SKIPPED" -eq 0 ]; }; then
     VERDICT="PASS"
+fi
+if [ "$SKIPPED" -gt 0 ]; then
+    printf '[skip accounting] %i check(s) skipped: platform-gated\n' "$SKIPPED"
 fi
 
 RATE=$(awk -v n="$EXECUTED" -v ms="$DUR_MS" 'BEGIN { printf "%.1f", ms > 0 ? 1000*n/ms : n }')

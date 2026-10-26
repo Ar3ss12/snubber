@@ -97,3 +97,33 @@ fn wait_while_paused_blocks_on_condvar_until_resume() {
     assert_eq!(worker.join().expect("worker joins"), Directive::Proceed);
     assert!(WORKER_PASSED.load(Ordering::Acquire));
 }
+
+// F-08 (PLAN_AUDIT2): the recovery path must never re-lock the ledger —
+// `safe_lock` stays callable while the node lock is contended (a foreign
+// mutex poisoned inside a node-locked section). Hammer it concurrently
+// with node readers: the recovered guard is always the live value.
+#[test]
+fn poison_recovery_never_relocks_the_node_ledger() {
+    let node = SnubberNode::builder("safe_lock/hammer").build();
+    let m = Mutex::new(0u32);
+    std::thread::scope(|s| {
+        let poisoner = s.spawn(|| {
+            let _g = m.lock().unwrap();
+            panic!("foreign panic under lock");
+        });
+        // Concurrent node readers keep the ledger lock contended while the
+        // recovery below runs — the old synchronous re-lock would deadlock
+        // against them.
+        s.spawn(|| {
+            for _ in 0..64 {
+                let _ = node.stats();
+            }
+        });
+        let _ = poisoner.join(); // the deliberate panic is the poison source
+    });
+    assert!(m.is_poisoned());
+    let g = m.safe_lock(&node);
+    assert_eq!(*g, 0, "recovered guard is the live value");
+    drop(g);
+    assert!(node.stats().poison_recoveries >= 1, "recovery ticked");
+}

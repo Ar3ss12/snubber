@@ -378,10 +378,15 @@ jobs:
   # forgotten Drop is invisible there. This lane runs WITHOUT it: any heap
   # allocation still owned at process exit fails the suite.
   #
-  # Excluded on purpose:
-  #   * tests/channel.rs:13  -- wall-clock throttle test, needs real time
-  #   * tests/task_engine.rs:271 -- wall-clock TTL margins (cfg(miri) ignore)
-  #   * supervisor suites -- spawn real processes, unsupported under Miri
+  # Excluded on purpose (this lane intentionally mirrors the 3a suite set):
+  #   * tests/channel.rs:13 four_senders_one_host_reject_new
+  #     -- sleep-based throttle retry needs real time (cfg_attr(miri, ignore))
+  #   * tests/task_engine.rs:296 spurious_repolls_do_not_reset_the_ttl_clock
+  #     -- wall-clock TTL margins (cfg_attr(miri, ignore))
+  #   * the 3b concurrency suites -- wall-clock deadlines, process spawns and
+  #     grace windows that Miri cannot schedule deterministically; every
+  #     allocation-ownership path they exercise is already covered by the
+  #     3a suites above (guard, erased, conduit, watchdog, ...).
   miri-leaks:
     name: Miri Leak Checking (no -Zmiri-ignore-leaks)
     needs: quality

@@ -611,8 +611,11 @@ def run(args: argparse.Namespace, repo: Path) -> int:
         print(f"  {label}  {name}" + (f"  ({detail})" if detail else ""))
     if skipped:
         print(f"  [skip accounting] {len(skipped)} check(s) skipped: platform-gated", flush=True)
-    # A skipped check is a hole, not a pass: reduced coverage fails the run.
-    verdict = "PASS" if not failed and not skipped else "FAIL"
+    # A skipped check is a hole, not a pass. In CI (GitHub Actions sets
+    # CI=true/1) any skip fails the run; locally a platform-gated skip is
+    # printed above and allowed (mirrors stress_harness.sh's in_ci rule).
+    in_ci = os.environ.get("CI", "").lower() in ("true", "1")
+    verdict = "PASS" if not failed and (not skipped or not in_ci) else "FAIL"
     print(f"[VERDICT] {verdict}", flush=True)
 
     stats = {

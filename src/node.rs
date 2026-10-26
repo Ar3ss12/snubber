@@ -4013,6 +4013,14 @@ impl SnubberNode {
     /// The recovered guard is the live value — the caller continues safely.
     /// NOTE: the poison flag is sticky — every `safe_lock` on an
     /// already-poisoned mutex ticks again (one tick per recovery, honest).
+    ///
+    /// The recovery path NEVER re-locks the ledger synchronously: this
+    /// must stay callable while the caller holds the node lock (a foreign
+    /// `Mutex` poisoned inside a node-locked section). The tick uses
+    /// `try_lock` — when the ledger is momentarily held (including by the
+    /// calling thread itself) the tick is skipped and the recovery still
+    /// hands back the live guard. A skipped tick under-reports one
+    /// recovery; a synchronous re-lock would deadlock instead.
     pub fn lock_poison_tolerant<'a, T>(
         &self,
         m: &'a std::sync::Mutex<T>,
@@ -4021,15 +4029,12 @@ impl SnubberNode {
             Ok(g) => g,
             Err(poison) => {
                 // Count the recovery WITHOUT re-locking our own ledger:
-                // a plain `note_poison_recovery()` would `self.lock()` while
-                // the caller may already hold it. Direct inner access only.
-                let mut inner = match self.inner.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                inner.stats.poison_recoveries = inner.stats.poison_recoveries.saturating_add(1);
-                hard_clamp_slots(&mut inner);
-                drop(inner);
+                // the caller may already hold it (a poison recovery inside
+                // a node-locked section must not deadlock).
+                if let Ok(mut inner) = self.inner.try_lock() {
+                    inner.stats.poison_recoveries = inner.stats.poison_recoveries.saturating_add(1);
+                    hard_clamp_slots(&mut inner);
+                }
                 poison.into_inner()
             }
         }

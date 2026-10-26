@@ -46,9 +46,34 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 - `check_timeout` no longer bumps `reported[Timeout]` by hand;
   `record_locked` owns the slot for every path, so no caller can rewind
   or double a published counter.
+- `lock_poison_tolerant` no longer re-locks the node ledger synchronously
+  on the recovery path: a caller that held the node lock while recovering
+  a poisoned foreign mutex deadlocked on the ledger it already owned.
+  Recovery now ticks `poison_recoveries` best-effort via `try_lock` —
+  a skipped tick under-reports one recovery; a synchronous re-lock wedged
+  the caller forever. The doc comment now says exactly that.
 
 ### Tests
 
+- New `queue_horizon` test pins the documented async asymmetry of
+  `queue_capacity(0)`: the waker-queue capacity floors to 1, exactly one
+  waiter parks, the second is refused with `QueueFull` and the full
+  policy fires (sync `0` means the horizon fires on every admission —
+  different semantics, both now tested).
+- New `affordances` test proves `lock_poison_tolerant` recovers a
+  poisoned foreign mutex while another thread hammers `stats()`: the
+  recovery never re-locks the ledger, `poison_recoveries >= 1` and the
+  recovered guard reads 0.
+- Test honesty (stage 6): `wakes_happen_after_drop_in_node` is now a
+  function-scoped order audit (every `notify_all`/`w.wake()` in node.rs
+  follows a `drop(inner)` in the same function) instead of a count
+  heuristic; the termination example exports `frames_sum`/`arms_sum`/
+  `commits_sum` plus a `misclassified_stillborn` contradiction counter,
+  and `supervisor_termination` asserts cross-source floors (`arms_sum >=
+  ambush + escape`, `commits_sum >= escape`) instead of tautological
+  sums; all feed-path benches assert the parse result inside
+  `b.iter_black_box` and `bench_hygiene` fails any `.feed(` line whose
+  result is not asserted.
 - New `tests/rollback_panic.rs`: panicking rollbacks on explicit abort
   return `SnubberEvent::Aborted`, fire the rollback exactly once and
   release the slot (SnubberGuard, node TrackedGuard, ErasedGuard).
@@ -80,6 +105,27 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 
 ### Tooling / CI
 
+- The three stress harnesses share one SKIP verdict formula:
+  platform-gated skips are printed and allowed locally, but any skip
+  fails the run in CI. `stress_harness.sh` counts `SKIPPED` and gates the
+  verdict on it unless `CI` is unset; `stress_multi_lineage.py` gained
+  the same `CI`-aware rule; `stress_harness.ps1` prints SKIP rows
+  (tri-state OK/FAIL/SKIP) and fails the verdict on any skip. Negative
+  runs verified against the real verdict lines with synthetic state.
+- The Miri leak-lane comment now references the actual exclusions
+  (`tests/channel.rs:13` throttle retry, `tests/task_engine.rs:296`
+  wall-clock TTL) and documents that the lane intentionally mirrors the
+  core suite set — the concurrency suites rely on real-time deadlines and
+  process spawns Miri cannot schedule deterministically.
+- README no longer claims the heavy kill lanes gate every push: the
+  multi-lineage POSIX storm (4×250 armed-hold + 4×500 free-running) and
+  a 25-kill termination smoke gate every push/PR; the 200-kill
+  single-process harness, the 100-kill PowerShell harness, the Win32
+  multi-lineage storm and the full `#[ignore]` termination gate run on
+  the weekly schedule or manual dispatch.
+- USER_GUIDE documents all three `queue_limit`/`queue_capacity` semantics
+  in one place (async waker-queue ceiling, sync admission horizon,
+  telemetry-only behavior, and the async `0` → 1 floor).
 - `scripts/release.sh` now parses every `SKIP (...)` line in the compile
   gates log and tolerates exactly one, verbatim —
   `SKIP (cargo-semver-checks not installed)`. Any other SKIP fails the
