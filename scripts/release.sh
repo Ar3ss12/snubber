@@ -115,7 +115,7 @@ step "cargo fmt --check"
 cargo fmt --check || die "formatting drift (run: cargo fmt)"
 
 step "clippy (-D warnings, all targets/features)"
-cargo clippy ${JOBS} --all-targets --all-features -- -D warnings || die "clippy"
+cargo clippy ${JOBS} --locked --all-targets --all-features -- -D warnings || die "clippy"
 
 step "full suite + doctests + badge"
 CARGO_TERM_COLOR=never cargo test ${JOBS} --locked --all-features --color never \
@@ -171,7 +171,7 @@ if [ "${MODE}" = "nopublish" ]; then
 fi
 
 step "cargo publish --dry-run"
-cargo publish --dry-run || die "publish dry-run (dirty tree or package error)"
+cargo publish --dry-run --locked || die "publish dry-run (dirty tree or package error)"
 
 printf '\nRELEASE GATES GREEN\n'
 printf 'Next, only on an explicit order: git tag -a vX.Y.Z -m "...", push the tag, cargo publish.\n'
