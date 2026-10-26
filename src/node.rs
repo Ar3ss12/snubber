@@ -3756,6 +3756,15 @@ impl SnubberNode {
                     drop(old);
                     return core::task::Poll::Pending;
                 }
+                // The entry is gone. If an evictor retired it (the flag is
+                // stored under this same lock), the documented verdict for
+                // that future is `QueueFull`: re-parking here would burn a
+                // fresh slot and could evict a bystander. A settle pop
+                // leaves the flag clear — that re-park is honest.
+                if prev.load(Ordering::Acquire) {
+                    drop(inner);
+                    return core::task::Poll::Ready(Err(EnterError::QueueFull));
+                }
             }
 
             let q_cap = inner.queue_limit.max(1);
@@ -4028,6 +4037,12 @@ impl SnubberNode {
     /// calling thread itself) the tick is skipped and the recovery still
     /// hands back the live guard. A skipped tick under-reports one
     /// recovery; a synchronous re-lock would deadlock instead.
+    ///
+    /// The `hard_clamp_slots` repair is skipped together with the tick,
+    /// which is safe: a FOREIGN mutex poison cannot tear `NodeInner` (only
+    /// a panic inside a node-locked section can, and that path recovers in
+    /// `lock()`), and when another thread holds the ledger it finishes its
+    /// own mutation before releasing.
     pub fn lock_poison_tolerant<'a, T>(
         &self,
         m: &'a std::sync::Mutex<T>,

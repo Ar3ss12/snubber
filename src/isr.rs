@@ -191,13 +191,29 @@ impl IsrBridge {
     /// On `Full` the telemetry cell is dropped and `shed` increments
     /// (saturating); emergency trips never go through here — they use
     /// `trip()` and bypass the ring.
+    ///
+    /// Single producer per bridge: the ISR owns `head`, the main loop owns
+    /// `tail` (SPSC). Two producers sharing one bridge would corrupt the
+    /// ring regardless of the atomics.
     #[inline]
     pub fn try_push(&self, signal: IsrSignal) -> Result<(), IsrPushError> {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
         if head.wrapping_sub(tail) >= ISR_RING_CAP as u8 {
-            if self.shed.load(Ordering::Relaxed) < u16::MAX {
-                self.shed.fetch_add(1, Ordering::Relaxed);
+            // Saturating add as one CAS loop: a load-then-add let two
+            // producers on the u16::MAX edge wrap the counter to zero
+            // exactly when shed volume matters most.
+            let mut cur = self.shed.load(Ordering::Relaxed);
+            while cur < u16::MAX {
+                match self.shed.compare_exchange_weak(
+                    cur,
+                    cur + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
             }
             return Err(IsrPushError::Full);
         }
@@ -379,5 +395,18 @@ mod unit_tests {
             let _ = bridge.try_push(IsrSignal::new(OP_PULSE, 0, 0));
         }
         assert_eq!(bridge.shed_count(), 5);
+    }
+
+    /// The saturating add is one atomic op: after the ceiling every extra
+    /// shed must leave the counter at `u16::MAX`, never wrap to 0.
+    #[test]
+    #[cfg_attr(miri, ignore)] // 65,535 pushes: plain counter math, no model value
+    fn shed_saturates_at_the_ceiling_without_wrap() {
+        let bridge = IsrBridge::new();
+        while bridge.try_push(IsrSignal::new(OP_PULSE, 0, 1)).is_ok() {}
+        for _ in 0..=usize::from(u16::MAX) {
+            let _ = bridge.try_push(IsrSignal::new(OP_PULSE, 0, 0));
+        }
+        assert_eq!(bridge.shed_count(), u16::MAX);
     }
 }
