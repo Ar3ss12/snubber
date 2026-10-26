@@ -65,7 +65,7 @@ surface, wire format and telemetry layout are untouched.
   the library on Rust 1.70 in three shapes (core, core + alloc, std).
   Proven locally with `cargo +1.70 check --locked --lib` (all three
   green) and a negative probe: a temporary `LazyLock` fails on 1.70 with
-  `E0063` / `lazy_cell` unstable. The guide now states the honest scope —
+  `E0658` (`lazy_cell` unstable). The guide now states the honest scope —
   the dev graph (criterion → clap) needs Rust 1.74+, so tests and benches
   are outside the floor and this lane deliberately does not use
   `-D warnings` (linting stays in the stable quality job; 1.70's
