@@ -75,7 +75,9 @@ pub struct FaultRecord {
     pub stage_label: Option<&'static str>,
     /// Milliseconds spent waiting in the queue before admission.
     pub queue_wait_ms: u64,
-    /// Milliseconds elapsed between admission and failure.
+    /// Milliseconds elapsed between admission and failure. `0` when the
+    /// guard carried no deadline (`needs_stamp` leaves it unstamped, so
+    /// unarmed admissions never read the clock).
     pub elapsed_ms: u64,
     /// Number of retries already performed for this logical task (0 = first attempt).
     pub retry_count: u32,
@@ -92,7 +94,8 @@ pub struct GuardSnapshot {
     pub stage_label: Option<&'static str>,
     /// Milliseconds spent waiting in the queue before admission.
     pub queue_wait_ms: u64,
-    /// Milliseconds elapsed since admission.
+    /// Milliseconds elapsed since admission. `0` when the guard carries no
+    /// deadline (`needs_stamp` leaves it unstamped).
     pub elapsed_ms: u64,
     /// Deadline in milliseconds (0 = no deadline).
     pub deadline_ms: u64,
@@ -3441,7 +3444,7 @@ impl SnubberNode {
             is_passthrough: false,
             is_probe: was_half_open,
             priority,
-            armed_at_ms: now_ms(),
+            armed_at_ms: if needs_stamp(deadline) { now_ms() } else { 0 },
             deadline_ms: deadline,
             cpu_budget_ms: cpu_budget,
             stall_ceiling_ms: stall_ceiling,
@@ -3475,7 +3478,7 @@ impl SnubberNode {
             is_passthrough: true,
             is_probe: false,
             priority: Priority::Normal,
-            armed_at_ms: now_ms(),
+            armed_at_ms: 0,
             deadline_ms: 0,
             cpu_budget_ms: 0,
             stall_ceiling_ms: 0,
@@ -3964,7 +3967,7 @@ impl SnubberNode {
             stall_ceiling_ms,
             cpu_sampler: None,
             armed_cpu_ms: 0,
-            armed_at_ms: now,
+            armed_at_ms: if needs_stamp(deadline_ms) { now } else { 0 },
             settled: false,
             is_passthrough: false,
             is_probe,
@@ -5203,7 +5206,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             stage: self.stage,
             stage_label: self.stage_label,
             queue_wait_ms: self.queue_wait_ms,
-            elapsed_ms: now_ms().saturating_sub(self.armed_at_ms),
+            elapsed_ms: elapsed_since_stamp(self.armed_at_ms),
             deadline_ms: self.deadline_ms,
             retry_count: self.retry_count,
         }
@@ -5540,7 +5543,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             stage,
             stage_label: self.stage_label,
             queue_wait_ms: self.queue_wait_ms,
-            elapsed_ms: now_ms().saturating_sub(self.armed_at_ms),
+            elapsed_ms: elapsed_since_stamp(self.armed_at_ms),
             retry_count: self.retry_count,
             ..self.arming.clone()
         };
@@ -5598,6 +5601,31 @@ fn console_attached() -> bool {
     std::io::stderr().is_terminal()
 }
 
+/// Does an admission need a wall stamp?
+///
+/// `armed_at_ms` exists only for the watchdog: every reader
+/// (`is_expired`, `stall_kind`, `check_timeout`) returns early when
+/// `deadline_ms == 0`. Stamping an unarmed guard would pay one OS clock
+/// read per admission for a value nobody reads.
+#[inline]
+fn needs_stamp(deadline_ms: u64) -> bool {
+    deadline_ms > 0
+}
+
+/// Milliseconds since an admission stamp; `0` when no stamp was taken.
+///
+/// A guard armed inside the first millisecond of the process also reads 0
+/// here — the same value a stamped-but-just-armed guard would report, so
+/// the sentinel never invents a duration.
+#[inline]
+fn elapsed_since_stamp(armed_at_ms: u64) -> u64 {
+    if armed_at_ms == 0 {
+        0
+    } else {
+        now_ms().saturating_sub(armed_at_ms)
+    }
+}
+
 /// Refill the token bucket for one admission stamp.
 ///
 /// `now` is read BEFORE the node mutex, so two admissions can reach the
@@ -5618,8 +5646,19 @@ fn refill_tokens(rate_last_ms: u64, tokens: f64, now: u64, rate: u32) -> (u64, f
 }
 
 #[cfg(test)]
-mod rate_tests {
-    use super::refill_tokens;
+mod admission_math_tests {
+    use super::{elapsed_since_stamp, needs_stamp, refill_tokens};
+
+    #[test]
+    fn no_deadline_takes_no_stamp() {
+        assert!(!needs_stamp(0), "an unarmed guard must not read the clock");
+        assert!(needs_stamp(1), "a deadline needs a stamp");
+        assert_eq!(
+            elapsed_since_stamp(0),
+            0,
+            "an unstamped guard reports no duration"
+        );
+    }
 
     #[test]
     fn bucket_stamp_never_moves_backwards() {

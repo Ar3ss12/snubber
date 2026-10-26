@@ -52,6 +52,12 @@ fn wall_only_guard_times_out_without_sampler() {
         Err(TimeoutCheck::TimedOut) => {}
         _ => panic!("lease blown must settle as TimedOut"),
     }
+    let fault = node.stats().last_fault.expect("timeout fault recorded");
+    assert!(
+        fault.elapsed_ms >= 9,
+        "a stamped guard reports its wall age: {}",
+        fault.elapsed_ms
+    );
 }
 
 #[test]

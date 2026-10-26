@@ -12,6 +12,13 @@ surface, wire format and telemetry layout are untouched.
 
 ### Fixed
 
+- A guard with no watchdog armed takes no admission stamp
+  (`needs_stamp`): `armed_at_ms` is written only when a deadline exists,
+  and the passthrough dummy never reads the clock. `node.enter + commit`
+  drops 124 → ~91 ns, the passthrough canary 96.5 → ~55 ns (50-sample
+  Criterion runs, 2026-10-27). The documented cost: `FaultRecord::elapsed_ms`
+  and `GuardSnapshot::elapsed_ms` are `0` for guards without a deadline;
+  the timing contract is still pinned by a deadline-armed timeout test.
 - The token bucket can no longer be refilled twice for the same wall
   time. `now_ms()` is read before the node mutex, so two admissions can
   reach the lock out of order; the old code then wrote the older stamp

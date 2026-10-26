@@ -1824,8 +1824,8 @@ below ~2 ns are inside run-to-run noise and are not claimed as wins.
 | `ProfileHarness` + `HarnessReport` / `run_boundary_harness` | 2 / std | one `Vec` of samples + sort | Deterministic PRNG, min/median/max/jitter/burst matrix, `report.envelope(headroom)`; accessors: `HarnessReport::mean_us()`, `ProfileHarness::{samples, burst_len}`; `FastPrng` is the xorshift32 payload generator behind `run` |
 | `snapshot.diff(&later)` + `write_summary` | 2 / cold | pure `Copy` math | Counter deltas + memory/queue window (`SnapshotDiff`) |
 | `write_triage(&mut out, node, &snap)` | 2 / cold | `fmt::Write`, no alloc | One ASCII verdict card per node |
-| `node_passthrough_enter` | 2 / std canary | **~97.1 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
-| `node_passthrough_scoped` | 2 / std canary | **~94.8 ns** | Same transit through `scoped()` — work runs, books stay clean |
+| `node_passthrough_enter` | 2 / std canary | **~55 ns** | Open-doors transit: lock-free count + unstamped dummy guard, no slots/breaker/`EpochGate`/clock |
+| `node_passthrough_scoped` | 2 / std canary | **~52 ns** | Same transit through `scoped()` — work runs, books stay clean |
 | `contended_node_enter_threads_6` (6 threads, shared `enter_auto` admit counter) | 2 / std contended | **~925 ns** | MESI cache-line bouncing on node mutex; StaleEpoch losers bounded-retry (cap 64 + yield), same contract as `concurrency_stress` |
 | `contended_node_scoped_threads_6` (6 threads) | 2 / std contended | **~899 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
 | `contended_gateway_mpsc_threads_6` (6 producers + drain) | 2 / std contended | **~146 ns** | Bounded multi-producer write under parallel core flood |

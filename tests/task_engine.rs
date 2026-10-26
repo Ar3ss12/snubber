@@ -135,7 +135,7 @@ fn checkpoint_and_snapshot_telemetry() {
 }
 
 #[test]
-fn implicit_drop_records_stage_label_and_timing() {
+fn implicit_drop_records_stage_label() {
     static ROLLED_BACK: AtomicBool = AtomicBool::new(false);
     ROLLED_BACK.store(false, Ordering::SeqCst);
 
@@ -156,7 +156,11 @@ fn implicit_drop_records_stage_label_and_timing() {
     let fault = stats.last_fault.expect("fault recorded");
     assert_eq!(fault.stage, 3);
     assert_eq!(fault.stage_label, Some("query_executing"));
-    assert!(fault.elapsed_ms >= 4);
+    // No watchdog is armed here, so the guard is deliberately unstamped
+    // (`needs_stamp`): unarmed admissions never read the clock, and the
+    // record carries no wall duration. Timing WITH a deadline is covered
+    // by `wall_only_guard_times_out_without_sampler` in clock_pulse.rs.
+    assert_eq!(fault.elapsed_ms, 0);
     assert_eq!(fault.retry_count, 0);
 }
 

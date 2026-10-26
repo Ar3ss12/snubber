@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-428%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-429%20passed-brightgreen.svg)]()
 
 <!-- Badge provenance: `bash scripts/check_test_count.sh` (all features, 5 ignored), last verified 2026-10-26. -->
 
@@ -106,7 +106,10 @@ the node mutex, so every sync admission paid an OS clock read even when
 the token bucket was disarmed (the default). Bench: `node.enter +
 commit` 126 → 166 ns; the bucket's arming is now mirrored outside the
 mutex and the stamp is taken only when a token is actually checked,
-restoring 124 ns. `cargo bench` regenerates the whole table into
+restoring 124 ns. The 2026-10-27 pass went further: a guard with no
+deadline armed takes no stamp at all (`needs_stamp`), which also removed
+the clock read from the passthrough canary — `node.enter + commit`
+124 → ~91 ns, `node_passthrough_enter + commit` 96.5 → ~55 ns. `cargo bench` regenerates the whole table into
 `target/criterion/*/new/estimates.json`. The scheduled `bench-full` CI
 lane runs `cargo bench --locked --bench admission_bench`, then
 `bash scripts/bench.sh --skip-run --github` to render
@@ -127,14 +130,14 @@ reads as an operation rather than a Criterion key. Differences below
 | `WorkerPulse::kick` + `PulseWatch::observe` | Layer 1.5 (`core`) | **~5.8 ns** | One-word heartbeat store + observe fold; no lock, no allocation |
 | `IsrBridge::try_push` + `try_pop` | Layer 1.5 (`core`) | **~7.1 ns** | 80 B SPSC ring, lock-free; malformed cells drained on pop |
 | `IsrBridge::trip` + `take_trips` | Layer 1.5 (`core`) | **~9.3 ns** | 32-bit latch swap; trip bypasses a full ring |
-| `node.enter + commit` | Layer 2 (`std`) | **~124 ns** | Full bulkhead, circuit breaker, auto-commit; no clock read when the token bucket is disarmed |
-| `node.enter_auto + commit` | Layer 2 (`std`) | **~131 ns** | + atomic sequence minting |
-| `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~125 ns** | Priority lane; same band as plain enter (one measurement) |
-| `node.transition` | Layer 2 (`std`) | **~125 ns** | ONE-enum state machine, zero flag drift |
+| `node.enter + commit` | Layer 2 (`std`) | **~91 ns** | Full bulkhead, circuit breaker, auto-commit; no clock read when neither the token bucket nor a deadline is armed (unstamped guard) |
+| `node.enter_auto + commit` | Layer 2 (`std`) | **~94 ns** | + atomic sequence minting |
+| `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~87 ns** | Priority lane; same band as plain enter (one measurement) |
+| `node.transition` | Layer 2 (`std`) | **~90 ns** | ONE-enum state machine, zero flag drift |
 | `node.transition_checked` + `LegalMove` | Layer 2 (`std`) | same path, no extra work | Compile-time only: the `LegalMove` proof erases to the same `transition` call; illegal moves fail at compile (E0277) |
 | `enter_erased_auto` | Layer 2 (`alloc`) | **~205 ns** | ONE boxed transaction (rollback + commit hook + node clone in a single allocation; 0.6.8 moved the breaker outcome onto the guard's real `commit`). 301.6 → ~205 ns after folding two boxes and two `Arc` clones into one |
-| `node_passthrough_enter + commit` | Layer 2 (`std` canary) | **~96.5 ns** | Open-doors transit: lock-free count + dummy guard, no slots/breaker/`EpochGate` |
-| `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~94.6 ns** | Same transit through `scoped()` — work runs, books stay clean |
+| `node_passthrough_enter + commit` | Layer 2 (`std` canary) | **~55 ns** | Open-doors transit: lock-free count + unstamped dummy guard, no slots/breaker/`EpochGate`/clock |
+| `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~52 ns** | Same transit through `scoped()` — work runs, books stay clean |
 | `ConflateSender::publish + take_latest` | Layer 2 (`std`) | **~21.7 ns** | One-slot latest wins, no allocation, no `Clone` bound |
 | `ConflateSender::publish` (occupied slot) | Layer 2 (`std`) | **~15.7 ns** | Replaced value counted, never queued |
 | `guard.commit_enveloped(64)` | Layer 2 (`std`) | **~142 ns** | Payload corridor exact; wall corridor only for profiled guards |
