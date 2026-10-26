@@ -8,6 +8,14 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 
 ### Fixed
 
+- The sync queue horizon is telemetry-only. When live admissions reach
+  `queue_capacity`, the node records the `BufferOverflow` gauge
+  (`buffer_overflow_total`, console line) but no longer executes
+  `policy.action` on the admission that still succeeds. Previously a
+  `TripBreaker`/`RollbackAndAlert`/custom policy armed on `BufferOverflow`
+  tripped the breaker or latched the UI alert on successful admissions.
+  The async `RejectNew` queue-full refusal is a genuine rejection and
+  keeps the full policy, including `bulkhead_rejections`.
 - Every automatic fault path (guard settle, async TTL timeout, async
   evict-oldest, admission refusals: bulkhead/stale/rate/breaker/poison)
   now bumps `reported[kind]` exactly once via `record_locked`, so
@@ -30,6 +38,13 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 
 ### Tests
 
+- New `tests/queue_horizon.rs`: `TripBreaker` and `RollbackAndAlert`
+  armed on `BufferOverflow` do not fire on horizon hits over
+  `queue_capacity(0)`; the gauge still exports `buffer_overflow_total`
+  and the conservation law holds; the async `QueueFull` refusal with the
+  same policy still trips the breaker and books `bulkhead_rejections`.
+  Negative run verified: restoring `record_locked` in the horizon branch
+  turns 2 of 4 tests red.
 - New `tests/metrics_reporting.rs`: every automatic path exports exactly
   one metric sample with `count >= 1`, the hook snapshot carries the same
   alert count, named vs automatic reports of one kind agree on the

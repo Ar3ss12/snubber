@@ -3337,11 +3337,14 @@ impl SnubberNode {
         }
 
         // 4. Queue horizon: backpressure gauge when the buffer is full.
-        // Telemetry record only (bump 0): the call is NOT refused here, so
-        // counting a bulkhead rejection would double-book an admission
-        // that goes on to succeed.
+        // Telemetry record only: the call is NOT refused here, so counting a
+        // bulkhead rejection would double-book an admission that goes on to
+        // succeed, and executing `policy.action` here would trip a breaker
+        // or raise the alert flag on an admission that goes through.
+        // `record_telemetry_locked` books the `reported[BufferOverflow]`
+        // metric + console line and skips every policy command.
         if inner.queued >= inner.queue_limit {
-            let mut outcome = Self::record_locked(&mut inner, FaultKind::BufferOverflow, 0);
+            let mut outcome = Self::record_telemetry_locked(&mut inner, FaultKind::BufferOverflow);
             drop(inner);
             let record = FaultRecord {
                 kind: FaultKind::BufferOverflow,
@@ -4156,6 +4159,27 @@ impl SnubberNode {
         record_kind: FaultKind,
         bump_kind: u8,
     ) -> ReportOutcome {
+        Self::record_inner_locked(inner, record_kind, bump_kind, true)
+    }
+
+    /// Telemetry-only twin of `record_locked`: same `reported[]` bump, same
+    /// console budget, but NEVER executes `policy.action`. Reserved for the
+    /// sync queue horizon, whose record is raised on an admission that still
+    /// SUCCEEDS — a `TripBreaker`/`RollbackAndAlert`/`Custom` policy armed on
+    /// `BufferOverflow` must not trip the breaker, raise the alert flag or
+    /// fire a hook on a call that was not refused. The async `RejectNew`
+    /// queue-full refusal is a genuine rejection and keeps using
+    /// `record_locked` with its full policy.
+    fn record_telemetry_locked(inner: &mut NodeInner, record_kind: FaultKind) -> ReportOutcome {
+        Self::record_inner_locked(inner, record_kind, 0, false)
+    }
+
+    fn record_inner_locked(
+        inner: &mut NodeInner,
+        record_kind: FaultKind,
+        bump_kind: u8,
+        apply_policy: bool,
+    ) -> ReportOutcome {
         let policy = inner.policies[record_kind.index()];
         // `reported[record_kind]` is the ALERT/metric counter, not a
         // conservation column: EVERY recorded fault bumps it exactly once,
@@ -4200,41 +4224,48 @@ impl SnubberNode {
         // come from the CALLER-built record, not from here — record_locked
         // only sees codes, so report()/observe() push the slot explicitly).
         // This spot stays integer-only: no push here, no alloc, no panic.
-        // Policy COMMAND half (under lock, no calls out).
+        // Policy COMMAND half (under lock, no calls out). Skipped entirely
+        // for telemetry-only records (`apply_policy == false`): those paths
+        // recorded an observation, not a verdict, so no policy command may
+        // fire on their behalf.
         // `BlockCaller` never reaches here as a command: it is consumed at
         // admission time (enter_inner parks the caller); if a fault FIRES
         // while BlockCaller is armed, the firing itself is silent.
-        let custom: Option<fn()> = match policy.action {
-            FaultAction::DiscardSilently | FaultAction::BlockCaller(_) => None,
-            FaultAction::BreakerOpen => {
-                // Caller-rejection action: realized at ADMISSION — the
-                // BulkheadFull verdict sheds immediately instead of
-                // parking. Under the lock there is nothing to command:
-                // every path that reports a kind with this action is
-                // already rejecting the caller.
-                None
-            }
-            FaultAction::RollbackAndAlert => {
-                inner.alert_pending = true;
-                None
-            }
-            FaultAction::TripBreaker => {
-                // Policy trip honors the OFF switch: `trip_after_failures(0)`
-                // + `failure_window(0)` = breaker fully disabled (heavy stress /
-                // server nodes). A policy that trips while disabled would
-                // isolate a node that asked for no isolation — the "1 of
-                // 40000" trap: 416 Panic reports with default TripBreaker
-                // policy weld the breaker OPEN after the first report.
-                let streak_off = inner.trip_after_failures == 0;
-                let window_off = inner.failure_window == 0;
-                if inner.breaker != BreakerState::HalfOpen && !(streak_off && window_off) {
-                    inner.breaker = BreakerState::Open;
-                    inner.stats.breaker_trips = inner.stats.breaker_trips.saturating_add(1);
-                    inner.stats.breaker_state = BreakerState::Open;
+        let custom: Option<fn()> = if apply_policy {
+            match policy.action {
+                FaultAction::DiscardSilently | FaultAction::BlockCaller(_) => None,
+                FaultAction::BreakerOpen => {
+                    // Caller-rejection action: realized at ADMISSION — the
+                    // BulkheadFull verdict sheds immediately instead of
+                    // parking. Under the lock there is nothing to command:
+                    // every path that reports a kind with this action is
+                    // already rejecting the caller.
+                    None
                 }
-                None
+                FaultAction::RollbackAndAlert => {
+                    inner.alert_pending = true;
+                    None
+                }
+                FaultAction::TripBreaker => {
+                    // Policy trip honors the OFF switch: `trip_after_failures(0)`
+                    // + `failure_window(0)` = breaker fully disabled (heavy stress /
+                    // server nodes). A policy that trips while disabled would
+                    // isolate a node that asked for no isolation — the "1 of
+                    // 40000" trap: 416 Panic reports with default TripBreaker
+                    // policy weld the breaker OPEN after the first report.
+                    let streak_off = inner.trip_after_failures == 0;
+                    let window_off = inner.failure_window == 0;
+                    if inner.breaker != BreakerState::HalfOpen && !(streak_off && window_off) {
+                        inner.breaker = BreakerState::Open;
+                        inner.stats.breaker_trips = inner.stats.breaker_trips.saturating_add(1);
+                        inner.stats.breaker_state = BreakerState::Open;
+                    }
+                    None
+                }
+                FaultAction::Custom(cmd) => Some(cmd),
             }
-            FaultAction::Custom(cmd) => Some(cmd),
+        } else {
+            None
         };
         let snapshot = Self::snapshot_stats_no_alloc(inner);
         let hooks = Arc::clone(&inner.hooks);
