@@ -1681,6 +1681,27 @@ Telemetry honesty, horizon semantics, abort contract, gate teeth, provenance.
 | Harness SKIP verdicts | Three harnesses, three SKIP policies: sh printed skips and passed, py failed on any skip, ps1 never printed them | One formula where CI is probed (sh, py): platform-gated skips print and pass locally, any skip fails in CI (`CI=true/1`); ps1 remains stricter — it fails on any skip in every environment | `scripts/stress_harness.{sh,ps1}`, `scripts/stress_multi_lineage.py` |
 | Docs provenance | Unsourced numbers: contended latencies matching no artifact, storm `wall_ms` diverging from reports, "four properties" over 13 invariants, 2,288 B `NodeInner`, `pool-gates` job name, a `Copy` shell `SnubberGuard` does not have, "Three layers" in lib.rs | Every published number carries a date + command; contended table = archived 2026-10-25 full run with the smoke re-run shown; storm numbers name their artifacts; 1,648 B with the measurement command; `Priority::COUNT` and `DEFAULT_EOF_GRACE_MS` are now actually const-asserted | `README.md`, `docs/INVARIANTS.md`, `src/policy.rs`, `src/pool/mod.rs` |
 
+## Fixed after 0.6.10: third-audit (PLAN_AUDIT3) batch
+
+Async eviction verdict, ISR counter saturation, bounds that follow
+`Priority::COUNT`, malformed handoff chunks, committed storm evidence.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| Evicted waiter re-poll | A future whose queue entry an `EvictOldest` evictor had already retired re-parked into a fresh slot on its next poll, burning capacity and evicting a bystander | The entry flag is read under the lock that stamps it; a retired future gets `Ready(Err(EnterError::QueueFull))` on its next poll (the documented verdict). A settle pop leaves the flag clear, so that re-park stays honest | `tests/async_primitives.rs::evict_oldest_wakes_the_evicted_future_with_queue_full` |
+| ISR shed counter | `shed_count()` was a `u16` incremented with a plain add: 65,536 sheds wrapped to 0 | Saturating CAS stops at `u16::MAX`; a full ring still sheds, the trip latch is untouched | `src/isr.rs::shed_saturates_at_the_ceiling_without_wrap` |
+| Per-lane bounds and hook casts | Per-lane indexing clamped with the literal `min(2)`; admission hooks cast in-flight counts with `as u32` | `Priority::MAX_INDEX` follows `Priority::COUNT`; hooks use `u32::try_from(..).unwrap_or(u32::MAX)` | full suite (inputs in `0..Priority::COUNT` behave identically) |
+| Out-of-range `OP_STATE` chunk | A frame whose `task` was not 0/1/2 was clamped to chunk 2, overwriting the tail chunk and its authoritative full-digest CRC | Out-of-range ids are malformed and dropped; the chunk index must be `< 3` | `tests/state_handoff.rs::out_of_range_state_chunk_is_not_chunk_two` |
+| Poison-recovery clamp | The `hard_clamp_slots` skip in `lock_poison_tolerant` was undocumented | The comment states why it is safe: a foreign mutex poison cannot tear `NodeInner`, the holder finishes its own mutation, and `lock()` clamps on its own poison path | `src/node.rs` |
+| Storm evidence | Storm numbers cited reports that live only in the gitignored `target/` tree and are overwritten by every re-run | The three 2026-10-26 reports are committed under `docs/evidence/` with a provenance README; README and this guide quote that content | `docs/evidence/README.md` |
+
+Release gates follow the same batch: the three Miri jobs compile with
+`RUSTFLAGS="-D warnings"` on the pinned nightly; `scripts/release.sh`
+passes `--locked` to clippy and to the publish dry-run; the stress
+harness refuses `--external-supervisor` under CI (no worker pid means no
+RSS/fd/exit evidence); and the Windows API-diff gate, like the shell one,
+diffs a release commit against the previous tag instead of failing.
+
 ## Fixed in 0.6.8: seventh-audit batch
 
 Accounting conservation, async liveness, erased booking, honest examples,
