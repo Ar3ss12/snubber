@@ -40,6 +40,14 @@ surface, wire format and telemetry layout are untouched.
   `Priority::MAX_INDEX + 1 == Priority::COUNT` (the lane table's last
   dense index) and the constant is used in every feature combination —
   no `allow(dead_code)` waiver.
+- Sync admission no longer reads the OS clock when the token bucket is
+  disarmed. `7481e9a` hoisted `now_ms()` out of the mutex unconditionally
+  to keep clock reads off the lock, which made every default admission
+  pay one clock read; the bucket's arming is now mirrored outside the
+  mutex (`SnubberNode::rate_per_sec`) and the stamp is taken only when a
+  token is actually checked. Full 50-sample bench on the same machine:
+  `node.enter + commit` 126.0 → 166.2 → 124.2 ns (baseline → regression →
+  fix); `enter_erased_auto` 208 → 243 → 205 ns.
 
 ### CI and release gates
 
@@ -90,6 +98,11 @@ surface, wire format and telemetry layout are untouched.
   `Runtime-Agnostic Async`, `Process Supervisor`, `Diagnostics &
   Health`); README's Layer 3 was still called "Async Waker Queue".
   `tests/doc_sync.rs` locks the bytes.
+- The README benchmark tables are re-measured from two full 50-sample
+  runs on 2026-10-26. The provenance paragraph records why the old table
+  was not reproducible at its own commit (lock-free rows matched, guarded
+  admission rows read 30–40% higher — the clock regression) and the
+  contended rows quote full-run artifacts instead of a smoke check.
 
 ### Tests
 
