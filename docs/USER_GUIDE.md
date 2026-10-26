@@ -1661,6 +1661,23 @@ reservation); the README lists the real `no_std` surface; `PulseTick` is
 documented as internal; the Layer 5 helper exports got a quick-reference
 row.
 
+## Fixed in 0.6.10: second-audit (PLAN_AUDIT2) batch
+
+Telemetry honesty, horizon semantics, abort contract, gate teeth, provenance.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| Automatic fault export | Guard settles, async TTL timeouts, evictions and admission refusals left `reported[kind]` at 0, so `metric_samples()` and the console alert showed `count=0` during an incident | Every automatic path bumps `reported[kind]` exactly once via `record_locked`; explicit `report()` and the automatic path of one kind land on the same slot | `tests/metrics_reporting.rs` |
+| BufferOverflow conservation | A named `BufferOverflow` record credited `bulkhead_rejections`, widening `admission_total() == total_started + shed_total()` | BufferOverflow is capacity telemetry, never a shed column; the async `QueueFull` refusal still books `bulkhead_rejections` | `tests/metrics_reporting.rs` |
+| Queue horizon | The sync horizon executed `policy.action` on an admission that still SUCCEEDED, tripping breakers and latching alerts on healthy traffic | Telemetry-only: `record_telemetry_locked` books the gauge (`buffer_overflow_total`, console line) and skips every policy command; the async `RejectNew` refusal keeps the full policy | `tests/queue_horizon.rs` |
+| `queue_capacity(0)` | One field, three undocumented semantics; async `0` silently behaved as `1` | Sync `0` = horizon fires on every admission; async `0` = waker queue floored to 1 (one waiter, then `QueueFull`) — documented in one place and pinned by tests | `tests/queue_horizon.rs` |
+| Lane death telemetry | `note_death` stamped `last_exit`/`last_class` onto a successor that attached during the EOF grace (or after its own reap) | The stamp is guarded by `generation && pid.is_none()`; the death stays in lane counters and `PoolReap` | `tests/supervisor_pool.rs` |
+| `abort()` rollback panic | An explicit `abort()` ran the rollback bare, so a panicking rollback escalated into a double-panic process abort — against the documented contract | Under `std` the rollback runs in `catch_unwind(AssertUnwindSafe(..))`, same as `Drop`; without `std` a rollback panic during unwind aborts (a Rust rule, documented) | `tests/rollback_panic.rs` |
+| Poison recovery relock | `lock_poison_tolerant` re-locked the node ledger synchronously on the recovery path — a caller holding the node lock deadlocked | Recovery ticks `poison_recoveries` best-effort via `try_lock`; the doc says a skipped tick under-reports, a re-lock wedges | `tests/affordances.rs` |
+| Test honesty | `wakes_happen_after_drop` counted instead of ordering; the termination "conservation" was tautological; feed benches never checked the parsed frame count | Function-scoped order audit; cross-source floors plus a `misclassified_stillborn` contradiction counter; every `.feed(` bench asserts its result (banned by `bench_hygiene` otherwise) | `tests/lock_hierarchy.rs`, `tests/supervisor_termination.rs`, `tests/bench_hygiene.rs` |
+| Harness SKIP verdicts | Three harnesses, three SKIP policies: sh printed skips and passed, py failed on any skip, ps1 never printed them | One formula: platform-gated skips print and pass locally, any skip fails in CI (`CI=true/1`) | `scripts/stress_harness.{sh,ps1}`, `scripts/stress_multi_lineage.py` |
+| Docs provenance | Unsourced numbers: contended latencies matching no artifact, storm `wall_ms` diverging from reports, "four properties" over 13 invariants, 2,288 B `NodeInner`, `pool-gates` job name, a `Copy` shell `SnubberGuard` does not have, "Three layers" in lib.rs | Every published number carries a date + command; contended table = archived 2026-10-25 full run with the smoke re-run shown; storm numbers name their artifacts; 1,648 B with the measurement command; `Priority::COUNT` and `DEFAULT_EOF_GRACE_MS` are now actually const-asserted | `README.md`, `docs/INVARIANTS.md`, `src/policy.rs`, `src/pool/mod.rs` |
+
 ## Fixed in 0.6.8: seventh-audit batch
 
 Accounting conservation, async liveness, erased booking, honest examples,
