@@ -50,10 +50,19 @@ if ! command -v cargo-semver-checks > /dev/null 2>&1 \
 fi
 
 # A baseline pointing at HEAD diffs an empty range: the gate would PASS
-# trivially unless the worktree is dirty. Say so instead of passing silently.
+# trivially unless the worktree is dirty. The one legitimate case is the
+# RELEASE COMMIT itself — the tag was just moved onto HEAD (that is what
+# tagging a release means). There the meaningful diff is against the
+# PREVIOUS tag; fall back to it instead of failing an honest release.
 if [ "$(git -C "${REPO_ROOT}" rev-parse "${BASELINE}^{commit}" 2>/dev/null || true)" = "$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || true)" ]; then
-    echo " FAIL (baseline ${BASELINE} is HEAD: committed-but-untagged API changes are invisible to this gate -- tag the release or pass an older baseline)"
-    exit 1
+    PREV="$(git -C "${REPO_ROOT}" describe --tags --abbrev=0 "${BASELINE}^" 2>/dev/null || true)"
+    if [ -n "${PREV}" ] && [ "${PREV}" != "${BASELINE}" ]; then
+        echo " note: ${BASELINE} is HEAD (release commit) — diffing against previous tag ${PREV}"
+        BASELINE="${PREV}"
+    else
+        echo " FAIL (baseline ${BASELINE} is HEAD and no previous tag exists: committed-but-untagged API changes are invisible to this gate -- tag the release or pass an older baseline)"
+        exit 1
+    fi
 fi
 
 CRATE="$(sed -n 's/^name *= *\"\([^\"]*\)\".*/\1/p' "${REPO_ROOT}/Cargo.toml" | head -1)"
