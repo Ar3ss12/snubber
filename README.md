@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-427%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-428%20passed-brightgreen.svg)]()
 
 <!-- Badge provenance: `bash scripts/check_test_count.sh` (all features, 5 ignored), last verified 2026-10-26. -->
 
@@ -55,6 +55,7 @@ The supervisor parser does not require a reader thread or stdout. `PipeDrain` is
 
 ```rust
 // std transport layered on the core scanner
+fn app_tick_ms() -> u64 { 0 /* firmware SysTick, ms */ }
 let drain = PipeDrain::manual_with_clock(app_tick_ms); // injectable clock
 let frames = drain.feed(uart_chunk);                   // any chunking, any size
 drain.finish();                                        // EOF → rescue classification

@@ -813,6 +813,21 @@ impl PipeDrain {
     /// The clock stamps `last_seen` and answers [`PipeDrain::idle_ms`], so
     /// lease sweeps are deterministic in tests and follow the firmware tick
     /// on embedded targets instead of a hidden `Instant`.
+    ///
+    /// ```
+    /// use snubber::supervisor::PipeDrain;
+    ///
+    /// fn app_tick_ms() -> u64 {
+    ///     0 // the firmware's SysTick counter, in milliseconds
+    /// }
+    ///
+    /// let drain = PipeDrain::manual_with_clock(app_tick_ms);
+    /// let frames = drain.feed(&[0u8; 7]); // any chunking, any size
+    /// assert_eq!(frames, 0); // a torn frame is retained, not delivered
+    /// drain.finish(); // EOF: rescue classification runs here
+    /// assert_eq!(drain.feed(&[0u8; 1]), 0); // a closed drain accepts nothing
+    /// assert_eq!(drain.feeds_after_eof(), 1);
+    /// ```
     #[must_use]
     pub fn manual_with_clock(clock: ClockFn) -> Self {
         Self {

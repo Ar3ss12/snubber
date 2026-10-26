@@ -110,6 +110,12 @@ surface, wire format and telemetry layout are untouched.
 
 ### Documentation
 
+- The `no_std` drain quickstart in `README.md` now compiles. It passed a
+  `u64` tick value to `PipeDrain::manual_with_clock`, whose argument is a
+  `ClockFn` (`fn() -> u64`); README fences are not doctested, so nothing
+  caught it. The fixed snippet is duplicated as a doctest on
+  `manual_with_clock`, and the badge moved to 428 (401 tests + 27
+  doctests, 5 ignored).
 - The three pool storm reports are committed under `docs/evidence/`
   (2026-10-26, with a provenance README). README and USER_GUIDE quote the
   committed files — `wall_ms=55/474/194`, 99,628 lease observer samples —
