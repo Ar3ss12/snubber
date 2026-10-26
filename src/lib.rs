@@ -2,25 +2,25 @@
 //!
 //! Five layers:
 //!
-//! * **Layer 1 (core-only, v0.1) — Core RAII Guard:** [`SnubberGuard`] (Drop-guaranteed
+//! * **Layer 1 (core-only, v0.1) — Core RAII Guard:** Rollback is structural: an admitted guard reverts unless it is committed. [`SnubberGuard`] (Drop-guaranteed
 //!   rollback), [`EpochGate`] (monotonic late-packet filter), the hang
 //!   classifier, [`ExecutionEnvelope`], [`MemoryWatch`] and the fault
 //!   policy tables.
-//! * **Layer 2 (`std`, v0.2) — Concurrency Bulkhead:** [`SnubberNode`] —
+//! * **Layer 2 (`std`, v0.2) — Concurrency Bulkhead:** Admission is capped; the breaker fails fast instead of queueing. [`SnubberNode`] —
 //!   bounded bulkhead, circuit breaker, priority lanes, flight-recorder
 //!   stats, `#[track_caller]` fault coordinates and a capped console
 //!   reporter; plus the channel gateway, watchdog, [`conduit`]/[`conflate`]
 //!   task steering and the boundary harness.
-//! * **Layer 3 (`std`) — Runtime-Agnostic Async:** [`SnubberNode::enter_async`]
+//! * **Layer 3 (`std`) — Runtime-Agnostic Async:** One parked waker per wait; any executor drives it, with no runtime dependency. [`SnubberNode::enter_async`]
 //!   parks one [`core::task::Waker`] and settles it from the node itself,
 //!   so it runs on any executor (Tokio, async-std, smol, embassy or a
 //!   hand-rolled loop) without pulling in a runtime crate; paced entry,
 //!   leases and settle helpers live here too.
 //! * **Layer 4 (`core` wire + `std` supervisor/pool) — Process Supervisor:**
-//!   [`ProcessToken`] framing, [`drain::SnubScanner`] parsing,
+//!   The supervisor owns the child process; the drain classifies its wire frames. [`ProcessToken`] framing, [`drain::SnubScanner`] parsing,
 //!   [`supervisor::PipeDrain`], the process pool and supervised entry points.
 //! * **Layer 5 (`core` codec + `std` render) — Diagnostics & Health:**
-//!   [`diagnostics`] 512-byte snapshot, anomaly triage and health export.
+//!   One 512-byte snapshot answers whether the system is healthy. [`diagnostics`] 512-byte snapshot, anomaly triage and health export.
 //!
 //! `alloc` is not a sixth layer: it upgrades the same five layers in
 //! place — [`crate::FaultDetail`] (owned breach reasons) on Layer 1,

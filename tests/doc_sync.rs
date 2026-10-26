@@ -1,6 +1,7 @@
 //! Doc tripwires: the FLOOR MAP anchors in `src/node.rs` must never rot,
-//! the L1–L5 layer map must stay byte-identical across the three public
-//! docs, and every module path quoted in prose must exist on disk.
+//! the L1–L5 layer map must keep its headings, order and canonical
+//! one-line tagline across the three public docs, and every module path
+//! quoted in prose must exist on disk.
 //!
 //! Line numbers in comments die the day someone adds an import. Text tags
 //! don't. If a refactor deletes or renames an anchor, this test goes red
@@ -105,6 +106,18 @@ const CANONICAL_LAYERS: [&str; 5] = [
     "Diagnostics & Health",
 ];
 
+/// The one sentence that defines each layer. It must appear within the
+/// layer's entry (heading, or two lines below it) in all three docs, so a
+/// doc cannot silently describe a different contract. Bodies are free to
+/// differ — this is the semantic anchor, not a byte lock.
+const CANONICAL_TAGLINES: [&str; 5] = [
+    "Rollback is structural: an admitted guard reverts unless it is committed.",
+    "Admission is capped; the breaker fails fast instead of queueing.",
+    "One parked waker per wait; any executor drives it, with no runtime dependency.",
+    "The supervisor owns the child process; the drain classifies its wire frames.",
+    "One 512-byte snapshot answers whether the system is healthy.",
+];
+
 fn read_doc(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|err| panic!("cannot read {path}: {err}"))
 }
@@ -128,9 +141,10 @@ fn find_layer_line<'a>(text: &'a str, prefix: &str, doc: &str) -> (usize, &'a st
     (index, line)
 }
 
-/// L1–L5 must read identically in `src/lib.rs`, `README.md` and
-/// `docs/USER_GUIDE.md`, in ascending order. Rename a layer in one file and
-/// this goes red on `cargo test`, not in a reader's head months later.
+/// L1–L5 must keep their canonical name, order AND tagline in `src/lib.rs`,
+/// `README.md` and `docs/USER_GUIDE.md`. Rename a layer or rewrite its
+/// one-line contract in one file and this goes red on `cargo test`, not in a
+/// reader's head months later.
 #[test]
 fn test_layer_map_is_identical_across_public_docs() {
     let lib = read_doc("src/lib.rs");
@@ -143,6 +157,7 @@ fn test_layer_map_is_identical_across_public_docs() {
 
     for (offset, name) in CANONICAL_LAYERS.iter().enumerate() {
         let n = offset + 1;
+        let tagline = CANONICAL_TAGLINES[offset];
 
         // src/lib.rs: `//! * **Layer N (feature qualifiers) — Name:** body`
         let lib_prefix = format!("//! * **Layer {n} ");
@@ -161,6 +176,19 @@ fn test_layer_map_is_identical_across_public_docs() {
         // docs/USER_GUIDE.md: `## Layer N: Name (details)`
         let guide_prefix = format!("## Layer {n}: {name}");
         guide_order.push(find_layer_line(&guide, &guide_prefix, "docs/USER_GUIDE.md").0);
+
+        for (doc, text, index) in [
+            ("src/lib.rs", &lib, index),
+            ("README.md", &readme, *readme_order.last().unwrap()),
+            ("docs/USER_GUIDE.md", &guide, *guide_order.last().unwrap()),
+        ] {
+            let window: Vec<&str> = text.lines().skip(index).take(4).collect();
+            assert!(
+                window.iter().any(|l| l.contains(tagline)),
+                "TRIPWIRE FIRED: {doc} Layer {n} must carry the canonical tagline \
+                 {tagline:?} within four lines of its heading; found: {window:?}"
+            );
+        }
     }
 
     for (doc, order) in [

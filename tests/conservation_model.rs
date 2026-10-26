@@ -8,13 +8,17 @@
 //! The ledger is the point. Branch tests prove each arm counts SOMETHING;
 //! this test proves the columns compose:
 //!
-//! * `admission_total() == total_started + shed_total()` — every attempt in
-//!   exactly one bucket, no matter which mechanism produced it.
+//! * caller-side attempts (`started + refusals`) equal `admission_total()`
+//!   — comparison against the ledger, not the crate's own identity.
 //! * `evicted` and `preempted` are side-events of admissions that ALREADY
 //!   sit in `total_started`: adding them to the shed side would double-book.
 //! * `reported[]` (per-`FaultKind`, the alert/metric ledger) is NOT a
 //!   conservation term: it counts timeouts, implicit drops and explicit
 //!   telemetry-only reports that never appeared on the admission boundary.
+//!
+//! `admission_total()` and `shed_total()` are arithmetic over the columns,
+//! so asserting one against the other is a tautology. The only real
+//! evidence is the ledger in this file.
 //!
 //! The breaker is disabled (`trip_after_failures(0)`) so column arithmetic
 //! stays independent of streak policy — the test is about conservation, not
@@ -65,22 +69,22 @@ impl Ledger {
         assert_eq!(st.passthrough_admissions, 0, "canary lane unused");
         assert_eq!(st.window_outcomes, 0, "no failure window armed");
 
-        // 3. The law itself, in the crate's own arithmetic.
+        // 3. The ledger above is the oracle. `admission_total()` and
+        //    `shed_total()` are arithmetic over those same columns
+        //    (`started + bulkhead + stale + breaker + rate + poisoned +
+        //    memory`, minus `started`), so comparing them with each other
+        //    cannot fail and proves nothing. What CAN fail is the crate's
+        //    books disagreeing with the attempts this script actually made.
         assert_eq!(
+            self.started + self.bulkhead,
             st.admission_total(),
-            st.total_started + st.shed_total(),
-            "every attempt lands in exactly one bucket"
+            "caller-side attempts == started + refusals"
         );
         assert_eq!(st.shed_total(), self.bulkhead, "only bulkhead sheds here");
         assert_eq!(st.shed_bulkhead(), self.bulkhead);
         assert_eq!(st.shed_rate(), 0);
         assert_eq!(st.shed_stale(), 0);
         assert_eq!(st.shed_preempted(), self.preempted, "own column forever");
-        assert_eq!(
-            self.started + self.bulkhead,
-            st.admission_total(),
-            "caller-side attempts == started + refusals"
-        );
 
         // 4. Side-events are NOT conservation terms: folding `evicted` or
         //    `preempted` into the shed side would double-book the admission

@@ -47,10 +47,22 @@ impl CpuClock for FakeCpuClock {
 
 #[test]
 fn no_wdt_feed_is_a_noop() {
-    let w = NoWdt;
+    // A no-op has no positive observable, so pin what a regression WOULD
+    // change: state on the type, or a syscall in the call. Feeding a
+    // watchdog counter is the neighbouring `CountingWdt` test's job.
+    assert_eq!(
+        core::mem::size_of::<NoWdt>(),
+        0,
+        "NoWdt is a marker: a field means it started carrying state"
+    );
+    let start = Instant::now();
     for _ in 0..1_000 {
-        w.feed();
+        NoWdt.feed();
     }
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "NoWdt::feed is empty; a sleep or syscall snuck in"
+    );
 }
 
 #[test]

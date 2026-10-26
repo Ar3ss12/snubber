@@ -9,8 +9,10 @@
 //! `EvictOldest` queue absorb the overflow.
 //!
 //! Gates: the breaker trips, evictions stay at the legal `max + 1`
-//! ceiling, every slot is conserved (`in_flight` returns to 0), and a
-//! fresh admission after the storm still returns (no wedge).
+//! ceiling, every slot is conserved (`in_flight` returns to 0), automatic
+//! recovery closes a tripped breaker (dedicated node — the storm's own
+//! streak never reaches its threshold), and a fresh admission after the
+//! storm still returns (no wedge).
 //!
 //! Run: `cargo test --release --test stress_breaker_churn -- --ignored`
 
@@ -212,17 +214,38 @@ fn breaker_churn_trips_recovers_and_conserves() {
     );
     // The window must have closed and reset at least once (its verdict
     // fired). From Open, the HalfOpen probe is scheduled only by a
-    // failure settle whose streak reaches `trip_after_failures` (1000) —
-    // this storm's fail-ok-fail-ok pattern never builds such a streak,
-    // so an Open breaker at storm end is a LEGAL state, not a wedge.
-    // The documented operator recovery is `reset_breaker()`: drive it
-    // and prove post-recovery liveness through the probe below.
-    node.reset_breaker();
-    assert_eq!(
-        node.stats().breaker_state,
-        BreakerState::Closed,
-        "manual recovery must close the breaker"
+    // failure settle whose streak reaches `trip_after_failures` — this
+    // storm's fail-ok-fail-ok pattern never builds such a streak, so an
+    // Open breaker at storm end is a LEGAL state, not a wedge.
+    //
+    // Automatic recovery is therefore proven on a dedicated node: one
+    // failure trips, one committed probe closes. `reset_breaker()` would
+    // be a tautology here — it only asserts that reset closes what reset
+    // closed, and the storm node's trip threshold is never reachable.
+    let recovering = SnubberNode::builder("breaker/auto-recovery")
+        .trip_after_failures(1)
+        .build();
+    drop(
+        recovering
+            .enter(1, 1, || {})
+            .expect("first admission admits"),
     );
+    assert_eq!(
+        recovering.stats().breaker_state,
+        BreakerState::HalfOpen,
+        "one implicit drop at trip_after_failures(1) must open the breaker"
+    );
+    recovering
+        .enter(2, 2, || {})
+        .expect("half-open admits exactly one probe")
+        .commit();
+    let recovered = recovering.stats();
+    assert_eq!(
+        recovered.breaker_state,
+        BreakerState::Closed,
+        "a committed half-open probe must close the breaker, not wedge it"
+    );
+    assert_eq!(recovered.committed, 1, "the probe's commit is booked");
 
     // Post-storm liveness: a fresh admission must RETURN (no wedge in the
     // paced/queue machinery). Bounded wait so a wedge fails the gate

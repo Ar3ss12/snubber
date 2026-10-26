@@ -62,6 +62,8 @@ let receipt = node.scoped_checked(
 
 ## Layer 1: Core RAII Guard (Stack Rollback)
 
+Rollback is structural: an admitted guard reverts unless it is committed.
+
 No nodes, no config. Three lines:
 
 ```rust
@@ -209,6 +211,8 @@ interrupt — the `unsafe` asm lives in YOUR app, never here).
 ---
 
 ## Layer 2: Concurrency Bulkhead (Bounded Queues & Backpressure)
+
+Admission is capped; the breaker fails fast instead of queueing.
 
 Wrap long-lived services, drivers, and background workers in a `SnubberNode`. The node is a bounded bulkhead with a flight recorder: it counts every path, remembers the last fault with caller file/line coordinates, and stops hammering dead hardware.
 
@@ -552,6 +556,8 @@ into any `core::fmt::Write`.
 
 ## Layer 3: Runtime-Agnostic Async (Tokio, Axum, gRPC)
 
+One parked waker per wait; any executor drives it, with no runtime dependency.
+
 `snubber` is completely runtime-agnostic: it requires **zero external dependencies** and uses pure `core::task::Waker` parking. The async engine is `std`-gated (it owns OS threads and an admission queue), so it runs identically in Tokio, async-std, smol, or any other `std` executor; `core`-only firmware uses the pulse, ISR and drain layers instead.
 
 ### 1. Zero-Runtime Waker Queue (`enter_async` / `enter_async_auto`)
@@ -746,6 +752,8 @@ handle.resume(); // Proceed == resume (there is no Directive::Resume)
 ---
 
 ## Layer 4: Process Supervisor & Crash Recovery (Surviving `kill -9`)
+
+The supervisor owns the child process; the drain classifies its wire frames.
 
 When a process is vaporized instantly (`kill -9`, `Stop-Process -Force`, `std::process::abort()`, SIGKILL, or hung Win32 drivers), **no destructors (`Drop`) execute in that process**. Rescue must come from an out-of-process supervisor.
 
@@ -1288,6 +1296,8 @@ payload drop accounting, non-`Clone` payload), `tests/execution_envelope.rs`
 ---
 
 ## Layer 5: Diagnostics & Health (Catastrophic Faults vs Capacity Shedding + `app.snub`)
+
+One 512-byte snapshot answers whether the system is healthy.
 
 A node that absorbs hits but tells nobody is an opaque black box. `snubber`
 splits every fault into two isolated contours — and gives you the tools

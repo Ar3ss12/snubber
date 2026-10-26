@@ -154,6 +154,17 @@ surface, wire format and telemetry layout are untouched.
 
 ### Tests
 
+- Four gates that could not fail now compare against an independent
+  oracle. `conservation_model` drops the
+  `admission_total() == started + shed_total()` tautology and checks the
+  caller-side ledger instead (folding `evicted` into `shed_total` now
+  fails 3 vs 2). `clock_park::no_wdt_feed_is_a_noop` pins a zero-sized
+  `NoWdt` and a syscall-free call (a 2 ms sleep in `feed` fails).
+  `stress_breaker_churn` replaces `reset_breaker(); assert Closed` with a
+  dedicated `trip_after_failures(1)` node that trips, admits one probe and
+  closes on commit (a probe that no longer closes reports `HalfOpen`).
+  `doc_sync` locks a canonical one-line tagline per layer next to each
+  heading in all three docs (deleting one fires the tripwire).
 - `tests/state_handoff.rs::out_of_range_state_chunk_is_not_chunk_two`
   (an out-of-range `task` must not promote to chunk 2) and
   `src/isr.rs::shed_saturates_at_the_ceiling_without_wrap`.
