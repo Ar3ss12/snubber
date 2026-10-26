@@ -639,11 +639,25 @@ impl<F: FnOnce()> SnubberGuard<F> {
     ///
     /// Use it when the fallible work returned an error value (as opposed to
     /// panicking / early-dropping, where `Drop` covers you implicitly).
+    ///
+    /// Under `std` a panicking rollback is swallowed here exactly as in
+    /// `Drop` — a planned abort never escalates into a double-panic
+    /// process abort. Without `std` there is no catcher (see rule 1).
     #[inline]
     pub fn abort(mut self, reason: &'static str) -> SnubberEvent<()> {
         if let Some(rollback) = self.rollback.take() {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            rollback();
+            // Bullet 1 — same contract as `Drop` below: a panicking rollback
+            // must not turn a planned abort into a double-panic process
+            // abort. Without `std` there is no catcher — documented, not hidden.
+            #[cfg(feature = "std")]
+            {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                rollback();
+            }
         }
         SnubberEvent::Aborted {
             header: self.header,

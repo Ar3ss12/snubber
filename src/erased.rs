@@ -149,10 +149,25 @@ impl ErasedGuard {
     }
 
     /// Immediately triggers the rollback closure and consumes the guard.
+    ///
+    /// Under `std` a panicking rollback is swallowed exactly as in `Drop`
+    /// — a planned abort never escalates into a double-panic process
+    /// abort. Without `std` there is no catcher (the rollback panic during
+    /// unwind aborts the process — a Rust rule, documented in
+    /// [`crate::SnubberGuard`]).
     #[inline]
     pub fn abort(mut self, _reason: &'static str) {
         if let Some(slots) = self.slots.take() {
-            slots.rollback();
+            #[cfg(feature = "std")]
+            {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    slots.rollback();
+                }));
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                slots.rollback();
+            }
         }
     }
 

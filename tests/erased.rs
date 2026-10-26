@@ -338,18 +338,14 @@ fn panicking_rollback_still_settles_the_erased_probe() {
         .commit();
     assert_eq!(node.stats().breaker_state, BreakerState::Closed);
 
-    // Explicit abort with a panicking rollback: the panic surfaces to the
-    // caller (abort is an explicit call), the probe still settles.
+    // Explicit abort with a panicking rollback: the panic is swallowed
+    // (same contract as Drop, PLAN_AUDIT2 F-05/D2), the probe still
+    // settles. A planned abort never escalates into a process abort.
     node.report(FaultKind::Panic, 4, 4);
     let guard = node
         .enter_erased(12, 12, || panic!("rollback explodes again"))
         .expect("probe admitted");
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || guard.abort("boom")));
-    assert!(
-        result.is_err(),
-        "abort must surface the user rollback panic"
-    );
+    guard.abort("boom");
     assert_eq!(
         node.stats().breaker_state,
         BreakerState::Open,

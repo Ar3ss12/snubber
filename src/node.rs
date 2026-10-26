@@ -5434,7 +5434,9 @@ impl<F: FnOnce()> TrackedGuard<F> {
 
     /// Windowed-batch position for dashboards: `(outcomes, failures)` in
     /// the currently open batch. Mirrored into `SnubberStats` on settle.
-    /// Planned failure path: rollback NOW, no breaker trip.
+    /// Planned failure path: rollback NOW, no breaker trip. A panicking
+    /// rollback is swallowed under `std` — the delegated
+    /// `SnubberGuard::abort` owns the catcher, same contract as `Drop`.
     /// Pass-through dummy: no-op — mark settled, return Aborted, touch nothing.
     pub fn abort(mut self, reason: &'static str) -> SnubberEvent<()> {
         if self.is_passthrough {

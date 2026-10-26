@@ -8,6 +8,12 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 
 ### Fixed
 
+- `SnubberGuard::abort` and `ErasedGuard::abort` now swallow a panicking
+  rollback under `std` (`catch_unwind(AssertUnwindSafe(..))`), matching
+  the documented contract and the `Drop` path: a planned abort never
+  escalates into a double-panic process abort. Without `std` the
+  behaviour is unchanged (a rollback panic during unwind aborts the
+  process — a Rust rule, documented). `commit` is untouched.
 - `PoolLane::note_death` no longer stamps `last_exit`/`last_class` onto a
   successor that attached while the reaper sat in the EOF grace (or after
   that successor's own life and reap advanced the generation). The death
@@ -43,6 +49,13 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 
 ### Tests
 
+- New `tests/rollback_panic.rs`: panicking rollbacks on explicit abort
+  return `SnubberEvent::Aborted`, fire the rollback exactly once and
+  release the slot (SnubberGuard, node TrackedGuard, ErasedGuard).
+  Negative runs verified per root fix (lib.rs, erased.rs): disabling the
+  catcher turns the tests red. The erased probe test was updated from
+  pinning the old "abort surfaces the panic" behaviour to the
+  documented swallow contract. README badge 416 → 419.
 - New `supervisor_pool` tests: attach-during-grace (thread + attach
   handshake, no sleep margin) leaves the successor's `last_exit`/
   `last_class` at `None`; a reaper without a successor still stamps its
