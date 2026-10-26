@@ -32,6 +32,18 @@ if ($Kills -le 0) { throw "-Kills must be > 0" }
 # is shooting during process startup instead of at an armed token.
 $minAmbush = if ($MinAmbushPct -lt 0) { if ($ArmedHold) { 70 } else { 0 } } else { $MinAmbushPct }
 
+# CI mode: GitHub Actions sets CI=true (or 1), same probe as the .sh
+# harness. CI must own the supervisor: the RSS, handle-growth and exit
+# gates are fed only by the launched path, so an external supervisor
+# would leave every leak gate without data while the verdict still read
+# PASS. The .sh flavor applies the identical rule.
+$ciFlag = if ($env:CI) { $env:CI.ToLowerInvariant() } else { "" }
+$inCi = ($ciFlag -eq "true" -or $ciFlag -eq "1")
+if ($inCi -and -not $Launch) {
+    Write-Host "[HARNESS] FAIL: CI requires -Launch: an external supervisor has no pid for the RSS/handle/exit gates, so the run would report without leak evidence" -ForegroundColor Red
+    exit 1
+}
+
 function Resolve-RepoPath([string]$p) {
     if ([System.IO.Path]::IsPathRooted($p)) { return $p }
     return (Join-Path $repoRoot $p)

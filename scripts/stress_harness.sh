@@ -2,7 +2,8 @@
 # snubber process termination stress harness (Linux / macOS).
 # Positional args (backward compatible): [target] [kills] [min_sleep_sec]
 # Flags: --launch (start supervisor too), --build, --debug, --aggressive,
-#        --external-supervisor (the caller launched it; required in CI)
+#        --external-supervisor (the caller launched it; local only — CI
+#        must use --launch so the leak gates have a supervisor to sample)
 set -u
 
 TARGET_PROCESS="process_termination_loop"
@@ -53,8 +54,12 @@ in_ci() {
         *) return 1 ;;
     esac
 }
-if in_ci && [ "$LAUNCH" != 1 ] && [ "$EXTERNAL_SUPERVISOR" != 1 ]; then
-    echo "[HARNESS] FAIL: CI requires --launch (or --external-supervisor when a test runner owns the supervisor); kill-only mode gates nothing" >&2
+# CI must own the supervisor. The RSS, fd-growth and exit-code gates are
+# fed only by the launched path; an external supervisor has no pid, so
+# every leak gate would silently vanish and the verdict could still say
+# PASS. Local runs keep the flag (the caller may own the process).
+if in_ci && [ "$LAUNCH" != 1 ]; then
+    echo "[HARNESS] FAIL: CI requires --launch: an external supervisor has no pid for the RSS/fd/exit gates, so the run would report without leak evidence" >&2
     exit 1
 fi
 
