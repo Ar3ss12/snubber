@@ -1158,14 +1158,17 @@ Measured costs (release, Criterion `layer4_worker_pool`): `attach +
 note_death` ~192 ns (ambush) / ~173 ns (escape), four-lane `report()`
 ~111 ns, four-lane `expired_lanes(5)` ~517 ns (~129 ns per lane, one
 state lock each), `namespace_task` ~1 ns, `note_memory_kb` ~12 ns. The
-storm gates on this machine (debug; 2026-10-25 artifacts): 4 lanes × 8 armed kills = 32/32
-ambush, `wall_ms=53`; the mixed storm produces an equal four-way split (A/E/S/D =
-8/8/8/8, 8 rescued) with `deadlock=true` and `wall_ms=479` — the orphan mode
+storm gates on this machine (debug; 2026-10-26 committed artifacts in
+`docs/evidence/`): 4 lanes × 8 armed kills = 32/32
+ambush, `wall_ms=55`; the mixed storm produces an equal four-way split (A/E/S/D =
+8/8/8/8, 8 rescued) with `deadlock=true` and `wall_ms=474` — the orphan mode
 keeps its pipe open past the 150 ms grace, so the deadlock bucket is
 proven, not simulated. The lease storm kills 24 workers that beat once
 and then hang (4 lanes × 6, 25 ms lease): 24/24 stillborn, `lease_kills=24`,
-0 deadlocks, 0 conservation breaks over 101,290 live `report()` samples
-from the observer thread, `[7,7,7,7]` generations, `wall_ms=199`.
+0 deadlocks, 0 conservation breaks over 99,628 live `report()` samples
+from the observer thread, `[7,7,7,7]` generations, `wall_ms=194`.
+`wall_ms` and the observer sample count are wall-clock observations and
+move with load; the bucket counters and generations are deterministic.
 
 **Reference:** `examples/19_worker_pool.rs` (supervisor and worker modes,
 `--mixed` four-class storm, `--lease-ms` euthanasia storm, JSON report),

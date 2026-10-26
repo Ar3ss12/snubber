@@ -4,6 +4,74 @@ All notable changes to `snubber`. Benchmarks live in [README.md](README.md);
 the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 ("Fixed in …" sections) and [docs/INVARIANTS.md](docs/INVARIANTS.md).
 
+## Unreleased
+
+Audit-3 closeout (PLAN_AUDIT3 findings K1/K2, H1–H7, D1–D4; D5 was
+dismissed after re-checking the examples). No API changes; the public
+surface, wire format and telemetry layout are untouched.
+
+### Fixed
+
+- `EnterFuture` honours the documented eviction verdict: when the waker
+  queue entry it owns has already been retired by an `EvictOldest`
+  evictor, the next poll returns `Ready(Err(EnterError::QueueFull))`
+  instead of re-parking into a fresh slot (which burned capacity and
+  could evict a bystander). The entry flag is read under the lock that
+  stamps it; a settle pop leaves it clear, so that re-park stays honest.
+- The ISR shed counter saturates at `u16::MAX` instead of wrapping to
+  zero — a shed count of 65,536 no longer reports "0 shed". Implemented
+  as a `compare_exchange_weak` loop (no deprecated `fetch_update`, MSRV
+  1.70 intact) and pinned by a 65,536-push test.
+- Per-lane counters and admission hooks clamp with
+  `Priority::MAX_INDEX` and `u32::try_from(..).unwrap_or(u32::MAX)`
+  instead of the literal `min(2)` and an `as u32` truncation, so the
+  bound follows `Priority::COUNT` and an over-large in-flight reading
+  cannot wrap.
+- The supervisor no longer clamps an out-of-range `OP_STATE` sequence id
+  to chunk 2: a frame whose `task` is not 0/1/2 is malformed and is
+  dropped, instead of overwriting the tail chunk and its authoritative
+  full-digest CRC.
+- `lock_poison_tolerant` documents why skipping `hard_clamp_slots` on the
+  recovery path is safe (a foreign mutex poison cannot tear `NodeInner`;
+  the holder finishes its own mutation, and `lock()` clamps on its own
+  poison path).
+
+### CI and release gates
+
+- `scripts/check_api_diff.ps1` no longer hard-fails when the baseline tag
+  is HEAD (the release commit itself): it falls back to the previous tag,
+  mirroring the `.sh` gate, and fails only when no previous tag exists.
+  `check_compile_gates.ps1` Gate 6 delegates to that script instead of
+  duplicating the rule.
+- The stress harness refuses to run an external supervisor in CI
+  (`CI=true/1` for `.sh` and `.py`; `.ps1` fails on any skip in every
+  environment): without a launched child there is no pid for the
+  RSS/fd/exit gates, so the run would report without leak evidence.
+- The three Miri jobs compile with `RUSTFLAGS="-D warnings"` (on top of
+  the existing `-Zmiri-strict-provenance`), so nightly-only lints fail
+  the lane instead of scrolling past. `scripts/release.sh` now passes
+  `--locked` to `cargo clippy` and `cargo publish --dry-run`, matching CI.
+
+### Documentation
+
+- The three pool storm reports are committed under `docs/evidence/`
+  (2026-10-26, with a provenance README). README and USER_GUIDE quote the
+  committed files — `wall_ms=55/474/194`, 99,628 lease observer samples —
+  and say which fields are deterministic counters and which are wall
+  clock.
+- README explains that `target/bench/snapshot.md` is rendered by
+  `scripts/bench.sh` into the gitignored `target/` tree and archived by
+  the `bench-full` CI lane; no copy lives in the repository.
+- USER_GUIDE states the actual SKIP policies: platform-gated skips print
+  and pass locally for `.sh`/`.py` but fail under `CI=true/1`; `.ps1`
+  fails on any skip in every environment.
+
+### Tests
+
+- `tests/state_handoff.rs::out_of_range_state_chunk_is_not_chunk_two`
+  (an out-of-range `task` must not promote to chunk 2) and
+  `src/isr.rs::shed_saturates_at_the_ceiling_without_wrap`.
+
 ## 0.6.10 (2026-10-26)
 
 Audit-2 closeout (PLAN_AUDIT2 findings F-01..F-26; tag and publish only
