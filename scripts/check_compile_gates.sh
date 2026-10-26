@@ -184,8 +184,9 @@ elif ! rustup target list --installed 2>/dev/null | grep -qx "thumbv7em-none-eab
     fi
 else
     BARE_METAL_TARGET="thumbv7em-none-eabihf"
-    if (cd "${REPO_ROOT}" && cargo check --locked --quiet --no-default-features --target "${BARE_METAL_TARGET}") \
-        && (cd "${REPO_ROOT}" && cargo check --locked --quiet --no-default-features --features alloc --target "${BARE_METAL_TARGET}"); then
+    # -D warnings: the core-only lane is a product guarantee, not a courtesy.
+    if (cd "${REPO_ROOT}" && RUSTFLAGS="-D warnings" cargo check --locked --quiet --no-default-features --target "${BARE_METAL_TARGET}") \
+        && (cd "${REPO_ROOT}" && RUSTFLAGS="-D warnings" cargo check --locked --quiet --no-default-features --features alloc --target "${BARE_METAL_TARGET}"); then
         echo "OK (core and alloc build for ${BARE_METAL_TARGET})"
     else
         echo "FAIL (no_std build failed for ${BARE_METAL_TARGET})"

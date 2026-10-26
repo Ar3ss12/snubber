@@ -175,7 +175,10 @@ if ($LibContent -cnotmatch '(?m)^#!\[cfg_attr\(not\(feature = "std"\), no_std\)\
     }
 } else {
     Push-Location $RepoRoot
+    $PrevRustFlags = $env:RUSTFLAGS
     try {
+        # -D warnings: the core-only lane is a product guarantee, not a courtesy.
+        $env:RUSTFLAGS = "-D warnings"
         cargo check --locked --quiet --no-default-features --target $BareMetalTarget
         if ($LASTEXITCODE -eq 0) {
             cargo check --locked --quiet --no-default-features --features alloc --target $BareMetalTarget
@@ -187,6 +190,7 @@ if ($LibContent -cnotmatch '(?m)^#!\[cfg_attr\(not\(feature = "std"\), no_std\)\
             $Failures++
         }
     } finally {
+        $env:RUSTFLAGS = $PrevRustFlags
         Pop-Location
     }
 }

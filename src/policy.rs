@@ -272,6 +272,10 @@ const _: () = {
             && Priority::Critical.code() == 2,
         "CRITICAL: Priority::code() must match enum discriminants"
     );
+    assert!(
+        Priority::MAX_INDEX + 1 == Priority::COUNT,
+        "CRITICAL: Priority::MAX_INDEX must stay the highest dense lane index"
+    );
     // Catastrophic classification contract:
     // Only uncommitted drops, panics, timeouts, and process deaths feed circuit breaker streaks.
     assert!(FaultKind::ImplicitDrop.is_catastrophic());

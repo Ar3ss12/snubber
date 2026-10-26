@@ -1,4 +1,6 @@
-//! Doc tripwires: the FLOOR MAP anchors in `src/node.rs` must never rot.
+//! Doc tripwires: the FLOOR MAP anchors in `src/node.rs` must never rot,
+//! the L1–L5 layer map must stay byte-identical across the three public
+//! docs, and every module path quoted in prose must exist on disk.
 //!
 //! Line numbers in comments die the day someone adds an import. Text tags
 //! don't. If a refactor deletes or renames an anchor, this test goes red
@@ -91,6 +93,119 @@ fn test_low_level_entries_point_at_canonical() {
         source.contains("# 🟢 CANONICAL APPLICATION ENTRY"),
         "TRIPWIRE FIRED: canonical header missing from enter_erased_auto.",
     );
+}
+
+/// The one true layer map. Every public document names each layer with the
+/// same bytes; only the surrounding heading syntax differs per file.
+const CANONICAL_LAYERS: [&str; 5] = [
+    "Core RAII Guard",
+    "Concurrency Bulkhead",
+    "Runtime-Agnostic Async",
+    "Process Supervisor",
+    "Diagnostics & Health",
+];
+
+fn read_doc(path: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|err| panic!("cannot read {path}: {err}"))
+}
+
+/// Returns `(line index, line)` for the single line starting with `prefix`.
+/// Zero hits or duplicates both name the doc and the expected heading.
+fn find_layer_line<'a>(text: &'a str, prefix: &str, doc: &str) -> (usize, &'a str) {
+    let mut hits = text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with(prefix));
+    let (index, line) = hits
+        .next()
+        .unwrap_or_else(|| panic!("{doc}: missing layer heading '{prefix}'"));
+    let duplicates = hits.count();
+    assert!(
+        duplicates == 0,
+        "TRIPWIRE FIRED: {doc}: layer heading '{prefix}' appears {} times",
+        duplicates + 1
+    );
+    (index, line)
+}
+
+/// L1–L5 must read identically in `src/lib.rs`, `README.md` and
+/// `docs/USER_GUIDE.md`, in ascending order. Rename a layer in one file and
+/// this goes red on `cargo test`, not in a reader's head months later.
+#[test]
+fn test_layer_map_is_identical_across_public_docs() {
+    let lib = read_doc("src/lib.rs");
+    let readme = read_doc("README.md");
+    let guide = read_doc("docs/USER_GUIDE.md");
+
+    let mut lib_order = Vec::new();
+    let mut readme_order = Vec::new();
+    let mut guide_order = Vec::new();
+
+    for (offset, name) in CANONICAL_LAYERS.iter().enumerate() {
+        let n = offset + 1;
+
+        // src/lib.rs: `//! * **Layer N (feature qualifiers) — Name:** body`
+        let lib_prefix = format!("//! * **Layer {n} ");
+        let (index, line) = find_layer_line(&lib, &lib_prefix, "src/lib.rs");
+        assert!(
+            line.contains(&format!(" — {name}:**")),
+            "TRIPWIRE FIRED: src/lib.rs Layer {n} must be named '{name}' \
+             ('... — {name}:**'), found: {line}"
+        );
+        lib_order.push(index);
+
+        // README.md: `  * **Layer N: Name:** body`
+        let readme_prefix = format!("  * **Layer {n}: {name}:**");
+        readme_order.push(find_layer_line(&readme, &readme_prefix, "README.md").0);
+
+        // docs/USER_GUIDE.md: `## Layer N: Name (details)`
+        let guide_prefix = format!("## Layer {n}: {name}");
+        guide_order.push(find_layer_line(&guide, &guide_prefix, "docs/USER_GUIDE.md").0);
+    }
+
+    for (doc, order) in [
+        ("src/lib.rs", &lib_order),
+        ("README.md", &readme_order),
+        ("docs/USER_GUIDE.md", &guide_order),
+    ] {
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "TRIPWIRE FIRED: {doc} lists layers out of L1–L5 order: {order:?}"
+        );
+    }
+}
+
+/// Collects `src/...` tokens from prose so a renamed module cannot survive
+/// as a stale pointer in the docs.
+fn documented_source_paths(text: &str) -> Vec<&str> {
+    let mut paths = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("src/") {
+        let tail = &rest[start..];
+        let end = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '.' | '-')))
+            .unwrap_or(tail.len());
+        let path = tail[..end].trim_end_matches(&['.', '-'][..]);
+        if path.len() > "src/".len() {
+            paths.push(path);
+        }
+        rest = &tail[end..];
+    }
+    paths
+}
+
+/// Every module path the public docs cite must exist on disk.
+#[test]
+fn test_documented_module_paths_exist() {
+    for doc in ["src/lib.rs", "README.md", "docs/USER_GUIDE.md"] {
+        let text = read_doc(doc);
+        for path in documented_source_paths(&text) {
+            assert!(
+                std::path::Path::new(path).exists(),
+                "TRIPWIRE FIRED: {doc} cites '{path}', which does not exist — update the prose"
+            );
+        }
+    }
 }
 
 /// The header above names one twin per `rust,no_run` fence. If a fence is

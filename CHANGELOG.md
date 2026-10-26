@@ -35,6 +35,11 @@ surface, wire format and telemetry layout are untouched.
   recovery path is safe (a foreign mutex poison cannot tear `NodeInner`;
   the holder finishes its own mutation, and `lock()` clamps on its own
   poison path).
+- A `core`-only build is warning-clean again: `Priority::MAX_INDEX` was
+  `dead_code` without `std`, so the const-assert block now pins
+  `Priority::MAX_INDEX + 1 == Priority::COUNT` (the lane table's last
+  dense index) and the constant is used in every feature combination —
+  no `allow(dead_code)` waiver.
 
 ### CI and release gates
 
@@ -51,6 +56,11 @@ surface, wire format and telemetry layout are untouched.
   the existing `-Zmiri-strict-provenance`), so nightly-only lints fail
   the lane instead of scrolling past. `scripts/release.sh` now passes
   `--locked` to `cargo clippy` and `cargo publish --dry-run`, matching CI.
+- The core-only lane now denies warnings. Gate 5 in
+  `check_compile_gates.{sh,ps1}` and the two `--no-default-features`
+  steps in `ci.yml` run under `RUSTFLAGS="-D warnings"`, so a warning on
+  bare `core` fails the gate instead of printing and passing. The `.ps1`
+  gate saves and restores the caller's `RUSTFLAGS`.
 
 ### Documentation
 
@@ -75,6 +85,11 @@ surface, wire format and telemetry layout are untouched.
   already complete, so a new undocumented public item now fails the
   build in every feature combination instead of scrolling past as a
   warning.
+- Every layer heading now carries the same canonical name in all three
+  public docs (`Core RAII Guard`, `Concurrency Bulkhead`,
+  `Runtime-Agnostic Async`, `Process Supervisor`, `Diagnostics &
+  Health`); README's Layer 3 was still called "Async Waker Queue".
+  `tests/doc_sync.rs` locks the bytes.
 
 ### Tests
 
@@ -89,6 +104,13 @@ surface, wire format and telemetry layout are untouched.
   `admission_total() == total_started + shed_total()`, `evicted` and
   `preempted` excluded from the shed side, and `reported[]` verified as
   an alert ledger rather than a conservation term.
+- `tests/doc_sync.rs::test_layer_map_is_identical_across_public_docs`
+  requires each of the five canonical layer names to appear exactly once,
+  byte-for-byte, in `src/lib.rs`, `README.md` and `docs/USER_GUIDE.md`,
+  in ascending order; `test_documented_module_paths_exist` fails when
+  prose cites a `src/...` module that is not on disk (it caught README's
+  `Async Waker Queue` and now guards against stale paths like the old
+  `src/async_entry.rs`).
 
 ## 0.6.10 (2026-10-26)
 
