@@ -139,6 +139,9 @@ impl Priority {
     /// Every lane in ascending order (`Background → Normal → Critical`).
     pub const ALL: [Priority; Self::COUNT] = [Self::Background, Self::Normal, Self::Critical];
 
+    /// Highest valid lane index, for bounds-clamping per-lane counters.
+    pub(crate) const MAX_INDEX: usize = Self::COUNT - 1;
+
     /// Numerical representation of priority ranking.
     #[inline]
     #[must_use]

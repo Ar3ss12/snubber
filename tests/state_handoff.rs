@@ -111,6 +111,35 @@ fn corrupted_frame_crc_rejected() {
 }
 
 #[test]
+fn out_of_range_state_chunk_is_not_chunk_two() {
+    use snubber::{PipeDrain, ProcessToken, StateDigest};
+
+    let mut bytes = [0x5Au8; STATE_LEN];
+    bytes[0] = 21;
+    let digest = StateDigest::new(bytes);
+    let frames = digest.to_frames();
+
+    let drain = PipeDrain::manual();
+    assert_eq!(drain.feed(&frames[0].to_bytes()), 1);
+    assert_eq!(drain.feed(&frames[1].to_bytes()), 1);
+
+    let mut stray: ProcessToken = frames[2];
+    stray.task = 7;
+    assert_eq!(drain.feed(&stray.to_bytes()), 1, "the frame still parses");
+    assert!(
+        drain.last_state().is_none(),
+        "task > 2 must not be clamped to chunk 2"
+    );
+
+    assert_eq!(drain.feed(&frames[2].to_bytes()), 1);
+    assert_eq!(
+        drain.last_state().map(|d| d.bytes[0]),
+        Some(21),
+        "chunks 0/1 were untouched; the real chunk 2 completes the digest"
+    );
+}
+
+#[test]
 fn mismatched_generation_chunks_rejected_by_full_crc() {
     use snubber::StateDigest;
     use std::io::Write;

@@ -1057,7 +1057,13 @@ fn apply_token(state: &mut DrainState, token: ProcessToken, now_ms: u64) {
         // Layout: payload[0..take] = data (24/24/16).
         // Frame 2 carries the authoritative full-digest CRC at payload[16..20].
         // Frame CRC at payload[24..28].
-        let seq = (token.task.min(2)) as usize;
+        // A sequence id outside the three-chunk layout is malformed, not
+        // "chunk 2": clamping it would let an unrelated frame overwrite the
+        // tail chunk and its CRC fields.
+        let seq = match usize::try_from(token.task) {
+            Ok(seq) if seq < state.scratch.len() => seq,
+            _ => return,
+        };
         let take = if seq < 2 { 24 } else { 16 };
         let mut want = [0u8; 4];
         want.copy_from_slice(&token.payload[24..28]);

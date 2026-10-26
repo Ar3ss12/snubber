@@ -1680,7 +1680,11 @@ impl SnubberNode {
         let depth = ((in_flight as u64 * 255 / max).min(255)) as u8;
         let cap = max_wait_ms.max(1);
         match handler {
-            Some(f) => f(in_flight as u32, max_in_flight as u32).min(cap),
+            Some(f) => f(
+                u32::try_from(in_flight).unwrap_or(u32::MAX),
+                u32::try_from(max_in_flight).unwrap_or(u32::MAX),
+            )
+            .min(cap),
             None => 1 + depth as u64 * cap / 255,
         }
     }
@@ -3152,9 +3156,12 @@ impl SnubberNode {
                         _ => 1000,
                     };
                     let friction_wait = match snap_friction {
-                        Some(f) => {
-                            self.run_admission_hook(|| f(snap_in_flight as u32, snap_max as u32))
-                        }
+                        Some(f) => self.run_admission_hook(|| {
+                            f(
+                                u32::try_from(snap_in_flight).unwrap_or(u32::MAX),
+                                u32::try_from(snap_max).unwrap_or(u32::MAX),
+                            )
+                        }),
                         None => 1 + depth as u64 * cap / 255,
                     };
                     let legacy_ms = match snap_action {
@@ -3403,7 +3410,7 @@ impl SnubberNode {
         }
         inner.in_flight = inner.in_flight.saturating_add(1);
         inner.queued = inner.queued.saturating_add(1);
-        let lane = priority.code().min(2) as usize;
+        let lane = (priority.code() as usize).min(Priority::MAX_INDEX);
         inner.lane_in_flight[lane] = inner.lane_in_flight[lane].saturating_add(1);
         if priority == Priority::Critical {
             inner.preempt_requested = false;
@@ -4410,7 +4417,7 @@ fn push_flight_inner(inner: &mut NodeInner, slot: FlightSlot) {
 fn release_slot_inner(inner: &mut NodeInner, lane: usize) {
     inner.in_flight = inner.in_flight.saturating_sub(1);
     inner.queued = inner.queued.saturating_sub(1);
-    let lane = lane.min(2);
+    let lane = lane.min(Priority::MAX_INDEX);
     inner.lane_in_flight[lane] = inner.lane_in_flight[lane].saturating_sub(1);
     if lane == 0 {
         inner.preempt_requested = false;
@@ -5248,7 +5255,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             return;
         }
         self.settled = true;
-        let lane = self.priority.code().min(2) as usize;
+        let lane = (self.priority.code() as usize).min(Priority::MAX_INDEX);
         if let Some(g) = self.guard.take() {
             drop(g); // `|| {}` — no hardware effect
         }
@@ -5285,7 +5292,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         self.settled = true;
         let node = self.node.clone();
         let is_probe = self.is_probe;
-        let lane = self.priority.code().min(2) as usize;
+        let lane = (self.priority.code() as usize).min(Priority::MAX_INDEX);
         self.release_profile();
         let waker = {
             let mut inner = node.lock().unwrap_or_else(|p| {
@@ -5356,7 +5363,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         let loc = core::panic::Location::caller();
         let header = self.arming.header;
         let node_name = self.arming.node.clone();
-        let lane = self.priority.code().min(2) as usize;
+        let lane = (self.priority.code() as usize).min(Priority::MAX_INDEX);
         if let Some(g) = self.guard.take() {
             drop(g); // hardware rollback runs HERE
         }
@@ -5458,7 +5465,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         self.settled = true;
         let node = self.node.clone();
         let is_probe = self.is_probe;
-        let lane = self.priority.code().min(2) as usize;
+        let lane = (self.priority.code() as usize).min(Priority::MAX_INDEX);
         self.release_profile();
         let waker = {
             let mut inner = node.lock().unwrap_or_else(|p| {
@@ -5503,7 +5510,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         }
         self.settled = true;
         let stage = self.stage;
-        let lane = self.priority.code().min(2) as usize;
+        let lane = (self.priority.code() as usize).min(Priority::MAX_INDEX);
         let record = FaultRecord {
             kind: FaultKind::ImplicitDrop,
             stage,
