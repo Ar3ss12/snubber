@@ -55,6 +55,19 @@ fn main() {
     let mut age_min_us = u64::MAX;
     let mut age_max_us = 0u64;
     let mut age_sum_us = 0u64;
+    // Drain-parsed frame totals: the children's own accounting, read
+    // back from the pipe. The report consumer uses these as an
+    // INDEPENDENT source for the conservation checks — the class
+    // buckets below are derived in one if/else chain, so sums of those
+    // buckets alone can never fail.
+    let mut frames_sum = 0u64;
+    let mut arms_sum = 0u64;
+    let mut commits_sum = 0u64;
+    // Contradiction counter: a cycle classified Stillborn while its pipe
+    // carried commit frames. The report consumer requires it to be zero —
+    // a broken classification shows up here even though every bucket sum
+    // stays green.
+    let mut misclassified_stillborn = 0u64;
 
     while total_reaped < target_kills {
         let gen = clock.generation();
@@ -121,6 +134,9 @@ fn main() {
         age_max_us = age_max_us.max(age_us);
         age_sum_us += age_us;
         let counters = drain.counters();
+        frames_sum += counters.frames as u64;
+        arms_sum += counters.arms as u64;
+        commits_sum += counters.commits as u64;
         let report_cycle =
             total_reaped % 100 == 0 || total_reaped <= 10 || total_reaped == target_kills;
 
@@ -141,6 +157,9 @@ fn main() {
                 escape_kills += 1;
                 "escape"
             } else {
+                if counters.commits > 0 {
+                    misclassified_stillborn += 1;
+                }
                 stillborn_kills += 1;
                 "stillborn"
             };
@@ -205,6 +224,10 @@ fn main() {
   "escape_kills": {},
   "stillborn_kills": {},
   "armed_hold": {},
+  "frames_sum": {},
+  "arms_sum": {},
+  "commits_sum": {},
+  "misclassified_stillborn": {},
   "age_us": {{ "min": {}, "mean": {}, "max": {} }},
   "final_generation": {},
   "elapsed_ms": {}
@@ -217,6 +240,10 @@ fn main() {
         escape_kills,
         stillborn_kills,
         armed_hold,
+        frames_sum,
+        arms_sum,
+        commits_sum,
+        misclassified_stillborn,
         age_min,
         age_mean_us,
         age_max_us,

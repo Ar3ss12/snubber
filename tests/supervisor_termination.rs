@@ -161,16 +161,43 @@ fn process_kill_stress_test() {
         kills,
         "Total reaped count mismatch!"
     );
-    let settled =
-        json_num(&report_content, "clean_settles") + json_num(&report_content, "ambush_kills");
-    assert_eq!(
-        settled, kills,
-        "every reaped process must be classified (clean + ambush)"
-    );
     let classes = json_num(&report_content, "ambush_kills")
         + json_num(&report_content, "escape_kills")
         + json_num(&report_content, "stillborn_kills");
     assert_eq!(classes, kills, "class buckets must sum to reaped");
+    // Cross-source conservation (PLAN_AUDIT2 F-06): the class buckets are
+    // derived in ONE if/else chain, so any sum of them is true by
+    // construction. The children's own frame accounting — parsed from the
+    // pipe into drain counters — is an independent record of what the
+    // workers actually did:
+    //   * an ambush required a parsed arm frame (the token came from it);
+    //   * an escape required at least one parsed commit frame.
+    // A misclassification (e.g. every death called `stillborn`) breaks
+    // these floors even though every bucket sum stays green.
+    let arms_sum = json_num(&report_content, "arms_sum");
+    let commits_sum = json_num(&report_content, "commits_sum");
+    let ambush = json_num(&report_content, "ambush_kills");
+    let escape = json_num(&report_content, "escape_kills");
+    assert!(
+        arms_sum >= ambush + escape,
+        "every ambush/escape cycle must have parsed an arm frame:          arms_sum={arms_sum} < ambush+escape={}",
+        ambush + escape
+    );
+    assert!(
+        commits_sum >= escape,
+        "every escape cycle must have parsed a commit frame:          commits_sum={commits_sum} < escape={escape}"
+    );
+    assert_eq!(
+        json_num(&report_content, "misclassified_stillborn"),
+        0,
+        "a Stillborn verdict contradicts observed commit frames —          the escape/stillborn split is broken"
+    );
+    if report_content.contains("\"armed_hold\": true") {
+        assert_eq!(
+            ambush, kills,
+            "armed-hold run: every kill must be an ambush"
+        );
+    }
     assert_eq!(
         json_num(&report_content, "final_generation"),
         kills + 1,

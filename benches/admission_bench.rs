@@ -405,7 +405,12 @@ fn bench_pipe_drain(c: &mut Criterion) {
     g.bench_function("drain_sync_256_frames", |b| {
         b.iter(|| {
             let drain = PipeDrain::drain_sync(Cursor::new(black_box(&wire[..])));
-            black_box(drain.counters());
+            assert_eq!(
+                drain.counters().frames,
+                FRAMES,
+                "drain_sync must parse the whole chunk"
+            );
+            black_box(drain.counters())
         });
     });
     g.finish();
@@ -418,7 +423,11 @@ fn bench_drain_feed(c: &mut Criterion) {
     let mut g = c.benchmark_group("layer4_drain_feed");
     let single = PipeDrain::manual();
     g.bench_function("drain_feed_frame", |b| {
-        b.iter(|| black_box(single.feed(black_box(&frame))));
+        b.iter(|| {
+            let parsed = single.feed(black_box(&frame));
+            assert_eq!(parsed, 1, "scanner must parse exactly one frame per feed");
+            black_box(parsed)
+        });
     });
 
     // 256 frames in one chunk: amortizes the per-call lock and branch.
@@ -429,7 +438,14 @@ fn bench_drain_feed(c: &mut Criterion) {
     }
     let bulk = PipeDrain::manual();
     g.bench_function("drain_feed_256_frames", |b| {
-        b.iter(|| black_box(bulk.feed(black_box(&wire))));
+        b.iter(|| {
+            let parsed = bulk.feed(black_box(&wire));
+            assert_eq!(
+                parsed, FRAMES,
+                "scanner must parse the whole 256-frame chunk per feed"
+            );
+            black_box(parsed)
+        });
     });
     g.finish();
 

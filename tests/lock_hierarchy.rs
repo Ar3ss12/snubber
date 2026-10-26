@@ -63,23 +63,51 @@ fn no_nested_locks_across_node_and_conduit() {
     }
 }
 
-/// Open-call audit: every `notify_all` / `w.wake()` in node.rs must be
-/// preceded (in the same function) by a `drop(inner)`. Documents the
-/// law; the grep above enforces the module boundary.
+/// Open-call audit WITH ORDER: split node.rs into function chunks; a
+/// chunk that wakes must release the node lock (`drop(inner)`) BEFORE
+/// its first wake site. Replaces the old count-based assert
+/// (`drops >= wakes.min(drops + 1)`), which was true by construction
+/// and proved nothing.
 #[test]
 fn wakes_happen_after_drop_in_node() {
     let node = src("src/node.rs");
-    let wakes = node.matches("notify_all").count()
-        + node.matches("w.wake()").count()
-        + node.matches("waker").count().min(1);
-    let drops = node.matches("drop(inner)").count();
+    let wake_verbs = ["notify_all", "w.wake()"];
+    let lines: Vec<&str> = node.lines().collect();
+
+    // Function boundaries: any line that OPENS a function item. Comments
+    // never start with `fn`, so a trimmed `fn`/`pub fn` prefix is a
+    // boundary whether the item sits at file level or inside an impl.
+    let mut starts: Vec<usize> = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("fn ") || t.starts_with("pub fn ") || t.starts_with("pub(crate) fn ") {
+            starts.push(idx);
+        }
+    }
+    starts.push(lines.len());
+
+    let mut woke_chunks = 0usize;
+    for window in starts.windows(2) {
+        let (from, to) = (window[0], window[1]);
+        let first_wake = (from..to).find(|&i| {
+            let code = lines[i].trim_start();
+            !code.starts_with("//") && wake_verbs.iter().any(|v| lines[i].contains(v))
+        });
+        let Some(wake_at) = first_wake else {
+            continue;
+        };
+        woke_chunks += 1;
+        assert!(
+            (from..wake_at).any(|i| lines[i].contains("drop(inner)")),
+            "open-call audit: function at node.rs:{} wakes ({}) while an earlier \
+             `drop(inner)` is absent in the same function — the node lock must be \
+             released before every wake",
+            wake_at + 1,
+            lines[wake_at].trim()
+        );
+    }
     assert!(
-        drops >= wakes.min(drops + 1),
-        "open-call audit: {wakes} wake sites vs {drops} drop(inner) — \
-         every wake must follow a drop"
-    );
-    assert!(
-        drops > 0,
-        "node.rs must contain drop(inner) open-call sites"
+        woke_chunks > 0,
+        "audit ran on an empty function split — boundary heuristic rotted"
     );
 }

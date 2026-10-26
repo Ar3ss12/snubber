@@ -376,6 +376,22 @@ fn bench_setup_outside_hot_loop() {
             idx + 1
         );
     }
+    // A `feed` whose parsed-frame count is never asserted measures a
+    // no-op scanner as if it worked. Every timed `.feed(` call must be
+    // followed (within 4 lines) by an assert on the returned count.
+    let lines: Vec<&str> = source.lines().collect();
+    for (idx, line) in lines.iter().enumerate() {
+        if line.contains(".feed(") {
+            let checked = lines[idx..(idx + 4).min(lines.len())]
+                .iter()
+                .any(|l| l.contains("assert"));
+            assert!(
+                checked,
+                "benches/admission_bench.rs:{}: feed without an asserted frame count —                  a silent no-op scanner would still 'pass'",
+                idx + 1
+            );
+        }
+    }
     for (tag, pin) in [
         ("IDEAL-1", "bench_contended_enter"),
         ("IDEAL-2", "bench_contended_scoped"),
