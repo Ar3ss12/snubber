@@ -6,6 +6,40 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 
 ## Unreleased
 
+### Fixed
+
+- Every automatic fault path (guard settle, async TTL timeout, async
+  evict-oldest, admission refusals: bulkhead/stale/rate/breaker/poison)
+  now bumps `reported[kind]` exactly once via `record_locked`, so
+  `metric_samples()` and the console alert see `count >= 1` during the
+  incident. The old split (only explicit `report()` and the rate/poison/
+  preempt codes wrote the slot) left automatic faults invisible to both
+  exporters. `bump_reported` is renamed `bump_column` and books only the
+  mechanism column for explicit reports; explicit `report()` and the
+  automatic path of the same kind now land on the same column.
+- A named `report(FaultKind::BufferOverflow, …)` no longer credits
+  `bulkhead_rejections` (a shed/conservation column). A BufferOverflow
+  RECORD is capacity telemetry; the sync queue horizon raises it on an
+  admission that still SUCCEEDS, so folding it into the shed columns
+  broke the conservation law `admission_total() == total_started +
+  shed_total()`. The async `RejectNew` queue-full refusal is a genuine
+  rejection and still books `bulkhead_rejections`.
+- `check_timeout` no longer bumps `reported[Timeout]` by hand;
+  `record_locked` owns the slot for every path, so no caller can rewind
+  or double a published counter.
+
+### Tests
+
+- New `tests/metrics_reporting.rs`: every automatic path exports exactly
+  one metric sample with `count >= 1`, the hook snapshot carries the same
+  alert count, named vs automatic reports of one kind agree on the
+  reported slot and the mechanism column, and BufferOverflow records
+  never enter the conservation law. Negative run verified: removing the
+  centralized `reported[]` bump turns 5 of 6 tests red.
+- `trap1_no_double_count_implicit_drop_with_reported` now pins the fixed
+  contract: one guard settle produces `reported[ImplicitDrop] == 1`
+  (previously it pinned the invisible-fault bug as `== 0`).
+
 ### Tooling / CI
 
 - `scripts/release.sh` (plus the new `justfile`) runs the whole release

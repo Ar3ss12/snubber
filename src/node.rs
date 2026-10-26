@@ -234,10 +234,16 @@ pub struct SnubberStats {
     pub queue_capacity: u64,
     /// Last recorded fault (any kind).
     pub last_fault: Option<FaultRecord>,
-    /// Per-kind explicit-report counters, indexed by [`FaultKind::index`].
-    /// (`reported[Panic]` counts supervisor-named panics; the guard-side
-    /// implicit drop of the same incident counts separately — honest,
-    /// no double-bookkeeping hidden.)
+    /// Per-kind recorded-fault counters, indexed by [`FaultKind::index`]:
+    /// EVERY fault of that kind, whether named by an explicit `report()` or
+    /// raised by an automatic path (guard settle, queue horizon, async TTL,
+    /// breaker / stale / bulkhead / evict / rate refusal). This is the slot
+    /// [`SnubberNode::metric_samples`] and the console alert read, so a fault
+    /// that fired always has a non-zero sample.
+    ///
+    /// It is NOT a conservation term: the admission law is built from the
+    /// mechanism columns (`bulkhead_rejections`, `stale_epochs_rejected`, …) —
+    /// see [`SnubberStats::admission_total`].
     pub reported: [u64; FaultKind::COUNT],
 }
 
@@ -256,8 +262,14 @@ impl SnubberStats {
             .saturating_add(self.implicit_drops)
     }
 
-    /// Capacity shedding: no free bulkhead slot (`BulkheadFull` +
-    /// `BufferOverflow` mirror). Upstream throughput exceeds worker capacity.
+    /// Capacity shedding: a REFUSED admission with no free bulkhead slot
+    /// (`BulkheadFull`, plus the async `RejectNew` queue-full refusal, which
+    /// is recorded as `BufferOverflow`). Upstream throughput exceeds worker
+    /// capacity.
+    ///
+    /// A telemetry-only queue-horizon `BufferOverflow` record — raised on an
+    /// admission that still SUCCEEDS — is never counted here: it would
+    /// double-book an attempt that also appears in `total_started`.
     #[must_use]
     pub fn shed_bulkhead(&self) -> u64 {
         self.bulkhead_rejections
@@ -1894,7 +1906,11 @@ impl SnubberNode {
     }
 
     /// Exporter rows for Prometheus/OpenMetrics/ETW: one
-    /// [`crate::MetricSample`] per (policy tag × kind) that fired.
+    /// [`crate::MetricSample`] per (policy tag × kind) that fired — an
+    /// explicit `report()` or an automatic path alike (guard settle, queue
+    /// horizon, async TTL, breaker / stale / bulkhead / evict / rate
+    /// refusal), because every path books `reported[]` through
+    /// `record_locked`.
     /// Iteration order = [`FaultKind::ALL`]. Zero rows when silent.
     ///
     /// HONEST NOTE (F10): cold diagnostic path — `Vec` + push allocate
@@ -2052,7 +2068,11 @@ impl SnubberNode {
             // streak instead of welding the breaker until reset.
             streak_trip_locked(&mut inner);
         }
-        Self::bump_reported(&mut inner, kind);
+        // Book the mechanism column for this kind, then the common
+        // `record_locked(kind, 0)` bumps `reported[kind]` exactly once — so an
+        // explicit report and the automatic path of the same kind end on the
+        // same books (same column, one reported).
+        Self::bump_column(&mut inner, kind);
         let mut outcome = Self::record_locked(&mut inner, kind, 0);
         drop(inner);
         self.publish_fault(&mut outcome, &record);
@@ -2078,10 +2098,9 @@ impl SnubberNode {
         self.lock().policies[kind.index()]
     }
 
-    /// Per-kind explicit-report counters, indexed by [`FaultKind::index`].
-    /// (`reported[Panic]` counts supervisor-named panics; the guard-side
-    /// implicit drop of the same incident counts separately — honest,
-    /// no double-bookkeeping hidden.)
+    /// Per-kind recorded-fault counters, indexed by [`FaultKind::index`] —
+    /// every fault that fired, explicit `report()` or automatic path alike
+    /// (same slot as the `reported` field of [`SnubberStats`]).
     pub fn reported(&self) -> [u64; FaultKind::COUNT] {
         self.lock().stats.reported
     }
@@ -3784,7 +3803,9 @@ impl SnubberNode {
             // Telemetry parity with the sync EvictOldest arm: the eviction
             // goes through `record_locked` + the per-kind policy, so a
             // user's `.policy(EvictedOldest, ..)` fires on the async path
-            // too and `reported` agrees with `stats.evicted`.
+            // too. `record_locked` books `stats.evicted` (bump code 4) AND
+            // `reported[EvictedOldest]` (the unconditional slot), so the
+            // `evicted_oldest_total` export is non-zero on this path.
             let evicted_record = evicted_waker.as_ref().map(|_| FaultRecord {
                 kind: FaultKind::EvictedOldest,
                 node: inner.name.clone(),
@@ -4059,12 +4080,25 @@ impl SnubberNode {
         }
     }
 
-    /// Second half of `record_locked` for explicit `report()` paths.
+    /// Column half of an explicit `report()`: book the MECHANISM column the
+    /// automatic twin of that kind books (`record_locked` codes 1–5/7), so an
+    /// explicit report and the automatic path agree on the same incident.
+    ///
+    /// The `reported[]` slot is NOT touched here — `record_locked` owns it, so
+    /// `report()` bumps it exactly once (this runs first, then the common
+    /// `record_locked(kind, 0)`).
+    ///
+    /// `BufferOverflow` deliberately has NO column: a `BufferOverflow` RECORD
+    /// is capacity telemetry — the sync queue horizon raises it on an
+    /// admission that goes on to SUCCEED — so it must never enter
+    /// `bulkhead_rejections` / `shed_bulkhead()` / the admission conservation
+    /// law. Folding it in here (the old behaviour) made `report(BufferOverflow)`
+    /// and the automatic horizon disagree on the very same event.
+    ///
     /// Integer-only, saturating, cannot panic — hard invariant, never
     /// `debug_assert` (survives `--release`).
     #[inline]
-    fn bump_reported(inner: &mut NodeInner, kind: FaultKind) {
-        inner.stats.reported[kind.index()] = inner.stats.reported[kind.index()].saturating_add(1);
+    fn bump_column(inner: &mut NodeInner, kind: FaultKind) {
         match kind {
             FaultKind::ImplicitDrop => {
                 inner.stats.implicit_drops = inner.stats.implicit_drops.saturating_add(1);
@@ -4073,7 +4107,7 @@ impl SnubberNode {
                 inner.stats.stale_epochs_rejected =
                     inner.stats.stale_epochs_rejected.saturating_add(1);
             }
-            FaultKind::BulkheadFull | FaultKind::BufferOverflow => {
+            FaultKind::BulkheadFull => {
                 inner.stats.bulkhead_rejections = inner.stats.bulkhead_rejections.saturating_add(1);
             }
             FaultKind::EvictedOldest => {
@@ -4081,6 +4115,9 @@ impl SnubberNode {
             }
             FaultKind::BreakerOpen => {
                 inner.stats.breaker_rejections = inner.stats.breaker_rejections.saturating_add(1);
+            }
+            FaultKind::PoisonedPayload => {
+                inner.stats.poisoned_rejected = inner.stats.poisoned_rejected.saturating_add(1);
             }
             FaultKind::Preempted => {
                 inner.stats.preempted = inner.stats.preempted.saturating_add(1);
@@ -4110,15 +4147,26 @@ impl SnubberNode {
     /// state) so the signature itself cannot smuggle a panicking call
     /// under the lock: 0 = none, 1 = breaker_rejections,
     /// 2 = stale_epochs_rejected, 3 = bulkhead_rejections, 4 = evicted,
-    /// 5 = poisoned_rejected (+reported), 6 = rate_rejected (+reported),
-    /// 7 = preempted (+reported). Every bump is a `saturating_add(1)`:
-    /// no caller can rewind a published counter.
+    /// 5 = poisoned_rejected, 6 = rate_rejected, 7 = preempted. Each is a
+    /// `saturating_add(1)` on the MECHANISM column only. The `reported[]`
+    /// slot is NOT part of this code: it is bumped unconditionally once per
+    /// record, above. No caller can rewind a published counter.
     fn record_locked(
         inner: &mut NodeInner,
         record_kind: FaultKind,
         bump_kind: u8,
     ) -> ReportOutcome {
         let policy = inner.policies[record_kind.index()];
+        // `reported[record_kind]` is the ALERT/metric counter, not a
+        // conservation column: EVERY recorded fault bumps it exactly once,
+        // from whichever path raised it — explicit `report()`, a guard
+        // settle, or an automatic admission refusal. It lives HERE and only
+        // here, so no path can forget it and no path can double it:
+        // `metric_samples()` and the console alert read this slot, and the
+        // old split (only bump codes 5/6/7 wrote it) left every automatic
+        // fault invisible to both (`count = 0` during the incident).
+        inner.stats.reported[record_kind.index()] =
+            inner.stats.reported[record_kind.index()].saturating_add(1);
         match bump_kind {
             1 => {
                 inner.stats.breaker_rejections = inner.stats.breaker_rejections.saturating_add(1);
@@ -4135,8 +4183,6 @@ impl SnubberNode {
             }
             5 => {
                 inner.stats.poisoned_rejected = inner.stats.poisoned_rejected.saturating_add(1);
-                inner.stats.reported[record_kind.index()] =
-                    inner.stats.reported[record_kind.index()].saturating_add(1);
             }
             6 => {
                 // Token bucket is its OWN column forever. Mirroring it into
@@ -4144,13 +4190,9 @@ impl SnubberNode {
                 // RateLimited attempt twice and contaminated
                 // `shed_bulkhead()` with rate pressure.
                 inner.stats.rate_rejected = inner.stats.rate_rejected.saturating_add(1);
-                inner.stats.reported[record_kind.index()] =
-                    inner.stats.reported[record_kind.index()].saturating_add(1);
             }
             7 => {
                 inner.stats.preempted = inner.stats.preempted.saturating_add(1);
-                inner.stats.reported[record_kind.index()] =
-                    inner.stats.reported[record_kind.index()].saturating_add(1);
             }
             _ => {}
         }
@@ -5303,8 +5345,9 @@ impl<F: FnOnce()> TrackedGuard<F> {
             inner.stats.breaker_state = BreakerState::Open;
         }
         inner.timeouts_fired = inner.timeouts_fired.saturating_add(1);
-        inner.stats.reported[FaultKind::Timeout.index()] =
-            inner.stats.reported[FaultKind::Timeout.index()].saturating_add(1);
+        // `reported[Timeout]` is bumped by `record_locked` below (the code-0
+        // arm owns it for every path); bumping it here too would double the
+        // watchdog metric.
         if dead {
             inner.deadlock_suspected = inner.deadlock_suspected.saturating_add(1);
             inner.stats.deadlock_suspected = inner.deadlock_suspected;

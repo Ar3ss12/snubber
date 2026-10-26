@@ -10,16 +10,22 @@ use snubber::{FaultKind, SnubberNode};
 #[test]
 fn trap1_no_double_count_implicit_drop_with_reported() {
     // Guard path (`settle_implicit`): ONE implicit drop bumps
-    // `implicit_drops` exactly once. `catastrophic_faults()` sums
-    // Panic/Timeout/ProcessDied reports + `implicit_drops` — the guard
-    // path never touches `reported[ImplicitDrop]`, so one drop = one
-    // fault, never two.
+    // `implicit_drops` AND `reported[ImplicitDrop]` exactly once each — the
+    // reported slot is booked by `record_locked`, so the drop is visible to
+    // `metric_samples()` (`implicit_drops_total` no longer exports zero).
+    // `catastrophic_faults()` sums Panic/Timeout/ProcessDied reports +
+    // `implicit_drops` — it does NOT read `reported[ImplicitDrop]`, so one
+    // drop = one fault, never two.
     let node = SnubberNode::builder("trap1_guard").build();
     let g = node.enter(1, 1, || {}).expect("admit");
     drop(g);
     let s = node.stats();
     assert_eq!(s.implicit_drops, 1);
-    assert_eq!(s.reported[FaultKind::ImplicitDrop.index()], 0);
+    assert_eq!(
+        s.reported[FaultKind::ImplicitDrop.index()],
+        1,
+        "guard drop must be exported, otherwise metric_samples() sees zero"
+    );
     assert_eq!(s.catastrophic_faults(), 1, "one drop = one fault, not two");
 }
 
