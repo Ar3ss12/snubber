@@ -62,8 +62,12 @@ echo -n "[2/7] Auditing saturating counters in src/node.rs... "
 # when this gate was written. A new bucket (rate/breaker/memory/evicted/
 # preempted/implicit drops/trips) must not be writable with a bare `+=`.
 COUNTERS='in_flight|total_started|committed|explicit_aborts|implicit_drops|bulkhead_rejections|poison_recoveries|stale_epochs_rejected|rate_rejected|breaker_rejections|memory_rejections|evicted|preempted|breaker_trips|reported'
-PLUS_EQ_HITS="$(grep -En "(^|[^_[:alnum:]])(${COUNTERS})[[:space:]]*\+=" "${REPO_ROOT}/src/node.rs" 2>&1)"
-rc=$?
+# `|| rc=$?`: a bare assignment under `set -e` aborts the script when
+# grep exits 1 (clean tree), which made the `rc -eq 1 -> OK` branch
+# unreachable and silently skipped the gate (and PARITY) instead of
+# reporting a clean scan.
+rc=0
+PLUS_EQ_HITS="$(grep -En "(^|[^_[:alnum:]])(${COUNTERS})[[:space:]]*\+=" "${REPO_ROOT}/src/node.rs" 2>&1)" || rc=$?
 if [ "$rc" -eq 0 ]; then
     # Doc/comment lines are not code: `committed += 1` in a contract
     # comment must not trip a scan for direct counter writes.
@@ -233,8 +237,8 @@ fi
 # leak. Scan all of src/: the offending call lived in the guard impls, not
 # only in node.rs helpers.
 echo -n "[7/7] Auditing settle paths for mem::forget... "
-FORGET_HITS="$(grep -rEn 'mem::forget' --include='*.rs' "${REPO_ROOT}/src" 2>&1)"
-rc=$?
+rc=0
+FORGET_HITS="$(grep -rEn 'mem::forget' --include='*.rs' "${REPO_ROOT}/src" 2>&1)" || rc=$?
 if [ "$rc" -eq 0 ]; then
     # Comments may name the historical bug; only code may not call it.
     CODE_HITS="$(printf '%s\n' "${FORGET_HITS}" | grep -vE '^.*:[0-9]+:[[:space:]]*//' || true)"

@@ -60,6 +60,15 @@ surface, wire format and telemetry layout are untouched.
   (`CI=true/1` for `.sh` and `.py`; `.ps1` fails on any skip in every
   environment): without a launched child there is no pid for the
   RSS/fd/exit gates, so the run would report without leak evidence.
+- Gate 2 and Gate 7 of `scripts/check_compile_gates.sh` no longer abort
+  on a clean scan. Both did `HITS="$(grep …)"; rc=$?` under
+  `set -euo pipefail`: a zero-hit grep killed the script before `rc=$?`,
+  so the `OK` branch (and the `PARITY:` line) never printed and the audit
+  silently did its best impression of a passing gate. The scans now keep
+  their exit code with `|| rc=$?`; proven by running the gates on a tree
+  with every masking comment removed — both print `OK` and `PARITY:
+  gates=7 counters=15 functions=3 metaphors=5` (before the fix the same
+  tree exited 1 with no output at all).
 - `termination-smoke` no longer hangs. The test used to launch the
   supervisor itself and then pass `--external-supervisor` (`.sh`) or
   nothing (`.ps1`), which tripped the CI `--launch` gate; the harness
