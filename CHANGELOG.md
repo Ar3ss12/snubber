@@ -57,6 +57,21 @@ the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 
 ### Tooling / CI
 
+- `scripts/release.sh` now parses every `SKIP (...)` line in the compile
+  gates log and tolerates exactly one, verbatim —
+  `SKIP (cargo-semver-checks not installed)`. Any other SKIP fails the
+  release; the old condition only checked the presence of the semver
+  SKIP, so a combination like "semver SKIP + Gate 5 SKIP" passed.
+- Every ignored release lane (`supervisor_pool_stress*`,
+  `stress_breaker_churn`, `supervisor_termination`) now requires
+  `executed > 0`: a green `0 passed` (renamed test, cfg'd-out module,
+  target-filter typo) fails the gate instead of silently passing. The
+  same executed>0 check is mirrored in the `release-ignored` and
+  `termination-smoke` CI jobs (bash shell on both Linux and Windows).
+  Negative proofs: a synthetic log with a foreign SKIP dies; a
+  `0 passed` lane log dies; honest logs pass with the executed count.
+- README tests badge 404 → 414 (10 new tests from the telemetry and
+  queue-horizon fixes); the badge drift gate caught the difference.
 - `scripts/release.sh` (plus the new `justfile`) runs the whole release
   gate in one command: fmt, clippy, full suite + doctests + badge drift,
   compile gates, the `#[ignore]` release lanes, the release identity gate

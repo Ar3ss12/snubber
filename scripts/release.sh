@@ -68,6 +68,49 @@ die() {
     exit 1
 }
 
+# The ONLY SKIP line a local release gate may ever print, verbatim.
+# Any other "SKIP (...)" means a gate silently did not run, which must
+# fail the release: the old condition only verified the PRESENCE of the
+# semver SKIP, so a combination like "semver SKIP + Gate 5 SKIP" passed.
+audit_gate_skips() {
+    local skips bad count
+    skips=$(grep -E 'SKIP \(' "${LOG_DIR}/gates.log" || true)
+    [ -n "${skips}" ] || return 0
+    bad=$(printf '%s\n' "${skips}" |
+        grep -v 'SKIP (cargo-semver-checks not installed)' || true)
+    if [ -n "${bad}" ]; then
+        printf '%s\n' "${bad}" >&2
+        die "unexpected SKIP in compile gates; only 'SKIP (cargo-semver-checks not installed)' is tolerated (log: ${LOG_DIR}/gates.log)"
+    fi
+    count=$(printf '%s\n' "${skips}" | grep -c 'SKIP (cargo-semver-checks not installed)')
+    printf 'WARN: %i tolerated gate SKIP line(s): cargo-semver-checks missing locally; CI runs it with teeth.\n' "${count}"
+}
+
+# A green `0 passed` on an ignored lane means the lane never ran (a
+# renamed test, a cfg'd-out module, a target-filter typo) — a silent
+# hole in the release gate. Require executed tests (passed + failed) > 0.
+require_executed_tests() {
+    local log="$1" lane="$2" executed
+    executed=$(awk -F'[ ;]' '/^test result:/{p+=$4; f+=$6} END{print p+f}' "${log}")
+    if [ "${executed}" -eq 0 ]; then
+        die "ignored lane '${lane}' executed 0 tests (log: ${log})"
+    fi
+    printf 'lane %s: executed %i test(s)\n' "${lane}" "${executed}"
+}
+
+run_ignored_lane() {
+    local log="$1"
+    shift
+    STRESS_TARGET_KILLS="${STRESS_TARGET_KILLS:-50}" \
+        cargo test ${JOBS} --release --locked "$@" \
+        >"${log}" 2>&1 ||
+        {
+            tail -n 40 "${log}"
+            die "release ignored lane failed (log: ${log})"
+        }
+    require_executed_tests "${log}" "$*"
+}
+
 step "cargo fmt --check"
 cargo fmt --check || die "formatting drift (run: cargo fmt)"
 
@@ -84,20 +127,23 @@ CARGO_TERM_COLOR=never cargo test ${JOBS} --locked --all-features --color never 
 bash scripts/check_test_count.sh "${LOG_DIR}/suite.log" || die "README badge drift"
 
 step "architectural compile gates"
-if bash scripts/check_compile_gates.sh >"${LOG_DIR}/gates.log" 2>&1; then
-    grep -E '^PARITY:' "${LOG_DIR}/gates.log" || true
-else
-    cat "${LOG_DIR}/gates.log"
-    # Gate 6 SKIP is a local-only condition (no cargo-semver-checks on a
-    # small box). CI installs the tool and treats SKIP as FAIL, so it can
-    # never reach a release. Any other non-zero exit is a real failure.
-    if grep -q 'SKIP (cargo-semver-checks not installed)' "${LOG_DIR}/gates.log" &&
-        ! grep -qE '^\[[0-9]+/7\].*FAIL' "${LOG_DIR}/gates.log"; then
-        printf 'WARN: Gate 6 SKIP locally (cargo-semver-checks missing); CI runs it with teeth.\n'
+GATES_EXIT=0
+bash scripts/check_compile_gates.sh >"${LOG_DIR}/gates.log" 2>&1 || GATES_EXIT=1
+audit_gate_skips
+if [ "${GATES_EXIT}" -ne 0 ]; then
+    if grep -q 'SKIP (cargo-semver-checks not installed)' "${LOG_DIR}/gates.log"; then
+        # The non-zero exit is the documented local-only condition: with
+        # cargo-semver-checks missing the audit reports itself NOT
+        # complete. audit_gate_skips already proved this semver SKIP is
+        # the ONLY skip in the log; CI installs the tool and runs the
+        # gate with teeth, so a release can never hide behind this.
+        printf 'WARN: compile-gate audit incomplete locally (cargo-semver-checks missing); CI runs it with teeth.\n'
     else
+        tail -n 20 "${LOG_DIR}/gates.log"
         die "compile gates (log: ${LOG_DIR}/gates.log)"
     fi
 fi
+grep -E '^PARITY:' "${LOG_DIR}/gates.log" || true
 
 if [ "${MODE}" = "fast" ]; then
     printf '\nFAST GATES GREEN (lanes, identity and publish dry-run skipped)\n'
@@ -105,18 +151,16 @@ if [ "${MODE}" = "fast" ]; then
 fi
 
 step "release ignored lanes"
-STRESS_TARGET_KILLS="${STRESS_TARGET_KILLS:-50}" \
-    cargo test ${JOBS} --release --locked \
+run_ignored_lane "${LOG_DIR}/lane_storms.log" \
     --test supervisor_pool_stress \
     --test supervisor_pool_stress_lease \
     --test supervisor_pool_stress_mixed \
     --test stress_breaker_churn \
-    -- --ignored || die "pool storms / breaker churn (release)"
+    -- --ignored
 
-STRESS_TARGET_KILLS="${STRESS_TARGET_KILLS:-50}" \
-    cargo test ${JOBS} --release --locked \
+run_ignored_lane "${LOG_DIR}/lane_termination.log" \
     --test supervisor_termination \
-    -- --ignored || die "termination storm (release)"
+    -- --ignored
 
 step "release identity (Cargo.toml vs tag vs CHANGELOG)"
 bash scripts/check_release_tag.sh || die "release identity"

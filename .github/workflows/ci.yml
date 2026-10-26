@@ -216,13 +216,21 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Pool storms + breaker churn (ignored gates)
+        shell: bash
         run: |
+          set -euo pipefail
           cargo test --release --locked \
             --test supervisor_pool_stress \
             --test supervisor_pool_stress_lease \
             --test supervisor_pool_stress_mixed \
             --test stress_breaker_churn \
-            -- --ignored
+            -- --ignored 2>&1 | tee "${RUNNER_TEMP}/lane_storms.log"
+          executed=$(awk -F'[ ;]' '/^test result:/{p+=$4; f+=$6} END{print p+f}' "${RUNNER_TEMP}/lane_storms.log")
+          if [ "${executed}" -eq 0 ]; then
+            echo "FAIL: release ignored lane executed 0 tests (renamed or cfg'd-out lane)" >&2
+            exit 1
+          fi
+          echo "lane executed ${executed} test(s)"
 
       - name: Upload Pool Gate Artifacts
         if: always()
@@ -261,7 +269,16 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Termination stress (reduced counts)
-        run: cargo test --release --locked --test supervisor_termination -- --ignored --nocapture
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --locked --test supervisor_termination -- --ignored --nocapture 2>&1 | tee "${RUNNER_TEMP}/termination.log"
+          executed=$(awk -F'[ ;]' '/^test result:/{p+=$4; f+=$6} END{print p+f}' "${RUNNER_TEMP}/termination.log")
+          if [ "${executed}" -eq 0 ]; then
+            echo "FAIL: termination lane executed 0 tests" >&2
+            exit 1
+          fi
+          echo "termination lane executed ${executed} test(s)"
 
   # 3. MIRI VERIFICATION: Formal memory model verification.
   # Split into two parallel jobs: Miri interprets all threads on one host
