@@ -189,6 +189,16 @@ surface, wire format and telemetry layout are untouched.
 
 ### Documentation
 
+- The `no_std` clock-injection snippets no longer withhold the signature.
+  The USER_GUIDE transport example called
+  `PipeDrain::manual_with_clock(app_tick_ms)` with `app_tick_ms` and
+  `uart_chunk` undeclared; it now declares
+  `fn app_tick_ms() -> u64 { 0 }` and a byte chunk, and the comment names
+  the type (`ClockFn = fn() -> u64, NOT a number`) in both docs. A
+  `doc_sync` tripwire fails the suite when any public rust fence calls
+  `manual_with_clock` without declaring `fn ...() -> u64` in the same
+  snippet.
+
 - Bench numbers no longer diverge between docs. The README prose
   (`attach + note_death` ~192/~173 ns, `report()` ~111 ns, lease sweep
   ~517 ns) and 14 USER_GUIDE rows (contended 925/899/146/34 ns, storm

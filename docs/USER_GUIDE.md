@@ -798,7 +798,10 @@ delivered by that call. Call `finish()` when the stream ends: the drain reaches
 ```rust
 use snubber::PipeDrain;
 
-let drain = PipeDrain::manual_with_clock(app_tick_ms); // app-owned ms counter
+fn app_tick_ms() -> u64 { 0 } // app-owned monotonic ms (firmware SysTick), never SystemTime
+let uart_chunk: [u8; 44] = [0; 44]; // chunk pushed by the UART/DMA task
+
+let drain = PipeDrain::manual_with_clock(app_tick_ms); // ClockFn = fn() -> u64, NOT a number
 let frames = drain.feed(&uart_chunk);                  // 0..=N complete frames
 let idle = drain.idle_ms();                            // measured on app_tick_ms
 drain.finish();                                        // EOF, idempotent

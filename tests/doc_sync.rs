@@ -339,6 +339,34 @@ fn test_bench_numbers_agree_across_readme_and_guide() {
     }
 }
 
+/// Any `manual_with_clock` snippet in the public docs must declare the
+/// `ClockFn` shape (`fn() -> u64`) in the same fence. `ClockFn` is a fn
+/// pointer, not a `u64`; a snippet that shows only the call makes a reader
+/// guess the signature through a compiler error.
+#[test]
+fn test_clock_injection_snippets_declare_the_fn() {
+    for doc in ["README.md", "docs/USER_GUIDE.md"] {
+        let text = read_doc(doc);
+        let mut rest = text.as_str();
+        while let Some(pos) = rest.find("```rust") {
+            let body = &rest[pos + "```rust".len()..];
+            let end = body
+                .find("```")
+                .unwrap_or_else(|| panic!("{doc}: unterminated rust fence"));
+            let fence = &body[..end];
+            if fence.contains("manual_with_clock(") {
+                assert!(
+                    fence.contains(") -> u64 {"),
+                    "TRIPWIRE FIRED: {doc} calls manual_with_clock without declaring \
+                     `fn ...() -> u64` in the same snippet — ClockFn is a fn pointer, \
+                     not a u64 value"
+                );
+            }
+            rest = &body[end + 3..];
+        }
+    }
+}
+
 /// Collects `src/...` tokens from prose so a renamed module cannot survive
 /// as a stale pointer in the docs.
 fn documented_source_paths(text: &str) -> Vec<&str> {
