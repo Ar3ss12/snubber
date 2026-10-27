@@ -13,6 +13,13 @@ no `--release`), 2026-10-26.
 | `2026-10-26_pool_stress_report.json` | `cargo test --test supervisor_pool_stress -- --ignored --nocapture` | `reaped`/`ambush` 32/32, `wall_ms` |
 | `2026-10-26_pool_mixed_stress_report.json` | `cargo test --test supervisor_pool_stress_mixed -- --ignored --nocapture` | `ambush`/`escape`/`stillborn`/`deadlocks` = 8/8/8/8, `deadlock=true` |
 | `2026-10-26_pool_lease_stress_report.json` | `cargo test --test supervisor_pool_stress_lease -- --ignored --nocapture` | `stillborn` 24/24, `lease_kills=24`, `monitor_checks` |
+| `2026-10-26_bench_snapshot.md` | `cargo bench` (all groups), table assembled by `bash scripts/bench.sh` | every `**<num> ns/us**` row cited by README.md / docs/USER_GUIDE.md |
+
+`2026-10-26_bench_snapshot.md` is a different kind of artifact: it comes
+from `cargo bench` (release profile, Criterion), not from a test-written
+report, and its rows are the latencies cited in README.md and
+docs/USER_GUIDE.md. `tests/doc_sync.rs::test_bench_numbers_match_evidence_artifact`
+checks every `~<number>` latency citation in those docs against it.
 
 `wall_ms` and `monitor_checks` are wall-clock observations: they move with
 load, compiler and scheduler. The structural counters (`reaped`, `ambush`,

@@ -1460,7 +1460,7 @@ without parking and hands the readings to your closure. It is the
 closure-friendly replacement for `BackpressurePolicy::Custom(fn)`, which
 stays as the legacy variant. Measured cost of the dynamic dispatch:
 ~1.8 ns per handler call; the full `friction_wait_ms` path is identical
-with either storage (~21.5 ns on the reference machine).
+with either storage (~21.7 ns on the reference machine).
 
 ### Runtime node names
 
@@ -1585,8 +1585,8 @@ Six audit-driven fixes; each has a deterministic regression test.
 | Lane generation timing | `note_death` bumped the lane clock AFTER the up-to-250 ms EOF grace — a successor attaching inside the window inherited the dead child's generation | The clock bumps before the grace wait: `attach()` during the window always returns a fresh generation | `tests/supervisor_pool.rs::successor_gets_fresh_generation_during_eof_grace` |
 | Conduit lost wakeup | `resume()` / `send_directive` called `notify_all` without holding the mutex the sync waiter holds across its check-to-park window | Notifications are issued under the same `cancel_reason` mutex — check-then-park and store-then-notify are mutually exclusive | `tests/conduit.rs::resume_never_loses_the_wakeup_under_pause_churn` |
 
-Bench group `layer2_async_waiters` (ready poll ~152 ns, park/wake/admit
-roundtrip ~546 ns) pins the async admission path.
+Bench group `layer2_async_waiters` (ready poll ~156 ns, park/wake/admit
+roundtrip ~542 ns) pins the async admission path.
 
 ## Fixed in 0.6.2: audit hardening
 
@@ -1822,7 +1822,7 @@ The `Layer` column is the chapter number of this guide plus what the row require
 | `RestartTracker::note_death(code, now)` | 4 / std | pure math | Process respawn backoff tracker, caller sleeps |
 | `StateDigest` + `take_state()` | 4 / core | 64 B, ~1 ns | Hot handoff: memory survives death |
 | `NoOrphanGuard` / `OrphanGuard` | 4 / std | trait only | Parent death = child processes reaped (app impl) |
-| `node.enter_auto` | 2 / std | **~94 ns** | Monotonic auto sequence ticket minting |
+| `node.enter_auto` | 2 / std | **~93 ns** | Monotonic auto sequence ticket minting |
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | 2 / std | 1 `Box` at arm + 1 clock read/stage | Stage wall/CPU breakdown (opt-in; default path untouched) |
 | `enter_async_auto_profiled` | 3 / std | 1 `Box` + 2 clock reads | Profiled async admission; arms on the admitting poll |
 | `guard.profile_snapshot()` | 2 / std | 1 wall + 1 CPU read | Mid-flight profile without settling |
@@ -1833,7 +1833,7 @@ The `Layer` column is the chapter number of this guide plus what the row require
 | `snapshot.diff(&later)` + `write_summary` | 5 / cold | pure `Copy` math | Counter deltas + memory/queue window (`SnapshotDiff`) |
 | `write_triage(&mut out, node, &snap)` | 5 / cold | `fmt::Write`, no alloc | One ASCII verdict card per node |
 | `node_passthrough_enter` | 2 / std canary | **~55 ns** | Open-doors transit: lock-free count + unstamped dummy guard, no slots/breaker/`EpochGate`/clock |
-| `node_passthrough_scoped` | 2 / std canary | **~52 ns** | Same transit through `scoped()` — work runs, books stay clean |
+| `node_passthrough_scoped` | 2 / std canary | **~51 ns** | Same transit through `scoped()` — work runs, books stay clean |
 | `contended_node_enter_threads_6` (6 threads, shared `enter_auto` admit counter) | 2 / std contended | **~971 ns** | MESI cache-line bouncing on node mutex; StaleEpoch losers bounded-retry (cap 64 + yield), same contract as `concurrency_stress` |
 | `contended_node_scoped_threads_6` (6 threads) | 2 / std contended | **~923 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
 | `contended_gateway_mpsc_threads_6` (6 producers + drain) | 2 / std contended | **~184 ns** | Bounded multi-producer write under parallel core flood |
@@ -1842,7 +1842,7 @@ The `Layer` column is the chapter number of this guide plus what the row require
 | `guard.settle_async(fut)` | 3 / std | zero lock during await | Commit across `.await` points |
 | `TaskConduit` / `TaskHandle` | 2 / std | lock-free atomics | 2-way live steering, pause/resume waker, drafts |
 | `PipeDrain` + `ProcessToken` | 4 / std | 44-byte stream; **~44 ns/frame** (256-frame sync drain) | Hardware rollback across process death (`kill -9`) |
-| `ProcessToken::commit(task)` / `from_bytes` / `to_bytes` | 4 / core | **~7.4 ns** parse / **~8.0 ns** frame; `commit` is `const` | 44-byte wire frame, no allocation; `commit(task)` builds the settle-clean marker (`OP_COMMIT`, zero payload) without touching the wire codec |
+| `ProcessToken::commit(task)` / `from_bytes` / `to_bytes` | 4 / core | **~7.4 ns** parse / **~7.9 ns** frame; `commit` is `const` | 44-byte wire frame, no allocation; `commit(task)` builds the settle-clean marker (`OP_COMMIT`, zero payload) without touching the wire codec |
 | `node.snapshot_v1()` + `encode()` | 5 / cold | 512 B, CRC32 | Crash-safe persistence, app-owned flush thread |
 | `find_anomalies()` / `assert_no_anomalies!` | 5 / cold | pure `u128` math | CI gate + diagnostics console + `[DIAG 0x…]` bug reports |
 | `NodeSet` set | 5 / cold | explicit `&Node` list + saturating aggregates | Multi-node pulse, never a `static` |

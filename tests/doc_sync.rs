@@ -297,45 +297,236 @@ fn test_quick_ref_layer_column_matches_chapters() {
     }
 }
 
-/// Shared bench numbers must not diverge between the README table and the
-/// USER_GUIDE quick reference: both quote the same Criterion run, so a
-/// number updated in one file and left stale in the other fails here.
-#[test]
-fn test_bench_numbers_agree_across_readme_and_guide() {
-    let readme = read_doc("README.md");
-    let guide = read_doc("docs/USER_GUIDE.md");
-
-    let shared: &[&str] = &[
-        "~5.4 ns", "~2.6 ns", "~2.0 ns", "~50.8 ns", "~21.7 ns", "~15.7 ns", "~142 ns", "~94 ns",
-        "~87 ns", "~90 ns", "~55 ns", "~52 ns", "~971 ns", "~923 ns", "~184 ns", "~40 ns",
-    ];
-
-    for token in shared {
-        assert!(
-            readme.contains(token),
-            "TRIPWIRE FIRED: README lost the bench number '{token}' — \
-             re-measure and update both docs from the same Criterion run"
-        );
-        assert!(
-            guide.contains(token),
-            "TRIPWIRE FIRED: docs/USER_GUIDE.md lost the bench number '{token}' \
-             (README still quotes it) — the two docs quote one run, update both"
-        );
+/// Parses `[0-9]+(\.[0-9]+)?` at the start of `chars`.
+/// Returns `(value, decimal count, chars consumed)`.
+fn parse_leading_number(chars: &[char]) -> Option<(f64, u32, usize)> {
+    let mut end = 0;
+    while end < chars.len() && chars[end].is_ascii_digit() {
+        end += 1;
     }
-    // Numbers that live in BOTH a table row and a prose sentence per doc:
-    // require two occurrences — a one-site update drops the count to one
-    // and fails, which a bare `contains` cannot catch.
-    let dual_site: &[&str] = &["~225 ns", "~187 ns", "~107 ns", "~519 ns"];
-    for token in dual_site {
-        for (doc, text) in [("README.md", &readme), ("docs/USER_GUIDE.md", &guide)] {
-            let hits = text.matches(token).count();
-            assert!(
-                hits >= 2,
-                "TRIPWIRE FIRED: {doc} quotes '{token}' {hits} time(s), want >= 2 \
-                 (table row + prose) — one site was updated from the Criterion run \
-                 and the other still carries the old measurement"
-            );
+    if end == 0 {
+        return None;
+    }
+    let mut consumed = end;
+    let mut decimals = 0u32;
+    let after = end + 1;
+    if end < chars.len()
+        && chars[end] == '.'
+        && after < chars.len()
+        && chars[after].is_ascii_digit()
+    {
+        consumed = after;
+        while consumed < chars.len() && chars[consumed].is_ascii_digit() {
+            consumed += 1;
         }
+        decimals = (consumed - after) as u32;
+    }
+    let digits: String = chars[..consumed].iter().collect();
+    digits
+        .parse::<f64>()
+        .ok()
+        .map(|value| (value, decimals, consumed))
+}
+
+/// Reads an `ns` / `us` / `µs` unit at the head of `chars` (after optional
+/// spaces) and returns `(is_microseconds, chars consumed including the
+/// skipped spaces)`.
+fn parse_unit(chars: &[char]) -> Option<(bool, usize)> {
+    let mut rest = chars;
+    let mut skipped = 0usize;
+    while !rest.is_empty() && (rest[0] == ' ' || rest[0] == '\u{a0}') {
+        rest = &rest[1..];
+        skipped += 1;
+    }
+    if rest.starts_with(&['n', 's']) {
+        Some((false, skipped + 2))
+    } else if rest.starts_with(&['\u{b5}', 's']) || rest.starts_with(&['u', 's']) {
+        Some((true, skipped + 2))
+    } else {
+        None
+    }
+}
+
+/// One `~<number> <unit>` latency citation found in a doc.
+struct Citation {
+    value: f64,
+    decimals: u32,
+    micros: bool,
+    raw: String,
+    /// `Some(reason)` when the token is not a raw Criterion number:
+    /// qualitative `~0`, or a derived per-frame / per-lane division.
+    skip: Option<&'static str>,
+}
+
+/// Extracts every tilde citation from a doc. Derived forms are marked, not
+/// dropped silently: `~44.5 ns/frame` and `~130 ns per lane` are the same
+/// committed measurement divided by a stated frame/lane count, and `~0 ns`
+/// is a qualitative branch claim.
+fn tilde_citations(text: &str) -> Vec<Citation> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '~' {
+            i += 1;
+            continue;
+        }
+        let Some((value, decimals, consumed)) = parse_leading_number(&chars[i + 1..]) else {
+            i += 1;
+            continue;
+        };
+        let unit_at = i + 1 + consumed;
+        let Some((micros, unit_len)) = parse_unit(&chars[unit_at..]) else {
+            i += 1;
+            continue;
+        };
+        let end = unit_at + unit_len;
+        let raw: String = chars[i..end].iter().collect();
+        let window: String = chars[end..(end + 30).min(chars.len())].iter().collect();
+        let skip = if raw.chars().filter(|c| c.is_ascii_digit()).all(|b| b == '0') {
+            Some("qualitative ~0 claim")
+        } else if window.contains("/frame") {
+            Some("derived per-frame division")
+        } else if window.contains("per lane") {
+            Some("derived per-lane division")
+        } else {
+            None
+        };
+        out.push(Citation {
+            value,
+            decimals,
+            micros,
+            raw,
+            skip,
+        });
+        i = end;
+    }
+    out
+}
+
+/// True when `c` is a faithful rounding or truncation of measurement `m`
+/// (both in the citation's own unit). Only the citation's own decimal count
+/// is tried: `~8.0` (one decimal) must NOT match 7.9 even though
+/// `round(7.9, 0) = 8` — decimal-agnostic matching would let `~800 ns`
+/// sail through against 790.
+fn citation_matches(c: &Citation, m: f64, m_micros: bool) -> bool {
+    let m = if c.micros == m_micros {
+        m
+    } else if c.micros {
+        m / 1000.0
+    } else {
+        m * 1000.0
+    };
+    let scale = 10f64.powi(c.decimals as i32);
+    let rounded = (m * scale + 0.5).floor() / scale;
+    let truncated = (m * scale).trunc() / scale;
+    (c.value - rounded).abs() < 1e-9 || (c.value - truncated).abs() < 1e-9
+}
+
+/// Committed measurements: `**<number> <unit>**` cells of the bench
+/// evidence artifact (`(value, is_microseconds, raw)` per row).
+fn artifact_measurements(text: &str) -> Vec<(f64, bool, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        if chars[i] != '*' || chars[i + 1] != '*' {
+            i += 1;
+            continue;
+        }
+        let start = i + 2;
+        let Some((value, _decimals, consumed)) = parse_leading_number(&chars[start..]) else {
+            i += 1;
+            continue;
+        };
+        let Some((micros, unit_len)) = parse_unit(&chars[start + consumed..]) else {
+            i += 1;
+            continue;
+        };
+        let end = start + consumed + unit_len;
+        if end + 1 < chars.len() && chars[end] == '*' && chars[end + 1] == '*' {
+            out.push((value, micros, chars[start..end].iter().collect::<String>()));
+            i = end + 2;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Every `~<number>` latency citation in README.md and docs/USER_GUIDE.md
+/// must round or truncate from a row of the committed bench evidence
+/// artifact — the docs carry no independent copy of the numbers. The old
+/// test compared the two docs against 20 duplicated literals and went blind
+/// the moment both docs were updated to the same stale value; this oracle
+/// compares both docs against one artifact and additionally fails when the
+/// two docs cite the same artifact row with disjoint value sets.
+#[test]
+fn test_bench_numbers_match_evidence_artifact() {
+    const ARTIFACT: &str = "docs/evidence/2026-10-26_bench_snapshot.md";
+    let rows = artifact_measurements(&read_doc(ARTIFACT));
+    assert!(
+        rows.len() >= 40,
+        "artifact parser found only {} measurement rows in {ARTIFACT} — the \
+         committed table shape changed and this oracle is going vacuously green",
+        rows.len()
+    );
+
+    let mut checked = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut doc_citations: Vec<(&'static str, Vec<Citation>)> = Vec::new();
+    for doc in ["README.md", "docs/USER_GUIDE.md"] {
+        let citations = tilde_citations(&read_doc(doc));
+        for c in &citations {
+            if let Some(reason) = c.skip {
+                skipped.push(format!("{doc}: {} ({reason})", c.raw));
+                continue;
+            }
+            assert!(
+                rows.iter()
+                    .any(|(m, m_micros, _)| citation_matches(c, *m, *m_micros)),
+                "TRIPWIRE FIRED: {doc} cites '{}' but no row of {} \
+                 rounds or truncates to it. Re-run `cargo bench`, refresh the \
+                 artifact from target/bench/snapshot.md, and update BOTH docs \
+                 to the artifact value — never the artifact to the docs.",
+                c.raw,
+                ARTIFACT
+            );
+            checked += 1;
+        }
+        doc_citations.push((doc, citations));
+    }
+    assert!(
+        checked >= 40,
+        "only {checked} bench citations were checked across README.md and \
+         docs/USER_GUIDE.md — the token scan broke (units or table shapes \
+         renamed?) and a green result here means nothing"
+    );
+
+    // Cross-doc agreement per artifact row: a row cited by both docs must be
+    // cited with at least one common value in each. Catches the same row
+    // rendered from two different runs (README ~93 / GUIDE ~94) even when a
+    // future artifact would make both sides individually valid.
+    for (idx, (m, m_micros, raw)) in rows.iter().enumerate() {
+        let values_for = |(_doc, cs): &(&'static str, Vec<Citation>)| -> Vec<f64> {
+            cs.iter()
+                .filter(|c| c.skip.is_none() && citation_matches(c, *m, *m_micros))
+                .map(|c| c.value)
+                .collect::<Vec<_>>()
+        };
+        let a = values_for(&doc_citations[0]);
+        let b = values_for(&doc_citations[1]);
+        if a.is_empty() || b.is_empty() {
+            continue; // cited by one doc only — no cross-doc contract
+        }
+        assert!(
+            a.iter().any(|v| b.iter().any(|w| (v - w).abs() < 1e-9)),
+            "TRIPWIRE FIRED: README.md and docs/USER_GUIDE.md cite artifact row \
+             `{raw}` (#{idx}) with disjoint values: README {:?}, GUIDE {:?} — one \
+             side was re-measured and the other kept the old citation",
+            a,
+            b
+        );
     }
 }
 

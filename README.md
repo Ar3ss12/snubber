@@ -132,13 +132,13 @@ reads as an operation rather than a Criterion key. Differences below
 | `IsrBridge::try_push` + `try_pop` | Layer 1.5 (`core`) | **~7.1 ns** | 80 B SPSC ring, lock-free; malformed cells drained on pop |
 | `IsrBridge::trip` + `take_trips` | Layer 1.5 (`core`) | **~9.3 ns** | 32-bit latch swap; trip bypasses a full ring |
 | `node.enter + commit` | Layer 2 (`std`) | **~91 ns** | Full bulkhead, circuit breaker, auto-commit; no clock read when neither the token bucket nor a deadline is armed (unstamped guard) |
-| `node.enter_auto + commit` | Layer 2 (`std`) | **~94 ns** | + atomic sequence minting |
+| `node.enter_auto + commit` | Layer 2 (`std`) | **~93 ns** | + atomic sequence minting |
 | `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~87 ns** | Priority lane; same band as plain enter (one measurement) |
 | `node.transition` | Layer 2 (`std`) | **~90 ns** | ONE-enum state machine, zero flag drift |
 | `node.transition_checked` + `LegalMove` | Layer 2 (`std`) | same path, no extra work | Compile-time only: the `LegalMove` proof erases to the same `transition` call; illegal moves fail at compile (E0277) |
 | `enter_erased_auto` | Layer 2 (`alloc`) | **~205 ns** | ONE boxed transaction (rollback + commit hook + node clone in a single allocation; 0.6.8 moved the breaker outcome onto the guard's real `commit`). 301.6 → ~205 ns after folding two boxes and two `Arc` clones into one |
 | `node_passthrough_enter + commit` | Layer 2 (`std` canary) | **~55 ns** | Open-doors transit: lock-free count + unstamped dummy guard, no slots/breaker/`EpochGate`/clock |
-| `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~52 ns** | Same transit through `scoped()` — work runs, books stay clean |
+| `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~51 ns** | Same transit through `scoped()` — work runs, books stay clean |
 | `ConflateSender::publish + take_latest` | Layer 2 (`std`) | **~21.7 ns** | One-slot latest wins, no allocation, no `Clone` bound |
 | `ConflateSender::publish` (occupied slot) | Layer 2 (`std`) | **~15.7 ns** | Replaced value counted, never queued |
 | `guard.commit_enveloped(64)` | Layer 2 (`std`) | **~142 ns** | Payload corridor exact; wall corridor only for profiled guards |
@@ -151,7 +151,7 @@ reads as an operation rather than a Criterion key. Differences below
 | `enter_async_auto_profiled` | Layer 3 (`std`, opt-in) | structural: 1 `Box` + 2 clock reads | Same waker parking, profile arms on the admitting poll |
 | `enter_async_auto` (ready poll) | Layer 3 (`std`) | **~156 ns** | Full admission through the future; the ready path allocates nothing |
 | `enter_async_auto` park/wake/admit roundtrip | Layer 3 (`std`) | **~542 ns** | Same-thread park (queue push + identity flag) -> slot release wake -> admitting re-poll; no executor, not a cross-core roundtrip |
-| `static_node.enter + commit` | Layer 2 (`std`) | **~126 ns** | Compile-time capacity assert + bulkhead + auto-commit |
+| `static_node.enter + commit` | Layer 2 (`std`) | **~125 ns** | Compile-time capacity assert + bulkhead + auto-commit |
 | `node.note_pulse_stall(lag_ms)` | Layer 2 (`std`) | structural: 1 atomic max | Missed heartbeat lands in `SnapshotV1` (pulse fields since v3; frame is v5) + `AnomalyKind::PulseStall` |
 | `node.note_memory_kb(used)` | Layer 2 (`std`, cold) | structural: 1 lock + 1 atomic store | External memory sample → soft/hard verdict; admissions refuse lock-free above soft |
 | `process_token.to_bytes()` | Layer 4 (`core`) | **~7.9 ns** | 44-byte framed wire serialization (`to_le_bytes`) |

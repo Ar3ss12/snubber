@@ -36,6 +36,21 @@ surface, wire format and telemetry layout are untouched.
   a fresh `pub fuzz_probe: u64` field with a bare `+=` fails with no list
   edit anywhere, both revert green.
 
+- The duplicated bench literals left the docs: the README/GUIDE
+  cross-check (`test_bench_numbers_agree_across_readme_and_guide`, 20
+  hard-coded tokens) is replaced by
+  `test_bench_numbers_match_evidence_artifact` in `tests/doc_sync.rs`,
+  which compares both docs against the committed Criterion snapshot
+  (`docs/evidence/2026-10-26_bench_snapshot.md`): every `~<number> ns/µs`
+  citation must round or truncate to an artifact row (derived
+  per-frame/per-lane figures and qualitative `~0` are skipped by rule),
+  and a row cited by both docs must be cited with a common value. The
+  old test went silent the moment both docs carried the same stale
+  number — the new one fails that injection, and fails a one-sided
+  wrong value too. Audit found nine stale citations (README `~94/~52/
+  ~126` vs measured 93.3/51.2/125.1; GUIDE additionally `~8.0/~21.5/
+  ~152/~546` vs 7.9/21.7/156.0/542.2); all docs now quote the artifact.
+
 - The release-tag gate only accepts "marked Unreleased" when the
   `## Unreleased` heading sits above the version's own section with no
   other section heading between the two: a stale marker below the
