@@ -402,14 +402,18 @@ fn bench_pipe_drain(c: &mut Criterion) {
     // `drain_sync` owns its state (one Arc + Mutex per stream), so the
     // measurement covers stream setup plus scanning all 256 frames; the
     // per-frame cost is what the throughput column reports.
+    // Verify the contract once, outside the timed closure: an `assert_eq!`
+    // inside `iter` charges comparison (and potential formatting) to every
+    // sample without measuring the parser.
+    let probe = PipeDrain::drain_sync(Cursor::new(&wire[..]));
+    assert_eq!(
+        probe.counters().frames,
+        FRAMES,
+        "drain_sync must parse the whole chunk"
+    );
     g.bench_function("drain_sync_256_frames", |b| {
         b.iter(|| {
             let drain = PipeDrain::drain_sync(Cursor::new(black_box(&wire[..])));
-            assert_eq!(
-                drain.counters().frames,
-                FRAMES,
-                "drain_sync must parse the whole chunk"
-            );
             black_box(drain.counters())
         });
     });
@@ -425,6 +429,8 @@ fn bench_drain_feed(c: &mut Criterion) {
     g.bench_function("drain_feed_frame", |b| {
         b.iter(|| {
             let parsed = single.feed(black_box(&frame));
+            // Kept inside the measured call on purpose: bench hygiene treats
+            // an unasserted `feed` as a silent no-op scanner.
             assert_eq!(parsed, 1, "scanner must parse exactly one frame per feed");
             black_box(parsed)
         });

@@ -18,8 +18,13 @@ use core::ops::{Deref, DerefMut};
 ///
 /// Wraps the canonical recovery idiom used across `TrackedGuard`
 /// settlement paths: on lock poisoning recovers via `into_inner()`
-/// and records one `poison_recoveries` tick on `node` so the fault
+/// and records a `poison_recoveries` tick on `node` so the fault
 /// stays visible in telemetry instead of panicking the caller.
+///
+/// The tick is best-effort: it uses `try_lock` on the ledger and is skipped
+/// when the ledger is momentarily held (including by the calling thread),
+/// because a synchronous re-lock from inside a node-locked section would
+/// deadlock. A skipped tick under-reports one recovery by design.
 ///
 /// The calling thread MUST NOT hold the poisoned value: recovery
 /// extracts the inner guard and continues. Node slot bounds are
@@ -104,18 +109,18 @@ impl<T, F: FnOnce()> Protected<T, F> {
     ///
     /// Preserves the authentic transaction header from the underlying guard.
     #[inline]
+    // INVARIANT: `new` fills the slot and only `abort`/`commit`/`Drop` take
+    // it; all three consume `self`, so the slot holds a guard.
+    #[allow(clippy::expect_used)]
     pub fn abort(mut self, reason: &'static str) -> super::SnubberEvent<()> {
         // Rollback FIRST, resource second — same order as `Drop`. A rollback
         // closure is allowed to read the protected resource; taking it
         // before the guard ran handed the closure a freed value.
-        let event = if let Some(guard) = self.guard.take() {
-            guard.abort(reason)
-        } else {
-            super::SnubberEvent::Aborted {
-                header: super::TransactionHeader::new(0, 0),
-                reason,
-            }
-        };
+        let event = self
+            .guard
+            .take()
+            .expect("protected guard invariant")
+            .abort(reason);
         self.resource.take();
         event
     }

@@ -724,7 +724,7 @@ struct DrainState {
     commits: u64,
     /// Last verified complete StateDigest.
     state: Option<StateDigest>,
-    /// Reassembly scratch: chunks per seq (28/28/8) + got-mask + full CRC.
+    /// Reassembly scratch: chunks per seq (24/24/16) + got-mask + full CRC.
     scratch: [[u8; TOKEN_PAYLOAD_LEN]; 3],
     scratch_got: u8,
     scratch_full_crc: u32,

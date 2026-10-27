@@ -288,19 +288,26 @@ if ($ForgetMatches) {
 
 Write-Host "---------------------------------------------"
 # Cross-language parity fingerprint: CI runs this and check_compile_gates.sh
-# on the same tree and requires both lines to match.
+# on the same tree and requires both lines to match. Printed only after the
+# failure tally: a failed audit must never end with a full PARITY line. A
+# tolerated semver SKIP still prints it (release.sh checks parity where the
+# tool is absent), with the reduced-coverage verdict printed first.
 $CounterCount = $CounterNames.Count
-Write-Host "PARITY: gates=7 counters=$CounterCount functions=$($Gate3Bodies.Count) metaphors=$($ForbiddenPatterns.Count)"
+$ParityLine = "PARITY: gates=7 counters=$CounterCount functions=$($Gate3Bodies.Count) metaphors=$($ForbiddenPatterns.Count)"
+if ($Failures -gt 0) {
+    Write-Host "$Failures invariant check(s) FAILED." -ForegroundColor Red
+    if ($Skips -gt 0) {
+        Write-Host "$Skips gate(s) SKIPPED -- coverage reduced, audit NOT complete." -ForegroundColor Yellow
+    }
+    exit 1
+}
 if ($Skips -gt 0) {
     # A skip is a hole, not a pass: reduced coverage must fail the gate.
     Write-Host "$Skips gate(s) SKIPPED -- coverage reduced, audit NOT complete." -ForegroundColor Yellow
     Write-Host "Re-run with the missing tool available (CI provisions every tool)." -ForegroundColor Yellow
+    Write-Host $ParityLine
     exit 1
 }
-if ($Failures -eq 0) {
-    Write-Host "All invariant gates PASSED." -ForegroundColor Green
-    exit 0
-} else {
-    Write-Host "$Failures invariant check(s) FAILED." -ForegroundColor Red
-    exit 1
-}
+Write-Host $ParityLine
+Write-Host "All invariant gates PASSED." -ForegroundColor Green
+exit 0

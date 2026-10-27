@@ -42,9 +42,12 @@ jobs:
           targets: thumbv7em-none-eabihf, i686-unknown-linux-gnu
 
       - name: Install cargo-semver-checks (Gate 6)
+        # Pinned, not `latest`: a floating verifier can start reporting (or
+        # stop reporting) breakage between two releases of this crate, which
+        # turns the API gate into a moving target. Bump deliberately.
         uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
         with:
-          tool: cargo-semver-checks
+          tool: cargo-semver-checks@0.48.0
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -72,6 +75,8 @@ jobs:
         # The crate claims 32-bit support (PulseTick AtomicU32 split,
         # usize-shaped sizes). An `usize == 8` assumption compiles on
         # x86_64 and breaks the 32-bit build; this gate catches it.
+        # Runtime execution on a 32-bit process is covered by the Windows
+        # x86 lane in test-matrix (same pointer width, provable locally).
         env:
           RUSTFLAGS: "-D warnings"
         run: cargo check --locked --target i686-unknown-linux-gnu
@@ -163,11 +168,26 @@ jobs:
         if: runner.os == 'Windows'
         run: rustup target add thumbv7em-none-eabihf
 
+      - name: 32-bit Runtime Gate (Windows x86, frame parser)
+        if: runner.os == 'Windows'
+        # The quality job's i686 `cargo check` proves only that the 32-bit
+        # build compiles. This runs one deterministic, thread-free integration
+        # binary compiled for i686-pc-windows-msvc, so usize-width assumptions
+        # are exercised by a real 32-bit process (WoW64 on the x64 runner).
+        # frame_fuzz walks every wire offset and digest chunk without timing
+        # or process-spawn sensitivities, and reproduces locally on the same
+        # target.
+        run: |
+          rustup target add i686-pc-windows-msvc
+          cargo test --locked --target i686-pc-windows-msvc --test frame_fuzz
+
       - name: Install cargo-semver-checks (Windows gate parity)
         if: runner.os == 'Windows'
+        # Same pin as the quality job: Windows and Linux must agree on the
+        # verifier version, or the parity lane compares two rulesets.
         uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
         with:
-          tool: cargo-semver-checks
+          tool: cargo-semver-checks@0.48.0
 
       - name: Run Full Test Suite
         shell: bash

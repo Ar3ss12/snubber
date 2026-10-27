@@ -414,7 +414,9 @@ impl<S, D> TaskHandle<S, D> {
 /// Cancellation-safe: the waker pushed while parked is remembered in the
 /// future itself and removed from the queue on `Drop`, so a future dropped
 /// mid-pause (e.g. a timeout branch in `select!`) cannot leave a dead waker
-/// behind — each later `resume` wakes only live waiters.
+/// behind — each later `resume` wakes only live waiters. Removal happens
+/// under the queue mutex; the retired entry is dropped after the guard is
+/// released, because dropping a `Waker` runs foreign executor code.
 pub struct ResumeFuture<S, D> {
     inner: Arc<IntercomInner<S, D>>,
     identity: Option<Arc<AtomicBool>>,
@@ -426,12 +428,25 @@ impl<S, D> Drop for ResumeFuture<S, D> {
             // Identity-matched removal: only THIS future's entry is
             // retired, never a sibling's (a shared waker would make a
             // `will_wake`-based retain erase both).
-            match self.inner.wakers.lock() {
-                Ok(mut wakers) => wakers.retain(|q| !Arc::ptr_eq(&q.identity, &flag)),
-                Err(poisoned) => poisoned
-                    .into_inner()
-                    .retain(|q| !Arc::ptr_eq(&q.identity, &flag)),
-            }
+            //
+            // Find under the lock, drop after it: the retired entry owns a
+            // `Waker`, whose Drop runs executor code and may take executor
+            // locks. `retain` dropped it in place while the wakers mutex was
+            // still held.
+            let removed = match self.inner.wakers.lock() {
+                Ok(mut wakers) => wakers
+                    .iter()
+                    .position(|q| Arc::ptr_eq(&q.identity, &flag))
+                    .map(|pos| wakers.swap_remove(pos)),
+                Err(poisoned) => {
+                    let mut wakers = poisoned.into_inner();
+                    wakers
+                        .iter()
+                        .position(|q| Arc::ptr_eq(&q.identity, &flag))
+                        .map(|pos| wakers.swap_remove(pos))
+                }
+            };
+            drop(removed);
         }
     }
 }
@@ -504,6 +519,78 @@ impl<S, D> Future for ResumeFuture<S, D> {
             }
             _ => Poll::Ready(Ok(())),
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod waker_drop_tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::Wake;
+
+    const DROPPED_LOCK_FREE: u8 = 1;
+    const DROPPED_UNDER_LOCK: u8 = 2;
+
+    /// Waker payload whose Drop probes the queue mutex: a parked entry owns
+    /// the last `Waker`, so its Drop is exactly where the retired waker is
+    /// released.
+    struct Probe {
+        inner: Arc<IntercomInner<u8, ()>>,
+        seen: Arc<AtomicU8>,
+    }
+
+    impl Wake for Probe {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let code = match self.inner.wakers.try_lock() {
+                Ok(_) => DROPPED_LOCK_FREE,
+                Err(_) => DROPPED_UNDER_LOCK,
+            };
+            self.seen.store(code, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn resume_future_drop_retires_the_waker_outside_the_queue_lock() {
+        let (conduit, handle): (TaskConduit<u8>, TaskHandle<u8>) = TaskConduit::pair(0);
+        handle.send_directive(Directive::Pause);
+        let mut future = conduit.wait_for_resume_async();
+
+        let seen = Arc::new(AtomicU8::new(0));
+        let probe = Arc::new(Probe {
+            inner: Arc::clone(&handle.inner),
+            seen: Arc::clone(&seen),
+        });
+        let waker = Waker::from(Arc::clone(&probe));
+        {
+            let mut cx = Context::from_waker(&waker);
+            assert!(Pin::new(&mut future).poll(&mut cx).is_pending());
+        }
+        {
+            let wakers = handle.inner.wakers.lock().expect("fresh queue");
+            assert_eq!(wakers.len(), 1, "the paused future parks one entry");
+        }
+
+        // The parked entry must hold the last reference to the Probe, so its
+        // Drop is the moment the future retires the waker.
+        drop(waker);
+        drop(probe);
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "waker still parked");
+
+        drop(future);
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            DROPPED_LOCK_FREE,
+            "the retired waker's Drop ran while the queue mutex was held"
+        );
+        assert!(
+            handle.inner.wakers.lock().expect("fresh queue").is_empty(),
+            "Drop must remove this future's entry"
+        );
     }
 }
 

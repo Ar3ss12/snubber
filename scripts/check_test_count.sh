@@ -84,9 +84,22 @@ if [ "$runs" -eq 0 ]; then
     exit 1
 fi
 
-# A positive floor turns parse regressions and empty runs into failures.
-if [ "$passed" -lt 300 ]; then
-    echo "FAIL: only $passed passed tests parsed from $runs result lines (floor 300)"
+# A positive floor turns parse regressions and empty runs into failures. The
+# floor tracks the current suite (467 passed after the 0.6.12 audit fixes)
+# instead of the old 300: a `cfg` slip that silently drops a third of the
+# tests must fail, not clear a bar set when the suite was smaller.
+FLOOR=450
+# `cargo test` counts ignored native lanes and ignored doctests. Seven are
+# observed (six release/storm lanes plus one ignored doctest); a rising count
+# means a test quietly stopped running on the default path.
+IGNORED_CEILING=8
+if [ "$passed" -lt "$FLOOR" ]; then
+    echo "FAIL: only $passed passed tests parsed from $runs result lines (floor $FLOOR)"
+    exit 1
+fi
+
+if [ "$ignored" -gt "$IGNORED_CEILING" ]; then
+    echo "FAIL: $ignored ignored tests (ceiling $IGNORED_CEILING) — a test silently left the default suite"
     exit 1
 fi
 

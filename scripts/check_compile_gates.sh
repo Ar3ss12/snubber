@@ -288,17 +288,26 @@ echo "---------------------------------------------"
 # and check_compile_gates.ps1 on the same tree and requires both lines to
 # match. If the PS flavor scans fewer counters or functions, parity fails.
 # The counter count is the size of the set derived from SnubberStats above.
-printf 'PARITY: gates=7 counters=%s functions=3 metaphors=5\n' "${COUNTER_COUNT}"
+#
+# The fingerprint is printed only after the failure tally, so a failed audit
+# never ends with a full PARITY line (the 0.6.12 log printed PARITY first and
+# the human-readable log looked complete). A tolerated semver SKIP still
+# prints it: release.sh verifies parity on machines where that tool is absent,
+# and the reduced-coverage verdict precedes the line.
+if [ "$FAILURES" -gt 0 ]; then
+    echo "$FAILURES invariant check(s) FAILED."
+    if [ "$SKIPS" -gt 0 ]; then
+        echo "$SKIPS gate(s) SKIPPED — coverage reduced, audit NOT complete."
+    fi
+    exit 1
+fi
 if [ "$SKIPS" -gt 0 ]; then
     # A skip is a hole, not a pass: reduced coverage must fail the gate.
     echo "$SKIPS gate(s) SKIPPED — coverage reduced, audit NOT complete."
     echo "Re-run with the missing tool available (CI provisions every tool)."
+    printf 'PARITY: gates=7 counters=%s functions=3 metaphors=5\n' "${COUNTER_COUNT}"
     exit 1
 fi
-if [ "$FAILURES" -eq 0 ]; then
-    echo "All invariant gates PASSED."
-    exit 0
-else
-    echo "$FAILURES invariant check(s) FAILED."
-    exit 1
-fi
+printf 'PARITY: gates=7 counters=%s functions=3 metaphors=5\n' "${COUNTER_COUNT}"
+echo "All invariant gates PASSED."
+exit 0

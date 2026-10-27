@@ -115,6 +115,24 @@ fn custom_friction_curve_calculates_backpressure_delay() {
     assert!((4..=60).contains(&ms), "capped friction park: {ms}ms");
 }
 
+#[test]
+fn friction_curve_saturates_at_the_wait_ceiling() {
+    // A full bulkhead has depth 255, so the curve is `1 + 255 * cap / 255`.
+    // With `cap = u64::MAX` the intermediate product overflowed u64: a debug
+    // panic and a wrapped (tiny) wait in release. The curve must saturate at
+    // the configured ceiling instead.
+    let node = SnubberNode::builder("pace/overflow")
+        .max_in_flight(1)
+        .backpressure(BackpressurePolicy::AdaptiveBlock {
+            max_wait_ms: u64::MAX,
+            shed_deeper_than: None,
+        })
+        .build();
+    let held = node.enter(1, 1, || {}).expect("first slot");
+    assert_eq!(node.friction_wait_ms(), u64::MAX);
+    held.commit();
+}
+
 // Regression (0.6.2, bug 7): an EXPLICIT `FaultAction::BreakerOpen` policy
 // on BulkheadFull sheds the caller immediately — no friction park — even
 // under a node-level AdaptiveBlock that would otherwise sleep. The DEFAULT

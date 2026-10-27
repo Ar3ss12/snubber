@@ -1745,7 +1745,7 @@ never disagree with the chapter map above.
 | `contended_node_enter_threads_6` (6 threads, shared `enter_auto` admit counter) | 2 / std contended | 6-thread saturation | MESI cache-line bouncing on node mutex; StaleEpoch losers bounded-retry (cap 64 + yield), same contract as `concurrency_stress` |
 | `contended_node_scoped_threads_6` (6 threads) | 2 / std contended | 6-thread saturation | Full transactional cycle under contention (entry + work + auto-commit) |
 | `contended_gateway_mpsc_threads_6` (6 producers + drain) | 2 / std contended | 6-thread saturation | Bounded multi-producer write under parallel core flood |
-| `cross_thread_isr_bridge_push_pop` (push core + pop core) | 1.5 / core inter-core | honest inter-core bus latency | Lock-free SPSC ring across physical cores (honest inter-core bus latency, not L1-hot loop) |
+| `cross_thread_isr_bridge_push_pop` (two threads) | 1.5 / core | two-thread handoff, no affinity pinning | Lock-free SPSC ring between two OS threads (honest two-thread handoff latency, not an L1-hot loop; the benchmark pins neither thread to a core) |
 | `node.enter_async_auto` | 3 / std | 0% CPU waker park | Async admission under bounded concurrency |
 | `guard.settle_async(fut)` | 3 / std | zero lock during await | Commit across `.await` points |
 | `TaskConduit` / `TaskHandle` | 2 / std | lock-free atomics | 2-way live steering, pause/resume waker, drafts |

@@ -2043,8 +2043,10 @@ impl SnubberNode {
         let BackpressurePolicy::AdaptiveBlock { max_wait_ms, .. } = policy else {
             return 0;
         };
-        let max = max_in_flight.max(1) as u64;
-        let depth = ((in_flight as u64 * 255 / max).min(255)) as u8;
+        // u128 intermediate: `depth * cap` with a large `max_wait_ms` overflowed
+        // u64 in the product before the division, wrapping the wait on release.
+        let max = max_in_flight.max(1) as u128;
+        let depth = (in_flight as u128 * 255 / max).min(255) as u8;
         let cap = max_wait_ms.max(1);
         match handler {
             Some(f) => f(
@@ -2052,7 +2054,7 @@ impl SnubberNode {
                 u32::try_from(max_in_flight).unwrap_or(u32::MAX),
             )
             .min(cap),
-            None => 1 + depth as u64 * cap / 255,
+            None => 1u64.saturating_add((u128::from(depth) * u128::from(cap) / 255) as u64),
         }
     }
 
@@ -3615,8 +3617,10 @@ impl SnubberNode {
                     let snap_action = inner.policies[FaultKind::BulkheadFull.index()].action;
                     drop(inner);
                     // PHASE B (no lock): foreign + float math here.
-                    let max = snap_max.max(1) as u64;
-                    let depth = ((snap_in_flight as u64 * 255 / max).min(255)) as u8;
+                    // u128 intermediates: the sync twin's product overflowed
+                    // u64 for a large `max_wait_ms`; same fix, same curve.
+                    let max = snap_max.max(1) as u128;
+                    let depth = (snap_in_flight as u128 * 255 / max).min(255) as u8;
                     let cap = match snap_policy {
                         BackpressurePolicy::AdaptiveBlock { max_wait_ms, .. } => max_wait_ms.max(1),
                         _ => 1000,
@@ -3628,7 +3632,9 @@ impl SnubberNode {
                                 u32::try_from(snap_max).unwrap_or(u32::MAX),
                             )
                         }),
-                        None => 1 + depth as u64 * cap / 255,
+                        None => {
+                            1u64.saturating_add((u128::from(depth) * u128::from(cap) / 255) as u64)
+                        }
                     };
                     let legacy_ms = match snap_action {
                         FaultAction::BlockCaller(ms) => ms,

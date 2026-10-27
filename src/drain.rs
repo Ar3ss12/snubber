@@ -14,8 +14,9 @@
 /// Payload bytes carried by one [`ProcessToken`] frame.
 ///
 /// FORMAT CONTRACT: 28 B on the wire (`u64 task + u32 opcode + 28 B
-/// payload` = 40 B body after [`TOKEN_MAGIC`]). The state handoff splits
-/// the 64 B digest into 28/28/16 chunks against this ceiling.
+/// payload` = 40 B body after [`TOKEN_MAGIC`]). The state handoff carries
+/// 24 digest bytes per frame (two 24 B chunks, then 16 B: 24/24/16) against
+/// this ceiling.
 pub const TOKEN_PAYLOAD_LEN: usize = 28;
 
 /// One token body: payload plus `task`/`opcode` fields, bytes.
