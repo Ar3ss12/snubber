@@ -8,7 +8,8 @@
 #   2. clippy on all targets/features with -D warnings
 #   3. full suite INCLUDING doctests + README badge drift gate (one run)
 #   4. architectural compile gates (Gate 6 SKIP is local-only; CI has teeth)
-#   5. release ignored lanes: pool storms + breaker churn, termination storm
+#   5. release ignored lanes: pool storms + breaker churn, termination storm,
+#      rollback wedge canary
 #   6. release identity gate (Cargo.toml vs latest tag vs CHANGELOG.md)
 #   7. cargo publish --dry-run
 #
@@ -135,6 +136,13 @@ run_ignored_lane "${LOG_DIR}/lane_storms.log" \
 
 run_ignored_lane "${LOG_DIR}/lane_termination.log" \
     --test supervisor_termination \
+    -- --ignored
+
+# The rollback canary wedges a child on purpose: the lane must require the
+# child to name its own RollbackStall before the parent kills it, and
+# `require_executed_tests` refuses a lane that ran nothing.
+run_ignored_lane "${LOG_DIR}/lane_rollback.log" \
+    --test rollback_guardrails \
     -- --ignored
 
 step "release identity (Cargo.toml vs tag vs CHANGELOG)"

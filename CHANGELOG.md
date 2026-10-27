@@ -4,6 +4,69 @@ All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.
 the audit-batch fix tables live at the bottom of this file, and the
 current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
+## Unreleased
+
+Rollback bodies are named, budgeted and observable from outside the node
+lock; the false "rollback re-entry deadlocks" law is gone. No existing
+public signature changed — the new surface is additive (`#[non_exhaustive]`
+enums, new methods, new `SnubberStats` fields).
+
+### Fixed
+
+- The User Guide claimed that calling back into the same node from a
+  rollback body "deadlocks". Measured on all three paths it does not: the
+  ledger lock is released before the body runs. The guide now states the
+  measured behavior (sync refuses at capacity, async parks, erased scopes
+  are granted), and `tests/doc_sync.rs` fails if the myth returns.
+- A slow rollback left no trace (`last_fault: None` after 400 ms). It now
+  lands in `SnubberStats::rollback_stalls` / `max_rollback_ms` and — when
+  the body RETURNS past the budget — in
+  `reported[FaultKind::RollbackStall]`, `last_fault` and the flight ring.
+  A body that panics mints no verdict: an unwind is not a measurement.
+- `tests/lock_hierarchy.rs` now proves what Invariant 6 only asserted:
+  every rollback invocation site (13, inventory count asserted) runs with
+  the node ledger lock released.
+
+### Added
+
+- `SnubberNode::rollback_phase()`: lock-free view (`active`, `epoch`,
+  `task_id`, `elapsed_ms`, `budget_ms`, `max_ms`, `stalls`) answerable
+  from any thread while a body runs.
+- `SnubberNodeBuilder::rollback_budget_ms(n)`: arms the phase clock. The
+  default stays clock-free — two atomic writes per body, no clock read.
+- `watchdog::poll_rollback(&node, budget_ms) -> Option<RollbackStall>`:
+  a pure read (no lock, thread or allocation) that books nothing. The
+  observer supplies the cadence; the node supplies the clock, so an
+  unarmed node honestly returns `None` instead of inventing age.
+- `RollbackReentrancy::{Allow (default), Refuse}` plus
+  `SnubberNodeBuilder::rollback_reentrancy(..)`: `Allow` keeps 0.6.x
+  behavior and counts re-entries in `SnubberStats::rollback_reentries`;
+  `Refuse` returns `EnterError::RollbackReentrant` before any lock on the
+  same thread (sync and async), other threads unaffected.
+- `FaultKind::RollbackStall` (14th kind, `Warn`, metric tag
+  `rollback_stalls_total`), `StallKind::RollbackStall` and
+  `classify_rollback(elapsed_ms, budget_ms)`.
+- `examples/20_rollback_budget.rs`: a rollback body that re-locks a held
+  mutex, named from outside the lock; the example exits while its worker
+  stays wedged.
+
+### Changed
+
+- `SnapshotV1` is v6: the per-kind `reported` tail grew 13 → 14 for
+  `RollbackStall`. The 512 B frame contract holds (330/508 B used); older
+  frames refuse as `BadVersion` instead of half-parsing.
+
+### Tests
+
+- `tests/rollback_guardrails.rs`: 15 tests plus one `#[ignore]`
+  subprocess canary pin the measured re-entry law, the held bulkhead slot,
+  the phase view, the budget verdict, the re-entrancy policy and the
+  outside watchdog. The canary now requires the child to name its own
+  `RollbackStall` before the parent kills it.
+- Suite 446 → 464 passed (67 result lines); `scripts/release.sh` runs the
+  rollback canary as an ignored release lane, and a lane that executes
+  0 tests fails the release.
+
 ## 0.6.11 (2026-10-27)
 
 Audit-3 closeout (PLAN_AUDIT3 findings K1/K2, H1–H7, D1–D4; D5 was
