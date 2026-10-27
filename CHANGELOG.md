@@ -4,6 +4,67 @@ All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.
 the audit-batch fix tables live at the bottom of this file, and the
 current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
+## 0.6.13 (2026-10-27)
+
+A patch release of the verification machinery, one teardown ordering and the
+docs, two hours after 0.6.12. The public API is unchanged:
+`cargo-semver-checks` 0.51.0 against v0.6.12 reports 202 checks pass, 58 skip.
+
+### Fixed
+
+- `scripts/release_gate_verdict.sh` read a `FAIL (...)` line that shared its
+  line with the `[n/7]` progress prefix as a non-failure, and accepted a
+  tolerated semver SKIP as a complete audit. The scan now matches the `FAIL`
+  token anywhere on the line, requires the gate's own final verdict, and
+  rejects exit 0 that still carries a SKIP. Ten synthetic logs pin the
+  matrix, including `FAIL (` plus a tolerated SKIP -> exit 1.
+- `ResumeFuture::drop` removed its waker under the queue mutex and dropped it
+  inside the same critical section. Removal stays under the lock (it is the
+  dedup boundary); the drop now runs after the guard is released. A probe
+  waker whose `Drop` calls `try_lock` proves it: `left: 2` on the old
+  `retain`, `1` after the fix.
+- `friction_wait_ms` (sync and async twins) computed `depth * cap` in u64:
+  `max_wait_ms = u64::MAX` panicked in debug and wrapped in release. Both use
+  u128 intermediates and `saturating_add` now; a regression holds a slot at
+  `u64::MAX` and asserts the ceiling is returned exactly.
+- Gate 6 reported every non-zero verifier exit as "breaking API change". CI
+  hit this false verdict for real: cargo-semver-checks 0.48.0 parses rustdoc
+  JSON v56/v57 only, stable 1.99 emits v61, so the tool never ran. The gate
+  now classes 0 clean / 1 semver violation / 2 gate misconfiguration /
+  3 verifier could not run, and `check_compile_gates.{sh,ps1}` names the
+  class; a legacy 0.48-style exit 1 is split by the `--- failure <lint>`
+  report heading.
+
+### Changed
+
+- `cargo-semver-checks` is pinned to 0.51.0 in both CI install steps (quality
+  and Windows parity): it parses rustdoc v57/v60/v61.
+- The compile gates print `PARITY` only after a clean failure tally, so a
+  failed audit never ends with a complete-looking fingerprint; a tolerated
+  local semver SKIP still prints it after the reduced-coverage verdict.
+- The suite floor moves 300 -> 450 with an ignored ceiling of 8 (measured
+  suite: 467 passed, 7 ignored, 67 result lines).
+- CI gains a real 32-bit runtime lane: `frame_fuzz` runs on
+  `i686-pc-windows-msvc` (WoW64), reproduced locally; the quality job keeps
+  the i686 compile check.
+- `benches/admission_bench.rs`: `drain_sync` verification left the timed
+  window, while `feed` assertions stay inside it because the bench-hygiene
+  gate requires every timed `feed` to assert its parsed frame count.
+
+### Documentation
+
+- `OP_STATE` packaging is documented as 24/24/16 bytes (frames 0/1 carry 24
+  digest bytes, frame 2 carries 16), matching `drain.rs` and `supervisor.rs`.
+- `SafeLockExt` describes its poison tick as best-effort: skipped while the
+  ledger lock is held, under-reporting by design.
+- `Protected::abort` keeps a structural guard invariant
+  (`expect("protected guard invariant")`) instead of fabricating an empty
+  `TransactionHeader`.
+- Bench topology statements match the harness: contended rows are 6
+  concurrent OS threads with no CPU affinity pinning, and the SPSC bridge is
+  a two-thread handoff, not an inter-core bus measurement. `BENCHMARKS.md`,
+  `docs/USER_GUIDE.md` and the bench comments say the same thing.
+
 ## 0.6.12 (2026-10-27)
 
 Rollback bodies are named, budgeted and observable from outside the node
