@@ -44,10 +44,13 @@ jobs:
       - name: Install cargo-semver-checks (Gate 6)
         # Pinned, not `latest`: a floating verifier can start reporting (or
         # stop reporting) breakage between two releases of this crate, which
-        # turns the API gate into a moving target. Bump deliberately.
+        # turns the API gate into a moving target. Bump deliberately, and keep
+        # the pin ahead of the rustdoc JSON format stable emits: 0.48.0 knew
+        # v56/v57 only and died on `unsupported rustdoc format v61` (CI,
+        # 2026-10-27); 0.51.0 parses v57/v60/v61.
         uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
         with:
-          tool: cargo-semver-checks@0.48.0
+          tool: cargo-semver-checks@0.51.0
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -187,7 +190,7 @@ jobs:
         # verifier version, or the parity lane compares two rulesets.
         uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
         with:
-          tool: cargo-semver-checks@0.48.0
+          tool: cargo-semver-checks@0.51.0
 
       - name: Run Full Test Suite
         shell: bash

@@ -260,10 +260,19 @@ if ($GitExit -ne 0 -or -not $ApiBaseline) {
         # rule here is how the Windows gate drifted from .sh at v0.6.10.
         $ApiDiffScript = Join-Path $ScriptDir "check_api_diff.ps1"
         & powershell -NoProfile -ExecutionPolicy Bypass -File $ApiDiffScript $ApiBaseline
-        if ($LASTEXITCODE -eq 0) {
+        $ApiRc = $LASTEXITCODE
+        if ($ApiRc -eq 0) {
             Write-Host " OK (no breaking change vs $ApiBaseline)" -ForegroundColor Green
         } else {
-            Write-Host " FAIL (public API gate vs ${ApiBaseline}: see the API diff output above)" -ForegroundColor Red
+            # Name the failure class instead of calling every non-zero a
+            # breaking change (parity with the .sh gate).
+            if ($ApiRc -eq 1) {
+                Write-Host " FAIL (breaking API change vs ${ApiBaseline}: see the API diff output above)" -ForegroundColor Red
+            } elseif ($ApiRc -eq 2) {
+                Write-Host " FAIL (API gate misconfigured vs ${ApiBaseline}: baseline, checkout or lockfile -- see the API diff output above)" -ForegroundColor Red
+            } else {
+                Write-Host " FAIL (API verifier could not run vs ${ApiBaseline} -- tool/toolchain error, not an API verdict)" -ForegroundColor Red
+            }
             $Failures++
         }
     }

@@ -2,7 +2,10 @@
 # Public API semver gate. Compares the working tree against the latest
 # reachable git tag with `cargo-semver-checks` when the tool is installed.
 #
-# Exit codes: 0 = clean or SKIP (tool/tag unavailable), 1 = breaking change.
+# Exit codes: 0 = clean or SKIP (tool/tag unavailable), 1 = breaking change,
+# 2 = gate misconfiguration (no usable baseline, missing tool under CI, lock
+# mutation), 3 = the verifier could not run (tool/toolchain error, not a
+# verdict). Parity with check_api_diff.sh; Gate 6 names the class.
 
 param([string]$Baseline = "")
 
@@ -31,7 +34,7 @@ Write-Host "[API] semver diff" -NoNewline
 if (-not $Baseline) {
     if ($InCi) {
         Write-Host " FAIL (CI: no git tag baseline -- checkout must fetch tags and the repo must be tagged per release)" -ForegroundColor Red
-        exit 1
+        exit 2
     }
     if (Test-Path "$RepoRoot\.git\shallow") {
         Write-Host " SKIP (no git tag baseline; shallow clone -- run: git fetch --tags --unshallow)"
@@ -44,7 +47,7 @@ if (-not $Baseline) {
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     if ($InCi) {
         Write-Host " FAIL (CI: cargo not installed -- workflow must install the toolchain)" -ForegroundColor Red
-        exit 1
+        exit 2
     }
     Write-Host " SKIP (cargo not installed)"
     exit 0
@@ -57,7 +60,7 @@ $ErrorActionPreference = $PrevEap
 if ($SemverExit -ne 0) {
     if ($InCi) {
         Write-Host " FAIL (CI: cargo-semver-checks missing -- workflow must install it)" -ForegroundColor Red
-        exit 1
+        exit 2
     }
     Write-Host " SKIP (cargo-semver-checks not installed; cargo install cargo-semver-checks)"
     exit 0
@@ -84,7 +87,7 @@ if ($BaselineCommit -and $BaselineCommit -eq $HeadCommit) {
         $Baseline = $PreviousTag
     } else {
         Write-Host " FAIL (baseline $Baseline is HEAD and no previous tag exists: committed-but-untagged API changes are invisible to this gate -- tag the release or pass an older baseline)" -ForegroundColor Red
-        exit 1
+        exit 2
     }
 }
 
@@ -92,25 +95,41 @@ $Crate = (Select-String -Path "$RepoRoot\Cargo.toml" -Pattern '^name\s*=\s*"(.+)
     Select-Object -First 1).Matches[0].Groups[1].Value
 Write-Host " baseline=$Baseline package=$Crate"
 Push-Location $RepoRoot
+$SemverLog = [System.IO.Path]::GetTempFileName()
 try {
     # cargo-semver-checks has no --locked flag: snapshot the lockfile and
     # fail if the tool rewrote it (the CI gate cannot see this otherwise).
     $LockPath = Join-Path $RepoRoot "Cargo.lock"
     $LockBefore = if (Test-Path $LockPath) { (Get-FileHash $LockPath -Algorithm SHA256).Hash } else { "" }
-    & cargo semver-checks check-release --baseline-rev $Baseline --package $Crate
+    $PrevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & cargo semver-checks check-release --baseline-rev $Baseline --package $Crate 2>&1 |
+        Tee-Object -FilePath $SemverLog
     $SemverExit = $LASTEXITCODE
+    $ErrorActionPreference = $PrevEap
     $LockAfter = if (Test-Path $LockPath) { (Get-FileHash $LockPath -Algorithm SHA256).Hash } else { "" }
     # An empty hash means the lockfile vanished: `"" -eq ""` would hide any
     # rewrite. Parity with check_api_diff.sh.
     if (-not $LockBefore -or -not $LockAfter) {
         Write-Host " FAIL (could not hash Cargo.lock: it is missing -- lock mutation would be invisible)" -ForegroundColor Red
-        exit 1
+        exit 2
     }
     if ($LockBefore -ne $LockAfter) {
         Write-Host " FAIL (cargo-semver-checks rewrote Cargo.lock; restore it and pin the toolchain)" -ForegroundColor Red
+        exit 2
+    }
+    if ($SemverExit -eq 0) { exit 0 }
+    # 0.48.x exits 1 for both a violation and a tool error; 0.50+ split 100
+    # (lint failure) from 101 (tool error). The `--- failure <lint>` heading
+    # is printed by both generations, so it decides the legacy mixed case.
+    $LogText = if (Test-Path $SemverLog) { [string](Get-Content $SemverLog -Raw) } else { "" }
+    if ($SemverExit -eq 100 -or $LogText -match '(?m)^--- failure ') {
+        Write-Host " verdict: cargo-semver-checks reported a semver violation (exit $SemverExit)"
         exit 1
     }
-    exit $SemverExit
+    Write-Host " FAIL (verifier could not run: cargo-semver-checks exit $SemverExit -- tool/toolchain error, not an API verdict)" -ForegroundColor Red
+    exit 3
 } finally {
+    Remove-Item $SemverLog -ErrorAction SilentlyContinue
     Pop-Location
 }

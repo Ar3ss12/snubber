@@ -241,7 +241,16 @@ elif command -v cargo-semver-checks > /dev/null 2>&1     || (cd "${REPO_ROOT}" &
     if (cd "${REPO_ROOT}" && bash "${SCRIPT_DIR}/check_api_diff.sh" "${API_BASELINE}"); then
         echo "OK (no breaking change vs ${API_BASELINE})"
     else
-        echo "FAIL (breaking API change vs ${API_BASELINE}: run scripts/check_api_diff.sh)"
+        # Name the failure class instead of calling every non-zero a breaking
+        # change: on 2026-10-27 CI printed "breaking API change" for a verifier
+        # that could not parse rustdoc v61, and the real cause lived only in
+        # the log above the gate line.
+        rc=$?
+        case "${rc}" in
+            1) echo "FAIL (breaking API change vs ${API_BASELINE}: run scripts/check_api_diff.sh)" ;;
+            2) echo "FAIL (API gate misconfigured vs ${API_BASELINE}: baseline, checkout or lockfile — see the API diff output above)" ;;
+            *) echo "FAIL (API verifier could not run vs ${API_BASELINE} — tool/toolchain error, not an API verdict)" ;;
+        esac
         FAILURES=$((FAILURES + 1))
     fi
 else

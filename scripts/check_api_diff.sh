@@ -3,7 +3,11 @@
 # Public API semver gate. Compares the working tree against the latest
 # reachable git tag with `cargo-semver-checks` when the tool is installed.
 #
-# Exit codes: 0 = clean or SKIP (tool/tag unavailable), 1 = breaking change.
+# Exit codes: 0 = clean or SKIP (tool/tag unavailable), 1 = breaking change,
+# 2 = gate misconfiguration (no usable baseline, missing tool under CI, lock
+# mutation), 3 = the verifier could not run (tool/toolchain error, not a
+# verdict). check_compile_gates.{sh,ps1} name the class in Gate 6 instead of
+# reporting every non-zero as "breaking API change".
 
 set -euo pipefail
 
@@ -29,7 +33,7 @@ echo -n "[API] semver diff"
 if [ -z "${BASELINE}" ]; then
     if in_ci; then
         echo " FAIL (CI: no git tag baseline — checkout must fetch tags and the repo must be tagged per release)"
-        exit 1
+        exit 2
     fi
     if [ -f "${REPO_ROOT}/.git/shallow" ]; then
         echo " SKIP (no git tag baseline; shallow clone — run: git fetch --tags --unshallow)"
@@ -43,7 +47,7 @@ if ! command -v cargo-semver-checks > /dev/null 2>&1 \
     && ! cargo semver-checks --version > /dev/null 2>&1; then
     if in_ci; then
         echo " FAIL (CI: cargo-semver-checks missing — workflow must install it)"
-        exit 1
+        exit 2
     fi
     echo " SKIP (cargo-semver-checks not installed; cargo install cargo-semver-checks)"
     exit 0
@@ -61,7 +65,7 @@ if [ "$(git -C "${REPO_ROOT}" rev-parse "${BASELINE}^{commit}" 2>/dev/null || tr
         BASELINE="${PREV}"
     else
         echo " FAIL (baseline ${BASELINE} is HEAD and no previous tag exists: committed-but-untagged API changes are invisible to this gate -- tag the release or pass an older baseline)"
-        exit 1
+        exit 2
     fi
 fi
 
@@ -75,19 +79,33 @@ cd "${REPO_ROOT}"
 # rewrite Cargo.lock behind the gate's back. Snapshot it and fail if the
 # tool mutated the lockfile (reproducibility hole the CI gate cannot see).
 LOCK_BEFORE="$(git -C "${REPO_ROOT}" hash-object Cargo.lock 2>/dev/null || true)"
+# The exit code alone cannot separate "breaking change" from "the verifier
+# could not run": 0.48.x exits 1 for both, and only 0.50+ split 100 (lint
+# failure) from 101 (tool error). The `--- failure <lint>` report heading is
+# printed by both generations, so it decides the legacy mixed case.
+SEMVER_LOG="$(mktemp)"
+trap 'rm -f "${SEMVER_LOG}"' EXIT
 set +e
-cargo semver-checks check-release --baseline-rev "${BASELINE}" --package "${CRATE}"
-SEMVER_RC=$?
+cargo semver-checks check-release --baseline-rev "${BASELINE}" --package "${CRATE}" 2>&1 | tee "${SEMVER_LOG}"
+SEMVER_RC=${PIPESTATUS[0]}
 set -e
 LOCK_AFTER="$(git -C "${REPO_ROOT}" hash-object Cargo.lock 2>/dev/null || true)"
 # An empty hash means git could not read the lockfile: the before/after
 # comparison would then be `"" == ""` and every mutation would pass unseen.
 if [ -z "${LOCK_BEFORE}" ] || [ -z "${LOCK_AFTER}" ]; then
     echo " FAIL (could not hash Cargo.lock: it is missing or git cannot read it — lock mutation would be invisible)"
-    exit 1
+    exit 2
 fi
 if [ "${LOCK_BEFORE}" != "${LOCK_AFTER}" ]; then
     echo " FAIL (cargo-semver-checks rewrote Cargo.lock; restore it and pin the toolchain)"
+    exit 2
+fi
+if [ "${SEMVER_RC}" -eq 0 ]; then
+    exit 0
+fi
+if [ "${SEMVER_RC}" -eq 100 ] || grep -q '^--- failure ' "${SEMVER_LOG}"; then
+    echo " verdict: cargo-semver-checks reported a semver violation (exit ${SEMVER_RC})"
     exit 1
 fi
-exit "${SEMVER_RC}"
+echo " FAIL (verifier could not run: cargo-semver-checks exit ${SEMVER_RC} — tool/toolchain error, not an API verdict)"
+exit 3
