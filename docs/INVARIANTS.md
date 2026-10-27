@@ -67,6 +67,13 @@ capacity with `BulkheadFull`, async parks as `Pending`, erased scopes are
 granted because their slot was released at admission). The invariant is
 about OUR lock; a rollback that re-takes a FOREIGN mutex the caller's
 `work()` already holds hangs anyway, and no node counter can see it.
+The rollback half of the law is a static gate, not a hope:
+`tests/lock_hierarchy.rs::rollback_bodies_never_run_under_the_node_lock`
+scans every pinned invocation site (13, across `src/lib.rs`,
+`src/erased.rs`, `src/node.rs`) and trips if any lock taken earlier in the
+same function is still held when user code runs; the site inventory count
+itself is asserted, so a renamed or reformatted call site fails the gate
+instead of silently shrinking it.
 
 ### Invariant 7: Pulse Lag Is Never Silent (Black-Box Trace)
 Every missed `WorkerPulse` verdict recorded via
