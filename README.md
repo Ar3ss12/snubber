@@ -2,28 +2,77 @@
 
 [![CI](https://github.com/Ar3ss12/snubber/actions/workflows/ci.yml/badge.svg)](https://github.com/Ar3ss12/snubber/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
-[![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
 [![Tests](https://img.shields.io/badge/tests-439%20passed-brightgreen.svg)](https://github.com/Ar3ss12/snubber/actions/workflows/ci.yml)
 
 <!-- Badge provenance: `bash scripts/check_test_count.sh` (all features, 5 ignored), last verified 2026-10-27. -->
 
-> **Transactional safety fuse and failure-recovery engine for Rust.**  
-> Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
+> **Transactional safety fuse and failure-recovery engine for Rust.** If a
+> protected section fails — `panic!`, an early-return `?`, or the process
+> being killed — physical pins, database locks and memory settle back to a
+> safe state through `Drop`, and whoever supervises the work gets a
+> classification of what actually happened.
 
-Zero external dependencies. `#![forbid(unsafe_code)]`. Compatible from bare-metal embedded firmware (`core`-only) to high-throughput multi-threaded servers (`std`).
+Zero deps · `#![forbid(unsafe_code)]` · MSRV 1.70 · one crate from `core`-only bare metal to multi-threaded `std`.
 
 ---
 
-## ⚡ Quickstart (10 seconds)
+## What it guarantees
 
-Add to `Cargo.toml`:
+* **Rollback is structural.** An admitted guard reverts unless it commits — an
+  error return and a panic leave through the same door. `scoped_sealed` adds a
+  `!Send` seal: leaking a scope across threads fails at compile.
+* **It survives the process, not only the function.** A supervised child emits a
+  framed 44-byte token when it arms; if it dies (`kill -9`, `TerminateProcess`,
+  OOM euthanasia) the parent reads the pipe to EOF and classifies every reap as
+  **true ambush**, **clean escape** or **stillborn**, with
+  `ambush + escape + stillborn == reaped` gated on every run.
+* **Refusals carry telemetry.** Bulkhead, sliding-window breaker and three
+  priority lanes answer with `retry_after_ms` and queue depth; shedding is
+  counted as silent discard, never a fake success, and under the default
+  policies capacity pressure never trips a breaker.
+* **Async without a runtime.** `enter_async_auto` parks on `core::task::Waker`:
+  0% CPU while waiting, no Tokio or async-std dependency.
+* **A hang gets a verdict.** A monotonic clock plus a CPU-sample fold settles a
+  hot `loop {}` as `SpinDetected` and a blocked syscall as `TimedOut` —
+  identical rollback, distinct diagnosis, no thread killed. One
+  `WorkerPulse::kick()` strokes a hardware watchdog on firmware.
+* **State outlives the process.** A 64-byte `StateDigest` is a ticket, not
+  storage: a worker near its soft memory limit streams its checkpoint through a
+  fixed buffer and hands the digest to its successor.
+* **Health is one fixed frame.** A 512-byte, zero-allocation `SnapshotV1` with
+  CRC32 answers whether the system is healthy, and `assert_no_anomalies!()`
+  turns that into a CI gate.
+* **Impedance is bounded both ways.** A 10 000 msg/s producer into a 60 FPS
+  consumer gets a one-slot `ConflateSender` (latest wins, replacements counted,
+  backlog 0 or 1), and the 16-byte `ExecutionEnvelope` also catches work that
+  returns *too fast* as `envelope_underflows`.
+* **N lineages in one process.** `WorkerPool` gives every lane its own
+  `PipeDrain`, generation clock, restart tracker and memory watch; a lane whose
+  pipe never reaches EOF gets its own bucket (`ReapClass::Deadlocked`) instead
+  of being guessed into another.
+* **Extensible by contract.** Public enums are `#[non_exhaustive]`, so new
+  verdicts are additive; `friction_fn` / `pressure_fn` take capturing closures
+  and run outside the node lock; `snub_check_map!` maps breaches into your error
+  type.
+* **Bulkhead Scope (erased guards):** the erased path (`enter_erased_auto`,
+  `spawn_guarded`) commits its admission probe at entry, so `max_in_flight(N)`
+  bounds concurrent *admissions*, not live erased transactions; two live erased
+  workers are never serialized by the node. Serialize at the application layer
+  if you need a lease for the worker's lifetime — the typed `enter` / `scoped`
+  guards hold their slot until settlement and are unaffected.
+
+---
+
+## Quick start (10 seconds)
+
 ```toml
 [dependencies]
 snubber = "0.6"
 ```
 
-Wrap critical work in **`scoped`** — commits on `Ok`, automatically rolls back on `Err` or `panic!`:
+Wrap critical work in **`scoped_checked`**: commits on `Ok`, rolls back on `Err`,
+on `panic!` and on early return:
 
 ```rust
 use snubber::{snub_check, SnubberNode};
@@ -47,125 +96,134 @@ let receipt = node.scoped_checked(
 
 ---
 
-## 🔌 Embedded & `no_std`
+## The delta
 
-`std` and `alloc` are additive features. Without `std` the crate is `core`-only (`#![cfg_attr(not(feature = "std"), no_std)]`); CI builds **both** `core` and `core + alloc` for `thumbv7em-none-eabihf`, and `WorkerPulse` drops to a 32-bit atomic on targets without 64-bit CAS. The `no_std` surface is the watchdog, ISR bridge, clock, envelope, contract, policy, diagnostics core, memory watch, drain (token parser + `SnubScanner`), and `Protected`; the protect layer's ergonomic `SafeLockExt` extension is `std`, because the locks it wraps are `std` locks; `alloc` upgrades the same layers with the erased guard and owned node-name types; `SnubberNode` itself and the async engine, supervisor, pool, channel, conduit, conflate, and harness layers are `std` because they own OS threads, pipes, and process trees.
+```rust
+// WITHOUT snubber: the rollback is a second path you maintain by hand
+ledger.lock_funds(req);
+let outcome = charge(req);                 // panics here -> funds stay locked
+if outcome.is_ok() { ledger.commit(); } else { ledger.unlock(); }
 
-The supervisor parser does not require a reader thread or stdout. `PipeDrain` is `std` (it owns the EOF state and counters); push bytes from a UART/DMA task and declare EOF yourself. On `core`-only targets, the same bytes go straight into the `core` `SnubScanner`:
+// WITH snubber: one call, both exits covered, panic included
+node.scoped_checked(req, |r| { snub_check!(r.amount > 0, "bad amount"); Ok(()) },
+    || ledger.unlock_funds(), charge)?;
+```
+
+---
+
+## When to use / when not
+
+* Hardware and interlock sections (relay lines, actuator pins) where a panic
+  must not leave an output energized — the `core` surface needs no allocator.
+* Per-endpoint or per-tenant admission in a server, replacing hand-rolled
+  counters and breakers.
+* Supervising child processes you cannot trust to exit cleanly, and workers that
+  must hand state to a successor generation.
+* Async entry points in a runtime you do not control.
+* **Not for:** distributed transactions — settlement is in-process `Drop` plus
+  one pipe frame, there is no two-phase commit. Not a lock implementation —
+  `SafeLockExt` wraps locks in guard ergonomics, it does not replace `Mutex`. Not
+  a thread scheduler — pool lanes restart children, they do not place threads.
+* **`std` is a real boundary:** `SnubberNode`, the async engine, supervisor,
+  pool, gateway, conduit, conflate and harness layers own OS threads, pipes and
+  process trees. Format ceilings (3 priority lanes, 4 profile stages, 16 ISR
+  slots, 28 B token payload, 512 B snapshot, 250 ms EOF grace) are published
+  constants, not tunables.
+
+---
+
+## Embedded & `no_std`
+
+`std` and `alloc` are additive features; without `std` the crate is `core`-only
+(`#![cfg_attr(not(feature = "std"), no_std)]`). CI builds **both** `core` and
+`core + alloc` for `thumbv7em-none-eabihf`. `core`-only targets get the guard,
+epoch gate, pulse, ISR bridge, clock, envelope, policy, drain scanner and memory
+watch; `alloc` upgrades those layers in place rather than adding one.
+
+`PipeDrain` is `std` because it owns EOF state and counters, so on a `std`
+transport push bytes from a UART/DMA task and declare EOF yourself; on
+`core`-only targets the same bytes go straight into the `core` `SnubScanner`.
 
 ```rust
 // std transport layered on the core scanner
 fn app_tick_ms() -> u64 { 0 /* firmware SysTick, ms */ }
 let drain = PipeDrain::manual_with_clock(app_tick_ms); // ClockFn = fn() -> u64, not a number
 let frames = drain.feed(uart_chunk);                   // any chunking, any size
-drain.finish();                                        // EOF → rescue classification
+drain.finish();                                        // EOF -> rescue classification
 ```
 
-`ProcessToken::write_to(&mut sink)` and `StateDigest::write_to(&mut sink)` (`std`-gated) replace `emit_if_supervised` when the transport is not stdout: no environment lookup, no global lock, errors returned. On bare metal, `to_bytes()` returns the 44-byte frame for your own transport.
+`ProcessToken::write_to(&mut sink)` and `StateDigest::write_to(&mut sink)`
+(`std`-gated) replace `emit_if_supervised` when the transport is not stdout; on
+bare metal `to_bytes()` returns the 44-byte frame for your own transport.
 
 ---
 
-## 🛡️ Architecture & Guarantees
+## Performance
 
-* **Zero-Boilerplate RAII Rollback:** No manual token tracking. Scoped executions auto-commit on success and guarantee resource release via `Drop` on panics, errors, or early returns.
-* **Single-Digit-Nanosecond Overhead:** The base stack guard costs single-digit nanoseconds and commit consumes the disarmed, allocation-free guard shell (a plain stack move — no heap, no extra wire bytes). Measured per-operation figures, including the contended group: [BENCHMARKS.md](BENCHMARKS.md).
-* **Strict Determinism:** `#![forbid(unsafe_code)]`, zero external dependencies. Predictable behavior across bare-metal microcontrollers and multi-socket servers alike.
-* **Runtime-Agnostic Async:** Bounded waker queue built on `core::task::Waker` consuming **0% CPU** without depending on Tokio, async-std, or background threads.
-* **Adaptive Backpressure & Pacing:** Refusals carry physical telemetry (`retry_after_ms`, queue depth 0..255) allowing clients to pace incoming traffic instead of overwhelming dead hardware.
-* **Out-of-Process Crash Recovery:** The local stress bench (AMD Ryzen 5 4600H, release build) ran 10,000 hard `TerminateProcess` (`kill -9`) executions in armed-hold mode with zero pipe deadlocks and 100% token rescue; CI gates the multi-lineage POSIX storm on every push/PR (4 lanes × 250 armed-hold kills + 4×500 free-running on ubuntu and macos) plus a 25-kill termination smoke, while the 200-kill single-process harness, the 100-kill PowerShell harness, the Win32 multi-lineage storm and the full `#[ignore]` termination gate run on the weekly schedule or manual dispatch. Every reap is classified as **true ambush** (armed token at death), **clean escape** (commit seen) or **stillborn** (killed during startup); a multi-lineage storm runs 4 independent supervisors in parallel with per-lane latency and handle gates, and `WorkerPool` hosts N isolated lineages inside one process (one private `PipeDrain` per worker).
-* **Isolated Error Domains:** `FaultKind::is_catastrophic()` cleanly separates unrecoverable failures (Panic, Timeout, ProcessDied, ImplicitDrop) from routine capacity shedding (bulkhead limits, rate limits, stale epochs). Under the default policies, shedding pressure never trips circuit breakers; a per-kind `FaultAction::BreakerOpen` override can opt in.
-* **Monotonic Hang Clock:** Boot-relative `Instant` (`SystemClock`) — NTP sync, DST changes, and manual edits never move a deadline. Firmware brings its own `SysTick` tick via `MonotonicMs`.
-* **SPIN vs SLEEP Classification:** A hot `loop {}` settles as `SpinDetected`, a blocked syscall as `TimedOut` — identical rollback, distinct verdict, no thread ever killed. A one-atomic-word `WorkerPulse` heartbeat (8 B on 64-bit, 4 B on 32-bit targets) strokes the hardware WDT on firmware.
-* **Zero-Allocation Telemetry:** 512-byte diagnostic snapshots with CRC32 integrity, zero heap allocations on the hot path, and CI validation via `assert_no_anomalies!()`.
-* **Selective Pass-Through (Canary Law):** Builder-sealed `passthrough(true)` runs open-doors transit for differential proof — naked leaks counted lock-free, guarded rescues; wire frame stays 512 B.
-* **Extensible by Contract:** Public error/classification enums are `#[non_exhaustive]`, so new verdicts are additive — downstream matches must keep a `_` arm, and the crate's own internal matches stay exhaustive. `friction_fn` / `pressure_fn` accept capturing closures stored in `Arc<dyn Fn>` and run outside the node lock; `snub_check_map!` maps invariant breaches into your error type; `NodeName::{Static, Owned}` names nodes at runtime without touching the `Copy` telemetry frames (owned-name nodes export the marker `<owned>` in metric/anomaly rows; read `FaultRecord::node` or `node.name()` for the exact label); supervisor entry points have explicit `_argv` variants (`run_supervised_guard_argv`, `run_supervised_guard_with_lease_argv`, `run_supervised_guard_with_memory_argv`) so embedders that don't own `std::env::args` can pass their own argument vector; format ceilings (3 priority lanes, 4 profile stages, 16 ISR slots, 28 B token payload, 512 B snapshot, 250 ms EOF grace) are published constants.
-* **Published Helpers & Constants:** `DrainCounters` (frames/arms/commits per drain), `TokenRollback` (emergency `fn` handler), `ProfiledEnterFuture`, `backpressure_of(&EnterError)`, `GatewaySender`/`GatewayHost`, `TOKEN_MAGIC`/`SNAPSHOT_MAGIC`, `LANE_SHIFT`/`TASK_LOCAL_MASK`, `STATE_LEN` — all re-exported and documented in the API table of `docs/USER_GUIDE.md` (`STATE_LEN`, token/snapshot layouts in their layer chapters).
-* **Liveness-Correct Concurrency:** every parked async waiter either gets woken or is deregistered (`EvictOldest` resolves the victim to `QueueFull`, never a zombie); the gateway depth counter balances every send with exactly one take (signed arithmetic — the throttle latch can never wedge on an empty queue); a timed-out half-open probe re-opens the breaker instead of wedging; a new generation re-handshakes even at epoch 0; lane generations bump before the EOF grace window, so successors never inherit a dead child's generation; conduit resume/cancel notifications are issued under the waiter's mutex (no lost wakeups).
-* **Audit-Hardened Semantics:** shedding never masquerades as success — `BulkheadFull` defaults to counted silent discard (an explicit per-kind `FaultAction::BreakerOpen` still sheds immediately); erased-entry probes settle with the guard, not at admission; a bulkhead rejection no longer burns the epoch (retry works); watchdog timeouts feed the streak breaker; `IsrBridge::try_pop` drains malformed cells; supervisor logs state intent (`LINEAGE_BUMP`, `no_kill_self_drain_expected`) instead of implying actions the one-shot call never takes.
-* **Bulkhead Scope (erased guards):** the erased path (`enter_erased_auto`, `spawn_guarded`) commits its admission probe at entry, so the slot is released immediately: `max_in_flight(N)` bounds concurrent *admissions*, not live erased transactions. It is the same mechanism that lets a bulkhead rejection retry without burning the epoch — and it means two live erased workers are never serialized by the node. Serialize at the application layer (mutex, dedicated pool) if you need a lease for the worker's lifetime; the typed `enter`/`scoped` guards hold their slot until settlement and are unaffected.
-* **Impedance Bridge:** A 10 000 msg/s producer feeding a 60 FPS consumer gets a one-slot `ConflateSender` — latest wins, replacements counted, backlog stays at 0 or 1. A 16-byte `ExecutionEnvelope` also guards the other wall: work that returns too fast (stale cache, skipped loop) ticks `envelope_underflows` without feeding the breaker. `ProfileHarness` measures min/median/max/jitter/burst and derives the envelope from real numbers.
+Cost shapes; measured figures live in exactly one place.
+
+| Path | Cost / footprint |
+|---|---|
+| guard arm + `commit` | stack move + owned-field drop, zero heap allocation |
+| node admission (bulkhead + breaker) | one short lock; no clock read unless a lease or token bucket is armed |
+| async wait | `core::task::Waker` parking, 0% CPU |
+| child-death rescue | one 44 B frame over the pipe, classified at EOF |
+| health snapshot | 512 B, zero allocation, CRC32 |
+
+👉 Full 52-operation Criterion matrix, contended group and termination-storm
+tables — hardware context and committed artifacts included:
+**[BENCHMARKS.md](BENCHMARKS.md)**; signatures and footprints without
+measurements: [API & cost quick reference](docs/USER_GUIDE.md#api--cost-quick-reference).
 
 ---
 
-## 🏎️ Benchmark Snapshot
+## Documentation & layers
 
-Measured on AMD Ryzen 5 4600H, release build (`cargo bench --bench
-admission_bench`; Criterion 800 ms warmup, 2 s measurement, 50 samples,
-isolated node per bench; full 50-sample run of 2026-10-26, committed as
-[`docs/evidence/2026-10-26_bench_snapshot.md`](docs/evidence/2026-10-26_bench_snapshot.md)).
-Sub-2 ns deltas are run-to-run noise and are not claimed as wins.
-
-The full 52-operation matrix with per-row Criterion notes, the
-contended group and the termination-storm tables:
-**[BENCHMARKS.md](BENCHMARKS.md)**. The API & cost
-quick reference (signatures, layers and footprints, no measurements):
-[docs/USER_GUIDE.md](docs/USER_GUIDE.md#api--cost-quick-reference).
-
-### ⚡ Worker Pool (`WorkerPool`): N lineages in one process
-
-A single `Supervisor` owns one lineage: one armed slot, one `OP_STATE` scratch slot and one blocking `child.wait()`. The pool scales the count instead of merging state — every lane keeps its own `PipeDrain`, `GenerationClock`, `RestartTracker` (backoff + storm window) and `MemoryPolicy`, and one app thread waits on each child. The wire format does not change; `take_armed` still means exactly one worker's last un-settled token.
-
-```rust
-use snubber::pool::{namespace_task, PoolConfig, WorkerPool};
-
-let pool = WorkerPool::new(PoolConfig::new(4))?;          // 4 lanes, OnCrash, 50→1000 ms
-let lane = pool.lane(0).unwrap().clone();                 // one Arc per app thread
-let generation = lane.attach(pid, PipeDrain::spawn(stdout))?;
-let reap = lane.note_death(Some(exit_code), now_ms)?;           // waits ≤ 250 ms for EOF
-match reap.decision { /* Restart { delay_ms } | Stop | GiveUp */ }
-```
-
-`note_death` classifies from that lane's own pipe: **ambush** (token handed back), **escape** (commit seen), **stillborn** (neither). A pipe that does not reach EOF inside the grace window becomes a fourth honest bucket — `ReapClass::Deadlocked`; `PoolReport::healthy()` stays false until it is zero, and `ambush + escape + stillborn + deadlocks == reaps` is checked per lane and in the totals. Task ids can carry the lineage (`namespace_task`, `lane << 48 | local`), so a rescued token names its worker. A waiter blocked in `child.wait()` cannot see a *different* lane go silent, so one app-side monitor calls `pool.expired_lanes(lease_ms)` on a tick: it names only lanes that already proved traffic once, and the monitor kills those itself.
-
-Measured (`cargo test --test supervisor_pool_stress -- --ignored --nocapture`, 4 lanes × 8 hard kills, debug build): 32/32 reaps, 32/32 true ambush, 0 escape, 0 stillborn, 0 deadlocks, final generation `[9,9,9,9]` (= kills + 1 per lane), `wall_ms=55` (2026-10-26, [`docs/evidence/2026-10-26_pool_stress_report.json`](docs/evidence/2026-10-26_pool_stress_report.json)).
-
-The mixed storm cycles `armed → clean → silent → orphan` by `local % 4` inside the same run (`--mixed`, example 19): `cargo test --test supervisor_pool_stress_mixed -- --ignored --nocapture` measured 32/32 conserved reaps, **A/E/S/D = 8/8/8/8**, 8 rescued tokens, `deadlock=true` (the orphan modes hold the pipe open past the 150 ms grace), `[9,9,9,9]` generations, `wall_ms=474` (2026-10-26, [`docs/evidence/2026-10-26_pool_mixed_stress_report.json`](docs/evidence/2026-10-26_pool_mixed_stress_report.json)). A deadlocked lane is reported, never guessed into another bucket.
-
-The lease storm (`--lease-ms`, example 19) is the opposite case: every child emits one heartbeat and then hangs forever, so no `wait()` ever returns on its own. `cargo test --test supervisor_pool_stress_lease -- --ignored --nocapture` measured 24/24 reaps — all **stillborn** (a heartbeat is liveness, not a settlement), 0 ambush, 0 escape, 0 deadlocks, `lease_kills=24`, `conservation_breaks=0` over 99,628 live `report()` samples from the observer thread (2026-10-26, [`docs/evidence/2026-10-26_pool_lease_stress_report.json`](docs/evidence/2026-10-26_pool_lease_stress_report.json), `monitor_checks`), `[7,7,7,7]` generations, `wall_ms=194`. A child that hung before its first heartbeat is not expired — a pipe that never parsed a frame is the app's spawn timeout, not a lease breach.
-
-Every number in the three paragraphs above is copied from the committed reports in [`docs/evidence/`](docs/evidence/README.md): the bucket counters and generations are deterministic, while `wall_ms` and `monitor_checks` are wall-clock observations that move with load and were not hand-picked.
-
-All three storms plus `stress_breaker_churn` run in the `release-ignored` job of `.github/workflows/ci.yml` on every push and pull request (4 lanes × 8 / 6 / 8 kills and 8 threads × 1500 churn ops, ~2 s of test time); the heavier supervisor and multi-lineage harnesses stay scheduled or dispatch-only.
-
-Per-reap cost scales with lanes, not with the pool: each lane locks only its own state — measured per-operation figures in [BENCHMARKS.md](BENCHMARKS.md).
+* 📊 **[Benchmarks (`BENCHMARKS.md`)](BENCHMARKS.md)** — the single numeric home: latency matrix, contended group, storm tables.
+* 🧨 **[Invariants & verification protocol (`docs/INVARIANTS.md`)](docs/INVARIANTS.md)** — formal guarantees, admission conservation, slot-leak proofs, gate taxonomy.
+* 📘 **[User Guide (`docs/USER_GUIDE.md`)](docs/USER_GUIDE.md)** — the field manual for the current crate: recipes, traps, per-layer contracts.
+  * **Layer 1: Core RAII Guard:** Rollback is structural: an admitted guard reverts unless it is committed. Stack rollback, `EpochGate`, `Protected`, `SafeLockExt` and the universal ergonomics (`scoped`, `scoped_checked`, `snub_check!`).
+  * **Layer 2: Concurrency Bulkhead:** Admission is capped; the breaker fails fast instead of queueing. `SnubberNode`, presets, token buckets, sliding-window breakers, priority preemption, `passthrough` canary transit, external memory limits and opt-in execution profiles.
+  * **Layer 3: Runtime-Agnostic Async:** One parked waker per wait; any executor drives it, with no runtime dependency. `enter_async_auto`, `settle_async`, `enter_paced_async`.
+  * **Layer 4: Process Supervisor:** The supervisor owns the child process; the drain classifies its wire frames. `PipeDrain` with three drivers (`spawn`, `drain_sync`, `feed` + `finish`), framed tokens, generation bumps, `RestartTracker` backoff, memory euthanasia and `WorkerPool`.
+  * **Layer 5: Diagnostics & Health:** One 512-byte snapshot answers whether the system is healthy. `SnapshotV1`, anomaly detection, `SnapshotDiff`, the ASCII triage card and `assert_no_anomalies!()`.
 
 ---
 
-## 📖 Documentation & Architecture Layers
+## Examples
 
-* 📊 **[Benchmarks (`BENCHMARKS.md`)](BENCHMARKS.md)** — the full 52-operation Criterion matrix, the contended group and the termination-storm tables; the only public doc that quotes measured figures. The API & cost quick reference (no measurements) closes the [User Guide](docs/USER_GUIDE.md#api--cost-quick-reference).
-* 📘 **[Invariants & Verification Protocol (`docs/INVARIANTS.md`)](docs/INVARIANTS.md)** — Formal mathematical guarantees, admission conservation, zero slot leak proofs.
-* 📘 **[User Guide (`docs/USER_GUIDE.md`)](docs/USER_GUIDE.md)** — Comprehensive architecture manual:
-  * **Layer 1: Core RAII Guard:** Rollback is structural: an admitted guard reverts unless it is committed. Stack rollback, `EpochGate`, and universal ergonomics (`scoped`, `scoped_checked`, `snub_check!`).
-  * **Layer 1.5: Hang Classification:** Monotonic clock (`MonotonicMs` / `SystemClock`), CPU-spin classifier (`classify_stall` → `CpuSpin` / `DeadlockStall`; `guard.check_timeout()` → `SpinDetected` / `TimedOut`), one-word `WorkerPulse` heartbeat + `WdtSink`, ISR bridge (`IsrBridge`, 80 B SPSC ring + 32-bit trip latch, `IsrBridge::trip` bypasses `Full`), idle-park (`IdlePark` / `wfi`/`wfe` on firmware, `wfe` needs `SEVONPEND=1` at boot), pulse black-box (`pulse_stalls` + `PulseStall` anomaly, snapshot v5).
-  * **Layer 2: Concurrency Bulkhead:** Admission is capped; the breaker fails fast instead of queueing. `SnubberNode`, presets, token buckets, sliding-window breakers, priority preemption, builder-sealed `passthrough` canary transit, external memory limits (`memory_limits` → `note_memory_kb`), and opt-in execution profiles (`enter_auto_profiled` → `commit_profiled`). Impedance bridge: one-slot conflation (`ConflateSender`), 16 B `ExecutionEnvelope` corridors (`commit_enveloped`), and the deterministic `ProfileHarness` that measures the corridor before you promise it.
-  * **Layer 3: Runtime-Agnostic Async:** One parked waker per wait; any executor drives it, with no runtime dependency. Runtime-agnostic async execution (`enter_async_auto`, `settle_async`, `enter_paced_async`).
-  * **Layer 4: Process Supervisor:** The supervisor owns the child process; the drain classifies its wire frames. Out-of-process process supervisor, framed IPC tokens, `PipeDrain`, generation bumps, and memory euthanasia (`MemoryPolicy` → soft drain / hard `DeathCause::MemoryLimit`). `PipeDrain` has three drivers over one parser — `spawn` (reader thread), `drain_sync` (blocking `Read`), and `feed` + `finish` (caller-pushed chunks) — plus an injectable `ClockFn` for lease timing and `write_to` sinks for non-stdout transports. The 64 B `StateDigest` is a ticket, not storage: a soft-limit worker must stream its checkpoint through a fixed buffer — `hard - soft` is allocator headroom, not a drain countdown. `WorkerPool` runs N independent lineages (one drain, clock, tracker and memory watch per lane) with per-lane rescue classification and an aggregated report.
-  * **Layer 5: Diagnostics & Health:** One 512-byte snapshot answers whether the system is healthy. Zero-allocation telemetry, `SnapshotV1` v5 (memory + queue gauges, per-`FaultKind` counters including `RateLimited`), anomaly detection (`MemoryGrowth`, `QueueSaturation`), `SnapshotDiff`, ASCII triage card, and CI verification gates.
+Every file in [`examples/`](examples) runs with `cargo run --example <name>`.
+
+| # | Example | What it proves |
+|---|---|---|
+| 01 | [Hardware fuse](examples/01_hardware_fuse.rs) | Zero-allocation physical interlock |
+| 02 | [Worker daemon](examples/02_worker_daemon.rs) | Autonomous slot claiming by a background worker |
+| 03 | [Scoped database](examples/03_scoped_database.rs) | Concurrency limits and adaptive backpressure |
+| 04 | [Async web gateway](examples/04_async_web_gateway.rs) | Runtime-agnostic async entry with pacing metadata |
+| 05 | [Task conduit](examples/05_task_conduit_steering.rs) | Bi-directional task control and live telemetry |
+| 06 | [Process supervisor](examples/06_process_supervisor.rs) | Surviving `kill -9` of a child |
+| 07 | [State handoff](examples/07_state_handoff.rs) | Crash-resilient digest passing to a successor |
+| 08 | [Hot standby failover](examples/08_hot_standby_failover.rs) | Zero-framework N+1 spare-slot failover |
+| 09 | [Pipeline supervisor](examples/09_pipeline_supervisor.rs) | All resilience layers end to end |
+| 10 | [Persist snapshot](examples/10_persist_snapshot.rs) | Crash-safe 512 B frame flush the app owns |
+| 11 | [Hang classifier](examples/11_hang_classifier.rs) | `SpinDetected` vs `TimedOut` from one sample pair |
+| 12 | [ISR bridge](examples/12_isr_bridge.rs) | Interrupt to guard abort over a lock-free SPSC ring |
+| 13 | [Canary differential](examples/13_canary_differential.rs) | Naked `passthrough` leaks vs guarded rescue |
+| 14 | [Memory recycle](examples/14_memory_recycle.rs) | Soft-limit drain, hard-limit kill verdict |
+| 15 | [Supervised memory loop](examples/15_supervised_memory.rs) | Real supervisor + worker on the memory policy |
+| 16 | [Streaming checkpoint](examples/16_streaming_checkpoint.rs) | 16 MiB through a 64 KiB buffer; `--naive` dies |
+| 17 | [Impedance bridge](examples/17_impedance_bridge.rs) | Raw stream vs conflation vs paced gateway |
+| 18 | [Impedance calibration](examples/18_impedance_calibration.rs) | `ProfileHarness` derives the envelope from samples |
+| 19 | [Worker pool](examples/19_worker_pool.rs) | N lineages per pool, `--mixed` and `--lease-ms` storms |
 
 ---
 
-## 🧪 Production Patterns
+## Where to go next
 
-* **[01 Hardware Fuse (`examples/01_hardware_fuse.rs`)](examples/01_hardware_fuse.rs):** Zero-allocation physical interlock safety.
-* **[02 Worker Daemon (`examples/02_worker_daemon.rs`)](examples/02_worker_daemon.rs):** Autonomous slot claiming for background workers.
-* **[03 Scoped Database (`examples/03_scoped_database.rs`)](examples/03_scoped_database.rs):** Concurrency limits and adaptive backpressure.
-* **[04 Async Web Gateway (`examples/04_async_web_gateway.rs`)](examples/04_async_web_gateway.rs):** Runtime-agnostic async entry with pacing metadata.
-* **[05 Task Conduit Steering (`examples/05_task_conduit_steering.rs`)](examples/05_task_conduit_steering.rs):** Bi-directional task control and live telemetry.
-* **[06 Process Supervisor (`examples/06_process_supervisor.rs`)](examples/06_process_supervisor.rs):** Surviving abnormal child process termination (`kill -9`).
-* **[07 State Handoff (`examples/07_state_handoff.rs`)](examples/07_state_handoff.rs):** Crash-resilient successor state digest passing.
-* **[08 Hot Standby Failover (`examples/08_hot_standby_failover.rs`)](examples/08_hot_standby_failover.rs):** Zero-framework N+1 standby spare slot failover.
-* **[09 Pipeline Supervisor (`examples/09_pipeline_supervisor.rs`)](examples/09_pipeline_supervisor.rs):** Full end-to-end integration of all resilience layers.
-* **[10 Persist Snapshot (`examples/10_persist_snapshot.rs`)](examples/10_persist_snapshot.rs):** Crash-safe 512 B frame flush the app owns (tmp write + rename); the crate never touches files.
-* **[11 Hang Classifier (`examples/11_hang_classifier.rs`)](examples/11_hang_classifier.rs):** App-side CPU clock backend; hot `loop {}` settles as `SpinDetected`, blocked sleep as `TimedOut` — no thread is ever killed.
-* **[12 ISR Bridge (`examples/12_isr_bridge.rs`)](examples/12_isr_bridge.rs):** Hardware interrupt to guard abort via lock-free SPSC ring (80 B, ~2 bus cycles per push) — timer pulse feeds `WorkerPulse`, overcurrent trip latches a bit that bypasses a full ring.
-* **[13 Canary Differential (`examples/13_canary_differential.rs`)](examples/13_canary_differential.rs):** Naked `passthrough(true)` leaks vs guarded rescue on a virtual driver — comparative proof stand, zero real hardware moves.
-* **[14 Memory Recycle (`examples/14_memory_recycle.rs`)](examples/14_memory_recycle.rs):** Soft limit → drain → `StateDigest` handoff to a successor generation; hard limit → `MemoryPolicy` kill verdict.
-* **[15 Supervised Memory Loop (`examples/15_supervised_memory.rs`)](examples/15_supervised_memory.rs):** Real supervisor + worker processes on `run_supervised_guard_with_memory` — soft logs the drain window, hard euthanizes without draining (`DeathCause::MemoryLimit`).
-* **[16 Streaming Checkpoint (`examples/16_streaming_checkpoint.rs`)](examples/16_streaming_checkpoint.rs):** 16 MiB body through a 64 KiB stack buffer (`tmp` → `sync_all` → `rename` → seal → successor restore); `--naive` clones the state, crosses hard and is killed mid-`write_all` with no sealed file and no ticket.
-* **[17 Impedance Bridge (`examples/17_impedance_bridge.rs`)](examples/17_impedance_bridge.rs):** One 10 000 msg/s producer through a raw stream (unbounded backlog), a one-slot conflation channel (latest wins, coalescing counted) and a paced gateway (HWM/LWM with `retry_after_ms`) at 60 FPS.
-* **[18 Impedance Calibration (`examples/18_impedance_calibration.rs`)](examples/18_impedance_calibration.rs):** `ProfileHarness` measures min/median/max/jitter/burst, derives an `ExecutionEnvelope` with headroom, then a node judges real settlements — including a deliberate no-op that lands below the floor.
-* **[19 Worker Pool (`examples/19_worker_pool.rs`)](examples/19_worker_pool.rs):** N independent lineages in one pool — one `PipeDrain`, generation clock, restart tracker and memory watch per lane; every child is killed only after its decisive frame is parsed, and the JSON report gates `reaped`, `ambush`, `deadlock` and `final_generation`. `--mixed` cycles ambush/escape/stillborn/deadlock in one storm; `--lease-ms` kills workers that beat once and then hang, using `expired_lanes` from a monitor thread.
+* **[docs.rs/snubber](https://docs.rs/snubber)** — the generated API reference.
+* **[CHANGELOG.md](CHANGELOG.md)** — release history and the audit-batch fix tables.
+* **[`.github/workflows/ci.yml`](.github/workflows/ci.yml)** — the gates this
+  README quotes: MSRV lanes, bare-metal builds, storm lanes, test-count badge.
 
 ---
 

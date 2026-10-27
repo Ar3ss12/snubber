@@ -341,6 +341,28 @@ surface, wire format and telemetry layout are untouched.
   injection (wrong `417.4` → TRIPWIRE → surgical revert → green). The
   storm oracle is the 439th passing test (badge moved 438 → 439, 5
   ignored).
+- The README is rewritten from the readme-forge blueprint (write mode)
+  rather than patched again: the first screen is now title → one
+  guarantee sentence → hygiene line → `scoped_checked` quick start →
+  delta → when-not, the ten former guarantee essays are folded into
+  eleven bullets under "What it guarantees", and the firmware story sits
+  under its own heading after the limits. Measured: prose (excluding
+  code, tables and badges) 20,624 → 7,680 characters, whole file 23,112 →
+  12,725; prose *lines* read 81 → 104 only because the old file kept
+  unwrapped lines up to 1,011 characters. What survived is verifiable
+  only: the format ceilings are published constants re-checked in source
+  this pass (3 lanes `src/policy.rs:137`, 4 stages `src/node.rs:4562`,
+  16 ISR slots `src/isr.rs:30`, 28 B payload `src/drain.rs:17`, 512 B
+  snapshot `src/diagnostics.rs:27`, 250 ms EOF grace
+  `src/pool/mod.rs:59`, 44 B frame `src/drain.rs:89`, 64 B digest
+  `src/supervisor.rs:524`, 16 B envelope `src/envelope.rs:124`), the
+  10 000 msg/s → 60 FPS workload is re-derivable with
+  `cargo run --example 17_impedance_bridge`, and every measured latency
+  left the file (tilde-citation scan: 0 hits; banned-fluff scan: 0 hits).
+  All 27 local links resolve, the quick-start signature matches
+  `SnubberNode::scoped_checked` (`params, invariant, rollback, work`), the
+  `doc_sync` pins (erased-bulkhead scope, layer map, guide anchors) pass
+  unchanged at 13/13, and the badge stays 439.
 
 ### Tests
 
