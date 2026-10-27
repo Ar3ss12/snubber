@@ -182,6 +182,15 @@ surface, wire format and telemetry layout are untouched.
 
 ### Tests
 
+- New `isr_bridge` cross-thread FIFO test pushes 10,000 pulse signals
+  from one thread through the 16-slot SPSC ring while another pops them,
+  asserting opcode/reason/16-bit-sequence order end to end (Miri-scaled
+  to 200 pushes; both loops bounded by a 30 s deadline so a lost or
+  reordered signal fails instead of hanging). The pressure gauge asserts
+  refused pushes, not losses. The suite ships executable coverage for
+  the core branches at last: `cargo test --no-default-features --lib`
+  and `--features alloc` (19 tests each) run in CI quality, and the
+  suite joined the Miri concurrency lane.
 - Four gates that could not fail now compare against an independent
   oracle. `conservation_model` drops the
   `admission_total() == started + shed_total()` tautology and checks the

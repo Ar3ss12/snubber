@@ -712,6 +712,7 @@ mod unit_tests {
     static FLAG: AtomicBool = AtomicBool::new(false);
 
     #[test]
+    #[cfg(feature = "std")]
     fn header_display_names_all_fields() {
         let text = TransactionHeader::new(3, 9).to_string();
         assert_eq!(text, "gen=0 epoch=3 task=9");
@@ -811,6 +812,7 @@ mod unit_tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn node_gate_adopts_new_generation_at_epoch_zero() {
         let node = SnubberNode::builder("gate/gen0").build();
         assert!(
