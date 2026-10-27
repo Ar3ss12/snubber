@@ -105,6 +105,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   hot `loop {}` as `SpinDetected` and a blocked syscall as `TimedOut` —
   identical rollback, distinct diagnosis, no thread killed. One
   `WorkerPulse::kick()` strokes a hardware watchdog on firmware.
+* **A slow rollback is named, not silent.** `rollback_phase()` answers
+  `active`, `epoch`, `task_id` and — once `rollback_budget_ms` arms the
+  clock — `elapsed_ms`, `max_ms`, `stalls`, `reentries` from any thread
+  without the node lock. An overrun that returns becomes
+  `FaultKind::RollbackStall`; a body that never returns is named by
+  `watchdog::poll_rollback`. The body is never killed — detect and report.
 * **State outlives the process.** A 64-byte `StateDigest` is a ticket, not
   storage: a worker near its soft memory limit streams its checkpoint through a
   fixed buffer and hands the digest to its successor.

@@ -67,6 +67,12 @@ live on `RollbackPhase` instead of growing that struct.
   private — is a `constructible_struct_adds_field` break. `stalls`,
   `max_ms` and the new `reentries` are read from `rollback_phase()`, whose
   shape is free because the type does not exist in 0.6.11.
+- Docs carry the rules CI taught us: README's guarantee list names the
+  rollback view, the guide's quick-reference table gains `rollback_phase`
+  / `rollback_budget_ms` / `rollback_reentrancy` / `poll_rollback` rows
+  (layer column pinned by `tests/doc_sync.rs`), and Invariant 12 states
+  "append enum variants last" and "never add a field to a constructible
+  struct — publish a new `#[non_exhaustive]` view".
 
 ### Tests
 

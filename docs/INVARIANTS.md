@@ -259,6 +259,20 @@ The public verdict surface evolves additively and honestly:
   `_` arm. Internal (defining-crate) matches stay exhaustive — the
   attribute binds only downstream crates, and a wildcard there would be
   unreachable code.
+- New variants are APPENDED LAST. Declaration order is caller-visible
+  through `as` casts, and `cargo-semver-checks` reports an insertion as
+  `enum_no_repr_variant_discriminant_changed` (it caught
+  `StallKind::RollbackStall` inserted before `DeadlockStall`, moving the
+  latter from 3 to 4). `RollbackStall` is declared after `DeadlockStall`,
+  and `tests/rollback_guardrails.rs` pins `[0, 1, 2, 3, 4]` locally so a
+  machine without the semver tool still sees the break.
+- Existing constructible structs are never extended. `SnubberStats` has
+  public fields and `Default`, so downstream code can build it with a
+  struct literal: an added field — public or private — is
+  `constructible_struct_adds_field` (major), and `#[non_exhaustive]`
+  would itself be breaking. New telemetry goes into a new
+  `#[non_exhaustive]` view (`RollbackPhase`), never into an existing
+  struct.
 - Foreign hooks never run under the node lock. `friction_fn` /
   `friction_fn_ptr` / `pressure_fn` handlers are stored as
   `Arc<dyn Fn + Send + Sync>`, cloned (one atomic increment) under the

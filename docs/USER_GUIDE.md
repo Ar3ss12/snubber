@@ -1668,8 +1668,6 @@ what the row requires: `core` (no `std`), `alloc`, `std`, `cold`
 (diagnostics cold path), `contended` (saturated bench lane). A row must
 never disagree with the chapter map above.
 
-The `Layer` column is the chapter number of [docs/USER_GUIDE.md](docs/USER_GUIDE.md) plus what the row requires: `core` (no `std`), `alloc`, `std`, `cold` (diagnostics cold path), `contended` (saturated bench lane). A row must never disagree with the chapter map in that guide.
-
 | Operation | Layer | Cost / Footprint | When to Use |
 |---|---|---|---|
 | `snub_check!(cond, reason)` | 1 / core | single branch | Universal invariant check, returns `Err` |
@@ -1681,7 +1679,10 @@ The `Layer` column is the chapter number of [docs/USER_GUIDE.md](docs/USER_GUIDE
 | `node.cpu_budget_ms(n)` + `node.stall_ceiling_ms(n)` + `guard.with_cpu_sampler(f)` | 1.5 / std | 1 fn call at arming | CPU-spin budget + silence ceiling; `check_timeout` settles spin/deadlock distinctly |
 | `guard.stall_kind()` | 1.5 / std | 1 clock + 1 sample | Non-destructive hang verdict (no settle) |
 | `guard.check_timeout()` | 1.5 / std | 1 clock + 1 sample | Cooperative watchdog: `WithinBudget` / `TimedOut` / `SpinDetected` / `DeadlockSuspected` |
-| `snubber::watchdog::poll_rollback(&node, budget_ms)` | 2 / std | 1 pass over phase atomics, no lock/alloc | Outside verdict: a rollback body older than `budget_ms`, with `epoch`/`task_id`; books nothing |
+| `snubber::watchdog::poll_rollback(&node, budget_ms)` | 1 / std | 1 pass over phase atomics, no lock/alloc | Outside verdict: a rollback body older than `budget_ms`, with `epoch`/`task_id`; books nothing |
+| `node.rollback_phase()` | 1 / std | 7 relaxed atomic loads (+1 clock read only while a body is armed), no lock/alloc | Live rollback view: `active`, `epoch`, `task_id`, `elapsed_ms`, `budget_ms`, `max_ms`, `stalls`, `reentries` |
+| `node.builder(..).rollback_budget_ms(n)` | 1 / std | 2 atomic writes per body; 1 clock read only when `n > 0` | Arms the rollback clock; off by default, so `abort`/drop stays clock-free |
+| `RollbackReentrancy::{Allow, Refuse}` + `.rollback_reentrancy(..)` | 1 / std | 1 relaxed load per admission; TLS marker read only while a body is active | Policy for an admission attempted from this node's own rollback thread: `Refuse` returns `EnterError::RollbackReentrant` before any lock |
 | `IsrBridge::try_push/pop` + `trip/take_trips` + `IsrSignal` | 1.5 / core | 80 B, ~2 bus cycles | ISR signal into main loop; trip latch bypasses a full ring; no mutex/alloc/`unsafe` (M0-safe byte atomics); `head`/`tail` separated by 64 B cells, no `align(64)` pads |
 | `IsrSignal::new(opc, reason, value)` | 1.5 / core | 4 B, const | Pack `OP_EMERGENCY_TRIP` / `OP_PULSE` / `OP_PAUSE` |
 | `IdlePark::park` (`SpinPark`/firmware `wfi`/`wfe`) | 1.5 / core | structural: 0% CPU by design | 0%-CPU park: `Condvar` on `std`, `wfi`/`wfe` impl on firmware (`wfe` needs `SEVONPEND=1` at boot) |
