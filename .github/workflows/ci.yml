@@ -525,6 +525,13 @@ jobs:
           CARGO_TERM_COLOR: never
         run: cargo bench --locked --bench admission_bench
 
+      - name: Bench Threshold Gate (fail on a ~10x regression)
+        # A scheduled lane that only measures but never judges would
+        # regenerate the snapshot table without noticing a 10x slowdown.
+        # Ceilings are coarse by design; a missing estimates.json is a
+        # FAIL, not a SKIP.
+        run: bash scripts/bench_gate.sh target/criterion
+
       - name: Export Snapshot (fails on an empty table)
         run: bash scripts/bench.sh --skip-run --github
 
