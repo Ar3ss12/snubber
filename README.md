@@ -1,11 +1,10 @@
 # snubber
 
-[![CI](https://github.com/Ar3ss12/snubber/actions/workflows/ci.yml/badge.svg)](https://github.com/Ar3ss12/snubber/actions/workflows/ci.yml)
+[![GitHub](https://img.shields.io/badge/github-source-blue.svg)](https://github.com/Ar3ss12/snubber)
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
+[![docs.rs](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
+[![CI](https://github.com/Ar3ss12/snubber/actions/workflows/ci.yml/badge.svg)](https://github.com/Ar3ss12/snubber/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-439%20passed-brightgreen.svg)](https://github.com/Ar3ss12/snubber/actions/workflows/ci.yml)
-
-<!-- Badge provenance: `bash scripts/check_test_count.sh` (all features, 5 ignored), last verified 2026-10-27. -->
 
 > **Transactional safety fuse and failure-recovery engine for Rust.** If a
 > protected section fails — `panic!`, an early-return `?`, or the process

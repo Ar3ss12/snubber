@@ -177,11 +177,13 @@ jobs:
           set -o pipefail
           cargo test --locked 2>&1 | tee target/test-suite.log
 
-      - name: Test Count Badge Gate
-        # The README badge is a public claim: fail when it drifts from the
-        # tests that actually ran. Parsing the log avoids a second suite run;
-        # one OS suffices because the only cfg-gated tests have parallel
-        # Windows/non-Windows branches.
+      - name: Suite Health Gate
+        # The suite that actually ran must be green, the parsed counts must
+        # clear the floor, and README.md must publish no test count — the
+        # "tests-N passed" badge was removed on 2026-10-27 and this step is
+        # what keeps it from creeping back. Parsing the log avoids a second
+        # suite run; one OS suffices because the only cfg-gated tests have
+        # parallel Windows/non-Windows branches.
         if: runner.os == 'Linux'
         run: bash scripts/check_test_count.sh target/test-suite.log
 

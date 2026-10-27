@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Badge drift gate: the "tests-N passed" badge in README.md must equal the
-# number of tests that actually pass in this tree.
+# Suite health gate: the test run that actually happened must be green, the
+# parsed counts must clear a floor, and the README must not turn them into a
+# public number.
+#
+# The "tests-N passed" badge was removed on 2026-10-27 (owner's call): a test
+# count is a CI-log fact, not a landing-page fact — it duplicates the CI badge,
+# goes stale the moment a test is added, and reads as self-praise next to
+# anyhow / serde / rayon / tokio. This gate therefore guards the ABSENCE of a
+# numeric test claim, which is what actually keeps the contract true.
 #
 # Usage:
 #   bash scripts/check_test_count.sh [logfile]
@@ -8,7 +15,8 @@
 # With no argument the full suite runs; with a logfile the already captured
 # `cargo test` output is parsed instead (CI reuses target/test-suite.log).
 #
-# Exit codes: 0 match, 1 mismatch/parse error, 2 the test run failed.
+# Exit codes: 0 green + no vanity claim, 1 mismatch/parse error/claim found,
+# 2 the test run failed.
 
 set -uo pipefail
 
@@ -20,9 +28,11 @@ if [ ! -f "$README" ]; then
     exit 1
 fi
 
-badge="$(sed -n 's/.*tests-\([0-9][0-9]*\)%20passed.*/\1/p' "$README" | head -n 1)"
-if [ -z "$badge" ]; then
-    echo "FAIL: no 'tests-N%20passed' badge found in $README"
+# No numeric test-count badge or prose claim may come back: a shields.io
+# "tests-N passed" pill, or "<N> passing tests" style sentences.
+if grep -Eq 'tests-[0-9]+%20passed|badgen.*tests-[0-9]+|[0-9]+ (passing|passed) tests' "$README"; then
+    echo "FAIL: $README publishes a test count again — the number belongs in CI logs:"
+    grep -En 'tests-[0-9]+%20passed|badgen.*tests-[0-9]+|[0-9]+ (passing|passed) tests' "$README"
     exit 1
 fi
 
@@ -41,7 +51,7 @@ if [ -z "$LOG" ]; then
     status=$?
     if [ "$status" -ne 0 ]; then
         tail -n 40 "$LOG"
-        echo "FAIL: cargo test exited $status; badge cannot be validated"
+        echo "FAIL: cargo test exited $status; the suite is not green"
         exit 2
     fi
 fi
@@ -81,15 +91,9 @@ if [ "$passed" -lt 300 ]; then
 fi
 
 if [ "$failed" -ne 0 ]; then
-    echo "FAIL: $failed test(s) failed; badge must not be validated"
+    echo "FAIL: $failed test(s) failed"
     exit 1
 fi
 
-echo "badge=$badge passed=$passed ignored=$ignored runs=$runs"
-
-if [ "$passed" -ne "$badge" ]; then
-    echo "FAIL: README badge says $badge passed, tree reports $passed"
-    exit 1
-fi
-
-echo "OK: badge matches the tree"
+echo "passed=$passed failed=0 ignored=$ignored runs=$runs"
+echo "OK: suite green and the README publishes no test count"

@@ -137,6 +137,57 @@ fn test_erased_bulkhead_scope_stays_documented() {
     );
 }
 
+/// The badge row is a set of working instruments, not decoration: exactly
+/// five badges, each answering one landing-page question, each with a real
+/// target — and no numeric test count. The `tests-N passed` pill was deleted
+/// on 2026-10-27: a test count is a CI-log fact, it drifts the moment a test
+/// is added, and it reads as self-praise beside the CI badge that already
+/// proves the suite is green. `scripts/check_test_count.sh` guards the same
+/// rule from the script side; this pins the row's shape.
+#[test]
+fn test_readme_badges_are_instruments() {
+    let readme = read_doc("README.md");
+    let badges: Vec<&str> = readme
+        .lines()
+        .filter(|line| line.starts_with("[!["))
+        .collect();
+    assert_eq!(
+        badges.len(),
+        5,
+        "TRIPWIRE FIRED: the README badge row has {} badges, the row is five \
+         instruments (GitHub, Crates.io, docs.rs, CI, license) — check the \
+         links and the count",
+        badges.len()
+    );
+
+    const TARGETS: [&str; 5] = [
+        "](https://github.com/Ar3ss12/snubber)",
+        "](https://crates.io/crates/snubber)",
+        "](https://docs.rs/snubber)",
+        "](https://github.com/Ar3ss12/snubber/actions/workflows/ci.yml)",
+        "](#license)",
+    ];
+    for target in TARGETS {
+        assert!(
+            badges.iter().any(|badge| badge.contains(target)),
+            "TRIPWIRE FIRED: no badge links to '{target}' — every badge must be \
+             a teleport a reader can actually use from crates.io or docs.rs"
+        );
+    }
+
+    for badge in &badges {
+        assert!(
+            !badge.contains("]()"),
+            "TRIPWIRE FIRED: badge links nowhere: {badge}"
+        );
+        assert!(
+            !badge.contains("tests-") && !badge.contains("%20passed"),
+            "TRIPWIRE FIRED: the README publishes a test count again — the CI \
+             badge already proves the suite is green: {badge}"
+        );
+    }
+}
+
 /// The one true layer map. Every public document names each layer with the
 /// same bytes; only the surrounding heading syntax differs per file.
 const CANONICAL_LAYERS: [&str; 5] = [

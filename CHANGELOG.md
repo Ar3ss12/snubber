@@ -384,10 +384,36 @@ surface, wire format and telemetry layout are untouched.
   `Embedded & no_std` chapter, where the module split and the format ceilings
   (3 lanes, 4 stages, 16 ISR slots, 28 B payload, 512 B snapshot, 250 ms grace
   — all re-checked in source) already live. Prose 104 → 98 lines /
-  7,680 → 7,260 characters, guarantee bullets 11 → 10, first `rust` fence still
-  line 30, 27/27 local links resolve, banned-fluff and tilde-citation scans 0.
+  7,680 → 7,260 characters, guarantee bullets 11 → 10, first `rust` fence at
+  line 31, 27/27 local links resolve, banned-fluff and tilde-citation scans 0.
+- The badge row is now five instruments in canonical order — GitHub (source
+  teleport, because this same file renders on crates.io and docs.rs, where the
+  reader is NOT on GitHub), Crates.io, **docs.rs** (was missing entirely;
+  `https://docs.rs/snubber/badge.svg` is a live rustdoc-build status, not a
+  static pill), CI, license — and the `tests-439 passed` vanity badge is gone.
+  The count was a CI-log fact masquerading as a landing-page fact: it duplicated
+  the CI badge, needed a hand-edited number or a script run to stay honest, and
+  no top-tier crate (anyhow, serde, rayon, tokio, ripgrep) publishes one. All
+  five hrefs verified live over HTTPS (crates.io returns 403 to `curl` by bot
+  policy, the badge itself is 200). The `#![forbid(unsafe_code)]` / MSRV / `std`
+  facts stay in the prose hygiene line rather than becoming a sixth pill.
 
 ### Tests
+
+- New `doc_sync::test_readme_badges_are_instruments` pins the row's shape:
+  exactly 5 `[![…]](…)` lines, one linking to the repo, the registry, docs.rs,
+  the CI workflow and `#license`; no badge may carry an empty `]()`, and no
+  badge may publish a test count (`tests-…` / `%20passed`). `doc_sync` 13 → 14.
+- `scripts/check_test_count.sh` is retargeted, not deleted: the README has no
+  badge to reconcile any more, so it now parses the real `cargo test` log,
+  fails on any failure or a parse collapse (the 300-passed floor stays), and
+  fails if a numeric test count returns to the README — matching the CI step
+  renamed to "Suite Health Gate" and the docs/INVARIANTS.md gate-taxonomy row.
+  Negative proof on the injection (a `tests-999%20passed` badge):
+  `test_readme_badges_are_instruments` → "TRIPWIRE FIRED: the README badge row
+  has 6 badges"; script → "FAIL: README.md publishes a test count again";
+  surgical string revert → 14/14 and `OK: suite green and the README publishes
+  no test count`.
 
 - `doc_sync::test_readme_states_erased_bulkhead_scope` became
   `test_erased_bulkhead_scope_stays_documented`: it pinned the README, and the
