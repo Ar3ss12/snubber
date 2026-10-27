@@ -191,23 +191,6 @@ pub struct SnubberStats {
     pub pulse_stalls: u64,
     /// Worst pulse lag observed, ms (saturating max).
     pub max_pulse_lag_ms: u64,
-    /// Rollback bodies that overran the armed `rollback_budget_ms`.
-    /// Own column forever — a slow compensation is not a timeout and not
-    /// a bulkhead refusal. Stays `0` while the budget is disarmed.
-    pub rollback_stalls: u64,
-    /// Worst rollback-body duration observed, ms (saturating max).
-    /// `0` until a budget arms the clock around the body.
-    pub max_rollback_ms: u64,
-    /// Admission attempts that arrived on the very thread currently
-    /// running this node's rollback body. Counted BEFORE the pipeline:
-    /// under the default [`RollbackReentrancy::Allow`] the attempt still
-    /// competes for a slot (and is then counted by the usual perimeter
-    /// columns too), under `Refuse` it is refused here as
-    /// [`EnterError::RollbackReentrant`] and never reaches the perimeter —
-    /// so this mirror is the ONLY bucket for those refused attempts, and
-    /// they stay outside the conservation equation (same law as
-    /// `memory_rejections`).
-    pub rollback_reentries: u64,
     /// Token-bucket rejections (`rate_per_sec` over limit).
     pub rate_rejected: u64,
     /// Windowed-batch position: settled outcomes in the open batch.
@@ -747,8 +730,8 @@ impl SnubberNodeBuilder {
     ///
     /// When armed, every rollback body this node arms is timed and answerable
     /// from any thread via [`SnubberNode::rollback_phase`]; a body that
-    /// overruns the budget lands in `stats().rollback_stalls` and
-    /// `stats().max_rollback_ms`. The body is never cancelled — a foreign
+    /// overruns the budget lands in `RollbackPhase::stalls` and
+    /// `RollbackPhase::max_ms`. The body is never cancelled — a foreign
     /// lock re-taken inside it cannot be revoked without `unsafe`, so the
     /// honest contract is detect + report, never prevent.
     #[must_use]
@@ -760,7 +743,7 @@ impl SnubberNodeBuilder {
     /// What an admission attempted from this node's own rollback thread
     /// does. Default [`RollbackReentrancy::Allow`] (0.6.x behavior: the
     /// attempt competes normally and is counted in
-    /// `stats().rollback_reentries`); [`RollbackReentrancy::Refuse`]
+    /// [`RollbackPhase::reentries`]); [`RollbackReentrancy::Refuse`]
     /// returns [`EnterError::RollbackReentrant`] before any lock.
     ///
     /// Thread identity lives only under `std`: on `no_std` this knob is
@@ -1300,8 +1283,9 @@ pub enum EnterError {
     /// Admission attempted on the same thread that is inside this node's
     /// rollback body, while the node's
     /// [`RollbackReentrancy`] policy is `Refuse`. Refused BEFORE any lock;
-    /// counted in `rollback_reentries`. Never produced by the default
-    /// `Allow` policy, and never produced on `no_std` (no thread identity).
+    /// counted in [`RollbackPhase::reentries`]. Never produced by the
+    /// default `Allow` policy, and never produced on `no_std` (no thread
+    /// identity).
     RollbackReentrant,
 }
 
@@ -1545,6 +1529,17 @@ pub struct RollbackPhase {
     pub max_ms: u64,
     /// Bodies that overran `budget_ms` (own column, never merged).
     pub stalls: u64,
+    /// Admission attempts that arrived on the very thread running a
+    /// rollback body of this node (all-time, not "right now").
+    ///
+    /// Counted BEFORE the pipeline: under the default
+    /// [`RollbackReentrancy::Allow`] the attempt still competes for a slot
+    /// (and is then counted by the usual perimeter columns too), under
+    /// `Refuse` it is refused as [`EnterError::RollbackReentrant`] and
+    /// never reaches the perimeter — so this is the ONLY bucket for those
+    /// refused attempts, and they stay outside the conservation equation
+    /// (same law as `memory_rejections`).
+    pub reentries: u64,
 }
 
 /// What a node does when its own rollback body calls back into admission.
@@ -1567,11 +1562,11 @@ pub struct RollbackPhase {
 #[non_exhaustive]
 pub enum RollbackReentrancy {
     /// Admit (or refuse by the usual rules) and count in
-    /// [`SnubberStats::rollback_reentries`]. The default.
+    /// [`RollbackPhase::reentries`]. The default.
     #[default]
     Allow,
     /// Refuse with [`EnterError::RollbackReentrant`] and count in
-    /// [`SnubberStats::rollback_reentries`].
+    /// [`RollbackPhase::reentries`].
     Refuse,
 }
 
@@ -2143,9 +2138,6 @@ impl SnubberNode {
         // Columns filled lock-free, outside the mutex.
         stats.passthrough_admissions = self.passthrough_admissions.load(Ordering::Relaxed);
         stats.memory_rejections = self.memory_rejections.load(Ordering::Relaxed);
-        stats.rollback_stalls = self.inner.rollback.stalls.load(Ordering::Relaxed);
-        stats.max_rollback_ms = self.inner.rollback.max_ms.load(Ordering::Relaxed);
-        stats.rollback_reentries = self.inner.rollback.reentries.load(Ordering::Relaxed);
         stats
     }
 
@@ -2159,7 +2151,8 @@ impl SnubberNode {
     /// is the signal, not a bug: nothing inside the crate can revoke it.
     ///
     /// `elapsed_ms`/`max_ms`/`stalls` stay `0` until
-    /// [`SnubberNodeBuilder::rollback_budget_ms`] arms the clock.
+    /// [`SnubberNodeBuilder::rollback_budget_ms`] arms the clock;
+    /// `active`/`epoch`/`task_id`/`reentries` need no budget.
     #[must_use]
     pub fn rollback_phase(&self) -> RollbackPhase {
         let mirror = &self.inner.rollback;
@@ -2176,6 +2169,7 @@ impl SnubberNode {
             budget_ms: self.rollback_budget_ms,
             max_ms: mirror.max_ms.load(Ordering::Relaxed),
             stalls: mirror.stalls.load(Ordering::Relaxed),
+            reentries: mirror.reentries.load(Ordering::Relaxed),
         }
     }
 
@@ -4577,14 +4571,6 @@ impl SnubberNode {
             deadlock_suspected: s.deadlock_suspected,
             pulse_stalls: s.pulse_stalls,
             max_pulse_lag_ms: s.max_pulse_lag_ms,
-            // Rollback columns live outside the mutex (lock-free mirror) and
-            // `stats()` fills them after the lock. A hook snapshot fires as
-            // part of the settle it reports, so no final stall count exists
-            // yet — `0` is what the books say, not a claim that nothing
-            // stalled.
-            rollback_stalls: 0,
-            max_rollback_ms: 0,
-            rollback_reentries: 0,
             rate_rejected: s.rate_rejected,
             window_outcomes: s.window_outcomes,
             window_failures: s.window_failures,

@@ -65,17 +65,18 @@ pub enum StallKind {
     /// CPU time grew with the wall: `loop {}` spin. De-energize iron
     /// past the thread, never kill the thread itself.
     CpuSpin,
-    /// A rollback body ran past its armed budget. Produced ONLY by
-    /// [`classify_rollback`] — never by [`classify_stall`], which sees a
-    /// guard's `(wall, cpu)` pair and nothing about rollback bodies.
-    /// Sits between `CpuSpin` and `DeadlockStall` in declaration order:
-    /// a body that spins is a spin first, silence second.
-    RollbackStall,
     /// Wall silence at/above the stall ceiling with no CPU growth:
     /// wedged lock, dead pipe, or over-long OS suspension. Same
     /// cooperative settle as the other blown budgets, distinct verdict
     /// for the post-mortem dump.
     DeadlockStall,
+    /// A rollback body ran past its armed budget. Produced ONLY by
+    /// [`classify_rollback`] — never by [`classify_stall`], which sees a
+    /// guard's `(wall, cpu)` pair and nothing about rollback bodies.
+    /// Declared last on purpose: appending keeps every pre-existing
+    /// discriminant (and therefore the wire/`as` value of each variant)
+    /// where it was before this variant existed.
+    RollbackStall,
 }
 /// Classify one stall sample.
 ///

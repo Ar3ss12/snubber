@@ -135,9 +135,9 @@ switch belongs to your supervisor (`Supervisor`), and the in-process
 alternative is this verdict. Worked example:
 `examples/20_rollback_budget.rs` (finishes while its worker stays wedged).
 
-* `active`, `epoch`, `task_id` always work: two atomic writes per body, no
-  clock read, nothing to configure.
-* `elapsed_ms`, `max_ms` and `stats().rollback_stalls` need a budget:
+* `active`, `epoch`, `task_id` and `reentries` always work: two atomic
+  writes per body, no clock read, nothing to configure.
+* `elapsed_ms`, `max_ms` and `stalls` need a budget:
   `SnubberNode::builder(..).rollback_budget_ms(200)`. Until one is armed
   they stay `0` — the default keeps the abort path clock-free.
 * An overrun is a NAMED fault, not just a counter: a body that returns
@@ -157,7 +157,7 @@ alternative is this verdict. Worked example:
 `RollbackReentrancy::Allow` (default) keeps 0.6.x behavior byte-for-byte:
 an admission attempted on the same thread that is running this node's
 rollback body competes normally (slot free → admitted, slot held →
-`BulkheadFull`) and is counted in `stats().rollback_reentries`.
+`BulkheadFull`) and is counted in `RollbackPhase::reentries`.
 `RollbackReentrancy::Refuse` (opt-in) refuses that attempt *before any
 lock* with `EnterError::RollbackReentrant` — other threads are never
 affected, because the marker is per-thread:
@@ -173,7 +173,8 @@ let node = SnubberNode::builder("daemon")
 maps it to `Refusal::BadRequest` and `backpressure()` returns `None`, so
 a retry from inside the same body repeats the mistake. The marker needs
 thread identity, so the policy is inert on `no_std` (documented on the
-enum); `rollback_reentries` stays the only bucket for refused attempts.
+enum); `rollback_phase().reentries` stays the only bucket for refused
+attempts.
 
 ---
 

@@ -9,7 +9,9 @@ current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 Rollback bodies are named, budgeted and observable from outside the node
 lock; the false "rollback re-entry deadlocks" law is gone. No existing
 public signature changed — the new surface is additive (`#[non_exhaustive]`
-enums, new methods, new `SnubberStats` fields).
+enums, new methods, new `RollbackPhase` fields). `SnubberStats` keeps its
+0.6.11 shape: it is exhaustively constructible, so the rollback columns
+live on `RollbackPhase` instead of growing that struct.
 
 ### Fixed
 
@@ -19,7 +21,7 @@ enums, new methods, new `SnubberStats` fields).
   measured behavior (sync refuses at capacity, async parks, erased scopes
   are granted), and `tests/doc_sync.rs` fails if the myth returns.
 - A slow rollback left no trace (`last_fault: None` after 400 ms). It now
-  lands in `SnubberStats::rollback_stalls` / `max_rollback_ms` and — when
+  lands in `RollbackPhase::stalls` / `max_ms` and — when
   the body RETURNS past the budget — in
   `reported[FaultKind::RollbackStall]`, `last_fault` and the flight ring.
   A body that panics mints no verdict: an unwind is not a measurement.
@@ -30,8 +32,8 @@ enums, new methods, new `SnubberStats` fields).
 ### Added
 
 - `SnubberNode::rollback_phase()`: lock-free view (`active`, `epoch`,
-  `task_id`, `elapsed_ms`, `budget_ms`, `max_ms`, `stalls`) answerable
-  from any thread while a body runs.
+  `task_id`, `elapsed_ms`, `budget_ms`, `max_ms`, `stalls`, `reentries`)
+  answerable from any thread while a body runs.
 - `SnubberNodeBuilder::rollback_budget_ms(n)`: arms the phase clock. The
   default stays clock-free — two atomic writes per body, no clock read.
 - `watchdog::poll_rollback(&node, budget_ms) -> Option<RollbackStall>`:
@@ -40,7 +42,7 @@ enums, new methods, new `SnubberStats` fields).
   unarmed node honestly returns `None` instead of inventing age.
 - `RollbackReentrancy::{Allow (default), Refuse}` plus
   `SnubberNodeBuilder::rollback_reentrancy(..)`: `Allow` keeps 0.6.x
-  behavior and counts re-entries in `SnubberStats::rollback_reentries`;
+  behavior and counts re-entries in `RollbackPhase::reentries`;
   `Refuse` returns `EnterError::RollbackReentrant` before any lock on the
   same thread (sync and async), other threads unaffected.
 - `FaultKind::RollbackStall` (14th kind, `Warn`, metric tag
@@ -55,6 +57,16 @@ enums, new methods, new `SnubberStats` fields).
 - `SnapshotV1` is v6: the per-kind `reported` tail grew 13 → 14 for
   `RollbackStall`. The 512 B frame contract holds (330/508 B used); older
   frames refuse as `BadVersion` instead of half-parsing.
+- `StallKind::RollbackStall` is declared LAST (after `DeadlockStall`), not
+  between `CpuSpin` and `DeadlockStall`: inserting it there shifted
+  `DeadlockStall` from 3 to 4, which `cargo-semver-checks` reports as
+  `enum_no_repr_variant_discriminant_changed`. Appending keeps every
+  0.6.11 discriminant (and any caller-side `as` cast) where it was.
+- The three rollback counters do NOT join `SnubberStats`: that struct is
+  exhaustively constructible in 0.6.11, so any added field — public or
+  private — is a `constructible_struct_adds_field` break. `stalls`,
+  `max_ms` and the new `reentries` are read from `rollback_phase()`, whose
+  shape is free because the type does not exist in 0.6.11.
 
 ### Tests
 
@@ -62,7 +74,11 @@ enums, new methods, new `SnubberStats` fields).
   subprocess canary pin the measured re-entry law, the held bulkhead slot,
   the phase view, the budget verdict, the re-entrancy policy and the
   outside watchdog. The canary now requires the child to name its own
-  `RollbackStall` before the parent kills it.
+  `RollbackStall` before the parent kills it. The taxonomy test also pins
+  the 0.6.11 `StallKind` values (`0..=3`) as a local oracle for
+  `enum_no_repr_variant_discriminant_changed`: moving `RollbackStall` back
+  between `CpuSpin` and `DeadlockStall` fails it with `[0, 1, 2, 4, 3]`
+  (injected, observed, reverted byte-for-byte).
 - Suite 446 → 464 passed (67 result lines); `scripts/release.sh` runs the
   rollback canary as an ignored release lane, and a lane that executes
   0 tests fails the release.

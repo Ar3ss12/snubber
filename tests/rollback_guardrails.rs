@@ -474,14 +474,19 @@ fn rollback_phase_is_visible_while_the_body_is_parked() {
         calm.max_ms >= 100,
         "the completed body is billed in max_ms: {calm:?}"
     );
+    assert_eq!(calm.stalls, 0, "within budget, never a stall");
     let stats = node.stats();
-    assert_eq!(stats.max_rollback_ms, calm.max_ms, "one number, two views");
-    assert_eq!(stats.rollback_stalls, 0, "within budget, never a stall");
+    assert_eq!(
+        (stats.timeouts_fired, stats.deadlock_suspected),
+        (0, 0),
+        "a rollback body is timed by its own mirror: it must never leak \
+         into the guard-owned watchdog columns"
+    );
 }
 
 /// An overrun is a named column, not silence (finding F-07): a body past
-/// `rollback_budget_ms` increments `rollback_stalls` exactly once, and the
-/// counter measures OVERRUNS — a second, fast body must not add one.
+/// `rollback_budget_ms` increments `RollbackPhase::stalls` exactly once, and
+/// the counter measures OVERRUNS — a second, fast body must not add one.
 #[test]
 fn rollback_phase_counts_an_overrun_once() {
     let node = SnubberNode::builder("guardrails/phase/overrun")
@@ -522,7 +527,6 @@ fn rollback_phase_counts_an_overrun_once() {
         "the overrun duration is kept, got {} ms",
         phase.max_ms
     );
-    assert_eq!(node.stats().rollback_stalls, 1, "the column is published");
 
     // A fast body stays a body: the counter is about overruns, not calls.
     let _ = node.scoped(|| {}, || Err::<i32, &'static str>("work failed"));
@@ -581,8 +585,11 @@ fn phase_reports_activity_without_a_budget_and_stamps_no_clock() {
     assert!(!calm.active);
     assert_eq!(calm.max_ms, 0, "an unarmed clock cannot bill a duration");
     assert_eq!(calm.stalls, 0);
-    assert_eq!(node.stats().max_rollback_ms, 0);
-    assert_eq!(node.stats().rollback_stalls, 0);
+    assert_eq!(
+        (calm.reentries, node.stats().timeouts_fired),
+        (0, 0),
+        "no budget, no re-entry, and no leak into the guard-owned columns"
+    );
 }
 
 /// Stage 4: an overrun is not just a counter — it becomes a NAMED fault
@@ -605,7 +612,8 @@ fn budget_exceeded_rolls_back_phase_into_a_named_stall() {
 
     let stats = node.stats();
     assert_eq!(
-        stats.rollback_stalls, 1,
+        node.rollback_phase().stalls,
+        1,
         "the overrun is counted: {stats:?}"
     );
     assert_eq!(
@@ -637,7 +645,7 @@ fn budget_exceeded_rolls_back_phase_into_a_named_stall() {
         || std::thread::sleep(Duration::from_millis(5)),
         || Err::<i32, &'static str>("work failed"),
     );
-    assert_eq!(quiet.stats().rollback_stalls, 0);
+    assert_eq!(quiet.rollback_phase().stalls, 0);
     assert!(
         quiet.stats().last_fault.is_none(),
         "no budget, no clock, no verdict"
@@ -677,7 +685,8 @@ fn rollback_reentrancy_default_allows_and_counts() {
     );
     let stats = node.stats();
     assert_eq!(
-        stats.rollback_reentries, 1,
+        node.rollback_phase().reentries,
+        1,
         "the default counts what happened instead of refusing it"
     );
     assert!(
@@ -783,7 +792,7 @@ fn rollback_reentrancy_policy_refuse_returns_error() {
         "the caller must not retry from inside the same rollback body"
     );
     assert_eq!(
-        node.stats().rollback_reentries,
+        node.rollback_phase().reentries,
         2,
         "both refused attempts are counted"
     );
@@ -794,11 +803,11 @@ fn rollback_reentrancy_policy_refuse_returns_error() {
         .expect("rollback body returned once released");
     worker.join().expect("worker thread finished");
     assert_eq!(
-        node.stats().rollback_reentries,
+        node.rollback_phase().reentries,
         2,
         "the other thread's admission is not a re-entry"
     );
-    assert_eq!(node.stats().rollback_stalls, 0, "a refusal is not a stall");
+    assert_eq!(node.rollback_phase().stalls, 0, "a refusal is not a stall");
 }
 
 /// Taxonomy lock: `RollbackStall` is the LAST dense fault, Warn-level,
@@ -829,6 +838,23 @@ fn rollback_stall_kind_is_named_last_and_never_a_deadlock_verdict() {
         classify_stall_ceiling(10_000, 9_000, 1, 1, 10),
         StallKind::RollbackStall,
         "the watchdog classifier never mints the rollback verdict"
+    );
+
+    // The 0.6.11 discriminants are caller-visible: any code casting a kind to
+    // an integer sees them. `cargo-semver-checks` reports a shift as
+    // `enum_no_repr_variant_discriminant_changed` (it caught exactly that when
+    // RollbackStall was first inserted between CpuSpin and DeadlockStall);
+    // this assertion is the local oracle for the same break.
+    assert_eq!(
+        [
+            StallKind::WithinBudget as u8,
+            StallKind::SleepBlocked as u8,
+            StallKind::CpuSpin as u8,
+            StallKind::DeadlockStall as u8,
+            StallKind::RollbackStall as u8,
+        ],
+        [0, 1, 2, 3, 4],
+        "existing StallKind values must never move: declare new kinds LAST"
     );
 }
 
@@ -882,7 +908,7 @@ fn poll_rollback_names_a_body_from_outside_without_touching_the_books() {
     );
     assert_eq!(stall.budget_ms, BUDGET_MS);
     assert_eq!(
-        node.stats().rollback_stalls,
+        node.rollback_phase().stalls,
         0,
         "observing a stall must not book one"
     );
@@ -897,11 +923,10 @@ fn poll_rollback_names_a_body_from_outside_without_touching_the_books() {
         .expect("rollback body returned once released");
     worker.join().expect("worker thread finished");
     assert_eq!(
-        node.stats().rollback_stalls,
+        node.rollback_phase().stalls,
         1,
         "the returned body books its own overrun exactly once"
     );
-    assert_eq!(node.rollback_phase().stalls, 1);
 }
 
 /// Honest limit: the verdict's clock belongs to the node. Without

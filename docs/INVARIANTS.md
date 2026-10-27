@@ -13,7 +13,7 @@ At any point in time, the sum of all terminal and active states equals the total
 
 $$\text{Attempts} = \text{Admitted} + \text{BulkheadFull} + \text{BreakerOpen} + \text{StaleEpoch} + \text{RateLimited} + \text{InvariantBreach}$$
 
-where `BulkheadFull` folds the async `QueueFull` verdict in (the queue is part of the bulkhead), and async `QueueTtlExpired` attempts settle as `Timeout` (a timed-out attempt, not a shed one). Memory-pressure refusals are counted **before** the perimeter in their own lock-free column and are therefore not part of the perimeter equation. The same law covers re-entrant admission from a node's own rollback thread: those attempts are mirrored in `rollback_reentries` before the perimeter; under `RollbackReentrancy::Refuse` they are refused there (`EnterError::RollbackReentrant`) and stay outside the equation, while under the default `Allow` they continue into the perimeter and are counted by the usual columns too. No request is silently dropped, double-counted, or lost during state transitions, even under high-concurrency races.
+where `BulkheadFull` folds the async `QueueFull` verdict in (the queue is part of the bulkhead), and async `QueueTtlExpired` attempts settle as `Timeout` (a timed-out attempt, not a shed one). Memory-pressure refusals are counted **before** the perimeter in their own lock-free column and are therefore not part of the perimeter equation. The same law covers re-entrant admission from a node's own rollback thread: those attempts are mirrored in `rollback_phase().reentries` before the perimeter; under `RollbackReentrancy::Refuse` they are refused there (`EnterError::RollbackReentrant`) and stay outside the equation, while under the default `Allow` they continue into the perimeter and are counted by the usual columns too. No request is silently dropped, double-counted, or lost during state transitions, even under high-concurrency races.
 
 ### Invariant 2: Strict Slot Containment (Zero Leaks)
 For any `SnubberNode` configured with capacity $C$:
@@ -86,7 +86,7 @@ body that RETURNED after its budget lands in
 the default `Warn` policy; a body that panics mints no verdict (an unwind
 is not a measurement). Re-entrant admission is a policy, never a
 deadlock: `RollbackReentrancy::Allow` (default) admits or refuses by the
-usual rules and counts in `rollback_reentries`, while `Refuse` returns
+usual rules and counts in `rollback_phase().reentries`, while `Refuse` returns
 `EnterError::RollbackReentrant` BEFORE any lock on the per-thread marker
 (thread identity exists only under `std`; the policy is inert on
 `no_std`).
@@ -311,8 +311,8 @@ The node cannot cancel a rollback body (`#![forbid(unsafe_code)]`; no
 library may kill a caller thread), so the guarantee is detect-and-report:
 - While the body runs, `SnubberNode::rollback_phase()` answers from any
   thread with no lock and no allocation (`active`, `epoch`, `task_id`,
-  and — when `rollback_budget_ms` is armed — `elapsed_ms`, `max_ms`,
-  `stalls`).
+  `reentries`, and — when `rollback_budget_ms` is armed — `elapsed_ms`,
+  `max_ms`, `stalls`).
 - When the body RETURNS past its budget, the node books the overrun as
   `FaultKind::RollbackStall` (Invariant 6).
 - While the body is STILL running past an observer's budget,
