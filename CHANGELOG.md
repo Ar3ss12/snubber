@@ -4,7 +4,7 @@ All notable changes to `snubber`. Benchmarks live in [README.md](README.md);
 the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 ("Fixed in …" sections) and [docs/INVARIANTS.md](docs/INVARIANTS.md).
 
-## Unreleased
+## 0.6.11 (2026-10-27)
 
 Audit-3 closeout (PLAN_AUDIT3 findings K1/K2, H1–H7, D1–D4; D5 was
 dismissed after re-checking the examples). No API changes; the public
