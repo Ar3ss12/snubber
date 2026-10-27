@@ -300,14 +300,14 @@ surface, wire format and telemetry layout are untouched.
   `v0.6.0` header teasers, the version label on the Extensibility
   chapter and the nine `Fixed in …` audit-batch sections are gone; the
   guide now states in its header that it describes the current behavior
-  and links to this file for history. The audit tables moved verbatim
-  to "Audit-batch fix tables" at the bottom of this file, and the
-  EvictOldest one-slot overbooking ceiling is stated as current
-  contract in the Layer 2 shed-policy bullet (the BENCHMARKS.md link
-  that pointed at the deleted anchor now targets Layer 2). A `doc_sync`
-  tripwire fails the suite if the guide carries a `Fixed in …` heading,
-  a version-labelled Extensibility heading or a `v0.…` header teaser
-  again.
+  — with no link to this file and no mention of changes at all. The
+  audit tables moved verbatim to "Audit-batch fix tables" at the bottom
+  of this file, and the EvictOldest one-slot overbooking ceiling is
+  stated as current contract in the Layer 2 shed-policy bullet (the
+  BENCHMARKS.md link that pointed at the deleted anchor now targets
+  Layer 2). A `doc_sync` tripwire fails the suite if the guide carries
+  a `Fixed in …` heading, a version-labelled Extensibility heading, a
+  `v0.…` header teaser or any mention of `CHANGELOG` again.
 
 ### Tests
 

@@ -734,6 +734,10 @@ fn test_guide_has_no_release_history() {
             "> Extensibility (v0.",
             "header teaser narrating an old release — the Extensibility chapter documents the current surface",
         ),
+        (
+            "CHANGELOG",
+            "a mention of the changelog file — the guide describes the current state and names no change records",
+        ),
     ];
 
     for (token, why) in forbidden {

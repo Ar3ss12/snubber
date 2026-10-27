@@ -12,9 +12,7 @@
 > `msrv` CI lane (`cargo check --lib`, core / core+alloc / std) is what proves
 > the floor — a `cargo test` on 1.70 is not a supported configuration.
 >
-> This guide describes the current behavior of the crate. What changed
-> in which release — audit batches, fixes, renames — lives only in
-> [CHANGELOG.md](../CHANGELOG.md).
+> This guide describes the current behavior of the crate.
 
 ---
 
