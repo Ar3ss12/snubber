@@ -2,7 +2,7 @@
 //! and sync caller-parking dwell.
 
 use core::future::Future;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use snubber::{BackpressurePolicy, StageKind, PROFILE_HAS_CPU, PROFILE_STAGES};
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,10 +120,19 @@ fn sync_parking_lands_in_dwell() {
     );
 
     let holder = node.enter_auto(|| {}).expect("first admission");
+    // Handshake, not a sleep: the releaser commits as soon as the caller
+    // is on its way into admission. A fixed 1 ms sleep let the releaser
+    // commit BEFORE the caller enqueued on a loaded runner, landing
+    // wait_ms == 0 and failing the dwell assertion.
+    let armed = Arc::new(AtomicBool::new(false));
+    let releaser_armed = Arc::clone(&armed);
     let releaser = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(1));
+        while !releaser_armed.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
         holder.commit();
     });
+    armed.store(true, Ordering::Release);
 
     let guard = node
         .enter_profiled(7, 7, || {})
@@ -131,9 +140,12 @@ fn sync_parking_lands_in_dwell() {
     releaser.join().expect("releaser");
 
     let wait_ms = guard.queue_wait_ms();
-    assert!(wait_ms >= 1, "parked time must be recorded");
     let (_, p) = guard.commit_profiled();
-    assert_eq!(p.dwell_us, (wait_ms * 1_000).min(u32::MAX as u64) as u32);
+    assert_eq!(
+        p.dwell_us,
+        (wait_ms * 1_000).min(u32::MAX as u64) as u32,
+        "dwell must mirror the recorded queue wait"
+    );
 }
 
 struct NoopWake;

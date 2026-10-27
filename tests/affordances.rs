@@ -94,7 +94,19 @@ fn wait_while_paused_blocks_on_condvar_until_resume() {
         "worker passed wait_while_paused while the directive was still Pause"
     );
     handle.resume();
-    assert_eq!(worker.join().expect("worker joins"), Directive::Proceed);
+    // Bounded join: if the paused path ever deadlocked (the worker can
+    // never observe Resume), the lane must fail in seconds, not hang the
+    // whole test binary until the CI timeout.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(worker.join());
+    });
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(Directive::Proceed)) => {}
+        Ok(Ok(other)) => panic!("expected Proceed after resume, got {other:?}"),
+        Ok(Err(_)) => panic!("worker panicked inside wait_while_paused"),
+        Err(_) => panic!("safe_lock deadlock: worker never returned within 5 s of resume"),
+    }
     assert!(WORKER_PASSED.load(Ordering::Acquire));
 }
 

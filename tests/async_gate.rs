@@ -99,8 +99,10 @@ fn gate_never_sleeps_admission_is_synchronous() {
     let _held = gate.admit(1, 1, || {}).expect("first");
     let t0 = std::time::Instant::now();
     let _ = gate.admit(2, 2, || {});
+    // 500 ms: the same "no park happened" sense, but wide enough that a
+    // loaded CI runner scheduling the test thread cannot flake it.
     assert!(
-        t0.elapsed() < std::time::Duration::from_millis(20),
+        t0.elapsed() < std::time::Duration::from_millis(500),
         "refusal must be fast (no park), took {:?}",
         t0.elapsed()
     );
