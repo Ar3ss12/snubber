@@ -13,7 +13,7 @@ At any point in time, the sum of all terminal and active states equals the total
 
 $$\text{Attempts} = \text{Admitted} + \text{BulkheadFull} + \text{BreakerOpen} + \text{StaleEpoch} + \text{RateLimited} + \text{InvariantBreach}$$
 
-where `BulkheadFull` folds the async `QueueFull` verdict in (the queue is part of the bulkhead), and async `QueueTtlExpired` attempts settle as `Timeout` (a timed-out attempt, not a shed one). Memory-pressure refusals are counted **before** the perimeter in their own lock-free column and are therefore not part of the perimeter equation. No request is silently dropped, double-counted, or lost during state transitions, even under high-concurrency races.
+where `BulkheadFull` folds the async `QueueFull` verdict in (the queue is part of the bulkhead), and async `QueueTtlExpired` attempts settle as `Timeout` (a timed-out attempt, not a shed one). Memory-pressure refusals are counted **before** the perimeter in their own lock-free column and are therefore not part of the perimeter equation. The same law covers re-entrant admission from a node's own rollback thread: those attempts are mirrored in `rollback_reentries` before the perimeter; under `RollbackReentrancy::Refuse` they are refused there (`EnterError::RollbackReentrant`) and stay outside the equation, while under the default `Allow` they continue into the perimeter and are counted by the usual columns too. No request is silently dropped, double-counted, or lost during state transitions, even under high-concurrency races.
 
 ### Invariant 2: Strict Slot Containment (Zero Leaks)
 For any `SnubberNode` configured with capacity $C$:
@@ -79,6 +79,16 @@ scans every pinned invocation site (13, across `src/lib.rs`,
 same function is still held when user code runs; the site inventory count
 itself is asserted, so a renamed or reformatted call site fails the gate
 instead of silently shrinking it.
+An overrun of `rollback_budget_ms` is a named fault, not silence: the
+body that RETURNED after its budget lands in
+`reported[FaultKind::RollbackStall]`, `last_fault`, the flight ring and
+the default `Warn` policy; a body that panics mints no verdict (an unwind
+is not a measurement). Re-entrant admission is a policy, never a
+deadlock: `RollbackReentrancy::Allow` (default) admits or refuses by the
+usual rules and counts in `rollback_reentries`, while `Refuse` returns
+`EnterError::RollbackReentrant` BEFORE any lock on the per-thread marker
+(thread identity exists only under `std`; the policy is inert on
+`no_std`).
 
 ### Invariant 7: Pulse Lag Is Never Silent (Black-Box Trace)
 Every missed `WorkerPulse` verdict recorded via
@@ -259,10 +269,14 @@ The public verdict surface evolves additively and honestly:
   headers keep `&'static str` (owned labels export the `<owned>`
   marker there).
 - Format ceilings are published constants, not accidents:
-  `Priority::COUNT` (3), `PROFILE_STAGES` (4), `ISR_RING_CAP` (16),
+  `Priority::COUNT` (3), `FaultKind::COUNT` (14),
+  `PROFILE_STAGES` (4), `ISR_RING_CAP` (16),
   `TOKEN_PAYLOAD_LEN` (28) / `TOKEN_BODY_LEN` (40), `SNAPSHOT_LEN`
   (512), `DEFAULT_EOF_GRACE_MS` (250). Each is compile-asserted in the
-  source; changing one is a wire-format version bump.
+  source; changing one is a wire-format version bump. `FaultKind::COUNT`
+  sizes the `SnapshotV1::reported` tail, so a new kind is a snapshot
+  version bump (v6 grew the tail to 14 for `RollbackStall`; the frame
+  stays 512 B and older frames refuse as `BadVersion`).
 - `Supervisor::..._argv(&[String])` variants run the supervisor loop on
   an explicit argument vector; without `--supervisor` or with the worker
   flag present they return `false` before spawning anything.
@@ -314,13 +328,16 @@ cargo test --lib isr
 # Verify zero-nesting lock law (deadlock impossibility)
 cargo test --test lock_hierarchy
 
+# Verify the rollback phase, budget verdict and re-entrancy policy
+cargo test --test rollback_guardrails
+
 # Verify pulse black-box (stall verdicts in the current-version snapshot + anomaly)
 cargo test --test diagnostics pulse_stall
 
 # Verify extensibility contract (hooks outside the lock, names, ceilings, argv)
 cargo test --test extensibility
 
-# Verify memory refusal + snapshot v5 gauges (soft refuses, hard verdicts)
+# Verify memory refusal + snapshot v6 gauges (soft refuses, hard verdicts)
 cargo test --test memory_pressure
 
 # Verify supervisor euthanasia decisions and the real soft-drain loop

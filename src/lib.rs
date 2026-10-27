@@ -208,8 +208,8 @@ pub use policy::{
 };
 
 pub use clock::{
-    classify_stall, classify_stall_ceiling, CpuClock, IdlePark, MonotonicMs, NoWdt, PulseWatch,
-    SpinPark, StallKind, WdtSink, WorkerPulse,
+    classify_rollback, classify_stall, classify_stall_ceiling, CpuClock, IdlePark, MonotonicMs,
+    NoWdt, PulseWatch, SpinPark, StallKind, WdtSink, WorkerPulse,
 };
 
 pub use envelope::{EnvelopeVerdict, ExecutionEnvelope, PayloadVerdict, TimeVerdict};
@@ -225,10 +225,10 @@ pub use erased::{ClosurePolicy, ErasedGuard};
 #[cfg(feature = "std")]
 pub use node::{
     std_mono_ns, BreakerState, EnterError, ExecutionProfile, FaultHook, FaultRecord, FlightSlot,
-    GuardSnapshot, LegalMove, NanoClock, OverflowPolicy, ScopeToken, SnubberError, SnubberNode,
-    SnubberNodeBuilder, SnubberStats, SpawnedGuard, StageKind, StageSpan, StaticNode, SystemClock,
-    TelemetrySink, TimeoutCheck, TrackedGuard, DEFAULT_POLICIES, PROFILE_HAS_CPU,
-    PROFILE_SATURATED, PROFILE_STAGES, PROFILE_STAGE_OVERFLOW,
+    GuardSnapshot, LegalMove, NanoClock, OverflowPolicy, RollbackPhase, RollbackReentrancy,
+    ScopeToken, SnubberError, SnubberNode, SnubberNodeBuilder, SnubberStats, SpawnedGuard,
+    StageKind, StageSpan, StaticNode, SystemClock, TelemetrySink, TimeoutCheck, TrackedGuard,
+    DEFAULT_POLICIES, PROFILE_HAS_CPU, PROFILE_SATURATED, PROFILE_STAGES, PROFILE_STAGE_OVERFLOW,
 };
 
 #[cfg(feature = "std")]

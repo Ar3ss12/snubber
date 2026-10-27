@@ -115,12 +115,40 @@ if phase.active && phase.elapsed_ms > my_budget_ms {
 * `elapsed_ms`, `max_ms` and `stats().rollback_stalls` need a budget:
   `SnubberNode::builder(..).rollback_budget_ms(200)`. Until one is armed
   they stay `0` — the default keeps the abort path clock-free.
+* An overrun is a NAMED fault, not just a counter: a body that returns
+  after its budget lands in `stats().reported[FaultKind::RollbackStall]`,
+  in `last_fault`, in the flight ring, and through the default policy
+  (`Warn`, metric tag `rollback_stalls_total`). A body that panics mints
+  no verdict — an unwind is not a measurement.
 * The bulkhead slot is held while `active` is true, so a `BulkheadFull`
   refusal that looks unexplained has its cause named here.
 * Honest limits: guards you build by hand (`SnubberGuard::new`,
   `ErasedGuard::new`) carry no node handle and are invisible; a body that
   waits on a foreign lock shows as `active` forever — that is the finding,
   not a gap. Reference: `tests/rollback_guardrails.rs`.
+
+### Re-entrant admission from a rollback body is a policy
+
+`RollbackReentrancy::Allow` (default) keeps 0.6.x behavior byte-for-byte:
+an admission attempted on the same thread that is running this node's
+rollback body competes normally (slot free → admitted, slot held →
+`BulkheadFull`) and is counted in `stats().rollback_reentries`.
+`RollbackReentrancy::Refuse` (opt-in) refuses that attempt *before any
+lock* with `EnterError::RollbackReentrant` — other threads are never
+affected, because the marker is per-thread:
+
+```rust
+let node = SnubberNode::builder("daemon")
+    .rollback_reentrancy(RollbackReentrancy::Refuse) // paranoid mode
+    .rollback_budget_ms(200)
+    .build();
+```
+
+`RollbackReentrant` is a caller mistake, not backpressure: `classify()`
+maps it to `Refusal::BadRequest` and `backpressure()` returns `None`, so
+a retry from inside the same body repeats the mistake. The marker needs
+thread identity, so the policy is inert on `no_std` (documented on the
+enum); `rollback_reentries` stays the only bucket for refused attempts.
 
 ---
 
@@ -202,7 +230,7 @@ Contract: the watcher MUST NOT kill the worker thread or drop its
 guard from outside (poisoned mutexes, leaked allocator state). On a
 missed pulse it drives iron to safe state past the thread and reports
 via `node.note_pulse_stall(lag_ms)` — the lag lands in `SnapshotV1`
-(pulse fields since v3; the frame is now v5) and fires
+(pulse fields since v3; the frame is now v6) and fires
 `AnomalyKind::PulseStall`, so the post-mortem dump answers lag with
 `[DIAG 0x… <node> pulse_stall <lag>%]`. The worker settles itself at
 its next `check_timeout`.
@@ -708,9 +736,9 @@ match verdict {
   streak, never trips the breaker); `stats().memory_pressure` mirrors the flag.
 * **`MemoryWatch` / `MemoryVerdict`** are `core`-only and `Copy` (32 B), so
   firmware can reuse the verdict math without the `std` node.
-* **Snapshot v5** carries `memory_used_kb`, `memory_peak_kb`,
+* **Snapshot v6** carries `memory_used_kb`, `memory_peak_kb`,
   `memory_soft_kb`, `memory_hard_kb`, `memory_rejections`, `memory_pressure`,
-  `queue_depth` and `queue_capacity`. Still 512 B (322/508 payload bytes used).
+  `queue_depth` and `queue_capacity`. Still 512 B (330/508 payload bytes used).
 * **Anomalies**: `AnomalyKind::MemoryGrowth` fires on any pressured sample
   (ignores `min_sample`), `AnomalyKind::QueueSaturation` fires when
   `queue_depth / queue_capacity > bottleneck_pct`.
@@ -1299,7 +1327,7 @@ let (_event, profile, verdict) = guard.commit_enveloped(payload_bytes);
   gets `TimeVerdict::Inside`. The payload half is exact for any guard.
 * Floor misses tick `SnubberStats::envelope_underflows`, ceiling misses tick
   `envelope_overflows`. Neither feeds the breaker, neither changes
-  `SnubberEvent`, neither enters `SnapshotV1` (the 512 B frame stays v5).
+  `SnubberEvent`, neither enters `SnapshotV1` (the 512 B frame stays v6).
 * An underflow is the silent-skip signal: work returned faster or smaller
   than promised, so the cache was stale or the loop never ran.
 
@@ -1631,7 +1659,7 @@ The `Layer` column is the chapter number of [docs/USER_GUIDE.md](docs/USER_GUIDE
 | `IsrSignal::new(opc, reason, value)` | 1.5 / core | 4 B, const | Pack `OP_EMERGENCY_TRIP` / `OP_PULSE` / `OP_PAUSE` |
 | `IdlePark::park` (`SpinPark`/firmware `wfi`/`wfe`) | 1.5 / core | structural: 0% CPU by design | 0%-CPU park: `Condvar` on `std`, `wfi`/`wfe` impl on firmware (`wfe` needs `SEVONPEND=1` at boot) |
 | `WdtSink::feed` / `NoWdt` | 1.5 / core | structural: no-op on std | Stroke HW WDT on firmware (same `kick()` feeds it) |
-| `node.note_pulse_stall(lag_ms)` | 1.5 / std | structural: 1 atomic max | Record missed pulse into `SnapshotV1` (pulse fields since v3; frame is v5) + `AnomalyKind::PulseStall` |
+| `node.note_pulse_stall(lag_ms)` | 1.5 / std | structural: 1 atomic max | Record missed pulse into `SnapshotV1` (pulse fields since v3; frame is v6) + `AnomalyKind::PulseStall` |
 | `node.note_memory_kb(used_kb)` + `memory_verdict()` | 3 / std | 1 lock + 1 atomic store | External RSS sample → `MemoryVerdict` (Ok/Soft/Hard); admissions refuse lock-free above soft |
 | `MemoryWatch` + `MemoryVerdict` | 4 / core | 32 B, `Copy` | Verdict math for firmware; `hard < soft` clamps up |
 | `MemoryPolicy::new(soft, hard)` + `note(used)` | 4 / std | pure integer compares | Supervisor verdict: soft drains, hard kills; `death_cause()` names `MemoryLimit` |

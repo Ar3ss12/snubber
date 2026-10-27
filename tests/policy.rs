@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 #[test]
 fn default_table_covers_every_kind() {
     use snubber::DEFAULT_POLICIES;
-    assert_eq!(snubber::FaultKind::COUNT, 13);
-    assert_eq!(DEFAULT_POLICIES.len(), 13);
+    assert_eq!(snubber::FaultKind::COUNT, 14);
+    assert_eq!(DEFAULT_POLICIES.len(), 14);
     // Spot-check philosophy: lag is Debug, death is Critical.
     assert_eq!(
         DEFAULT_POLICIES[FaultKind::StaleEpoch.index()].log_level,

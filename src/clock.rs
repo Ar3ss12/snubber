@@ -65,6 +65,12 @@ pub enum StallKind {
     /// CPU time grew with the wall: `loop {}` spin. De-energize iron
     /// past the thread, never kill the thread itself.
     CpuSpin,
+    /// A rollback body ran past its armed budget. Produced ONLY by
+    /// [`classify_rollback`] — never by [`classify_stall`], which sees a
+    /// guard's `(wall, cpu)` pair and nothing about rollback bodies.
+    /// Sits between `CpuSpin` and `DeadlockStall` in declaration order:
+    /// a body that spins is a spin first, silence second.
+    RollbackStall,
     /// Wall silence at/above the stall ceiling with no CPU growth:
     /// wedged lock, dead pipe, or over-long OS suspension. Same
     /// cooperative settle as the other blown budgets, distinct verdict
@@ -87,6 +93,8 @@ pub enum StallKind {
 /// A deadlocked `Mutex` wait shows `cpu_delta == 0` (thread sleeps):
 /// below the ceiling it reports `SleepBlocked` (tolerated pause), at or
 /// above the ceiling it reports `DeadlockStall` (wedged, settle it).
+/// `RollbackStall` is never returned here — it belongs to
+/// [`classify_rollback`], which measures a rollback body's wall time.
 #[inline]
 #[must_use]
 pub const fn classify_stall(
@@ -125,6 +133,24 @@ pub const fn classify_stall_ceiling(
         return StallKind::DeadlockStall;
     }
     StallKind::SleepBlocked
+}
+
+/// Classify one completed rollback body against its budget.
+///
+/// Separate from [`classify_stall`] on purpose: the ledger measures the
+/// body's wall duration only (a user closure owns no CPU sampler), so
+/// spin-vs-sleep cannot be told apart from outside. Naming the overrun
+/// `RollbackStall` is the honest verdict; guessing `CpuSpin` would not be.
+///
+/// `budget_ms == 0` (the default) disables the clock: `WithinBudget`.
+#[inline]
+#[must_use]
+pub const fn classify_rollback(elapsed_ms: u64, budget_ms: u64) -> StallKind {
+    if budget_ms == 0 || elapsed_ms <= budget_ms {
+        StallKind::WithinBudget
+    } else {
+        StallKind::RollbackStall
+    }
 }
 
 /// 8-byte worker heartbeat: the worker calls [`WorkerPulse::kick`] once

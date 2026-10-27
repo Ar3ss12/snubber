@@ -198,6 +198,16 @@ pub struct SnubberStats {
     /// Worst rollback-body duration observed, ms (saturating max).
     /// `0` until a budget arms the clock around the body.
     pub max_rollback_ms: u64,
+    /// Admission attempts that arrived on the very thread currently
+    /// running this node's rollback body. Counted BEFORE the pipeline:
+    /// under the default [`RollbackReentrancy::Allow`] the attempt still
+    /// competes for a slot (and is then counted by the usual perimeter
+    /// columns too), under `Refuse` it is refused here as
+    /// [`EnterError::RollbackReentrant`] and never reaches the perimeter —
+    /// so this mirror is the ONLY bucket for those refused attempts, and
+    /// they stay outside the conservation equation (same law as
+    /// `memory_rejections`).
+    pub rollback_reentries: u64,
     /// Token-bucket rejections (`rate_per_sec` over limit).
     pub rate_rejected: u64,
     /// Windowed-batch position: settled outcomes in the open batch.
@@ -511,6 +521,16 @@ pub const DEFAULT_POLICIES: [FaultPolicy; FaultKind::COUNT] = [
         "rate limit exceeded, newcomer rejected",
         "rate_limited_total",
     ),
+    // RollbackStall — the body RETURNED, only late. Counted, warned,
+    // never a breaker failure: the transaction already settled itself.
+    // A policy that trips here would isolate a node whose compensation
+    // worked, just slowly.
+    FaultPolicy::arm(
+        FaultAction::DiscardSilently,
+        LogLevel::Warn,
+        "rollback body overran its budget",
+        "rollback_stalls_total",
+    ),
 ];
 
 /// Builder for [`SnubberNode`]. All limits are compile-time-visible
@@ -530,6 +550,7 @@ pub struct SnubberNodeBuilder {
     failure_threshold_percent: u8,
     timeout_ms: u64,
     rollback_budget_ms: u64,
+    rollback_reentrancy: RollbackReentrancy,
     cpu_budget_ms: u64,
     stall_ceiling_ms: u64,
     task_ttl_ms: u64,
@@ -564,6 +585,7 @@ impl SnubberNodeBuilder {
             failure_threshold_percent: 50,
             timeout_ms: 0,
             rollback_budget_ms: 0,
+            rollback_reentrancy: RollbackReentrancy::Allow,
             cpu_budget_ms: 0,
             stall_ceiling_ms: 0,
             task_ttl_ms: 0,
@@ -732,6 +754,20 @@ impl SnubberNodeBuilder {
     #[must_use]
     pub fn rollback_budget_ms(mut self, ms: u64) -> Self {
         self.rollback_budget_ms = ms;
+        self
+    }
+
+    /// What an admission attempted from this node's own rollback thread
+    /// does. Default [`RollbackReentrancy::Allow`] (0.6.x behavior: the
+    /// attempt competes normally and is counted in
+    /// `stats().rollback_reentries`); [`RollbackReentrancy::Refuse`]
+    /// returns [`EnterError::RollbackReentrant`] before any lock.
+    ///
+    /// Thread identity lives only under `std`: on `no_std` this knob is
+    /// inert (re-entry behaves as `Allow`).
+    #[must_use]
+    pub fn rollback_reentrancy(mut self, policy: RollbackReentrancy) -> Self {
+        self.rollback_reentrancy = policy;
         self
     }
 
@@ -1022,6 +1058,7 @@ impl SnubberNodeBuilder {
             auto_seq: Arc::new(AtomicU64::new(1)),
             rate_per_sec: self.rate_per_sec,
             rollback_budget_ms: self.rollback_budget_ms,
+            rollback_reentrancy: self.rollback_reentrancy,
             inner: Arc::new(NodeLedger {
                 rollback: RollbackMirror::new(),
                 books: Mutex::new(NodeInner {
@@ -1260,6 +1297,12 @@ pub enum EnterError {
     /// draining. Refused BEFORE any lock; counted in `memory_rejections`.
     /// Retry after 1 s — never counted as a failure streak.
     MemoryPressure,
+    /// Admission attempted on the same thread that is inside this node's
+    /// rollback body, while the node's
+    /// [`RollbackReentrancy`] policy is `Refuse`. Refused BEFORE any lock;
+    /// counted in `rollback_reentries`. Never produced by the default
+    /// `Allow` policy, and never produced on `no_std` (no thread identity).
+    RollbackReentrant,
 }
 
 impl EnterError {
@@ -1268,7 +1311,9 @@ impl EnterError {
     /// `Some` for `BulkheadFull / RateLimited / BreakerOpen` (capacity saturation);
     /// `None` for `StaleEpoch / InvariantBreach / QueueTtlExpired /
     /// PayloadBudgetExceeded / MemoryPressure` (memory pressure has no
-    /// `FaultKind`; its advisory wait is fixed at 1 s).
+    /// `FaultKind`; its advisory wait is fixed at 1 s) and for
+    /// `RollbackReentrant` (a retry from inside the same rollback body
+    /// would repeat the mistake — nothing to pace).
     #[must_use]
     pub fn backpressure(&self) -> Option<Backpressure> {
         match *self {
@@ -1285,7 +1330,8 @@ impl EnterError {
             | Self::InvariantBreach(_)
             | Self::QueueTtlExpired
             | Self::PayloadBudgetExceeded(_)
-            | Self::MemoryPressure => None,
+            | Self::MemoryPressure
+            | Self::RollbackReentrant => None,
         }
     }
 
@@ -1501,6 +1547,34 @@ pub struct RollbackPhase {
     pub stalls: u64,
 }
 
+/// What a node does when its own rollback body calls back into admission.
+///
+/// The crate cannot stop a body from hanging or from re-taking a foreign
+/// lock (see [`RollbackPhase`]); it CAN stop the body from quietly
+/// competing with itself for the node's capacity. Measured defaults:
+/// re-entry does not deadlock (it is admitted, or refused by the
+/// bulkhead, depending on free slots), so `Allow` keeps 0.6.x behavior
+/// byte-for-byte and only counts what happened.
+///
+/// `Refuse` is the paranoid mode: an admission attempted on the SAME
+/// thread that is inside this node's rollback body returns
+/// [`EnterError::RollbackReentrant`] before touching any lock. Other
+/// threads are never affected. Availability is honestly limited:
+/// thread identity exists only under `std` — on `no_std` the policy is
+/// inert (re-entry behaves as `Allow`), because guessing identity would
+/// be worse than admitting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum RollbackReentrancy {
+    /// Admit (or refuse by the usual rules) and count in
+    /// [`SnubberStats::rollback_reentries`]. The default.
+    #[default]
+    Allow,
+    /// Refuse with [`EnterError::RollbackReentrant`] and count in
+    /// [`SnubberStats::rollback_reentries`].
+    Refuse,
+}
+
 /// "No rollback body is being timed" sentinel — see `RollbackMirror::started_ms`.
 const IDLE_MS: u64 = u64::MAX;
 
@@ -1521,6 +1595,8 @@ struct RollbackMirror {
     started_ms: AtomicU64,
     max_ms: AtomicU64,
     stalls: AtomicU64,
+    /// Admissions attempted from this node's own rollback thread.
+    reentries: AtomicU64,
 }
 
 impl RollbackMirror {
@@ -1532,6 +1608,7 @@ impl RollbackMirror {
             started_ms: AtomicU64::new(IDLE_MS),
             max_ms: AtomicU64::new(0),
             stalls: AtomicU64::new(0),
+            reentries: AtomicU64::new(0),
         }
     }
 }
@@ -1546,6 +1623,39 @@ struct NodeLedger {
     rollback: RollbackMirror,
 }
 
+// Ledger whose rollback body is running on THIS thread (`0` = none).
+//
+// Per-thread by construction: two bodies on two threads must not see
+// each other, and a body that re-enters its own node must see itself.
+// The stamp saves and restores the previous value, so nesting (a body
+// that aborts a guard on another node and rolls THAT back) is exact.
+//
+// `std`-only: `no_std` has no thread identity, so
+// [`RollbackReentrancy::Refuse`] is inert there (documented on the enum).
+#[cfg(feature = "std")]
+std::thread_local! {
+    static ROLLBACK_BODY: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "std")]
+fn rollback_body_enter(ledger: &NodeLedger) -> usize {
+    let me = ledger as *const NodeLedger as usize;
+    ROLLBACK_BODY.try_with(|slot| slot.replace(me)).unwrap_or(0)
+}
+
+#[cfg(not(feature = "std"))]
+fn rollback_body_enter(_ledger: &NodeLedger) -> usize {
+    0
+}
+
+#[cfg(feature = "std")]
+fn rollback_body_leave(prev: usize) {
+    let _ = ROLLBACK_BODY.try_with(|slot| slot.set(prev));
+}
+
+#[cfg(not(feature = "std"))]
+fn rollback_body_leave(_prev: usize) {}
+
 /// Live marker of one rollback body.
 ///
 /// `Drop`, not a plain call at the end, because a panicking body under
@@ -1555,17 +1665,21 @@ struct RollbackStamp<'a> {
     /// Borrowed, not cloned: an `Arc` clone here would cost two extra
     /// atomic RMWs on every aborted transaction for no reach — the ledger
     /// outlives the body (the guard owns the `Arc` for the whole call).
-    mirror: &'a RollbackMirror,
+    ledger: &'a NodeLedger,
     /// Clock stamp; meaningful only when `budget_ms > 0` (a legit stamp
     /// can be `0` inside the process's first millisecond, so the budget —
     /// not the value — decides whether the clock was armed).
     armed_at_ms: u64,
     budget_ms: u64,
+    /// TLS value this body replaced (see [`RollbackStamp::close`]).
+    prev_body: usize,
+    billed: bool,
 }
 
 impl<'a> RollbackStamp<'a> {
-    /// Begin a body: always bumps the live counter (two atomic RMWs, no
-    /// clock read); stamps a start only when a budget is armed.
+    /// Begin a body: always bumps the live counter and marks the rolling
+    /// thread (two atomic RMWs + one TLS write, no clock read); stamps a
+    /// start only when a budget is armed.
     fn begin(ledger: &'a NodeLedger, epoch: u64, task_id: u64, budget_ms: u64) -> Self {
         let mirror = &ledger.rollback;
         let armed_at_ms = if budget_ms > 0 { now_ms() } else { 0 };
@@ -1582,27 +1696,59 @@ impl<'a> RollbackStamp<'a> {
             );
         }
         mirror.active.fetch_add(1, Ordering::Relaxed);
+        let prev_body = rollback_body_enter(ledger);
         Self {
-            mirror,
+            ledger,
             armed_at_ms,
             budget_ms,
+            prev_body,
+            billed: false,
+        }
+    }
+
+    /// Close the window NOW and return the overrun, ms.
+    ///
+    /// Called right after the body returns, before the settle: the caller
+    /// builds the `RollbackStall` record only when this is `Some`, so the
+    /// hot path pays nothing for the verdict it rarely needs.
+    fn finish(&mut self) -> Option<u64> {
+        if self.billed {
+            return None;
+        }
+        self.billed = true;
+        self.close()
+    }
+
+    /// Bring the counter (and the TLS marker) home exactly once, bill the
+    /// duration when a budget armed the clock, and name an overrun.
+    fn close(&mut self) -> Option<u64> {
+        let mirror = &self.ledger.rollback;
+        let prev = mirror.active.fetch_sub(1, Ordering::Relaxed);
+        if prev <= 1 {
+            mirror.started_ms.store(IDLE_MS, Ordering::Relaxed);
+        }
+        rollback_body_leave(self.prev_body);
+        if self.budget_ms == 0 {
+            return None;
+        }
+        let elapsed = now_ms().saturating_sub(self.armed_at_ms);
+        let _ = mirror.max_ms.fetch_max(elapsed, Ordering::Relaxed);
+        if elapsed > self.budget_ms {
+            mirror.stalls.fetch_add(1, Ordering::Relaxed);
+            Some(elapsed)
+        } else {
+            None
         }
     }
 }
 
 impl Drop for RollbackStamp<'_> {
     fn drop(&mut self) {
-        let mirror = self.mirror;
-        let prev = mirror.active.fetch_sub(1, Ordering::Relaxed);
-        if prev <= 1 {
-            mirror.started_ms.store(IDLE_MS, Ordering::Relaxed);
-        }
-        if self.budget_ms > 0 {
-            let elapsed = now_ms().saturating_sub(self.armed_at_ms);
-            let _ = mirror.max_ms.fetch_max(elapsed, Ordering::Relaxed);
-            if elapsed > self.budget_ms {
-                mirror.stalls.fetch_add(1, Ordering::Relaxed);
-            }
+        if !self.billed {
+            self.billed = true;
+            // A panicking body has no caller-side `finish()`; the books
+            // still come home, but no verdict is minted for an unwind.
+            let _ = self.close();
         }
     }
 }
@@ -1641,6 +1787,9 @@ pub struct SnubberNode {
     /// law as `rate_per_sec`): `0` — the default — keeps the clock off
     /// around a rollback body; every guard copies the knob at admission.
     rollback_budget_ms: u64,
+    /// Builder-sealed re-entrancy law (outside the mutex: the admission
+    /// path must decide BEFORE locking whether to refuse).
+    rollback_reentrancy: RollbackReentrancy,
 }
 
 /// Single-allocation settle path for erased admissions: one node clone and
@@ -1654,6 +1803,9 @@ struct ErasedTransaction<F> {
     /// Admission identity: the phase view names it while the body runs.
     epoch: u64,
     task_id: u64,
+    /// Admission call site (`#[track_caller]`): a late body's
+    /// `RollbackStall` record names the transaction origin, not the drop.
+    loc: &'static core::panic::Location<'static>,
     rollback: Option<F>,
     token: Option<crate::ProcessToken>,
 }
@@ -1674,7 +1826,7 @@ impl<F: FnOnce() + Send + 'static> crate::erased::ErasedSettle for ErasedTransac
             // Phase window covers the body AND the settle that follows:
             // the erased bulkhead slot was released at admission, but the
             // probe bit and the books still settle after the body.
-            let _rollback_stamp = RollbackStamp::begin(
+            let mut rollback_stamp = RollbackStamp::begin(
                 &self.node.inner,
                 self.epoch,
                 self.task_id,
@@ -1682,11 +1834,33 @@ impl<F: FnOnce() + Send + 'static> crate::erased::ErasedSettle for ErasedTransac
             );
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
             self.node.settle_erased_rollback(self.was_probe);
+            // Only a body that RETURNED earns a verdict: a panic resumes
+            // below, and the stamp's Drop still bills the counters.
+            let stalled_ms = if outcome.is_ok() {
+                rollback_stamp.finish()
+            } else {
+                None
+            };
             if let Err(payload) = outcome {
                 std::panic::resume_unwind(payload);
             }
             if let Some(token) = self.token {
                 crate::ProcessToken::commit(token.task).emit_if_supervised();
+            }
+            if let Some(elapsed_ms) = stalled_ms {
+                record_rollback_stall(
+                    &self.node.inner,
+                    RollbackStallSite {
+                        file: self.loc.file(),
+                        line: self.loc.line(),
+                        header: TransactionHeader::new(self.epoch, self.task_id),
+                        stage: 0,
+                        stage_label: None,
+                        queue_wait_ms: 0,
+                        elapsed_ms,
+                        retry_count: 0,
+                    },
+                );
             }
         }
     }
@@ -1971,6 +2145,7 @@ impl SnubberNode {
         stats.memory_rejections = self.memory_rejections.load(Ordering::Relaxed);
         stats.rollback_stalls = self.inner.rollback.stalls.load(Ordering::Relaxed);
         stats.max_rollback_ms = self.inner.rollback.max_ms.load(Ordering::Relaxed);
+        stats.rollback_reentries = self.inner.rollback.reentries.load(Ordering::Relaxed);
         stats
     }
 
@@ -2002,6 +2177,49 @@ impl SnubberNode {
             max_ms: mirror.max_ms.load(Ordering::Relaxed),
             stalls: mirror.stalls.load(Ordering::Relaxed),
         }
+    }
+
+    /// Book a re-entrant admission attempt and apply the policy.
+    ///
+    /// Zero cost while no body runs (one relaxed load). Only a thread that
+    /// is itself inside this node's rollback body counts — concurrent
+    /// bodies on other threads are invisible by construction (the marker
+    /// is per-thread).
+    #[inline]
+    fn note_reentry(&self) -> Option<EnterError> {
+        if self.inner.rollback.active.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        if !self.rollback_body_is_here() {
+            return None;
+        }
+        self.inner
+            .rollback
+            .reentries
+            .fetch_add(1, Ordering::Relaxed);
+        if self.rollback_reentrancy == RollbackReentrancy::Refuse {
+            Some(EnterError::RollbackReentrant)
+        } else {
+            None
+        }
+    }
+
+    /// Is the CURRENT thread inside this node's rollback body?
+    #[cfg(feature = "std")]
+    #[inline]
+    fn rollback_body_is_here(&self) -> bool {
+        let me = Arc::as_ptr(&self.inner) as usize;
+        ROLLBACK_BODY
+            .try_with(|slot| slot.get() == me)
+            .unwrap_or(false)
+    }
+
+    /// No thread identity on `no_std`: the policy is inert (see
+    /// [`RollbackReentrancy`]).
+    #[cfg(not(feature = "std"))]
+    #[inline]
+    fn rollback_body_is_here(&self) -> bool {
+        false
     }
 
     /// Builder-sealed pass-through law: `true` = open doors (canary mode).
@@ -2569,12 +2787,14 @@ impl SnubberNode {
             was_probe
         };
         let node = self.clone();
+        let loc = core::panic::Location::caller();
         Ok(crate::ErasedGuard::from_settle(Box::new(
             ErasedTransaction {
                 node,
                 was_probe,
                 epoch,
                 task_id,
+                loc,
                 rollback: Some(rollback),
                 token: None,
             },
@@ -3088,12 +3308,14 @@ impl SnubberNode {
             was_probe
         };
         let node = self.clone();
+        let loc = core::panic::Location::caller();
         Ok(crate::ErasedGuard::from_settle(Box::new(
             ErasedTransaction {
                 node,
                 was_probe,
                 epoch: seq,
                 task_id: seq,
+                loc,
                 rollback: Some(rollback),
                 token: Some(token),
             },
@@ -3266,6 +3488,13 @@ impl SnubberNode {
         if self.memory_pressure.load(Ordering::Acquire) {
             self.memory_rejections.fetch_add(1, Ordering::Relaxed);
             return Err(EnterError::MemoryPressure);
+        }
+        // Re-entrancy law: an attempt from inside THIS node's own rollback
+        // body (same thread) is booked; `Refuse` refuses it before any
+        // lock (the body already holds the bulkhead slot — a silent
+        // refusal would read as `BulkheadFull`, hiding the real cause).
+        if let Some(err) = self.note_reentry() {
+            return Err(err);
         }
         let header = arming.header;
         let epoch = header.epoch;
@@ -3864,6 +4093,12 @@ impl SnubberNode {
             self.memory_rejections.fetch_add(1, Ordering::Relaxed);
             return core::task::Poll::Ready(Err(EnterError::MemoryPressure));
         }
+        // Same law as the sync path: a poll on the thread that is inside
+        // this node's rollback body is booked; `Refuse` answers NOW
+        // instead of parking the waker behind the body's own slot.
+        if let Some(err) = self.note_reentry() {
+            return core::task::Poll::Ready(Err(err));
+        }
         let now = now_ms();
         // The TTL clock starts when the future actually PARKS (first
         // `waiters` entry), not at future construction: an executor may
@@ -4349,6 +4584,7 @@ impl SnubberNode {
             // stalled.
             rollback_stalls: 0,
             max_rollback_ms: 0,
+            rollback_reentries: 0,
             rate_rejected: s.rate_rejected,
             window_outcomes: s.window_outcomes,
             window_failures: s.window_failures,
@@ -4666,6 +4902,47 @@ pub(crate) struct AsyncAttempt<'a, F: FnOnce()> {
     pub evicted_out: &'a mut Option<Arc<AtomicBool>>,
     pub prior_flag: Option<&'a Arc<AtomicBool>>,
     pub enqueued_at_ms: &'a mut Option<u64>,
+}
+
+/// Site data of one `RollbackStall` verdict. The node name comes from the
+/// ledger under the same lock that books the record, so callers never
+/// need a second lock just to label the fault.
+struct RollbackStallSite {
+    file: &'static str,
+    line: u32,
+    header: TransactionHeader,
+    stage: u32,
+    stage_label: Option<&'static str>,
+    queue_wait_ms: u64,
+    elapsed_ms: u64,
+    retry_count: u32,
+}
+
+/// Record a named `RollbackStall`: the body RETURNED, only late.
+///
+/// Same pipeline as every other fault — `reported[]` bump, policy,
+/// console budget, flight ring — so the ring entry is the observable
+/// "which transaction sat inside a rollback body" signal, next to the
+/// lock-free [`RollbackPhase`] view.
+fn record_rollback_stall(node: &Arc<NodeLedger>, site: RollbackStallSite) {
+    let mut inner = lock_ledger(node);
+    let record = FaultRecord {
+        kind: FaultKind::RollbackStall,
+        node: inner.name.clone(),
+        file: site.file,
+        line: site.line,
+        header: site.header,
+        detail: Some(FaultDetail::Static("rollback overran budget")),
+        stage: site.stage,
+        stage_label: site.stage_label,
+        queue_wait_ms: site.queue_wait_ms,
+        elapsed_ms: site.elapsed_ms,
+        retry_count: site.retry_count,
+    };
+    let mut outcome = SnubberNode::record_locked(&mut inner, FaultKind::RollbackStall, 0);
+    drop(inner);
+    publish_fault_arc(node, &mut outcome, &record);
+    SnubberNode::emit(outcome, record);
 }
 
 fn publish_fault_arc(node: &Arc<NodeLedger>, outcome: &mut ReportOutcome, record: &FaultRecord) {
@@ -5263,6 +5540,22 @@ impl<F: FnOnce()> TrackedGuard<F> {
         self.stage_label
     }
 
+    /// Site data for a `RollbackStall` verdict on this guard's settle path:
+    /// the admission coordinates, not the drop site, so a post-mortem names
+    /// the transaction that overran.
+    fn rollback_stall_site(&self, elapsed_ms: u64) -> RollbackStallSite {
+        RollbackStallSite {
+            file: self.arming.file,
+            line: self.arming.line,
+            header: self.arming.header,
+            stage: self.stage,
+            stage_label: self.stage_label,
+            queue_wait_ms: self.queue_wait_ms,
+            elapsed_ms,
+            retry_count: self.retry_count,
+        }
+    }
+
     /// Set stage + label in one call (combined [`set_stage`](Self::set_stage)).
     ///
     /// ```text
@@ -5651,9 +5944,9 @@ impl<F: FnOnce()> TrackedGuard<F> {
         let header = self.arming.header;
         let node_name = self.arming.node.clone();
         let lane = (self.priority.code() as usize).min(Priority::MAX_INDEX);
-        {
+        let stalled_ms = {
             // Phase window: the body runs here, outside the ledger lock.
-            let _rollback_stamp = RollbackStamp::begin(
+            let mut rollback_stamp = RollbackStamp::begin(
                 &self.node,
                 self.arming.header.epoch,
                 self.arming.header.task_id,
@@ -5662,7 +5955,10 @@ impl<F: FnOnce()> TrackedGuard<F> {
             if let Some(g) = self.guard.take() {
                 drop(g); // hardware rollback runs HERE
             }
-        }
+            // Close the window before the settle: the verdict is minted
+            // outside the lock, like every other fault record.
+            rollback_stamp.finish()
+        };
         // Stamp the settle AFTER the rollback (so its duration is billed)
         // but BEFORE the lock: the clock must not be read under the node
         // mutex.
@@ -5725,6 +6021,9 @@ impl<F: FnOnce()> TrackedGuard<F> {
         if let Some(w) = waker {
             w.waker.wake();
         }
+        if let Some(elapsed_ms) = stalled_ms {
+            record_rollback_stall(&self.node, self.rollback_stall_site(elapsed_ms));
+        }
         self.release_profile();
         Err(if spin {
             TimeoutCheck::SpinDetected
@@ -5758,14 +6057,15 @@ impl<F: FnOnce()> TrackedGuard<F> {
         // (Invariant 6). Scoped to the body: the settle below is
         // lock-guarded bookkeeping, not user code — `active` may fall a
         // hair before the slot comes home, by design.
-        let event = {
-            let _rollback_stamp = RollbackStamp::begin(
+        let (event, stalled_ms) = {
+            let mut rollback_stamp = RollbackStamp::begin(
                 &self.node,
                 self.arming.header.epoch,
                 self.arming.header.task_id,
                 self.rollback_budget_ms,
             );
-            guard.abort(reason)
+            let event = guard.abort(reason);
+            (event, rollback_stamp.finish())
         };
         self.settled = true;
         let node = self.node.clone();
@@ -5788,6 +6088,9 @@ impl<F: FnOnce()> TrackedGuard<F> {
         };
         if let Some(w) = waker {
             w.waker.wake();
+        }
+        if let Some(elapsed_ms) = stalled_ms {
+            record_rollback_stall(&node, self.rollback_stall_site(elapsed_ms));
         }
         event
     }
@@ -5852,9 +6155,9 @@ impl<F: FnOnce()> Drop for TrackedGuard<F> {
         // v0.1 guard runs the HARDWARE rollback first (Drop order:
         // fields drop after this body — but `guard` is an Option holding
         // the v0.1 guard; take + drop it explicitly for clarity).
-        {
+        let stalled_ms = {
             // Phase window: the body runs here, outside the ledger lock.
-            let _rollback_stamp = RollbackStamp::begin(
+            let mut rollback_stamp = RollbackStamp::begin(
                 &self.node,
                 self.arming.header.epoch,
                 self.arming.header.task_id,
@@ -5863,8 +6166,14 @@ impl<F: FnOnce()> Drop for TrackedGuard<F> {
             if let Some(g) = self.guard.take() {
                 drop(g); // hardware rollback runs HERE
             }
-        }
+            // Close the window before the settle: the verdict is minted
+            // outside the lock, like every other fault record.
+            rollback_stamp.finish()
+        };
         self.settle_implicit();
+        if let Some(elapsed_ms) = stalled_ms {
+            record_rollback_stall(&self.node, self.rollback_stall_site(elapsed_ms));
+        }
     }
 }
 

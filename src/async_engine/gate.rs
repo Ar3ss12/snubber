@@ -123,9 +123,9 @@ pub fn classify(err: &EnterError) -> Refusal {
         | EnterError::QueueFull
         | EnterError::MemoryPressure => Refusal::Backoff,
         EnterError::StaleEpoch | EnterError::QueueTtlExpired => Refusal::Ignore,
-        EnterError::InvariantBreach(_) | EnterError::PayloadBudgetExceeded(_) => {
-            Refusal::BadRequest
-        }
+        EnterError::InvariantBreach(_)
+        | EnterError::PayloadBudgetExceeded(_)
+        | EnterError::RollbackReentrant => Refusal::BadRequest,
     }
 }
 

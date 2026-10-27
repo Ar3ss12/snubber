@@ -19,7 +19,10 @@
 //! rollback body: bodies publish a verdict code into an `AtomicU8`, and the
 //! test thread — whose panic is NOT swallowed — reads it.
 
-use snubber::{EnterError, FaultKind, SnubberError, SnubberNode};
+use snubber::{
+    classify, classify_rollback, classify_stall_ceiling, EnterError, FaultAction, FaultKind,
+    LogLevel, Refusal, RollbackReentrancy, SnubberError, SnubberNode, StallKind, DEFAULT_POLICIES,
+};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::channel;
@@ -37,6 +40,7 @@ const NESTED_ADMITTED: u8 = 1;
 const NESTED_REFUSED_BULKHEAD: u8 = 2;
 const NESTED_REFUSED_OTHER: u8 = 3;
 const NESTED_PARKED: u8 = 4;
+const NESTED_REFUSED_REENTRANT: u8 = 5;
 
 /// Run `body` on a throwaway thread and require a verdict within
 /// [`BODY_BUDGET`]. A body that never returns fails THIS test instead of
@@ -578,6 +582,253 @@ fn phase_reports_activity_without_a_budget_and_stamps_no_clock() {
     assert_eq!(calm.stalls, 0);
     assert_eq!(node.stats().max_rollback_ms, 0);
     assert_eq!(node.stats().rollback_stalls, 0);
+}
+
+/// Stage 4: an overrun is not just a counter — it becomes a NAMED fault
+/// (`FaultKind::RollbackStall`) carrying the admission coordinates, booked
+/// through the same pipeline as every other fault. A body that panics mints
+/// no verdict (unwind is not a measurement), and an unarmed budget mints
+/// nothing at all.
+#[test]
+fn budget_exceeded_rolls_back_phase_into_a_named_stall() {
+    const BUDGET_MS: u64 = 10;
+    let node = SnubberNode::builder("guardrails/budget/named-stall")
+        .max_in_flight(1)
+        .rollback_budget_ms(BUDGET_MS)
+        .build();
+    let outcome = node.scoped::<i32, &'static str, _, _>(
+        || std::thread::sleep(Duration::from_millis(80)),
+        || Err::<i32, &'static str>("work failed"),
+    );
+    assert!(matches!(outcome, Err(SnubberError::Work(_))));
+
+    let stats = node.stats();
+    assert_eq!(
+        stats.rollback_stalls, 1,
+        "the overrun is counted: {stats:?}"
+    );
+    assert_eq!(
+        stats.reported[FaultKind::RollbackStall.index()],
+        1,
+        "the overrun must also land in the per-kind column"
+    );
+    let last = stats.last_fault.as_ref().expect("a named record");
+    assert_eq!(last.kind, FaultKind::RollbackStall);
+    assert!(
+        last.elapsed_ms >= 60,
+        "the record carries the measured overrun, got {} ms",
+        last.elapsed_ms
+    );
+    assert_eq!(
+        classify_rollback(last.elapsed_ms, BUDGET_MS),
+        StallKind::RollbackStall
+    );
+    assert!(
+        node.dump_flight()
+            .iter()
+            .any(|slot| slot.kind == FaultKind::RollbackStall),
+        "the flight ring names the transaction, not just the count"
+    );
+
+    // Zero-cost default: the same shape without a budget books no verdict.
+    let quiet = SnubberNode::builder("guardrails/budget/quiet").build();
+    let _ = quiet.scoped(
+        || std::thread::sleep(Duration::from_millis(5)),
+        || Err::<i32, &'static str>("work failed"),
+    );
+    assert_eq!(quiet.stats().rollback_stalls, 0);
+    assert!(
+        quiet.stats().last_fault.is_none(),
+        "no budget, no clock, no verdict"
+    );
+}
+
+/// Default policy: a body that re-enters its own node is ADMITTED and
+/// COUNTED — the 0.6.x behavior, kept byte-for-byte, with a number attached.
+#[test]
+fn rollback_reentrancy_default_allows_and_counts() {
+    let node = SnubberNode::builder("guardrails/reentry/allow-counted")
+        .max_in_flight(2)
+        .build();
+    let verdict = Arc::new(AtomicU8::new(NOT_RUN));
+    let (caller, rollback_node) = (node.clone(), node.clone());
+    let v = Arc::clone(&verdict);
+    bounded("allow policy counts the re-entry", move || {
+        let outcome = caller.scoped::<i32, &'static str, _, _>(
+            move || {
+                let nested = rollback_node.scoped(|| {}, || Ok::<i32, &'static str>(1));
+                v.store(
+                    match nested {
+                        Ok(_) => NESTED_ADMITTED,
+                        Err(_) => NESTED_REFUSED_OTHER,
+                    },
+                    Ordering::SeqCst,
+                );
+            },
+            || Err::<i32, &'static str>("work failed"),
+        );
+        assert!(matches!(outcome, Err(SnubberError::Work(_))));
+    });
+    assert_eq!(
+        verdict.load(Ordering::SeqCst),
+        NESTED_ADMITTED,
+        "Allow is the default: the nested admission is granted"
+    );
+    let stats = node.stats();
+    assert_eq!(
+        stats.rollback_reentries, 1,
+        "the default counts what happened instead of refusing it"
+    );
+    assert!(
+        stats.last_fault.is_none(),
+        "an allowed re-entry is not a fault"
+    );
+}
+
+/// Opt-in `Refuse`: the SAME thread that is inside this node's rollback body
+/// gets `EnterError::RollbackReentrant` before any lock — on the sync AND the
+/// async path — while other threads keep working.
+#[test]
+fn rollback_reentrancy_policy_refuse_returns_error() {
+    let node = SnubberNode::builder("guardrails/reentry/refuse")
+        .max_in_flight(2)
+        .rollback_reentrancy(RollbackReentrancy::Refuse)
+        .build();
+    let sync_verdict = Arc::new(AtomicU8::new(NOT_RUN));
+    let async_verdict = Arc::new(AtomicU8::new(NOT_RUN));
+    let entered = Arc::new(AtomicBool::new(false));
+    let nested_done = Arc::new(AtomicBool::new(false));
+    let (gate_tx, gate_rx) = channel::<()>();
+    let (done_tx, done_rx) = channel::<()>();
+
+    let worker = {
+        let outer_node = node.clone();
+        let body_node = node.clone();
+        let entered = Arc::clone(&entered);
+        let nested_done = Arc::clone(&nested_done);
+        let sv = Arc::clone(&sync_verdict);
+        let av = Arc::clone(&async_verdict);
+        std::thread::spawn(move || {
+            let guard = outer_node
+                .enter(1, 1, move || {
+                    entered.store(true, Ordering::SeqCst);
+                    let nested = body_node.scoped(|| {}, || Ok::<i32, &'static str>(1));
+                    sv.store(
+                        match nested {
+                            Err(SnubberError::Admission(EnterError::RollbackReentrant)) => {
+                                NESTED_REFUSED_REENTRANT
+                            }
+                            Ok(_) => NESTED_ADMITTED,
+                            Err(_) => NESTED_REFUSED_OTHER,
+                        },
+                        Ordering::SeqCst,
+                    );
+                    let mut fut = Box::pin(body_node.enter_async_auto(|| {}));
+                    let waker = noop_waker();
+                    let mut cx = Context::from_waker(&waker);
+                    av.store(
+                        match fut.as_mut().poll(&mut cx) {
+                            Poll::Ready(Err(EnterError::RollbackReentrant)) => {
+                                NESTED_REFUSED_REENTRANT
+                            }
+                            Poll::Ready(Ok(_)) => NESTED_ADMITTED,
+                            _ => NESTED_REFUSED_OTHER,
+                        },
+                        Ordering::SeqCst,
+                    );
+                    nested_done.store(true, Ordering::SeqCst);
+                    // Hold the body open so the policy is observed while it runs.
+                    let _ = gate_rx.recv();
+                })
+                .expect("the first admission takes a slot");
+            drop(guard);
+            let _ = done_tx.send(());
+        })
+    };
+
+    spin_until_started(&entered);
+    let deadline = std::time::Instant::now() + BODY_BUDGET;
+    while !nested_done.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the body never finished its nested attempts"
+        );
+        std::thread::yield_now();
+    }
+
+    // Other threads are never affected: the marker is per-thread.
+    assert!(
+        node.scoped(|| {}, || Ok::<i32, &'static str>(7))
+            .is_ok_and(|v| v == 7),
+        "Refuse applies to the rollback thread only"
+    );
+    assert_eq!(
+        sync_verdict.load(Ordering::SeqCst),
+        NESTED_REFUSED_REENTRANT,
+        "the sync path must refuse before touching any lock"
+    );
+    assert_eq!(
+        async_verdict.load(Ordering::SeqCst),
+        NESTED_REFUSED_REENTRANT,
+        "the async path must resolve the refusal, not park a waiter"
+    );
+    assert_eq!(
+        classify(&EnterError::RollbackReentrant),
+        Refusal::BadRequest,
+        "a failed-before-lock refusal is the caller's mistake, not backpressure"
+    );
+    assert!(
+        EnterError::RollbackReentrant.backpressure().is_none(),
+        "the caller must not retry from inside the same rollback body"
+    );
+    assert_eq!(
+        node.stats().rollback_reentries,
+        2,
+        "both refused attempts are counted"
+    );
+
+    drop(gate_tx);
+    done_rx
+        .recv_timeout(Duration::from_millis(3_000))
+        .expect("rollback body returned once released");
+    worker.join().expect("worker thread finished");
+    assert_eq!(
+        node.stats().rollback_reentries,
+        2,
+        "the other thread's admission is not a re-entry"
+    );
+    assert_eq!(node.stats().rollback_stalls, 0, "a refusal is not a stall");
+}
+
+/// Taxonomy lock: `RollbackStall` is the LAST dense fault, Warn-level,
+/// non-catastrophic, and only `classify_rollback` can mint it — the watchdog
+/// classifier must never report a rollback verdict.
+#[test]
+fn rollback_stall_kind_is_named_last_and_never_a_deadlock_verdict() {
+    assert_eq!(FaultKind::RollbackStall.index() + 1, FaultKind::COUNT);
+    assert!(!FaultKind::RollbackStall.is_catastrophic());
+    let policy = DEFAULT_POLICIES[FaultKind::RollbackStall.index()];
+    assert_eq!(policy.log_level, Some(LogLevel::Warn));
+    assert!(matches!(policy.action, FaultAction::DiscardSilently));
+    assert_eq!(policy.metric_tag, Some("rollback_stalls_total"));
+
+    assert_eq!(classify_rollback(0, 0), StallKind::WithinBudget);
+    assert_eq!(
+        classify_rollback(20, 20),
+        StallKind::WithinBudget,
+        "equal to the budget is inside it"
+    );
+    assert_eq!(classify_rollback(21, 20), StallKind::RollbackStall);
+    assert_eq!(
+        classify_rollback(10_000, 0),
+        StallKind::WithinBudget,
+        "no budget, no verdict"
+    );
+    assert_ne!(
+        classify_stall_ceiling(10_000, 9_000, 1, 1, 10),
+        StallKind::RollbackStall,
+        "the watchdog classifier never mints the rollback verdict"
+    );
 }
 
 /// The cost of one wedged rollback, measured out of process.

@@ -49,11 +49,16 @@ pub enum FaultKind {
     /// was taken. Operational load shedding with its OWN column — never
     /// merged into `BulkheadFull`, never fed to that kind's policy.
     RateLimited,
+    /// A rollback body ran past the armed `rollback_budget_ms`. The body
+    /// RETURNED (the transaction already settled); this record names the
+    /// overrun for the post-mortem. Never a timeout, never a failure
+    /// streak: a slow compensation is an observation, not a dead task.
+    RollbackStall,
 }
 
 impl FaultKind {
     /// Total number of variants — matches lookup table dimensions.
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 14;
 
     /// Dense array index corresponding to declaration order.
     #[must_use]
@@ -72,6 +77,7 @@ impl FaultKind {
             Self::ProcessDied => 10,
             Self::Preempted => 11,
             Self::RateLimited => 12,
+            Self::RollbackStall => 13,
         }
     }
 
@@ -90,6 +96,7 @@ impl FaultKind {
         Self::ProcessDied,
         Self::Preempted,
         Self::RateLimited,
+        Self::RollbackStall,
     ];
 
     /// Discriminates unrecoverable failures from operational backpressure shedding.
@@ -98,7 +105,7 @@ impl FaultKind {
     ///   or uncommitted drops (`ImplicitDrop`). Feeds circuit breaker consecutive failure streaks.
     /// * `false` — Operational Shedding: defensive backpressure limits (`BulkheadFull`,
     ///   `BufferOverflow`, `EvictedOldest`, `StaleEpoch`, `BreakerOpen`, `PoisonedPayload`,
-    ///   `Preempted`, `RateLimited`).
+    ///   `Preempted`, `RateLimited`) and observations (`RollbackStall` — the body returned).
     ///   Tracked in telemetry; does not increment breaker failure streaks.
     #[must_use]
     pub const fn is_catastrophic(self) -> bool {
@@ -112,7 +119,8 @@ impl FaultKind {
             | Self::BreakerOpen
             | Self::PoisonedPayload
             | Self::Preempted
-            | Self::RateLimited => false,
+            | Self::RateLimited
+            | Self::RollbackStall => false,
         }
     }
 }
@@ -243,7 +251,7 @@ impl fmt::Display for FaultDetail {
 // Enforces table bounds and alignment guarantees at build time.
 const _: () = {
     assert!(
-        FaultKind::COUNT == 13,
+        FaultKind::COUNT == 14,
         "CRITICAL: FaultKind::COUNT drifted — update policy tables + SnapshotV1::reported"
     );
     assert!(
@@ -251,8 +259,8 @@ const _: () = {
         "CRITICAL: FaultKind::ALL out of sync with COUNT"
     );
     assert!(
-        FaultKind::RateLimited.index() + 1 == FaultKind::COUNT,
-        "CRITICAL: RateLimited must stay the last dense index"
+        FaultKind::RollbackStall.index() + 1 == FaultKind::COUNT,
+        "CRITICAL: RollbackStall must stay the last dense index"
     );
     assert!(
         Priority::Background as u8 == 0,
@@ -291,6 +299,10 @@ const _: () = {
     assert!(!FaultKind::PoisonedPayload.is_catastrophic());
     assert!(!FaultKind::Preempted.is_catastrophic());
     assert!(!FaultKind::RateLimited.is_catastrophic());
+    assert!(
+        !FaultKind::RollbackStall.is_catastrophic(),
+        "a slow rollback that RETURNED is an observation, not a failure streak"
+    );
 };
 
 /// Telemetry metric sample capturing fault occurrences per node.
