@@ -54,6 +54,19 @@ let receipt = node.scoped_checked(
 * `SnubberError::Admission(EnterError)` — The node rejected the call at the admission perimeter (circuit breaker open, bulkhead full, rate limited, invariant breach). **Protected resources were never touched; no rollback executed.**
 * `SnubberError::Work(E)` — The protected work unit returned an error `Err(E)`. **Emergency rollback was automatically executed via RAII before returning.**
 
+### Symptom → chapter (quick diagnosis)
+
+Five symptoms cover most production incidents; each row links the
+chapter that owns the fix.
+
+| Symptom | Where to look |
+|---|---|
+| The worker dies on `BulkheadFull` right after `thread::spawn` inside `scoped` | [2.5 Long-Lived Worker Daemon](#25-long-lived-worker-daemon-autonomous-slot-claiming) — who does the work takes the slot |
+| The soft-limit worker is OOM-killed while streaming its checkpoint | [4.6c Checkpoint physics](#46c-checkpoint-physics-64-b-is-a-ticket-not-storage) — [streaming recipe](#streaming-recipe-bounded-heap) and [cgroup v2 page cache](#cgroup-v2-page-cache-counts-against-the-limit) |
+| An async waiter never wakes or the queue wedges | [Layer 3](#layer-3-runtime-agnostic-async-tokio-axum-grpc) — waker queue bounds, `task_ttl`, `settle_async` |
+| A dead child's pipe never reaches EOF (`ReapClass::Deadlocked`) | [4.6d Worker pool](#46d-worker-pool-workerpool-n-lineages-one-pipe-per-worker) — the fourth honest bucket and `pool.expired_lanes` |
+| The snapshot reports anomalies or counters drift | [Layer 5](#layer-5-diagnostics--health-catastrophic-faults-vs-capacity-shedding--appsnub) — triage card, `assert_no_anomalies!` |
+
 ---
 
 ## Layer 1: Core RAII Guard (Stack Rollback)

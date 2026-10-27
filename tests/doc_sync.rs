@@ -713,3 +713,86 @@ fn test_guide_has_no_release_history() {
         );
     }
 }
+
+/// GitHub-slug of a heading, matching github-slugger: lowercase, drop
+/// every character that is not a letter, digit, `_`, `-` or space, then
+/// replace each space with `-`. Verified against the rendered anchors of
+/// this repo (`&` in a heading yields a double dash: "API & Cost" →
+/// `api--cost-quick-reference`).
+fn github_slug(heading: &str) -> String {
+    let mut out = String::new();
+    for ch in heading.trim().to_lowercase().chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-' || ch == ' ' {
+            out.push(ch);
+        }
+    }
+    out.replace(' ', "-")
+}
+
+/// Every internal anchor link in the guide — and every cross-document
+/// `USER_GUIDE.md#…` link from README and BENCHMARKS — must resolve to a
+/// heading that exists in docs/USER_GUIDE.md. The quick-diagnosis table
+/// and the "why the shape" prose are full of `#anchors`; one renamed
+/// heading must break the test, not silently rot into a dead link.
+#[test]
+fn test_guide_anchors_resolve_to_headings() {
+    let guide = read_doc("docs/USER_GUIDE.md");
+    let slugs: std::collections::BTreeSet<String> = guide
+        .lines()
+        .filter(|line| line.starts_with('#'))
+        .map(|line| github_slug(line.trim_start_matches('#')))
+        .collect();
+    assert!(
+        slugs.len() >= 20,
+        "only {} heading slugs parsed from docs/USER_GUIDE.md — heading \
+         extraction broke and this oracle is going vacuously green",
+        slugs.len()
+    );
+
+    let mut checked = 0usize;
+    let mut scan = |doc: &str, text: &str| {
+        let mut rest = text;
+        while let Some(pos) = rest.find("](#") {
+            let tail = &rest[pos + 3..];
+            let end = tail
+                .find(')')
+                .unwrap_or_else(|| panic!("{doc}: unterminated anchor link"));
+            let anchor = &tail[..end];
+            assert!(
+                slugs.contains(anchor),
+                "TRIPWIRE FIRED: {doc} links to dead anchor '#{anchor}' — \
+                 no heading in docs/USER_GUIDE.md renders that slug; \
+                 rename the link or restore the heading"
+            );
+            checked += 1;
+            rest = &tail[end + 1..];
+        }
+    };
+
+    scan("docs/USER_GUIDE.md", &guide);
+    for doc in ["README.md", "BENCHMARKS.md"] {
+        let text = read_doc(doc);
+        // only guide-targeting links: keep the fragment after the path
+        let mut rest = text.as_str();
+        while let Some(pos) = rest.find("docs/USER_GUIDE.md#") {
+            let tail = &rest[pos + "docs/USER_GUIDE.md#".len()..];
+            let end = tail
+                .find([')', ' ', '"'])
+                .unwrap_or_else(|| panic!("{doc}: unterminated guide anchor link"));
+            let anchor = &tail[..end];
+            assert!(
+                slugs.contains(anchor),
+                "TRIPWIRE FIRED: {doc} links to dead guide anchor '#{anchor}' — \
+                 no heading in docs/USER_GUIDE.md renders that slug; \
+                 rename the link or restore the heading"
+            );
+            checked += 1;
+            rest = &tail[end + 1..];
+        }
+    }
+    assert!(
+        checked >= 10,
+        "only {checked} anchors were checked — the link scan broke and \
+         a green result here means nothing"
+    );
+}
