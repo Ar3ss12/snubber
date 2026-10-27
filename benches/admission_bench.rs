@@ -851,7 +851,9 @@ fn bench_contended(c: &mut Criterion) {
             });
         });
     }
-    // IDEAL-4: inter-core SPSC bridge, push core + pop core.
+    // IDEAL-4: two-thread SPSC bridge, push thread + pop thread. Neither
+    // thread is pinned to a core, so the number is a thread-handoff cost,
+    // not a claim about inter-core bus latency.
     {
         let bridge = Arc::new(IsrBridge::new());
         g.bench_function("cross_thread_isr_bridge_push_pop", |b| {
