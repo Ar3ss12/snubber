@@ -108,26 +108,6 @@ fn re_park_replaces_waker_once_and_wakes_only_the_new_one() {
     // the newest waker may fire when the slot frees.
     static OLD_WOKEN: AtomicBool = AtomicBool::new(false);
     static NEW_WOKEN: AtomicBool = AtomicBool::new(false);
-    fn flag_waker(flag: &'static AtomicBool) -> Waker {
-        unsafe fn clone(data: *const ()) -> RawWaker {
-            RawWaker::new(data, &VT_FLAG)
-        }
-        unsafe fn wake(data: *const ()) {
-            (*(data as *const AtomicBool)).store(true, Ordering::SeqCst);
-        }
-        unsafe fn wake_by_ref(data: *const ()) {
-            (*(data as *const AtomicBool)).store(true, Ordering::SeqCst);
-        }
-        unsafe fn drop(_: *const ()) {}
-        static VT_FLAG: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-        unsafe {
-            Waker::from_raw(RawWaker::new(
-                flag as *const AtomicBool as *const (),
-                &VT_FLAG,
-            ))
-        }
-    }
-
     OLD_WOKEN.store(false, Ordering::SeqCst);
     NEW_WOKEN.store(false, Ordering::SeqCst);
     let node = SnubberNode::builder("async/re-park")
@@ -333,48 +313,47 @@ fn enter_async_repeated_polls_do_not_bloat_waiter_queue() {
 
 // --- Regression: EvictOldest waker loss + dropped-future deregistration ---
 
-static WOKEN_A: AtomicBool = AtomicBool::new(false);
-static WOKEN_B: AtomicBool = AtomicBool::new(false);
-
-fn waker_a() -> Waker {
-    unsafe fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(core::ptr::null(), &VT_A)
+/// A waker that records into a CALLER-OWNED flag.
+///
+/// Each test below declares its own `static` flags and passes them here.
+/// The previous shape (one shared `WOKEN_A`/`WOKEN_B` written by every
+/// waker in the file) let a parallel test reset or set the bit another
+/// test was asserting — the same defect that `waker_queue_sleeps_and_wakes_on_commit`
+/// documents for `WOKEN`, and it poisoned both directions: a positive
+/// assert could pass on another test's wake, a negative one could fail on
+/// another test's reset.
+fn flag_waker(flag: &'static AtomicBool) -> Waker {
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        RawWaker::new(data, &VT_FLAG)
     }
-    unsafe fn wake(_: *const ()) {
-        WOKEN_A.store(true, Ordering::SeqCst);
+    unsafe fn wake(data: *const ()) {
+        (*(data as *const AtomicBool)).store(true, Ordering::SeqCst);
     }
-    unsafe fn wake_by_ref(_: *const ()) {
-        WOKEN_A.store(true, Ordering::SeqCst);
-    }
-    unsafe fn drop(_: *const ()) {}
-    static VT_A: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT_A)) }
-}
-
-fn waker_b() -> Waker {
-    unsafe fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(core::ptr::null(), &VT_B)
-    }
-    unsafe fn wake(_: *const ()) {
-        WOKEN_B.store(true, Ordering::SeqCst);
-    }
-    unsafe fn wake_by_ref(_: *const ()) {
-        WOKEN_B.store(true, Ordering::SeqCst);
+    unsafe fn wake_by_ref(data: *const ()) {
+        (*(data as *const AtomicBool)).store(true, Ordering::SeqCst);
     }
     unsafe fn drop(_: *const ()) {}
-    static VT_B: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT_B)) }
+    static VT_FLAG: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+    unsafe {
+        Waker::from_raw(RawWaker::new(
+            flag as *const AtomicBool as *const (),
+            &VT_FLAG,
+        ))
+    }
 }
 
 #[test]
 fn evict_oldest_wakes_the_evicted_future_with_queue_full() {
+    static EVICTED_A: AtomicBool = AtomicBool::new(false);
+    static EVICTED_B: AtomicBool = AtomicBool::new(false);
+
     // Regression: EvictOldest used to `pop_front` the oldest parked waker
     // WITHOUT waking it — that task stayed Pending forever (zombie), and
     // re-polling it re-parked, evicting another victim: a wake/evict
     // livelock. Now the evicted future is marked and WOKEN, and its next
     // poll resolves to an honest QueueFull.
-    WOKEN_A.store(false, Ordering::SeqCst);
-    WOKEN_B.store(false, Ordering::SeqCst);
+    EVICTED_A.store(false, Ordering::SeqCst);
+    EVICTED_B.store(false, Ordering::SeqCst);
     let node = SnubberNode::builder("async/evict")
         .max_in_flight(1)
         .queue_limit(1)
@@ -383,7 +362,7 @@ fn evict_oldest_wakes_the_evicted_future_with_queue_full() {
     let _slot = node.enter(1, 1, || {}).expect("occupy the only slot");
 
     let mut fut_a = node.enter_async(2, 2, || {});
-    let wa = waker_a();
+    let wa = flag_waker(&EVICTED_A);
     let cx_a = &mut std::task::Context::from_waker(&wa);
     assert!(
         core::pin::Pin::new(&mut fut_a).poll(cx_a).is_pending(),
@@ -391,14 +370,14 @@ fn evict_oldest_wakes_the_evicted_future_with_queue_full() {
     );
 
     let mut fut_b = node.enter_async(3, 3, || {});
-    let wb = waker_b();
+    let wb = flag_waker(&EVICTED_B);
     let cx_b = &mut std::task::Context::from_waker(&wb);
     assert!(
         core::pin::Pin::new(&mut fut_b).poll(cx_b).is_pending(),
         "future B parks in the evicted slot"
     );
     assert!(
-        WOKEN_A.load(Ordering::SeqCst),
+        EVICTED_A.load(Ordering::SeqCst),
         "eviction MUST wake the evicted task, not drop its waker"
     );
     match core::pin::Pin::new(&mut fut_a).poll(cx_a) {
@@ -411,6 +390,8 @@ fn evict_oldest_wakes_the_evicted_future_with_queue_full() {
 
 #[test]
 fn dropped_parked_future_deregisters_its_queue_slot() {
+    static PARKED: AtomicBool = AtomicBool::new(false);
+
     // Regression: a future dropped while parked left its waker in the
     // queue forever — a slot nobody will ever wake, starving later
     // admissions (head-of-line blocking by a dead task).
@@ -420,7 +401,7 @@ fn dropped_parked_future_deregisters_its_queue_slot() {
     let _slot = node.enter(1, 1, || {}).expect("occupy the only slot");
 
     let mut fut = node.enter_async(2, 2, || {});
-    let wa = waker_a();
+    let wa = flag_waker(&PARKED);
     let cx = &mut std::task::Context::from_waker(&wa);
     assert!(core::pin::Pin::new(&mut fut).poll(cx).is_pending());
     assert_eq!(node.waiter_len(), 1, "parked before drop");
@@ -437,7 +418,7 @@ fn dropped_parked_future_deregisters_its_queue_slot() {
     assert!(core::pin::Pin::new(&mut fut2).poll(cx).is_pending());
     assert_eq!(node.waiter_len(), 1);
     drop(_slot);
-    assert!(WOKEN_A.load(Ordering::SeqCst), "real waiter must be woken");
+    assert!(PARKED.load(Ordering::SeqCst), "real waiter must be woken");
 }
 
 #[test]
@@ -493,15 +474,18 @@ fn admitted_on_spurious_repoll_leaves_no_ghost_waiter() {
 // waiter sleeps forever on a node that has no further settle to wake it.
 #[test]
 fn future_dropped_after_settle_pop_hands_the_slot_to_the_next_waiter() {
-    WOKEN_A.store(false, Ordering::SeqCst);
-    WOKEN_B.store(false, Ordering::SeqCst);
+    static HANDOFF_A: AtomicBool = AtomicBool::new(false);
+    static HANDOFF_B: AtomicBool = AtomicBool::new(false);
+
+    HANDOFF_A.store(false, Ordering::SeqCst);
+    HANDOFF_B.store(false, Ordering::SeqCst);
     let node = SnubberNode::builder("async/handoff")
         .max_in_flight(1)
         .build();
     let held = node.enter(1, 1, || {}).expect("hold the only slot");
 
-    let wa = waker_a();
-    let wb = waker_b();
+    let wa = flag_waker(&HANDOFF_A);
+    let wb = flag_waker(&HANDOFF_B);
     let mut cx_a = std::task::Context::from_waker(&wa);
     let mut cx_b = std::task::Context::from_waker(&wb);
     let mut fut_a = Box::pin(node.enter_async(2, 2, || {}));
@@ -513,11 +497,11 @@ fn future_dropped_after_settle_pop_hands_the_slot_to_the_next_waiter() {
     // Settle pops A (the oldest) and wakes it — exactly one winner.
     held.commit();
     assert!(
-        WOKEN_A.load(Ordering::SeqCst),
+        HANDOFF_A.load(Ordering::SeqCst),
         "settle wakes the oldest waiter"
     );
     assert!(
-        !WOKEN_B.load(Ordering::SeqCst),
+        !HANDOFF_B.load(Ordering::SeqCst),
         "a settle must not wake two waiters"
     );
 
@@ -525,7 +509,7 @@ fn future_dropped_after_settle_pop_hands_the_slot_to_the_next_waiter() {
     // already popped, so Drop sees the free slot and hands it to B.
     drop(fut_a);
     assert!(
-        WOKEN_B.load(Ordering::SeqCst),
+        HANDOFF_B.load(Ordering::SeqCst),
         "a cancelled winner must hand the slot to the next waiter"
     );
     match fut_b.as_mut().poll(&mut cx_b) {
@@ -541,6 +525,8 @@ fn future_dropped_after_settle_pop_hands_the_slot_to_the_next_waiter() {
 // HalfOpen with no admissible probe.
 #[test]
 fn half_open_async_probe_cancelled_in_queue_does_not_wedge_the_breaker() {
+    static PROBE: AtomicBool = AtomicBool::new(false);
+
     use std::task::Context;
 
     let node = SnubberNode::builder("async/half-open-cancel")
@@ -551,7 +537,7 @@ fn half_open_async_probe_cancelled_in_queue_does_not_wedge_the_breaker() {
     node.report(FaultKind::Panic, 2, 2); // Closed -> HalfOpen
     assert_eq!(node.stats().breaker_state, BreakerState::HalfOpen);
 
-    let wa = waker_a();
+    let wa = flag_waker(&PROBE);
     let mut cx = Context::from_waker(&wa);
     let mut probe = Box::pin(node.enter_async(3, 3, || {}));
     assert!(
@@ -586,8 +572,11 @@ fn half_open_async_probe_cancelled_in_queue_does_not_wedge_the_breaker() {
 // and the telemetry columns disagreed).
 #[test]
 fn async_eviction_reports_evicted_oldest_telemetry() {
-    WOKEN_A.store(false, Ordering::SeqCst);
-    WOKEN_B.store(false, Ordering::SeqCst);
+    static REPORT_A: AtomicBool = AtomicBool::new(false);
+    static REPORT_B: AtomicBool = AtomicBool::new(false);
+
+    REPORT_A.store(false, Ordering::SeqCst);
+    REPORT_B.store(false, Ordering::SeqCst);
     EVICT_HOOK_HITS.store(0, Ordering::SeqCst);
     let node = SnubberNode::builder("async/evict-telemetry")
         .max_in_flight(1)
@@ -602,15 +591,15 @@ fn async_eviction_reports_evicted_oldest_telemetry() {
     let _slot = node.enter(1, 1, || {}).expect("occupy the only slot");
 
     let mut fut_a = node.enter_async(2, 2, || {});
-    let wa = waker_a();
+    let wa = flag_waker(&REPORT_A);
     let cx_a = &mut std::task::Context::from_waker(&wa);
     assert!(core::pin::Pin::new(&mut fut_a).poll(cx_a).is_pending());
 
     let mut fut_b = node.enter_async(3, 3, || {});
-    let wb = waker_b();
+    let wb = flag_waker(&REPORT_B);
     let cx_b = &mut std::task::Context::from_waker(&wb);
     assert!(core::pin::Pin::new(&mut fut_b).poll(cx_b).is_pending());
-    assert!(WOKEN_A.load(Ordering::SeqCst), "eviction fired");
+    assert!(REPORT_A.load(Ordering::SeqCst), "eviction fired");
 
     let s = node.stats();
     assert_eq!(s.evicted, 1, "exactly one eviction, no double counting");
