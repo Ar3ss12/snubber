@@ -702,3 +702,45 @@ fn test_no_run_fences_match_header() {
         );
     }
 }
+
+/// The User Guide describes the current state of the crate; release
+/// history lives only in CHANGELOG.md (the audit-batch fix tables are
+/// the "Audit-batch fix tables" appendix there). A guide that narrates
+/// past releases reads stale the day after release, and its anchors rot
+/// when the next audit renumbers the batches. Any of the history
+/// constructs below reappearing in the guide fails the suite.
+#[test]
+fn test_guide_has_no_release_history() {
+    let guide = read_doc("docs/USER_GUIDE.md");
+
+    let forbidden: &[(&str, &str)] = &[
+        (
+            "## Fixed in 0.",
+            "release-history heading — the audit tables live in the CHANGELOG appendix",
+        ),
+        (
+            "## Fixed after 0.",
+            "release-history heading — the audit tables live in the CHANGELOG appendix",
+        ),
+        (
+            "## Extensibility (0.",
+            "version-labelled heading — the chapter map holds without the version tag",
+        ),
+        (
+            "> Hang layer (v0.",
+            "header teaser narrating an old release — Layer 1.5 documents the current hang layer",
+        ),
+        (
+            "> Extensibility (v0.",
+            "header teaser narrating an old release — the Extensibility chapter documents the current surface",
+        ),
+    ];
+
+    for (token, why) in forbidden {
+        assert!(
+            !guide.contains(token),
+            "TRIPWIRE FIRED: docs/USER_GUIDE.md carries release history ({token}…): {why}. \
+             The guide describes the current state; move history to CHANGELOG.md"
+        );
+    }
+}

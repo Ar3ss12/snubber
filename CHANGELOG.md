@@ -1,8 +1,8 @@
 # Changelog
 
 All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.md);
-the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
-("Fixed in …" sections) and [docs/INVARIANTS.md](docs/INVARIANTS.md).
+the audit-batch fix tables live at the bottom of this file, and the
+current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
 ## 0.6.11 (2026-10-27)
 
@@ -296,6 +296,18 @@ surface, wire format and telemetry layout are untouched.
   against the committed snapshot, and compares the two BENCHMARKS.md
   sections against each other per artifact row. The quick-reference
   `Layer` column pin reads the moved table.
+- The User Guide no longer narrates release history. The `v0.5` /
+  `v0.6.0` header teasers, the version label on the Extensibility
+  chapter and the nine `Fixed in …` audit-batch sections are gone; the
+  guide now states in its header that it describes the current behavior
+  and links to this file for history. The audit tables moved verbatim
+  to "Audit-batch fix tables" at the bottom of this file, and the
+  EvictOldest one-slot overbooking ceiling is stated as current
+  contract in the Layer 2 shed-policy bullet (the BENCHMARKS.md link
+  that pointed at the deleted anchor now targets Layer 2). A `doc_sync`
+  tripwire fails the suite if the guide carries a `Fixed in …` heading,
+  a version-labelled Extensibility heading or a `v0.…` header teaser
+  again.
 
 ### Tests
 
@@ -991,3 +1003,224 @@ builder-sealed pass-through canary with a differential proof.
 ## 0.5.0 — 2026-10-18
 
 Priority preemption, supervisor restart policies, invariant hardening.
+
+---
+
+## Audit-batch fix tables
+
+The per-audit contract tables (root cause → contract now → regression
+test) that used to live at the bottom of the User Guide, moved here
+verbatim: the guide describes the current state, this file owns the
+history. Each table matches the version section above it by name.
+
+## Fixed in 0.6.1: concurrency liveness
+
+Six audit-driven fixes; each has a deterministic regression test.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| Gateway depth drift | A take racing the producer's increment skipped its decrement; the counter crept up until the throttle latch wedged on an empty queue | Signed counter: every send adds exactly 1, every take subtracts exactly 1; `depth()` saturates at 0 | `tests/channel.rs::depth_counter_returns_to_zero_after_concurrent_storm` |
+| HalfOpen probe wedge | `check_timeout` on a probe left `half_open_probe` armed forever — the breaker refused everything | A timed-out probe re-opens the breaker (same contract as an implicit-dropped probe); `reset_breaker()` restores traffic | `tests/circuit_breaker.rs::probe_timeout_reopens_breaker_instead_of_wedging_half_open` |
+| EpochGate gen-0 adoption | A new generation was adopted and its epoch-0 packet rejected — the rebooted client's first packet (and every retransmission) was lost | A new generation is always a fresh re-handshake, epoch 0 included; "epoch 0 is never fresh" applies within one generation only | `src/lib.rs` tests: `generation_bump_at_epoch_zero_is_a_fresh_handshake`, `node_gate_adopts_new_generation_at_epoch_zero` |
+| `EvictOldest` waker loss | The oldest parked async waker was dropped without `wake()` — the task hung as a zombie | The victim is marked and woken; its next poll resolves to `Err(EnterError::QueueFull)` | `tests/async_primitives.rs::evict_oldest_wakes_the_evicted_future_with_queue_full` |
+| Dropped parked future | A future dropped while parked left its waker in the queue forever, starving later admissions | `Drop` deregisters exactly its own queue entry (identity flag, no allocation on the ready path) | `tests/async_primitives.rs::dropped_parked_future_deregisters_its_queue_slot` |
+| Lane generation timing | `note_death` bumped the lane clock AFTER the up-to-250 ms EOF grace — a successor attaching inside the window inherited the dead child's generation | The clock bumps before the grace wait: `attach()` during the window always returns a fresh generation | `tests/supervisor_pool.rs::successor_gets_fresh_generation_during_eof_grace` |
+| Conduit lost wakeup | `resume()` / `send_directive` called `notify_all` without holding the mutex the sync waiter holds across its check-to-park window | Notifications are issued under the same `cancel_reason` mutex — check-then-park and store-then-notify are mutually exclusive | `tests/conduit.rs::resume_never_loses_the_wakeup_under_pause_churn` |
+
+Bench group `layer2_async_waiters` (ready poll and park/wake/admit
+roundtrip; numbers in [BENCHMARKS.md](../BENCHMARKS.md)) pins the async
+admission path.
+
+## Fixed in 0.6.2: audit hardening
+
+Second audit pass; behavioral fixes, each with a regression test.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| Bulkhead shedding vs breaker | Default `FaultAction` for `BulkheadFull` was `BreakerOpen`: capacity saturation closed a HalfOpen probe as if work had succeeded | Default is `DiscardSilently` (counted, never trips — Capacity Shedding law); an explicit per-kind `FaultAction::BreakerOpen` still sheds the caller immediately, overriding `AdaptiveBlock` parking | `tests/backpressure.rs::explicit_breaker_open_action_sheds_without_parking` |
+| Erased probe settlement | `enter_erased` / `enter_supervised_erased` committed a throwaway probe at admission — the breaker went Closed before the real work ran | The probe settles on the erased guard: `commit()` = Closed, drop/abort = Open; nothing else closes it meanwhile | `tests/erased.rs::erased_admission_does_not_close_half_open_breaker` |
+| `IsrBridge::try_pop` vs malformed cells | An opcode-0 cell consumed a ring slot and returned a zeroed `IsrSignal` to the caller | `try_pop` drains malformed cells internally and keeps walking; a valid signal behind them is always delivered | `tests/isr_bridge.rs::malformed_cell_does_not_stall_the_drain` |
+| Second probe in HalfOpen | An implicit drop while already HalfOpen armed a second probe; the first stayed half-settled | One probe at a time: the streak path only re-arms from Closed/Open, never HalfOpen | `tests/circuit_breaker.rs::implicit_drop_in_half_open_does_not_arm_a_second_probe` |
+| Watchdog feeds the streak breaker | `check_timeout` TimedOut settled counters but never counted toward `trip_after_failures` | Non-probe timeouts feed the streak like any other failure and can trip the breaker | `tests/circuit_breaker.rs::watchdog_timeouts_trip_the_streak_breaker` |
+| Bulkhead rejection burned the epoch | The sync admission path adopted the epoch before the bulkhead decision — a `BulkheadFull` rejection made the caller's retry a `StaleEpoch` | The epoch is adopted only at PHASE C arming; admission checks freshness with `peek` (no adoption), so a shed caller can retry the same packet | `tests/bulkhead_capacity.rs::bulkhead_rejection_leaves_the_epoch_free_for_retry` |
+| Custom advisory uncapped | A custom `friction_fn` could return `retry_after_ms` far above the node's own pacing ceiling | The `Custom` verdict's advisory is clamped to the node's configured cap | `tests/backpressure.rs::custom_pressure_advisory_is_capped_by_the_node_ceiling` |
+| Supervisor EOF busy spin | The drain wait spun `yield_now` 50 times regardless of the child's exit progress | Bounded 250 ms grace with 1 ms sleeps (`DEFAULT_EOF_GRACE_MS`), then proceeds | existing `supervisor_memory_loop` coverage |
+| Soft verdict honesty | `[SUPERVISOR:MEMORY_DRAIN]` read like a command to the child, but the pipe is one-way and nothing was sent | Log line ends `action=no_kill_self_drain_expected`; docs state the worker self-drains via its own `SnubberNode` soft limit | `tests/supervisor_memory.rs` (log-tag asserts unchanged) |
+| Lineage bump tag | `[SUPERVISOR:RESTART]` printed although the one-shot call never spawns a successor | `[SUPERVISOR:LINEAGE_BUMP] gen=N restart=caller_decides` | no test asserted the old tag |
+| Harness burst counters | `ProfileHarness` burst/streak counters wrapped on `usize` overflow | Saturating arithmetic | `tests/harness.rs` (unchanged determinism) |
+
+Documentation-only corrections in the same pass: `eof_grace_ms = 0` (poll
+once, instant `Deadlocked`) and `u64::MAX` (unbounded) are documented on `PoolConfig` and
+`PoolLane::note_death`; `reap_timeouts` is a documented no-op touch-point (watchdog
+settlement is cooperative via `check_timeout`); `INVARIANTS.md` tags the
+Windows-only stress command with its POSIX equivalents.
+
+## Fixed in 0.6.3: audit closeout
+
+Third audit pass; every finding fixed in one release.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| `OP_SNAPSHOT` frame | `apply_token` treated the cold-diagnostics opcode as an arm: a lone snapshot frame incremented `arms`, and a snapshot arriving between an arm and its commit looked like a second armed transaction | The opcode is neutral: it arms nothing and clears nothing; the next `OP_COMMIT` or emergency opcode still settles the armed token | `tests/drain_feed.rs::snapshot_marker_neither_arms_nor_clears` |
+| `report()` feeds the streak breaker | Catastrophic `report()` calls incremented `consecutive_failures` but never tripped — an Open breaker stayed welded until `reset` instead of re-arming its probe | `report()` funnels through the same streak trip as the guard settle paths: Closed trips to HalfOpen (trip counter +1), Open re-arms the probe | `tests/circuit_breaker.rs::reported_failures_re_arm_the_probe_from_open` |
+| Ghost async waiter | An `EnterFuture` admitted on a spec-legal spurious re-poll left its queue entry parked forever — the bulkhead permanently lost one slot | The future deregisters its waiter on `Drop` unconditionally (identity-matched, idempotent); a re-park retires the superseded entry first | `tests/async_primitives.rs::admitted_on_spurious_repoll_leaves_no_ghost_waiter` |
+| `take_state` honesty | `take_state` peeked and returned the digest without clearing it — "take" lied, and a stale digest could be re-handed to a second replacement | The call consumes the digest: the next call returns `None`; `last_state` remains the non-consuming peek | existing supervisor tests (peek/consume split) |
+| Gen-0 child stdin | The generation-0 child inherited the supervisor's TTY on stdin while the pipe is one-way child→out | Stdin is `Stdio::null()`: a worker following the `take_stdin_digest` doc reads EOF immediately | behavioral, gen-0 spawn path |
+| Lane `last_exit` after attach | A lane attached to a replacement worker kept the previous worker's exit code until the new one died | `attach` clears `last_exit`: death classification reflects only the current worker | existing `supervisor_pool` coverage |
+| EvictOldest telemetry | The queue-horizon overflow recorded a bulkhead rejection although the call was NOT refused | Recorded as telemetry only (bump 0): counters match what callers actually observe | Gate 3 (record_locked body) covers the table |
+| `admission_total` parity | `SnapshotV1::admission_total` added `evicted` while `SnubberStats::admission_total` did not — two public counters for the same name disagreed | Both exclude `evicted`; the +1 overbooking of an EvictOldest admission is already counted in `total_started` | `src/diagnostics.rs` (in-file parity asserts) |
+| Pending-PASS harness loophole | A supervisor harness that launched a child but died before writing the report still printed PASS | Launch mode requires the report; missing report = FAIL; the deadlock check requires the `deadlock` key in the JSON (a malformed report can no longer false-pass) | `scripts/stress_harness.ps1`, `scripts/stress_harness.sh`, `scripts/stress_multi_lineage.ps1` |
+| Gate 3 empty-body false-pass | The zero-panic-under-lock gate silently passed when `fn record_locked` was renamed or moved (extracted body was empty) | Both the `.sh` and `.ps1` gates FAIL on an empty extraction | `scripts/check_compile_gates.sh`, `scripts/check_compile_gates.ps1` |
+| Attribute-anchor greps | Gate greps matched the veto/no_std attributes anywhere in a line (a commented-out copy would satisfy them) | Anchored to line start (`^#!\[`) in both gate flavors | `scripts/check_compile_gates.sh`, `scripts/check_compile_gates.ps1` |
+| Wedged supervisor harness | The `.sh` harness waited 600×0.1 s for a child that wedged before EOF and then reported the stale state | After the grace window the harness kills the child (`kill -9`) so the verdict reflects the wedged run, not a hung wait | `scripts/stress_harness.sh` |
+
+Documentation-only corrections in the same pass: `AsyncGate` construction
+shown as `AsyncGate::new(node)?`; grace/no-op semantics documented on
+`PoolConfig` and `PoolLane::note_death`; `WorkerPulse` memory comment
+distinguishes 4 B without a 64-bit CAS; EvictOldest sample notes the
+transient `max + 1` admission; `note_death(Some(code), ..)` examples match
+the API; INVARIANTS.md states the EvictOldest `C + 1` exception to
+Invariant 2; The bench matrix measures `commit` allocation-free.
+
+## Fixed in 0.6.4: post-release audit strike
+
+Fourth pass found one core-concurrency hole and a decorative CI gate; both closed with teeth.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| `EvictOldest` ceiling | Every saturated call re-booked: with `max + 2` live guards `hard_clamp_slots` erased the surplus from `in_flight` while `lane_in_flight` kept counting — the Critical-over-Background preemption precondition (`lane_in_flight[0] == in_flight`) could never hold again, silently disabling preemption | Overbooking is capped at exactly one slot (ceiling `max + 1`); a caller arriving beyond it is refused with `BulkheadFull` like any other shed | `tests/bulkhead_capacity.rs::evict_oldest_overbooking_caps_at_max_plus_one` |
+| Panicking erased rollback | In `enter_erased` / `enter_supervised_erased` the probe settle lived in the same hook AFTER the user rollback: a panicking rollback unwound past it, `ErasedGuard::drop`'s `catch_unwind` swallowed the panic, and the breaker stayed welded (stale `half_open_probe`) until a manual reset | The settle runs BEFORE the panic resumes (`catch_unwind` around the rollback, settle, `resume_unwind`): the books are always honest, the panic still reaches the caller of `abort()` / `commit()` | `tests/erased.rs::panicking_rollback_still_settles_the_erased_probe` |
+| Async eviction telemetry | The async `EvictOldest` arm bumped only the raw `stats.evicted` counter: no `record_locked`, no `FaultRecord`, no per-kind policy — a user's `.policy(EvictedOldest, ..)` never fired on the async path | Full sync-arm parity: `record_locked` (bump 4) + `publish_fault` + `emit`, so the per-kind policy and hooks fire and the counter is counted exactly once | `tests/async_primitives.rs::async_eviction_reports_evicted_oldest_telemetry` |
+| Gate 6 in CI (decorative) | `cargo-semver-checks` never ran: CI checkout had no tags (`SKIP`), the tool was never installed, and both SKIPs still printed "All invariant gates PASSED" with exit 0 | `ci.yml` fetches full history + tags, installs `cargo-semver-checks`; under `$CI` a SKIP is a FAIL (`.sh` gate), and the repo is tagged per release (`v0.6.3` baseline) | `scripts/check_compile_gates.sh` CI mode |
+| Harness kill identity (.sh) | `stress_harness.sh` followed the pid file / `pgrep` fallback straight to `kill -9`: a recycled pid, or any process whose argv merely CONTAINS the target path (a `tail -f` on the log, an editor), could be killed | Identity gate before every kill: `/proc/<pid>/exe` image name + monotonic starttime vs the last victim (Linux), image-name match on macOS/BSD — parity with the `.ps1` / `.py` killers | `scripts/stress_harness.sh::target_is_worker` |
+
+Documentation-only: `README.md` now attributes the correct verdict names
+to `classify_stall` (`CpuSpin` / `SleepBlocked` / `DeadlockStall` — the
+settle verdicts `SpinDetected` / `DeadlockSuspected` belong to
+`guard.check_timeout()`); INVARIANTS.md states the enforced $C+1$
+refusal.
+
+## Fixed in 0.6.6: fifth-audit batch
+
+Async liveness, storm-harness hygiene, and CI hardening.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| `ResumeFuture` waker leak | A future dropped mid-`.await` (e.g. by `tokio::select!`) left its waker in the conduit directive queue: the queue grew per cancellation and stale wakers were woken on the next directive | `Drop` removes the future's own parked waker (identity `will_wake` match under the wakers lock); no leak, no stale wake | `tests/conduit.rs::dropped_resume_future_removes_its_parked_waker` |
+| Zero-wait refusal after re-check | `enter` with `wait_ms == 0` (AdaptiveBlock `max_wait_ms: 0` / zero-friction custom curve) refused with `BulkheadFull` even when the slot freed while the caller was inside PHASE B (friction runs OUTSIDE the lock) | `else if in_flight >= max_in_flight` — the verified-free slot is admitted; a genuinely full bulkhead still refuses | `tests/bulkhead_capacity.rs::zero_wait_caller_admits_a_slot_freed_during_friction` |
+| Async waiter identity | Re-poll dedup used `will_wake`, so two `EnterFuture`s inside one task cross-matched and the sibling's queue entry was orphaned | Identity is the queue entry's own `evicted` flag (`Arc::ptr_eq`); re-park replaces the waker on that entry only | `tests/async_primitives.rs::enter_async_repeated_polls_do_not_bloat_waiter_queue` |
+| Async queue TTL origin | `enqueued_at_ms` never reset on re-parks: TTL/queue-wait measured from construction of the future, not from actual waiting | Stamped at the first park; TTL measures real queue time — and spurious re-polls never re-stamp it | `tests/task_engine.rs::spurious_repolls_do_not_reset_the_ttl_clock`, `tests/async_primitives.rs::dropped_parked_future_deregisters_its_queue_slot` |
+| Conduit poison | `update_state` silently returned on a poisoned state lock — the pause/cancel directive update vanished | Lock is recovered (`into_inner`) and the update applied; poison bookkeeping stays with the poisoner | `tests/conduit.rs` |
+| EOF grace forever-loop | `note_death`'s grace loop compared only against the clock: a non-advancing injected clock (firmware, tests) spun forever without a verdict | Poll-count backstop `polls >= grace*2` breaks without a deadlock verdict (a verdict needs a clock) | `tests/supervisor_pool.rs` grace window |
+| Storm-gate JSON parsing | Three storm gates asserted numbers by substring (`"reaped":32` matches `"reaped":320`): a collision false-passed the gate | Shared `json_num` parses the exact field value; mismatch is a loud FAIL | `tests/common/mod.rs`, three storm tests |
+| Harness worker orphan (.py) | After a supervisor hard-kill the worker kept spinning past `finalized=True` — the supervisor that would reap it was dead | The lane worker is killed right after the hard kill, identity-gated | `scripts/stress_multi_lineage.py` |
+| PS gate case sensitivity | The PowerShell gate flavor matched case-insensitively where the `.sh` gate is case-sensitive (unsafe scan, counter gate, lock-hygiene, attribute anchors) | `-CaseSensitive` / `-cmatch` on the parity gates | `scripts/check_compile_gates.ps1` |
+
+Scope corrections (documentation-only): the erased "iron law" section now
+states that the admission probe is not a lifetime lease on the slot —
+`max_in_flight(1)` does not serialize two live erased workers; Layer 3
+documents the settle wake-window semantics (a wake is a hint, not a
+reservation); the README lists the real `no_std` surface; `PulseTick` is
+documented as internal; the Layer 5 helper exports got a quick-reference
+row.
+
+## Fixed in 0.6.10: second-audit (PLAN_AUDIT2) batch
+
+Telemetry honesty, horizon semantics, abort contract, gate teeth, provenance.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| Automatic fault export | Guard settles, async TTL timeouts, evictions and admission refusals left `reported[kind]` at 0, so `metric_samples()` and the console alert showed `count=0` during an incident | Every automatic path bumps `reported[kind]` exactly once via `record_locked`; explicit `report()` and the automatic path of one kind land on the same slot | `tests/metrics_reporting.rs` |
+| BufferOverflow conservation | A named `BufferOverflow` record credited `bulkhead_rejections`, widening `admission_total() == total_started + shed_total()` | BufferOverflow is capacity telemetry, never a shed column; the async `QueueFull` refusal still books `bulkhead_rejections` | `tests/metrics_reporting.rs` |
+| Queue horizon | The sync horizon executed `policy.action` on an admission that still SUCCEEDED, tripping breakers and latching alerts on healthy traffic | Telemetry-only: `record_telemetry_locked` books the gauge (`buffer_overflow_total`, console line) and skips every policy command; the async `RejectNew` refusal keeps the full policy | `tests/queue_horizon.rs` |
+| `queue_capacity(0)` | One field, three undocumented semantics; async `0` silently behaved as `1` | Sync `0` = horizon fires on every admission; async `0` = waker queue floored to 1 (one waiter, then `QueueFull`) — documented in one place and pinned by tests | `tests/queue_horizon.rs` |
+| Lane death telemetry | `note_death` stamped `last_exit`/`last_class` onto a successor that attached during the EOF grace (or after its own reap) | The stamp is guarded by `generation && pid.is_none()`; the death stays in lane counters and `PoolReap` | `tests/supervisor_pool.rs` |
+| `abort()` rollback panic | An explicit `abort()` ran the rollback bare, so a panicking rollback escalated into a double-panic process abort — against the documented contract | Under `std` the rollback runs in `catch_unwind(AssertUnwindSafe(..))`, same as `Drop`; without `std` a rollback panic during unwind aborts (a Rust rule, documented) | `tests/rollback_panic.rs` |
+| Poison recovery relock | `lock_poison_tolerant` re-locked the node ledger synchronously on the recovery path — a caller holding the node lock deadlocked | Recovery ticks `poison_recoveries` best-effort via `try_lock`; the doc says a skipped tick under-reports, a re-lock wedges | `tests/affordances.rs` |
+| Test honesty | `wakes_happen_after_drop` counted instead of ordering; the termination "conservation" was tautological; feed benches never checked the parsed frame count | Function-scoped order audit; cross-source floors plus a `misclassified_stillborn` contradiction counter; every `.feed(` bench asserts its result (banned by `bench_hygiene` otherwise) | `tests/lock_hierarchy.rs`, `tests/supervisor_termination.rs`, `tests/bench_hygiene.rs` |
+| Harness SKIP verdicts | Three harnesses, three SKIP policies: sh printed skips and passed, py failed on any skip, ps1 never printed them | One formula where CI is probed (sh, py): platform-gated skips print and pass locally, any skip fails in CI (`CI=true/1`); ps1 remains stricter — it fails on any skip in every environment | `scripts/stress_harness.{sh,ps1}`, `scripts/stress_multi_lineage.py` |
+| Docs provenance | Unsourced numbers: contended latencies matching no artifact, storm `wall_ms` diverging from reports, "four properties" over 13 invariants, 2,288 B `NodeInner`, `pool-gates` job name, a `Copy` shell `SnubberGuard` does not have, "Three layers" in lib.rs | Every published number carries a date + command; contended table = archived full run with the smoke re-run shown; storm numbers name their artifacts; 1,648 B with the measurement command; `Priority::COUNT` and `DEFAULT_EOF_GRACE_MS` are now actually const-asserted | `README.md`, `docs/INVARIANTS.md`, `src/policy.rs`, `src/pool/mod.rs` |
+
+## Fixed after 0.6.10: third-audit (PLAN_AUDIT3) batch
+
+Async eviction verdict, ISR counter saturation, bounds that follow
+`Priority::COUNT`, malformed handoff chunks, committed storm evidence.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| Evicted waiter re-poll | A future whose queue entry an `EvictOldest` evictor had already retired re-parked into a fresh slot on its next poll, burning capacity and evicting a bystander | The entry flag is read under the lock that stamps it; a retired future gets `Ready(Err(EnterError::QueueFull))` on its next poll (the documented verdict). A settle pop leaves the flag clear, so that re-park stays honest | `tests/async_primitives.rs::evict_oldest_wakes_the_evicted_future_with_queue_full` |
+| ISR shed counter | `shed_count()` was a `u16` incremented with a plain add: 65,536 sheds wrapped to 0 | Saturating CAS stops at `u16::MAX`; a full ring still sheds, the trip latch is untouched | `src/isr.rs::shed_saturates_at_the_ceiling_without_wrap` |
+| Per-lane bounds and hook casts | Per-lane indexing clamped with the literal `min(2)`; admission hooks cast in-flight counts with `as u32` | `Priority::MAX_INDEX` follows `Priority::COUNT`; hooks use `u32::try_from(..).unwrap_or(u32::MAX)` | full suite (inputs in `0..Priority::COUNT` behave identically) |
+| Out-of-range `OP_STATE` chunk | A frame whose `task` was not 0/1/2 was clamped to chunk 2, overwriting the tail chunk and its authoritative full-digest CRC | Out-of-range ids are malformed and dropped; the chunk index must be `< 3` | `tests/state_handoff.rs::out_of_range_state_chunk_is_not_chunk_two` |
+| Poison-recovery clamp | The `hard_clamp_slots` skip in `lock_poison_tolerant` was undocumented | The comment states why it is safe: a foreign mutex poison cannot tear `NodeInner`, the holder finishes its own mutation, and `lock()` clamps on its own poison path | `src/node.rs` |
+| Storm evidence | Storm numbers cited reports that live only in the gitignored `target/` tree and are overwritten by every re-run | The three 2026-10-26 reports are committed under `docs/evidence/` with a provenance README; README and this guide quote that content | `docs/evidence/README.md` |
+
+Release gates follow the same batch: the three Miri jobs compile with
+`RUSTFLAGS="-D warnings"` on the pinned nightly; `scripts/release.sh`
+passes `--locked` to clippy and to the publish dry-run; the stress
+harness refuses any kill-only run under CI (`--launch` is mandatory:
+without the supervisor pid there is no RSS/fd/exit evidence); and the
+Windows API-diff gate, like the shell one,
+diffs a release commit against the previous tag instead of failing.
+
+## Fixed in 0.6.8: seventh-audit batch
+
+Accounting conservation, async liveness, erased booking, honest examples,
+gate teeth.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| Admission conservation | `admission_total` summed `total_started`, the refusal columns AND `evicted`; a sync `EvictOldest` overbook made the identity impossible to hold | `shed_total()` counts every first-pass refusal exactly once; `evicted` / `preempted` are side-events of an admission already in `total_started`; `admission_total() == total_started + shed_total()` | `tests/invariants.rs`, `tests/bulkhead_capacity.rs`, `tests/industrial.rs` |
+| Rate mirror | A `RateLimited` refusal incremented both `rate_rejected` and `bulkhead_rejections` (one shed counted twice) | `rate_rejected` only | `tests/invariants.rs` |
+| Depth gauge | `in_flight` proxy was `total_started - committed`, so aborted and implicitly dropped transactions looked in flight forever | Subtracts `explicit_aborts` and `implicit_drops` too | `tests/node_stats.rs` |
+| Async terminal `Ready` | An early refusal left the queue entry parked (ghost squatting `queue_limit`); a spurious re-poll could leave `half_open_probe` set | Every terminal `Ready` retires the entry this future still owns (identity-matched) and clears probe state | `tests/async_primitives.rs::admitted_on_spurious_repoll_leaves_no_ghost_waiter` |
+| Cancellation handoff | A task dropped between settle-pop and wake left the slot idle until the NEXT settle | `Drop for EnterFuture` observes the free slot in `deregister_waiter` and wakes the next waiter | `tests/async_primitives.rs` |
+| Erased admission booking | A throwaway `commit()` at admission wrote `committed += 1` and a clean breaker outcome before any work ran | Admission settles the slot only; the erased guard's real `commit()` books `committed`, one window outcome and the streak reset | `tests/supervisor.rs`, `tests/erased.rs` |
+| Erased rollback booking | A rollback (drop/panic) booked NO settle counter: the `total_started` from admission stayed unmatched and the depth gauge reported a ghost in-flight transaction forever | Rollback books one planned abort (`explicit_aborts += 1`) and re-opens a HalfOpen probe; the failure streak is untouched (sync `abort()` parity) | `tests/erased.rs::erased_rollback_books_an_abort_and_clears_the_depth_gauge` |
+| Poisoned locks on cold paths | Gateway books, conduit drafts and the cancel-reason guard used `if let Ok` / `.ok()`: the update was dropped, and the notify fired unlocked | `into_inner` recovery; the cancel notify stays under the guard | `tests/conduit.rs`, `tests/channel.rs` |
+| `Protect` order | `abort()` took the resource before running the rollback, so the closure saw a freed value | Rollback first, resource second (same order as `Drop`) | `tests/guard.rs` (`error_drops_resource_and_executes_rollback_once`) |
+| Drain ordering | `feed` checked EOF before taking the ingest lock (a concurrent close could interleave); the `ClockFn` ran under the state lock | Ingest lock taken before the EOF check; one clock read per chunk outside the state lock (`apply_token_at`) | `tests/drain_feed.rs` |
+| Channel HWM / throttle | `capacity * 3 / 4` could overflow at absurd capacities; depth loaded `Relaxed` could bypass an armed throttle | `capacity - capacity / 4`; `Acquire` depth load | `tests/channel.rs` |
+| Overflow / clamp | `ttl.as_millis() as u64` truncated on 128-bit `as_millis`; restart reserve could overflow; recovered lane histograms could exceed `in_flight`; `slowest_stage` indexed past `stage_count` | `try_from` saturating cast; `saturating_add`; lane clamp to the aggregate after recovery; clamped stage slice | `tests/profiling.rs`, `tests/node_stats.rs` |
+| Example honesty | Examples 03/11/12 "proved" rollbacks with counters they incremented themselves; 04 slept without checking | Observable state (open DB handles, iron energization, laser latch) and a real timed sleep with an elapsed assertion | `examples/03_*.rs`, `examples/04_*.rs`, `examples/11_*.rs`, `examples/12_*.rs` |
+| Bench hygiene | `TaskConduit::pair` / `PipeDrain::drain_sync` allocations escaped the HEAVY allowlist; `write_to` benches used `std::io::sink()` (no copy, so the number was fiction); per-sample drains were built inside the timed loop | HEAVY list extended; `sink()` banned; lane attach/reap use `iter_batched` so drain construction is untimed (`attach+reap` 338/407 → 220/177 ns, `write_to` 0.5 → 2.1 ns re-measured) | `tests/bench_hygiene.rs` |
+| Script/CI teeth | grep rc=2 read as "no match"; missing reports and tool/target SKIPs passed; a baseline tag equal to `HEAD` compared the crate to itself; `cargo-semver-checks` (no `--locked` flag) could rewrite `Cargo.lock` unnoticed; the stress harness published a PASS even when its stats report failed to write | All are FAILs; `--locked` everywhere; both API gates hash `Cargo.lock` around the run; an empty/missing stats report aborts the harness; zero-sample leak gates fail | `scripts/*`, `.github/workflows/ci.yml` |
+| Miri provenance | Fake wakers built via `transmute`-style tricks tripped strict provenance | `Waker::from(Arc<dyn Wake>)`; `-Zmiri-strict-provenance` in both CI lanes | `tests/task_engine.rs`, CI |
+| Settle-path `mem::forget` | Layer-1 `commit`/`abort` settled with `mem::forget(self)`, which skips drop glue for every field — the exact shape that leaked one `NodeInner` per transaction from `TrackedGuard` before 0.5.2 | The event is constructed and the disarmed guard drops normally (`Drop` sees the taken slots); `#![deny(clippy::mem_forget)]` plus gate 7 reject any reintroduction | `tests/guard_alloc_budget.rs::layer1_settlement_is_byte_neutral_across_250k_guards` |
+| Erased path allocation | `ErasedGuard` boxed the rollback and the commit hook separately, and the node path cloned the node twice and closed over it from two closures: two allocations and two `Arc` clones per admission | One boxed `ErasedSettle` transaction holds the rollback, the hook, the node clone and the optional token; settle, abort bookkeeping and panic semantics are unchanged | `tests/erased.rs`, `tests/supervisor.rs`, `tests/guard_alloc_budget.rs`; `enter_erased_auto + commit` 301.6 → 207.75 ns |
+
+Documentation-only: README saturation figure restated as measured
+(~1.1M admissions/sec on six contending threads), `WorkerPulse`
+footprint arch-conditional (8 B / 4 B), pool and contention numbers
+re-measured on this machine, storm timings re-measured (mixed storm
+`wall_ms=474`, 2026-10-26 artifact
+`docs/evidence/2026-10-26_pool_mixed_stress_report.json`; ~90k lease
+samples), and the API table gains `PoolReap`,
+`LaneSnapshot`, `PoolTotals`, `expired_lanes`, `DEFAULT_EOF_GRACE_MS`
+and the argv-twin rows.
+
+## Fixed in 0.6.7: sixth-audit batch
+
+Conduit waker identity, core-exposed drain, honest bookkeeping, CI teeth.
+
+| Fix | Contract before | Contract now | Test |
+|---|---|---|---|
+| `ResumeFuture` waker identity | Re-poll dedup used `will_wake`: two `ResumeFuture`s polled by one task cross-matched, so a pause directive could update the sibling's queue slot and orphan the other | Identity is a minted `Arc<AtomicBool>` flag per parked future (`Arc::ptr_eq`); re-park replaces the waker on its own slot only; `Drop` removes exactly that slot | `tests/conduit.rs::dropped_resume_future_removes_its_parked_waker` |
+| Wake outside the wakers lock | `wake_async` called `waker.wake()` while holding the conduit's wakers lock: executor code ran under the lock, and a foreign panic poisoned it silently | Wakers are drained under the lock and woken after it; the lock is poison-tolerant (`into_inner`) | `tests/conduit.rs` |
+| Async queue TTL origin (conduit sibling) | The spurious re-poll re-park re-stamped `enqueued_at_ms`, so a task that repeatedly re-polled could starve its own `task_ttl` forever | The TTL clock is stamped at the FIRST park only; re-parks refresh the waker, never the clock | `tests/task_engine.rs::spurious_repolls_do_not_reset_the_ttl_clock` |
+| Memory-pressure pairing | `note_memory_kb` stored the pressure verdict with `Release`, but admission paths loaded it `Relaxed`: a pressure refusal could be decided from a stale verdict | Loads pair with the store (`Acquire`) on both sync and async admission paths | `tests/memory_boundary.rs` |
+| `FaultKind` wire growth | The snapshot flag region grew silently with `FaultKind::COUNT`; a future kind could walk the flag bytes into the CRC region undetected | Compile-time const-assert: flag region + CRC must fit the snapshot contract, or the build fails | `src/diagnostics.rs` const gate |
+| Core drain reachability | `ProcessToken` / `SnubScanner` / `TOKEN_*` / `OP_*` lived in the `std` supervisor module: bare-metal feed-driven parsing was impossible | New always-on `drain` module (core): token wire types, parser, and scanner compile under `no_std`; `supervisor` re-exports keep every historical path; `snubber::ProcessToken` / `snubber::SnubScanner` now resolve at the crate root | `tests/drain_feed.rs`, thumb gate |
+| Honest refusal buckets | Four suites swallowed refusals with `Err(_)` or hand-counted one bucket: a miscounted or vanished attempt passed green | Every attempt lands in exactly one counted bucket and the local counts are tied to the node's own books (started / committed / implicit drops / bulkhead / breaker); unexpected refusal kinds panic | `tests/stress_breaker_churn.rs`, `tests/priority_preemption.rs`, `tests/transition_orphan.rs`, `tests/industrial.rs`, `tests/bulkhead_capacity.rs` |
+| CI `--locked` | Most cargo invocations (clippy, no_std checks, doc, miri, bench compile) resolved the dependency graph unlocked: a stale `Cargo.lock` surfaced at release, not at PR | Every cargo invocation in CI runs `--locked` | `.github/workflows/ci.yml` |
+| Semver-gate SKIP teeth | `check_api_diff` exited 0 on a missing tag baseline or missing tool — a misconfigured workflow skipped Gate 6 silently | Under `CI=true` a SKIP is a FAIL (both `.sh` and `.ps1` flavors); local runs still SKIP | `scripts/check_api_diff.sh`, `scripts/check_api_diff.ps1` |
+| Bench snapshot honesty | `bench.sh` warned on an empty snapshot locally and wrote the output file non-atomically: a crashed parser could leave a truncated README table | Empty snapshot fails in every mode (parity with `bench.ps1`); the snapshot is published atomically (temp file + move) | `scripts/bench.sh` |
+| Zero-sampling leak gates | Storm harnesses skipped the leak gates when the sampler collected 0 samples (e.g. its `catch{}` swallowed every poll): a run with no samples passed | Zero sampling in launch mode is an explicit FAIL check | `scripts/stress_harness.ps1`, `scripts/stress_harness.sh`, `scripts/stress_multi_lineage.ps1` |
+| Explicit SKIP accounting | `stress_multi_lineage.py` booked the macOS-unavailable handle-growth check as a PASS ("n/a") | Platform-gated checks are reported as explicit SKIP rows and never count as passes | `scripts/stress_multi_lineage.py` |
+| Windowed-batch wording | `failure_rate` was documented as a "sliding window", but the counters reset after every `window` outcomes: a failure pattern spanning a batch boundary is judged by its batch, and the docs overpromised | Docs (builder, stats fields, preset, USER_GUIDE) describe the filled-batch window honestly | doc sync (0.6.7) |
+
+Documentation-only: the README `no_std`/`alloc` surface list now matches
+the module gates (core `drain` added, `conduit`/`conflate` listed as
+`std`, `erased`/`name` listed as `alloc`); the USER_GUIDE API table
+gained `run_supervised_guard_with_grace` and the core `drain` rows and
+cites the TTL regression test.

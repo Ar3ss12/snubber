@@ -113,7 +113,7 @@ because cloning 50 MB of state crosses the hard limit before the first
 `write_all`; a pre-fork RSS number is not a container number because
 [cgroup v2 counts page cache](docs/USER_GUIDE.md#cgroup-v2-page-cache-counts-against-the-limit);
 and `EvictOldest` admits exactly one transient
-[`max + 1`](docs/USER_GUIDE.md#fixed-in-064-post-release-audit-strike)
+[`max + 1`](docs/USER_GUIDE.md#layer-2-concurrency-bulkhead-bounded-queues-backpressure)
 slot — beyond that it sheds like every other caller.
 
 ## Contended Multi-Threaded Latencies (Real Thread Saturation)
