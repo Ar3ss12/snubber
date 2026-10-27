@@ -189,6 +189,14 @@ surface, wire format and telemetry layout are untouched.
 
 ### Documentation
 
+- The README latency table drops the `SnubberStats::shed_total` +
+  `success_rate_per_mille` micro-bench row (two getter loads, no
+  operation to choose); the bench and exporter labels stay. A `doc_sync`
+  tripwire fails the suite if a public doc cites `success_permille` —
+  a method that has never existed (the real one is
+  `success_rate_per_mille`) — or if `src/node.rs` loses either real
+  getter.
+
 - The `no_std` clock-injection snippets no longer withhold the signature.
   The USER_GUIDE transport example called
   `PipeDrain::manual_with_clock(app_tick_ms)` with `app_tick_ms` and

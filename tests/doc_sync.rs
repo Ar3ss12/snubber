@@ -367,6 +367,32 @@ fn test_clock_injection_snippets_declare_the_fn() {
     }
 }
 
+/// Public docs must not cite SnubberStats methods that the source does not
+/// define. The quick reference once sold `success_permille` (the real
+/// method is `success_rate_per_mille`), so a reader's autocomplete found
+/// nothing; the exporter labels now use the real name, and this tripwire
+/// keeps a phantom from creeping back in.
+#[test]
+fn test_snubberstats_method_names_match_source() {
+    let node_src = read_doc("src/node.rs");
+    assert!(
+        node_src.contains("pub fn success_rate_per_mille"),
+        "TRIPWIRE FIRED: src/node.rs lost `success_rate_per_mille` — update \
+         the docs and the bench exporter labels together"
+    );
+    assert!(
+        node_src.contains("pub fn shed_total"),
+        "TRIPWIRE FIRED: src/node.rs lost `shed_total` — update the docs"
+    );
+    for doc in ["README.md", "docs/USER_GUIDE.md"] {
+        assert!(
+            !read_doc(doc).contains("success_permille"),
+            "TRIPWIRE FIRED: {doc} cites `success_permille`, a method that does \
+             not exist (the real one is `success_rate_per_mille`)"
+        );
+    }
+}
+
 /// Collects `src/...` tokens from prose so a renamed module cannot survive
 /// as a stale pointer in the docs.
 fn documented_source_paths(text: &str) -> Vec<&str> {
