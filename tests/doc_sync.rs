@@ -362,9 +362,9 @@ struct Citation {
 }
 
 /// Extracts every tilde citation from a doc. Derived forms are marked, not
-/// dropped silently: `~44.5 ns/frame` and `~130 ns per lane` are the same
-/// committed measurement divided by a stated frame/lane count, and `~0 ns`
-/// is a qualitative branch claim.
+/// dropped silently: the `~<number> ns/frame` and `~<number> ns per lane`
+/// tokens are the same committed measurement divided by a stated
+/// frame/lane count, and the all-zero token is a qualitative branch claim.
 fn tilde_citations(text: &str) -> Vec<Citation> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
@@ -409,9 +409,10 @@ fn tilde_citations(text: &str) -> Vec<Citation> {
 
 /// True when `c` is a faithful rounding or truncation of measurement `m`
 /// (both in the citation's own unit). Only the citation's own decimal count
-/// is tried: `~8.0` (one decimal) must NOT match 7.9 even though
-/// `round(7.9, 0) = 8` — decimal-agnostic matching would let `~800 ns`
-/// sail through against 790.
+/// is tried: a one-decimal citation must NOT match a measurement whose
+/// one-decimal rounding differs, even if their zero-decimal roundings
+/// agree — decimal-agnostic matching would let a mis-scaled citation
+/// sail through.
 fn citation_matches(c: &Citation, m: f64, m_micros: bool) -> bool {
     let m = if c.micros == m_micros {
         m
@@ -508,7 +509,8 @@ fn test_bench_numbers_match_evidence_artifact() {
 
     // Cross-doc agreement per artifact row: a row cited by both docs must be
     // cited with at least one common value in each. Catches the same row
-    // rendered from two different runs (README ~93 / GUIDE ~94) even when a
+    // rendered from two different runs (one doc at the artifact's value,
+    // the other still at the previous run's) even when a
     // future artifact would make both sides individually valid.
     for (idx, (m, m_micros, raw)) in rows.iter().enumerate() {
         let values_for = |(_doc, cs): &(&'static str, Vec<Citation>)| -> Vec<f64> {
