@@ -3595,18 +3595,20 @@ impl SnubberNode {
     /// Checks breaker, epoch gate, bulkhead, and token bucket.
     /// If bulkhead is full, parks `waker` in `inner.waiters` and returns `Pending`
     /// WITHOUT consuming `rollback`!
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn enter_async_attempt<F: FnOnce()>(
         &self,
-        epoch: u64,
-        task_id: u64,
-        loc: &'static core::panic::Location<'static>,
-        rollback: &mut Option<F>,
-        waker: &core::task::Waker,
-        evicted_out: &mut Option<Arc<AtomicBool>>,
-        prior_flag: Option<&Arc<AtomicBool>>,
-        enqueued_at_ms: &mut Option<u64>,
+        a: AsyncAttempt<'_, F>,
     ) -> core::task::Poll<Result<TrackedGuard<F>, EnterError>> {
+        let AsyncAttempt {
+            epoch,
+            task_id,
+            loc,
+            rollback,
+            waker,
+            evicted_out,
+            prior_flag,
+            enqueued_at_ms,
+        } = a;
         // Pass-through transit: ready dummy NOW, never park a Waker.
         // Consumes the rollback UNINVOKED (`take` + `let _` frees captures
         // without running the body). No lock, no queue, no EpochGate.
@@ -4396,6 +4398,35 @@ impl SnubberNode {
 /// Free helper for `TrackedGuard` paths (no `self: SnubberNode` there —
 /// only `Arc<Mutex<NodeInner>>`). Same ZERO-PANIC rule: clones BEFORE
 /// the second lock, pointer moves under it.
+/// Poison-tolerant lock of the node ledger. Shared by every settle and
+/// publish site: on poisoning, recover via `into_inner()`, tick one
+/// `poison_recoveries` and clamp the slots so the breaker never reads a
+/// torn write. Mirrors `SnubberNode::lock`.
+fn lock_ledger(m: &Mutex<NodeInner>) -> std::sync::MutexGuard<'_, NodeInner> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poison) => {
+            let mut g = poison.into_inner();
+            g.stats.poison_recoveries = g.stats.poison_recoveries.saturating_add(1);
+            hard_clamp_slots(&mut g);
+            g
+        }
+    }
+}
+
+/// Bundled parameters of one `enter_async_attempt` poll: the future's
+/// identity, its rollback slot and the waker bookkeeping.
+pub(crate) struct AsyncAttempt<'a, F: FnOnce()> {
+    pub epoch: u64,
+    pub task_id: u64,
+    pub loc: &'static core::panic::Location<'static>,
+    pub rollback: &'a mut Option<F>,
+    pub waker: &'a core::task::Waker,
+    pub evicted_out: &'a mut Option<Arc<AtomicBool>>,
+    pub prior_flag: Option<&'a Arc<AtomicBool>>,
+    pub enqueued_at_ms: &'a mut Option<u64>,
+}
+
 fn publish_fault_arc(
     node: &Arc<Mutex<NodeInner>>,
     outcome: &mut ReportOutcome,
@@ -4411,12 +4442,7 @@ fn publish_fault_arc(
         line: record.line,
     };
     {
-        let mut inner = node.lock().unwrap_or_else(|p| {
-            let mut g = p.into_inner();
-            g.stats.poison_recoveries = g.stats.poison_recoveries.saturating_add(1);
-            hard_clamp_slots(&mut g);
-            g
-        });
+        let mut inner = lock_ledger(node);
         inner.stats.last_fault = Some(owned);
         push_flight_inner(&mut inner, slot);
     }
@@ -4765,7 +4791,6 @@ fn streak_trip_locked(inner: &mut NodeInner) {
 }
 
 impl ProfileState {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         wall: NanoClock,
         cpu: Option<NanoClock>,
@@ -5126,12 +5151,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             payload: envelope.payload_verdict(payload_bytes),
         };
         if verdict.has_underflow() || verdict.has_overflow() {
-            let mut inner = node.lock().unwrap_or_else(|p| {
-                let mut g = p.into_inner();
-                g.stats.poison_recoveries = g.stats.poison_recoveries.saturating_add(1);
-                hard_clamp_slots(&mut g);
-                g
-            });
+            let mut inner = lock_ledger(&node);
             if verdict.has_underflow() {
                 inner.stats.envelope_underflows = inner.stats.envelope_underflows.saturating_add(1);
             }
@@ -5296,12 +5316,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         }
         self.release_profile();
         let waker = {
-            let mut inner = self.node.lock().unwrap_or_else(|p| {
-                let mut g = p.into_inner();
-                g.stats.poison_recoveries = g.stats.poison_recoveries.saturating_add(1);
-                hard_clamp_slots(&mut g);
-                g
-            });
+            let mut inner = lock_ledger(&self.node);
             release_slot_inner(&mut inner, lane);
             inner.waiters.pop_front()
         };
@@ -5330,12 +5345,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         let lane = (self.priority.code() as usize).min(Priority::MAX_INDEX);
         self.release_profile();
         let waker = {
-            let mut inner = node.lock().unwrap_or_else(|p| {
-                let mut g = p.into_inner();
-                g.stats.poison_recoveries = g.stats.poison_recoveries.saturating_add(1);
-                hard_clamp_slots(&mut g);
-                g
-            });
+            let mut inner = lock_ledger(&node);
             inner.stats.committed = inner.stats.committed.saturating_add(1);
             note_outcome(&mut inner, false);
             inner.stats.window_outcomes = inner.window_outcomes;
@@ -5406,12 +5416,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         // but BEFORE the lock: the clock must not be read under the node
         // mutex.
         let settled_at_ms = now_ms();
-        let mut inner = self.node.lock().unwrap_or_else(|p| {
-            let mut g = p.into_inner();
-            g.stats.poison_recoveries = g.stats.poison_recoveries.saturating_add(1);
-            hard_clamp_slots(&mut g);
-            g
-        });
+        let mut inner = lock_ledger(&self.node);
         release_slot_inner(&mut inner, lane);
         // A timed-out probe is a probe FAILURE: without this the
         // `half_open_probe` flag stayed armed forever and the breaker
@@ -5503,12 +5508,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         let lane = (self.priority.code() as usize).min(Priority::MAX_INDEX);
         self.release_profile();
         let waker = {
-            let mut inner = node.lock().unwrap_or_else(|p| {
-                let mut g = p.into_inner();
-                g.stats.poison_recoveries = g.stats.poison_recoveries.saturating_add(1);
-                hard_clamp_slots(&mut g);
-                g
-            });
+            let mut inner = lock_ledger(&node);
             release_slot_inner(&mut inner, lane);
             inner.stats.explicit_aborts = inner.stats.explicit_aborts.saturating_add(1);
             // Planned aborts do NOT feed the breaker streak — but a
@@ -5555,12 +5555,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             retry_count: self.retry_count,
             ..self.arming.clone()
         };
-        let mut inner = self.node.lock().unwrap_or_else(|p| {
-            let mut g = p.into_inner();
-            g.stats.poison_recoveries = g.stats.poison_recoveries.saturating_add(1);
-            hard_clamp_slots(&mut g);
-            g
-        });
+        let mut inner = lock_ledger(&self.node);
         release_slot_inner(&mut inner, lane);
         inner.stats.implicit_drops = inner.stats.implicit_drops.saturating_add(1);
         note_outcome(&mut inner, true);

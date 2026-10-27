@@ -101,16 +101,16 @@ impl<F: FnOnce() + Unpin> Future for EnterFuture<F> {
             return Poll::Ready(Err(EnterError::QueueFull));
         }
         let mut evicted_slot: Option<Arc<AtomicBool>> = None;
-        let attempt = this.node.enter_async_attempt(
-            this.epoch,
-            this.task_id,
-            this.loc,
-            &mut this.rollback,
-            cx.waker(),
-            &mut evicted_slot,
-            this.evicted.as_ref(),
-            &mut this.enqueued_at_ms,
-        );
+        let attempt = this.node.enter_async_attempt(crate::node::AsyncAttempt {
+            epoch: this.epoch,
+            task_id: this.task_id,
+            loc: this.loc,
+            rollback: &mut this.rollback,
+            waker: cx.waker(),
+            evicted_out: &mut evicted_slot,
+            prior_flag: this.evicted.as_ref(),
+            enqueued_at_ms: &mut this.enqueued_at_ms,
+        });
         if attempt.is_pending() {
             let new_flag = evicted_slot.take();
             if let Some(new) = &new_flag {

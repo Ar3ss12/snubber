@@ -439,7 +439,7 @@ impl RestartTracker {
             if self.deaths_ms.len() > self.window.max_restarts as usize {
                 self.giveups = self.giveups.saturating_add(1);
                 return RestartDecision::GiveUp {
-                    deaths_in_window: self.deaths_ms.len() as u32,
+                    deaths_in_window: u32::try_from(self.deaths_ms.len()).unwrap_or(u32::MAX),
                 };
             }
         }
