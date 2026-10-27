@@ -321,9 +321,16 @@ fn slot_is_held_across_the_rollback_body() {
     );
     // …but NOTHING published says which live slot is currently inside a
     // rollback body (finding F-03, restated after measurement: my probe read
-    // the ring as an in-flight registry and mis-called it a lie). Stage 3
-    // adds the lock-free answer; when it lands this note is replaced by a
-    // `rollback_phase()` assertion — the count above stays.
+    // the ring as an in-flight registry and mis-called it a lie). The ring
+    // stays a fault ring — `rollback_phase()` is the live-slot answer, and
+    // it must agree with the bulkhead above.
+    let phase = node.rollback_phase();
+    assert!(
+        phase.active,
+        "F-03: a parked rollback must be visible from another thread without \
+         the ledger lock — the bulkhead refuses `BulkheadFull` and this view \
+         must name why"
+    );
 
     // Let the body finish: the slot comes home and the node works again.
     drop(gate_tx);
@@ -397,6 +404,180 @@ fn slot_is_held_across_the_rollback_body_on_the_implicit_drop_path() {
     node.enter(3, 3, || {})
         .expect("slot released after the rollback body")
         .commit();
+}
+
+/// Stage 3: the phase is answerable from ANOTHER thread while the body is
+/// still parked — no ledger lock, no allocation, no clock unless a budget
+/// is armed. Identity (`epoch`/`task_id`) is what makes the view useful in
+/// a post-mortem: it names the transaction the bulkhead is refusing for.
+#[test]
+fn rollback_phase_is_visible_while_the_body_is_parked() {
+    let node = SnubberNode::builder("guardrails/phase/visible")
+        .max_in_flight(1)
+        .rollback_budget_ms(1_000)
+        .build();
+    let entered = Arc::new(AtomicBool::new(false));
+    let (gate_tx, gate_rx) = channel::<()>();
+    let (done_tx, done_rx) = channel::<()>();
+
+    let worker = {
+        let node = node.clone();
+        let entered = Arc::clone(&entered);
+        std::thread::spawn(move || {
+            let guard = node
+                .enter(2, 7, move || {
+                    entered.store(true, Ordering::SeqCst);
+                    let _ = gate_rx.recv();
+                })
+                .expect("the first admission takes the only slot");
+            drop(guard); // implicit settle runs the parked body
+            let _ = done_tx.send(());
+        })
+    };
+
+    spin_until_started(&entered);
+    std::thread::sleep(Duration::from_millis(150));
+
+    let phase = node.rollback_phase();
+    assert!(phase.active, "the parked body must be visible: {phase:?}");
+    assert!(
+        phase.elapsed_ms >= 100,
+        "the clock must be running for the OLDEST active body, got {} ms",
+        phase.elapsed_ms
+    );
+    assert_eq!(
+        (phase.epoch, phase.task_id),
+        (2, 7),
+        "the phase must name the transaction holding the slot: {phase:?}"
+    );
+    assert_eq!(phase.budget_ms, 1_000, "the armed budget is reported");
+    assert_eq!(
+        phase.stalls, 0,
+        "a body inside its budget is not a stall: {phase:?}"
+    );
+
+    drop(gate_tx);
+    done_rx
+        .recv_timeout(Duration::from_millis(3_000))
+        .expect("rollback body returned once released");
+    worker.join().expect("worker thread finished");
+
+    let calm = node.rollback_phase();
+    assert!(!calm.active, "phase must clear after settle: {calm:?}");
+    assert_eq!(calm.elapsed_ms, 0, "no body, no elapsed clock");
+    assert!(
+        calm.max_ms >= 100,
+        "the completed body is billed in max_ms: {calm:?}"
+    );
+    let stats = node.stats();
+    assert_eq!(stats.max_rollback_ms, calm.max_ms, "one number, two views");
+    assert_eq!(stats.rollback_stalls, 0, "within budget, never a stall");
+}
+
+/// An overrun is a named column, not silence (finding F-07): a body past
+/// `rollback_budget_ms` increments `rollback_stalls` exactly once, and the
+/// counter measures OVERRUNS — a second, fast body must not add one.
+#[test]
+fn rollback_phase_counts_an_overrun_once() {
+    let node = SnubberNode::builder("guardrails/phase/overrun")
+        .max_in_flight(1)
+        .rollback_budget_ms(20)
+        .build();
+    let entered = Arc::new(AtomicBool::new(false));
+    let (gate_tx, gate_rx) = channel::<()>();
+    let (done_tx, done_rx) = channel::<()>();
+
+    let worker = {
+        let node = node.clone();
+        let entered = Arc::clone(&entered);
+        std::thread::spawn(move || {
+            let guard = node
+                .enter(1, 1, move || {
+                    entered.store(true, Ordering::SeqCst);
+                    let _ = gate_rx.recv();
+                })
+                .expect("the first admission takes the only slot");
+            drop(guard);
+            let _ = done_tx.send(());
+        })
+    };
+
+    spin_until_started(&entered);
+    std::thread::sleep(Duration::from_millis(120));
+    drop(gate_tx);
+    done_rx
+        .recv_timeout(Duration::from_millis(3_000))
+        .expect("rollback body returned once released");
+    worker.join().expect("worker thread finished");
+
+    let phase = node.rollback_phase();
+    assert_eq!(phase.stalls, 1, "one overrun, one stall: {phase:?}");
+    assert!(
+        phase.max_ms >= 100,
+        "the overrun duration is kept, got {} ms",
+        phase.max_ms
+    );
+    assert_eq!(node.stats().rollback_stalls, 1, "the column is published");
+
+    // A fast body stays a body: the counter is about overruns, not calls.
+    let _ = node.scoped(|| {}, || Err::<i32, &'static str>("work failed"));
+    assert_eq!(
+        node.rollback_phase().stalls,
+        1,
+        "a body inside the budget must not inflate the stall column"
+    );
+}
+
+/// Zero-cost default, measured through behavior: with no budget armed the
+/// body is still VISIBLE (`active`), but no clock is stamped — `elapsed_ms`
+/// and `max_ms` stay `0` even after a 150 ms body. That is the contract
+/// `needs_stamp` keeps for the watchdog, extended to rollbacks.
+#[test]
+fn phase_reports_activity_without_a_budget_and_stamps_no_clock() {
+    let node = SnubberNode::builder("guardrails/phase/no-clock")
+        .max_in_flight(1)
+        .build();
+    let entered = Arc::new(AtomicBool::new(false));
+    let (gate_tx, gate_rx) = channel::<()>();
+    let (done_tx, done_rx) = channel::<()>();
+
+    let worker = {
+        let node = node.clone();
+        let entered = Arc::clone(&entered);
+        std::thread::spawn(move || {
+            let guard = node
+                .enter(1, 1, move || {
+                    entered.store(true, Ordering::SeqCst);
+                    let _ = gate_rx.recv();
+                })
+                .expect("the first admission takes the only slot");
+            drop(guard);
+            let _ = done_tx.send(());
+        })
+    };
+
+    spin_until_started(&entered);
+    std::thread::sleep(Duration::from_millis(150));
+    let phase = node.rollback_phase();
+    assert!(phase.active, "activity needs no budget to be visible");
+    assert_eq!(phase.budget_ms, 0, "the default budget is disabled");
+    assert_eq!(
+        phase.elapsed_ms, 0,
+        "no budget, no clock stamp — `elapsed_ms` must not invent one"
+    );
+
+    drop(gate_tx);
+    done_rx
+        .recv_timeout(Duration::from_millis(3_000))
+        .expect("rollback body returned once released");
+    worker.join().expect("worker thread finished");
+
+    let calm = node.rollback_phase();
+    assert!(!calm.active);
+    assert_eq!(calm.max_ms, 0, "an unarmed clock cannot bill a duration");
+    assert_eq!(calm.stalls, 0);
+    assert_eq!(node.stats().max_rollback_ms, 0);
+    assert_eq!(node.stats().rollback_stalls, 0);
 }
 
 /// The cost of one wedged rollback, measured out of process.

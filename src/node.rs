@@ -191,6 +191,13 @@ pub struct SnubberStats {
     pub pulse_stalls: u64,
     /// Worst pulse lag observed, ms (saturating max).
     pub max_pulse_lag_ms: u64,
+    /// Rollback bodies that overran the armed `rollback_budget_ms`.
+    /// Own column forever — a slow compensation is not a timeout and not
+    /// a bulkhead refusal. Stays `0` while the budget is disarmed.
+    pub rollback_stalls: u64,
+    /// Worst rollback-body duration observed, ms (saturating max).
+    /// `0` until a budget arms the clock around the body.
+    pub max_rollback_ms: u64,
     /// Token-bucket rejections (`rate_per_sec` over limit).
     pub rate_rejected: u64,
     /// Windowed-batch position: settled outcomes in the open batch.
@@ -522,6 +529,7 @@ pub struct SnubberNodeBuilder {
     failure_window: u32,
     failure_threshold_percent: u8,
     timeout_ms: u64,
+    rollback_budget_ms: u64,
     cpu_budget_ms: u64,
     stall_ceiling_ms: u64,
     task_ttl_ms: u64,
@@ -555,6 +563,7 @@ impl SnubberNodeBuilder {
             failure_window: 0,
             failure_threshold_percent: 50,
             timeout_ms: 0,
+            rollback_budget_ms: 0,
             cpu_budget_ms: 0,
             stall_ceiling_ms: 0,
             task_ttl_ms: 0,
@@ -708,6 +717,21 @@ impl SnubberNodeBuilder {
     pub fn failure_rate(mut self, window: u32, percent: u8) -> Self {
         self.failure_window = window;
         self.failure_threshold_percent = percent.clamp(1, 100);
+        self
+    }
+
+    /// Rollback-body budget in milliseconds. `0` = disabled (default: no
+    /// OS clock read around a rollback body — two atomic writes only).
+    ///
+    /// When armed, every rollback body this node arms is timed and answerable
+    /// from any thread via [`SnubberNode::rollback_phase`]; a body that
+    /// overruns the budget lands in `stats().rollback_stalls` and
+    /// `stats().max_rollback_ms`. The body is never cancelled — a foreign
+    /// lock re-taken inside it cannot be revoked without `unsafe`, so the
+    /// honest contract is detect + report, never prevent.
+    #[must_use]
+    pub fn rollback_budget_ms(mut self, ms: u64) -> Self {
+        self.rollback_budget_ms = ms;
         self
     }
 
@@ -997,62 +1021,66 @@ impl SnubberNodeBuilder {
             memory_rejections: Arc::new(AtomicU64::new(0)),
             auto_seq: Arc::new(AtomicU64::new(1)),
             rate_per_sec: self.rate_per_sec,
-            inner: Arc::new(Mutex::new(NodeInner {
-                name: self.name,
-                max_in_flight: self.max_in_flight,
-                queue_limit: self.queue_limit,
-                overflow: self.overflow,
-                trip_after_failures: self.trip_after_failures,
-                failure_window: self.failure_window,
-                failure_threshold_percent: self.failure_threshold_percent,
-                timeout_ms: self.timeout_ms,
-                cpu_budget_ms: self.cpu_budget_ms,
-                stall_ceiling_ms: self.stall_ceiling_ms,
-                task_ttl_ms: self.task_ttl_ms,
-                payload_budget_bytes: self.payload_budget_bytes,
-                envelope: self.envelope,
-                memory: MemoryWatch::new(self.memory_soft_kb, self.memory_hard_kb),
-                memory_pressure,
-                rate_per_sec: self.rate_per_sec,
-                rate_tokens: self.rate_per_sec as f64,
-                rate_last_ms: now_ms(),
-                fallback: self.fallback,
-                console_cap: self.console_cap,
-                console: self.console,
-                console_frame: self.console_frame,
-                flight_depth: self.flight_depth,
-                // `push_flight_inner` caps at `flight_depth.max(1)`; reserve
-                // that so the first fault never allocates under the lock.
-                flight: VecDeque::with_capacity(self.flight_depth.max(1)),
-                hooks: Arc::new(self.hooks),
-                policies: self.policies,
-                backpressure_policy: self.backpressure_policy,
-                friction_fn: self.friction_fn,
-                pressure_fn: self.pressure_fn,
-                gate: EpochGate::new(),
-                waiters: VecDeque::new(),
-                in_flight: 0,
-                queued: 0,
-                lane_in_flight: [0, 0, 0],
-                preempt_requested: false,
-                consecutive_failures: 0,
-                window_outcomes: 0,
-                window_failures: 0,
-                breaker: BreakerState::Closed,
-                half_open_probe: false,
-                console_used: 0,
-                alert_pending: false,
-                timeouts_fired: 0,
-                deadlock_suspected: 0,
-                pulse_stalls: 0,
-                max_pulse_lag_ms: 0,
-                stats: SnubberStats {
-                    memory_soft_kb: self.memory_soft_kb,
-                    memory_hard_kb: self.memory_hard_kb,
-                    queue_capacity: self.queue_limit as u64,
-                    ..SnubberStats::default()
-                },
-            })),
+            rollback_budget_ms: self.rollback_budget_ms,
+            inner: Arc::new(NodeLedger {
+                rollback: RollbackMirror::new(),
+                books: Mutex::new(NodeInner {
+                    name: self.name,
+                    max_in_flight: self.max_in_flight,
+                    queue_limit: self.queue_limit,
+                    overflow: self.overflow,
+                    trip_after_failures: self.trip_after_failures,
+                    failure_window: self.failure_window,
+                    failure_threshold_percent: self.failure_threshold_percent,
+                    timeout_ms: self.timeout_ms,
+                    cpu_budget_ms: self.cpu_budget_ms,
+                    stall_ceiling_ms: self.stall_ceiling_ms,
+                    task_ttl_ms: self.task_ttl_ms,
+                    payload_budget_bytes: self.payload_budget_bytes,
+                    envelope: self.envelope,
+                    memory: MemoryWatch::new(self.memory_soft_kb, self.memory_hard_kb),
+                    memory_pressure,
+                    rate_per_sec: self.rate_per_sec,
+                    rate_tokens: self.rate_per_sec as f64,
+                    rate_last_ms: now_ms(),
+                    fallback: self.fallback,
+                    console_cap: self.console_cap,
+                    console: self.console,
+                    console_frame: self.console_frame,
+                    flight_depth: self.flight_depth,
+                    // `push_flight_inner` caps at `flight_depth.max(1)`; reserve
+                    // that so the first fault never allocates under the lock.
+                    flight: VecDeque::with_capacity(self.flight_depth.max(1)),
+                    hooks: Arc::new(self.hooks),
+                    policies: self.policies,
+                    backpressure_policy: self.backpressure_policy,
+                    friction_fn: self.friction_fn,
+                    pressure_fn: self.pressure_fn,
+                    gate: EpochGate::new(),
+                    waiters: VecDeque::new(),
+                    in_flight: 0,
+                    queued: 0,
+                    lane_in_flight: [0, 0, 0],
+                    preempt_requested: false,
+                    consecutive_failures: 0,
+                    window_outcomes: 0,
+                    window_failures: 0,
+                    breaker: BreakerState::Closed,
+                    half_open_probe: false,
+                    console_used: 0,
+                    alert_pending: false,
+                    timeouts_fired: 0,
+                    deadlock_suspected: 0,
+                    pulse_stalls: 0,
+                    max_pulse_lag_ms: 0,
+                    stats: SnubberStats {
+                        memory_soft_kb: self.memory_soft_kb,
+                        memory_hard_kb: self.memory_hard_kb,
+                        queue_capacity: self.queue_limit as u64,
+                        ..SnubberStats::default()
+                    },
+                }),
+            }),
         }
     }
 }
@@ -1436,12 +1464,155 @@ impl<const IN_FLIGHT: usize, const QUEUE: usize> StaticNode<IN_FLIGHT, QUEUE> {
     }
 }
 
+/// Live view of the rollback phase, read WITHOUT the node lock.
+///
+/// A rollback body armed by this node runs outside the ledger lock
+/// (Invariant 6, open-call), so a supervisor, watchdog tick or `main`
+/// loop can ask this question while the body is parked — including a body
+/// that will never return. The bulkhead slot stays held until the body
+/// returns, so `active == true` names the transaction behind refused
+/// admissions (`BulkheadFull` while `in_flight` may already read 0).
+///
+/// Honest limits: standalone guards built by hand (`SnubberGuard::new`,
+/// `ErasedGuard::new`) carry no node handle and are therefore invisible
+/// here; so is a body that re-takes a FOREIGN mutex the caller's `work()`
+/// still holds — it shows as `active` forever, which is the point: the
+/// clock keeps running, nothing clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct RollbackPhase {
+    /// A rollback body is running right now.
+    pub active: bool,
+    /// Epoch of the most recently started body (`0` = never observed).
+    pub epoch: u64,
+    /// Task id of the most recently started body (`0` = never observed).
+    pub task_id: u64,
+    /// Age of the OLDEST active body, ms.
+    ///
+    /// Always `0` while no budget is armed: the clock stamp is off by
+    /// default (mirror of `needs_stamp`), so an abort costs two atomic
+    /// writes and no OS clock read.
+    pub elapsed_ms: u64,
+    /// Armed budget, ms (`0` = disabled).
+    pub budget_ms: u64,
+    /// Worst completed body, ms (`0` until a budget arms the clock).
+    pub max_ms: u64,
+    /// Bodies that overran `budget_ms` (own column, never merged).
+    pub stalls: u64,
+}
+
+/// "No rollback body is being timed" sentinel — see `RollbackMirror::started_ms`.
+const IDLE_MS: u64 = u64::MAX;
+
+/// Lock-free rollback mirror, stored NEXT TO the ledger in one allocation.
+///
+/// Guard handles already carry that `Arc`, so stamping a body costs no
+/// extra clone and no extra allocation on the admission path.
+struct RollbackMirror {
+    /// Bodies running right now (`0` = idle).
+    active: AtomicU64,
+    /// Identity of the most recently started body.
+    epoch: AtomicU64,
+    task_id: AtomicU64,
+    /// Start of the OLDEST active body (`IDLE_MS` = no clock stamp).
+    /// NOT `0`: `now_ms()` legitimately returns `0` inside the process's
+    /// first millisecond, and a zero sentinel was misread as "no body"
+    /// (the same trap `elapsed_since_stamp` documents).
+    started_ms: AtomicU64,
+    max_ms: AtomicU64,
+    stalls: AtomicU64,
+}
+
+impl RollbackMirror {
+    const fn new() -> Self {
+        Self {
+            active: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+            task_id: AtomicU64::new(0),
+            started_ms: AtomicU64::new(IDLE_MS),
+            max_ms: AtomicU64::new(0),
+            stalls: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Ledger + lock-free mirrors behind one `Arc`.
+///
+/// Guard handles carry this instead of a bare `Mutex<NodeInner>` so the
+/// phase view is reachable without cloning another `Arc` per admission —
+/// the zero-cost-by-default law on the `scoped`-abort path.
+struct NodeLedger {
+    books: Mutex<NodeInner>,
+    rollback: RollbackMirror,
+}
+
+/// Live marker of one rollback body.
+///
+/// `Drop`, not a plain call at the end, because a panicking body under
+/// `no_std` has no catcher: the counter must come home during the unwind,
+/// or [`RollbackPhase::active`] would report a body that no longer exists.
+struct RollbackStamp<'a> {
+    /// Borrowed, not cloned: an `Arc` clone here would cost two extra
+    /// atomic RMWs on every aborted transaction for no reach — the ledger
+    /// outlives the body (the guard owns the `Arc` for the whole call).
+    mirror: &'a RollbackMirror,
+    /// Clock stamp; meaningful only when `budget_ms > 0` (a legit stamp
+    /// can be `0` inside the process's first millisecond, so the budget —
+    /// not the value — decides whether the clock was armed).
+    armed_at_ms: u64,
+    budget_ms: u64,
+}
+
+impl<'a> RollbackStamp<'a> {
+    /// Begin a body: always bumps the live counter (two atomic RMWs, no
+    /// clock read); stamps a start only when a budget is armed.
+    fn begin(ledger: &'a NodeLedger, epoch: u64, task_id: u64, budget_ms: u64) -> Self {
+        let mirror = &ledger.rollback;
+        let armed_at_ms = if budget_ms > 0 { now_ms() } else { 0 };
+        mirror.epoch.store(epoch, Ordering::Relaxed);
+        mirror.task_id.store(task_id, Ordering::Relaxed);
+        if budget_ms > 0 {
+            // Oldest start wins: a second concurrent body must not reset
+            // the clock a watcher is already measuring.
+            let _ = mirror.started_ms.compare_exchange(
+                IDLE_MS,
+                armed_at_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+        mirror.active.fetch_add(1, Ordering::Relaxed);
+        Self {
+            mirror,
+            armed_at_ms,
+            budget_ms,
+        }
+    }
+}
+
+impl Drop for RollbackStamp<'_> {
+    fn drop(&mut self) {
+        let mirror = self.mirror;
+        let prev = mirror.active.fetch_sub(1, Ordering::Relaxed);
+        if prev <= 1 {
+            mirror.started_ms.store(IDLE_MS, Ordering::Relaxed);
+        }
+        if self.budget_ms > 0 {
+            let elapsed = now_ms().saturating_sub(self.armed_at_ms);
+            let _ = mirror.max_ms.fetch_max(elapsed, Ordering::Relaxed);
+            if elapsed > self.budget_ms {
+                mirror.stalls.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Monitored node: bulkhead + breaker + telemetry recorder around v0.1 guards.
 ///
 /// Clone is cheap (`Arc`): all handles share one recorder.
 #[derive(Clone)]
 pub struct SnubberNode {
-    inner: Arc<Mutex<NodeInner>>,
+    inner: Arc<NodeLedger>,
     /// Builder-sealed pass-through law (immutable after `build()`).
     /// Outside the mutex: transit reads it without locking.
     passthrough: bool,
@@ -1466,6 +1637,10 @@ pub struct SnubberNode {
     /// admission path must know whether the token bucket is armed BEFORE
     /// it locks, so a disarmed bucket (the default) reads no clock at all.
     rate_per_sec: u32,
+    /// Builder-sealed rollback budget, mirrored outside the mutex (same
+    /// law as `rate_per_sec`): `0` — the default — keeps the clock off
+    /// around a rollback body; every guard copies the knob at admission.
+    rollback_budget_ms: u64,
 }
 
 /// Single-allocation settle path for erased admissions: one node clone and
@@ -1476,6 +1651,9 @@ pub struct SnubberNode {
 struct ErasedTransaction<F> {
     node: SnubberNode,
     was_probe: bool,
+    /// Admission identity: the phase view names it while the body runs.
+    epoch: u64,
+    task_id: u64,
     rollback: Option<F>,
     token: Option<crate::ProcessToken>,
 }
@@ -1493,6 +1671,15 @@ impl<F: FnOnce() + Send + 'static> crate::erased::ErasedSettle for ErasedTransac
             // `half_open_probe` set and the breaker welded shut until a
             // manual reset. The panic still reaches the caller — only the
             // books are guaranteed first.
+            // Phase window covers the body AND the settle that follows:
+            // the erased bulkhead slot was released at admission, but the
+            // probe bit and the books still settle after the body.
+            let _rollback_stamp = RollbackStamp::begin(
+                &self.node.inner,
+                self.epoch,
+                self.task_id,
+                self.node.rollback_budget_ms,
+            );
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
             self.node.settle_erased_rollback(self.was_probe);
             if let Err(payload) = outcome {
@@ -1782,7 +1969,39 @@ impl SnubberNode {
         // Columns filled lock-free, outside the mutex.
         stats.passthrough_admissions = self.passthrough_admissions.load(Ordering::Relaxed);
         stats.memory_rejections = self.memory_rejections.load(Ordering::Relaxed);
+        stats.rollback_stalls = self.inner.rollback.stalls.load(Ordering::Relaxed);
+        stats.max_rollback_ms = self.inner.rollback.max_ms.load(Ordering::Relaxed);
         stats
+    }
+
+    /// Lock-free rollback-phase view: is a rollback body running, for how
+    /// long, and for which transaction?
+    ///
+    /// Answered from plain atomics — no ledger lock, no allocation — so a
+    /// supervisor may call it while the body is parked or wedged. A body
+    /// that re-takes a FOREIGN mutex and hangs shows as `active` with a
+    /// growing `elapsed_ms` (when a budget armed the clock) forever; that
+    /// is the signal, not a bug: nothing inside the crate can revoke it.
+    ///
+    /// `elapsed_ms`/`max_ms`/`stalls` stay `0` until
+    /// [`SnubberNodeBuilder::rollback_budget_ms`] arms the clock.
+    #[must_use]
+    pub fn rollback_phase(&self) -> RollbackPhase {
+        let mirror = &self.inner.rollback;
+        let started = mirror.started_ms.load(Ordering::Relaxed);
+        RollbackPhase {
+            active: mirror.active.load(Ordering::Relaxed) > 0,
+            epoch: mirror.epoch.load(Ordering::Relaxed),
+            task_id: mirror.task_id.load(Ordering::Relaxed),
+            elapsed_ms: if started == IDLE_MS {
+                0
+            } else {
+                now_ms().saturating_sub(started)
+            },
+            budget_ms: self.rollback_budget_ms,
+            max_ms: mirror.max_ms.load(Ordering::Relaxed),
+            stalls: mirror.stalls.load(Ordering::Relaxed),
+        }
     }
 
     /// Builder-sealed pass-through law: `true` = open doors (canary mode).
@@ -2354,6 +2573,8 @@ impl SnubberNode {
             ErasedTransaction {
                 node,
                 was_probe,
+                epoch,
+                task_id,
                 rollback: Some(rollback),
                 token: None,
             },
@@ -2871,6 +3092,8 @@ impl SnubberNode {
             ErasedTransaction {
                 node,
                 was_probe,
+                epoch: seq,
+                task_id: seq,
                 rollback: Some(rollback),
                 token: Some(token),
             },
@@ -3453,6 +3676,7 @@ impl SnubberNode {
             is_probe: was_half_open,
             priority,
             armed_at_ms: if needs_stamp(deadline) { now_ms() } else { 0 },
+            rollback_budget_ms: self.rollback_budget_ms,
             deadline_ms: deadline,
             cpu_budget_ms: cpu_budget,
             stall_ceiling_ms: stall_ceiling,
@@ -3487,6 +3711,7 @@ impl SnubberNode {
             is_probe: false,
             priority: Priority::Normal,
             armed_at_ms: 0,
+            rollback_budget_ms: 0,
             deadline_ms: 0,
             cpu_budget_ms: 0,
             stall_ceiling_ms: 0,
@@ -3986,6 +4211,7 @@ impl SnubberNode {
             cpu_sampler: None,
             armed_cpu_ms: 0,
             armed_at_ms: if needs_stamp(deadline_ms) { now } else { 0 },
+            rollback_budget_ms: self.rollback_budget_ms,
             settled: false,
             is_passthrough: false,
             is_probe,
@@ -4039,7 +4265,7 @@ impl SnubberNode {
         // AFTER the lock was released — the books are intact, the guard is
         // gone). ZERO-PANIC phases A/C make this path unreachable in theory;
         // in practice count it so `poison_recoveries > 0` screams in stats.
-        match self.inner.lock() {
+        match self.inner.books.lock() {
             Ok(g) => g,
             Err(poison) => {
                 let mut g = poison.into_inner();
@@ -4083,7 +4309,7 @@ impl SnubberNode {
                 // Count the recovery WITHOUT re-locking our own ledger:
                 // the caller may already hold it (a poison recovery inside
                 // a node-locked section must not deadlock).
-                if let Ok(mut inner) = self.inner.try_lock() {
+                if let Ok(mut inner) = self.inner.books.try_lock() {
                     inner.stats.poison_recoveries = inner.stats.poison_recoveries.saturating_add(1);
                     hard_clamp_slots(&mut inner);
                 }
@@ -4116,6 +4342,13 @@ impl SnubberNode {
             deadlock_suspected: s.deadlock_suspected,
             pulse_stalls: s.pulse_stalls,
             max_pulse_lag_ms: s.max_pulse_lag_ms,
+            // Rollback columns live outside the mutex (lock-free mirror) and
+            // `stats()` fills them after the lock. A hook snapshot fires as
+            // part of the settle it reports, so no final stall count exists
+            // yet — `0` is what the books say, not a claim that nothing
+            // stalled.
+            rollback_stalls: 0,
+            max_rollback_ms: 0,
             rate_rejected: s.rate_rejected,
             window_outcomes: s.window_outcomes,
             window_failures: s.window_failures,
@@ -4410,8 +4643,8 @@ impl SnubberNode {
 /// publish site: on poisoning, recover via `into_inner()`, tick one
 /// `poison_recoveries` and clamp the slots so the breaker never reads a
 /// torn write. Mirrors `SnubberNode::lock`.
-fn lock_ledger(m: &Mutex<NodeInner>) -> std::sync::MutexGuard<'_, NodeInner> {
-    match m.lock() {
+fn lock_ledger(ledger: &NodeLedger) -> std::sync::MutexGuard<'_, NodeInner> {
+    match ledger.books.lock() {
         Ok(g) => g,
         Err(poison) => {
             let mut g = poison.into_inner();
@@ -4435,11 +4668,7 @@ pub(crate) struct AsyncAttempt<'a, F: FnOnce()> {
     pub enqueued_at_ms: &'a mut Option<u64>,
 }
 
-fn publish_fault_arc(
-    node: &Arc<Mutex<NodeInner>>,
-    outcome: &mut ReportOutcome,
-    record: &FaultRecord,
-) {
+fn publish_fault_arc(node: &Arc<NodeLedger>, outcome: &mut ReportOutcome, record: &FaultRecord) {
     outcome.snapshot.last_fault = Some(record.clone());
     let owned = record.clone();
     let slot = FlightSlot {
@@ -4918,7 +5147,7 @@ impl ProfileState {
 /// killer thread behind your back.
 #[must_use = "a TrackedGuard that is never committed rolls back on drop"]
 pub struct TrackedGuard<F: FnOnce()> {
-    node: Arc<Mutex<NodeInner>>,
+    node: Arc<NodeLedger>,
     guard: Option<super::SnubberGuard<F>>,
     arming: FaultRecord,
     settled: bool,
@@ -4928,6 +5157,7 @@ pub struct TrackedGuard<F: FnOnce()> {
     is_probe: bool,
     priority: Priority,
     armed_at_ms: u64,
+    rollback_budget_ms: u64,
     deadline_ms: u64,
     cpu_budget_ms: u64,
     stall_ceiling_ms: u64,
@@ -5421,8 +5651,17 @@ impl<F: FnOnce()> TrackedGuard<F> {
         let header = self.arming.header;
         let node_name = self.arming.node.clone();
         let lane = (self.priority.code() as usize).min(Priority::MAX_INDEX);
-        if let Some(g) = self.guard.take() {
-            drop(g); // hardware rollback runs HERE
+        {
+            // Phase window: the body runs here, outside the ledger lock.
+            let _rollback_stamp = RollbackStamp::begin(
+                &self.node,
+                self.arming.header.epoch,
+                self.arming.header.task_id,
+                self.rollback_budget_ms,
+            );
+            if let Some(g) = self.guard.take() {
+                drop(g); // hardware rollback runs HERE
+            }
         }
         // Stamp the settle AFTER the rollback (so its duration is billed)
         // but BEFORE the lock: the clock must not be read under the node
@@ -5515,7 +5754,19 @@ impl<F: FnOnce()> TrackedGuard<F> {
         // Same single-settle invariant as the commit arm above.
         #[allow(clippy::expect_used)]
         let guard = self.guard.take().expect("guard already settled");
-        let event = guard.abort(reason);
+        // Phase window: the body runs here, OUTSIDE the ledger lock
+        // (Invariant 6). Scoped to the body: the settle below is
+        // lock-guarded bookkeeping, not user code — `active` may fall a
+        // hair before the slot comes home, by design.
+        let event = {
+            let _rollback_stamp = RollbackStamp::begin(
+                &self.node,
+                self.arming.header.epoch,
+                self.arming.header.task_id,
+                self.rollback_budget_ms,
+            );
+            guard.abort(reason)
+        };
         self.settled = true;
         let node = self.node.clone();
         let is_probe = self.is_probe;
@@ -5601,8 +5852,17 @@ impl<F: FnOnce()> Drop for TrackedGuard<F> {
         // v0.1 guard runs the HARDWARE rollback first (Drop order:
         // fields drop after this body — but `guard` is an Option holding
         // the v0.1 guard; take + drop it explicitly for clarity).
-        if let Some(g) = self.guard.take() {
-            drop(g); // hardware rollback runs HERE
+        {
+            // Phase window: the body runs here, outside the ledger lock.
+            let _rollback_stamp = RollbackStamp::begin(
+                &self.node,
+                self.arming.header.epoch,
+                self.arming.header.task_id,
+                self.rollback_budget_ms,
+            );
+            if let Some(g) = self.guard.take() {
+                drop(g); // hardware rollback runs HERE
+            }
         }
         self.settle_implicit();
     }
@@ -5726,11 +5986,14 @@ mod async_poison_tests {
             .build();
         let poisoner = node.clone();
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = poisoner.inner.lock().unwrap();
+            let _guard = poisoner.inner.books.lock().unwrap();
             panic!("poison the ledger on purpose");
         }));
         assert!(poisoned.is_err(), "the poisoner must unwind");
-        assert!(node.inner.is_poisoned(), "the ledger is really poisoned");
+        assert!(
+            node.inner.books.is_poisoned(),
+            "the ledger is really poisoned"
+        );
 
         let waker = Waker::from(Arc::new(NoopWake));
         let mut cx = Context::from_waker(&waker);

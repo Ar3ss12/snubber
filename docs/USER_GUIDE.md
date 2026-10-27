@@ -97,6 +97,31 @@ How it works: the guard owns your rollback closure. `commit()` disarms it (succe
 6. **Seal the scope:** Prefer `node.scoped_sealed(rb, work)` where thread-leakage is the threat — the `!Send` `ScopeToken` makes `spawn` with context a compile error (E0277).
 7. **Never suppress guard drop:** Never use `std::mem::forget` on guards. A guard owns node references and telemetry allocations. Disarming is done strictly through `commit()`. `commit()` marks the transaction settled while allowing the guard's inner fields to cleanly release their allocations upon leaving scope.
 
+### Watching a rollback from outside
+
+The crate cannot cancel a rollback body (that needs `unsafe`, and no library
+has the right to kill your thread), but it can name one — from another
+thread, without the node lock:
+
+```rust
+let phase = node.rollback_phase(); // lock-free, no allocation
+if phase.active && phase.elapsed_ms > my_budget_ms {
+    // your reaction: alarm, drain, restart the worker
+}
+```
+
+* `active`, `epoch`, `task_id` always work: two atomic writes per body, no
+  clock read, nothing to configure.
+* `elapsed_ms`, `max_ms` and `stats().rollback_stalls` need a budget:
+  `SnubberNode::builder(..).rollback_budget_ms(200)`. Until one is armed
+  they stay `0` — the default keeps the abort path clock-free.
+* The bulkhead slot is held while `active` is true, so a `BulkheadFull`
+  refusal that looks unexplained has its cause named here.
+* Honest limits: guards you build by hand (`SnubberGuard::new`,
+  `ErasedGuard::new`) carry no node handle and are invisible; a body that
+  waits on a foreign lock shows as `active` forever — that is the finding,
+  not a gap. Reference: `tests/rollback_guardrails.rs`.
+
 ---
 
 ## Layer 1.5: Hang Classification (SPIN vs SLEEP vs DEADLOCK + Pulse)

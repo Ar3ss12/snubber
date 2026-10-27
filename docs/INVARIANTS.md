@@ -67,6 +67,11 @@ capacity with `BulkheadFull`, async parks as `Pending`, erased scopes are
 granted because their slot was released at admission). The invariant is
 about OUR lock; a rollback that re-takes a FOREIGN mutex the caller's
 `work()` already holds hangs anyway, and no node counter can see it.
+The open-call window itself is observable from any thread without the
+lock: `SnubberNode::rollback_phase()` reads plain atomics (two writes per
+body, a clock stamp only when `rollback_budget_ms` is armed) and names the
+`epoch`/`task_id` whose slot the bulkhead is still holding —
+`tests/rollback_guardrails.rs` pins the parked, overrun and unarmed cases.
 The rollback half of the law is a static gate, not a hope:
 `tests/lock_hierarchy.rs::rollback_bodies_never_run_under_the_node_lock`
 scans every pinned invocation site (13, across `src/lib.rs`,
