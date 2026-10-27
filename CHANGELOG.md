@@ -277,6 +277,15 @@ surface, wire format and telemetry layout are untouched.
   admission) — the `enter_erased_auto` doc carries the same note, and a
   `doc_sync` tripwire fails the suite if either disappears.
 
+- `docs/INVARIANTS.md` section 2 gained the "Gate taxonomy": a table
+  classifying every compile gate, `doc_sync` check family and the
+  test-count badge as either a semantic oracle (compiler, real build,
+  real run, committed artifact) or a drift tripwire (text scan standing
+  in where stable Rust has no oracle), each with the reason. The gate
+  scripts and `tests/doc_sync.rs` headers point at the section. No gate,
+  threshold or assertion changed; nothing was deleted — tripwires stay
+  because where no oracle exists, a loud drift alarm IS the protection.
+
 ### Tests
 
 - New `channel` test closes the senders and asserts the receive side

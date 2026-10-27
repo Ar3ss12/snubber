@@ -1,5 +1,7 @@
 # scripts/check_compile_gates.ps1
 # Automated audit gate for snubber architectural invariants and AGENTS.md rules.
+# Which of these 7 checks are semantic oracles and which are drift tripwires:
+# docs/INVARIANTS.md, section 2, "Gate taxonomy".
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition

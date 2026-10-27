@@ -7,6 +7,9 @@
 //! don't. If a refactor deletes or renames an anchor, this test goes red
 //! and names the missing tag.
 //!
+//! Which of these checks are semantic oracles and which are drift
+//! tripwires: docs/INVARIANTS.md, section 2, "Gate taxonomy".
+//!
 //! Twin audit note (compile-only doc-tests): the 6 `rust,no_run` fences
 //! (`spawn_guarded`, `console_node`, `ErasedGuard`, `assert_no_anomalies`,
 //! `wait_while_paused`, `LegalMove`) are guarded by REAL twins in the

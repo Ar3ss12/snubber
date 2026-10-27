@@ -351,6 +351,41 @@ powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines
 python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggressive --armed-hold
 ```
 
+### Gate taxonomy: semantic oracles vs drift tripwires
+
+Two mechanisms protect this crate and they are not interchangeable:
+
+- **Oracle** — a compiler, a real build, a real run or a committed
+  measurement decides the guarantee (clippy lint, bare-metal compile,
+  semver diff, `cargo test`, artifact comparison). Deleting the check's
+  text does not weaken the guarantee; injecting the defect cannot pass.
+- **Drift tripwire** — a text scan stands where no stable-Rust oracle
+  mechanism exists. It is loud on drift (FAIL names the site) and
+  guards *consistency*, not semantics.
+
+`scripts/check_compile_gates.sh` / `.ps1` (7 gates, one `PARITY:` line per
+flavor) and `tests/doc_sync.rs` classify as follows:
+
+| Check | Guarantee | Class | Why this mechanism |
+|---|---|---|---|
+| Gate 1 — `#![forbid(unsafe_code)]` presence + `unsafe{` scan of src | No unsafe anywhere in the library | Tripwire around the real enforcement | Nothing at compile level tests an attribute's *absence*; the attribute IS the enforcement (any `unsafe` block fails the build) and the scan is the second contour that notices the attribute itself being removed |
+| Gate 2 — arithmetic scan over the counter ledger | Stats counters never wrap | Tripwire with run-time-derived scope | A type-level oracle (newtyped counters) breaks the public `SnubberStats` API — rejected. The scan scope derives from `pub struct SnubberStats` fields + `in_flight` at run time, so a new ledger bucket is covered without editing either script (0.6.11) |
+| Gate 3 — `format!`/`print*` scan of the three lock-path bodies | No allocation-for-formatting under the node mutex | Tripwire | No stable lint names "allocates while a lock is held"; bodies are extracted by function name and extraction failure FAILs the gate rather than skipping silently |
+| Clippy denies in `src/lib.rs` (`unwrap_used`, `expect_used`, `panic`, `mem_forget`) | Panic-free library (Invariants 3 and 6 rest on it) and no forgettable guard | Oracle | Compiler-checked crate-wide since 0.6.11; every `#[allow]` is a reviewed site carrying its reason |
+| Gate 4 — forbidden-metaphors grep (src, benches, examples, tests) | AGENTS.md §14 documentation register | Tripwire | Style policy — there is no semantic oracle for "what reads as marketing" |
+| Gate 5 — `thumbv7em-none-eabihf` compile + feature-shape anchors | Zero-dependency `no_std` core builds on bare metal | Oracle (the compile) with tripwire anchors | The bare-metal build IS the gate; anchors are a second contour noticing accidental edits to the gate's own shape. Missing toolchain = SKIP, and on CI SKIP = FAIL |
+| Gate 6 — `cargo-semver-checks` against the last release | Public API honors semver | Oracle | Real API diff against the published baseline; on CI SKIP = FAIL |
+| Gate 7 — `mem::forget` text scan | Guards are never leaked by `mem::forget` | Tripwire around the oracle (deny) | The clippy deny is the enforcement; the grep is redundancy for the lint's restrict-group blind spots |
+| `doc_sync` — headings, taglines, layer column, module paths, anchors | Public docs agree with each other and with the source layout | Tripwire | Text policy of prose docs; no oracle outside the text exists. Fails per doc, per heading |
+| `doc_sync` — bench numbers | README/GUIDE latencies equal the committed Criterion snapshot | Oracle against artifact | `test_bench_numbers_match_evidence_artifact` checks every `~<number>` citation against `docs/evidence/2026-10-26_bench_snapshot.md` (round-or-truncate); the docs hold no third copy of the numbers (0.6.11) |
+| `scripts/check_test_count.sh` | README test badge equals the suite in the tree | Oracle | Runs `cargo test` and compares derived counts; nothing is pinned |
+
+Two rules follow for the next refactor: do not add a hand-maintained list of
+names or numbers to a tripwire when the list can be derived at run time
+(Gate 2's counter scope, doc_sync's artifact rule are the precedents); and do
+not delete a tripwire because it "only matches text" — where no oracle
+exists for the guarantee, a loud drift alarm IS the protection.
+
 ### Test threshold convention: determinism, not percentages
 
 Every volume assertion in a test must be tied to the mechanism the test
