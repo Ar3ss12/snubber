@@ -76,9 +76,27 @@ if [ -z "${SECTION_LINE}" ]; then
     echo "[RELEASE] FAIL: Cargo.toml ${VERSION} is ahead of ${TAG} but CHANGELOG.md has no ${VERSION} section"
     exit 1
 fi
+VERSION_LINE="$(printf '%s\n' "${SECTION_LINE}" | cut -d: -f1)"
 
-if grep -Eiq "^##[[:space:]]*(\[unreleased\]|unreleased)" "${CHANGELOG}" \
-    || printf '%s\n' "${SECTION_LINE}" | grep -Eiq 'unreleased'; then
+# "Marked Unreleased" means an `## Unreleased` heading sits ABOVE this
+# version's section with no other section heading between the two. A stale
+# `## Unreleased` below the section (or in an old section's body) must not
+# satisfy the gate.
+marked_unreleased() {
+    if printf '%s\n' "${SECTION_LINE}" | grep -Eiq 'unreleased'; then
+        return 0
+    fi
+    UNRELEASED_LINE="$(grep -nEi "^##[[:space:]]*(\[unreleased\]|unreleased)" "${CHANGELOG}" | head -1 | cut -d: -f1 || true)"
+    if [ -z "${UNRELEASED_LINE}" ] || [ "${UNRELEASED_LINE}" -ge "${VERSION_LINE}" ]; then
+        return 1
+    fi
+    if sed -n "$((UNRELEASED_LINE + 1)),$((VERSION_LINE - 1))p" "${CHANGELOG}" | grep -qE '^## '; then
+        return 1
+    fi
+    return 0
+}
+
+if marked_unreleased; then
     echo "[RELEASE] OK: Cargo.toml ${VERSION} is ahead of ${TAG} and marked Unreleased in CHANGELOG"
     exit 0
 fi

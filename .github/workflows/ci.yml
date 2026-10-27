@@ -39,7 +39,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          targets: thumbv7em-none-eabihf
+          targets: thumbv7em-none-eabihf, i686-unknown-linux-gnu
 
       - name: Install cargo-semver-checks (Gate 6)
         uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
@@ -67,6 +67,14 @@ jobs:
         run: |
           cargo check --locked --no-default-features --target thumbv7em-none-eabihf
           cargo check --locked --no-default-features --features alloc --target thumbv7em-none-eabihf
+
+      - name: 32-bit Pointer-Width Gate (i686, core + alloc)
+        # The crate claims 32-bit support (PulseTick AtomicU32 split,
+        # usize-shaped sizes). An `usize == 8` assumption compiles on
+        # x86_64 and breaks the 32-bit build; this gate catches it.
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo check --locked --target i686-unknown-linux-gnu
 
       - name: Core-only Unit Tests (no-default-features)
         # The core branches of src/ previously had zero EXECUTED coverage:

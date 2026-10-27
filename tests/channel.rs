@@ -134,6 +134,21 @@ fn sender_rejects_on_full_and_disconnect() {
 }
 
 #[test]
+fn host_recv_reports_disconnected_after_senders_drop() {
+    // The receive-side error kind must be distinguishable too: with every
+    // sender gone and the queue drained, recv() settles as
+    // `GatewayRecvError::Disconnected`, never Ok and never a hang.
+    let (tx, rx) = gateway::<u32>(2);
+    assert_eq!(tx.send(7), Ok(()));
+    assert_eq!(rx.recv(), Ok(7));
+    drop(tx);
+    match rx.recv() {
+        Err(snubber::GatewayRecvError::Disconnected) => {}
+        other => panic!("expected Disconnected after senders drop, got {other:?}"),
+    }
+}
+
+#[test]
 fn depth_counter_returns_to_zero_after_concurrent_storm() {
     // Regression: `on_take` used a load-then-store that skipped the
     // decrement when a take raced the producer's `fetch_add(1)` (item

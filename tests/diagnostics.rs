@@ -7,8 +7,8 @@
 use snubber::{
     assert_no_anomalies, diagnostic_line, find_anomalies, find_anomalies_for_snapshot,
     print_health, write_diagnostic_line, write_health, write_triage, AnomalyKind, AnomalyPolicy,
-    FaultKind, FaultPolicy, FaultRecord, NodeSet, SnapshotV1, SnubberNode, SnubberStats,
-    TelemetrySink, SNAPSHOT_LEN,
+    FaultKind, FaultPolicy, FaultRecord, NodeSet, SnapshotError, SnapshotV1, SnubberNode,
+    SnubberStats, TelemetrySink, SNAPSHOT_LEN, SNAPSHOT_VERSION,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -49,13 +49,30 @@ fn snapshot_rejects_tampering() {
     let node = SnubberNode::builder("tamper").build();
     let snap = node.snapshot_v1();
     let mut bytes = snap.encode();
-    // Flip a payload byte: CRC must fail.
+    // Flip a payload byte: CRC must fail — and name itself `BadCrc`.
     bytes[42] ^= 0xFF;
-    assert!(SnapshotV1::decode(&bytes).is_err());
-    // Corrupt magic: hard refusal.
+    match SnapshotV1::decode(&bytes) {
+        Err(SnapshotError::BadCrc { want, got }) => {
+            assert_ne!(want, got, "a flipped payload byte must move the CRC");
+        }
+        other => panic!("expected BadCrc for a payload flip, got {other:?}"),
+    }
+    // Corrupt magic: hard refusal named `BadMagic`.
     let mut bad = snap.encode();
     bad[0] = b'X';
-    assert!(SnapshotV1::decode(&bad).is_err());
+    match SnapshotV1::decode(&bad) {
+        Err(SnapshotError::BadMagic) => {}
+        other => panic!("expected BadMagic for a magic flip, got {other:?}"),
+    }
+    // Bump the version word: refusal named `BadVersion` (carries the read version).
+    let mut newer = snap.encode();
+    newer[4] = newer[4].wrapping_add(1);
+    match SnapshotV1::decode(&newer) {
+        Err(SnapshotError::BadVersion(v)) => {
+            assert_ne!(v, SNAPSHOT_VERSION, "read version must differ");
+        }
+        other => panic!("expected BadVersion for a version bump, got {other:?}"),
+    }
 }
 
 #[test]

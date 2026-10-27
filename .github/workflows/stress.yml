@@ -42,7 +42,9 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Python Runtime
-        run: python3 --version
+        # Assert the floor the harness needs, not just that a binary exists
+        # (a 3.x < 3.8 interpreter would print a version and fail later).
+        run: python3 -c 'import sys; assert sys.version_info >= (3, 8), sys.version'
 
       - name: Build Supervisor Example (release)
         run: cargo build --release --locked --example process_termination_loop

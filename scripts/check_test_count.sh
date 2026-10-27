@@ -10,7 +10,7 @@
 #
 # Exit codes: 0 match, 1 mismatch/parse error, 2 the test run failed.
 
-set -u
+set -uo pipefail
 
 README="${README_PATH:-README.md}"
 LOG="${1:-}"

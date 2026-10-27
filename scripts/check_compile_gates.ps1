@@ -140,7 +140,10 @@ foreach ($Dir in @("benches", "examples", "tests")) {
 }
 $MetaphorMatches = @()
 foreach ($Pat in $ForbiddenPatterns) {
-    $Found = Select-String -Path $ScanFiles -Pattern $Pat
+    # CaseSensitive keeps parity with the POSIX gate's grep (no -i): a
+    # metaphor spelled in mixed case must fail here the same way it does
+    # under bash.
+    $Found = Select-String -Path $ScanFiles -CaseSensitive -Pattern $Pat
     if ($Found) { $MetaphorMatches += $Found }
 }
 if ($MetaphorMatches.Count -gt 0) {
