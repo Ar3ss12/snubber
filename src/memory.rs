@@ -151,6 +151,8 @@ const _: () = {
 };
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// tests exercise the panic paths on purpose; the unwinds ARE the contract
 mod tests {
     use super::*;
 

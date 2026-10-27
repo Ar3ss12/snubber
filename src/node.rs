@@ -3613,6 +3613,10 @@ impl SnubberNode {
         // Consumes the rollback UNINVOKED (`take` + `let _` frees captures
         // without running the body). No lock, no queue, no EpochGate.
         if self.passthrough {
+            // Admission always arms a rollback slot; `None` here is a logic
+            // bug in this crate, not a runtime condition. The panic-free
+            // alternative would drop a live rollback unexecuted.
+            #[allow(clippy::expect_used)]
             let rb = rollback.take().expect("rollback present on admission");
             let arming = FaultRecord {
                 kind: FaultKind::ImplicitDrop,
@@ -3953,6 +3957,10 @@ impl SnubberNode {
         let node_name = inner.name.clone();
         drop(inner);
 
+        // The lock is released; admission armed this slot, so `None` is a
+        // logic bug. Panicking here runs `record_locked`'s implicit-drop
+        // accounting instead of stranding the rollback closure uncalled.
+        #[allow(clippy::expect_used)]
         let rb = rollback.take().expect("rollback present on admission");
         let guard = super::SnubberGuard::new(epoch, task_id, rb);
         let arming = FaultRecord {
@@ -5337,6 +5345,10 @@ impl<F: FnOnce()> TrackedGuard<F> {
             self.release_profile();
             return event;
         }
+        // The `settled` early-return above guarantees the slot is `Some`
+        // exactly once; an `if let` here would silently swallow a double
+        // settle of the async state machine instead of flagging the bug.
+        #[allow(clippy::expect_used)]
         let guard = self.guard.take().expect("guard already settled");
         let event = guard.commit();
         self.settled = true;
@@ -5500,6 +5512,8 @@ impl<F: FnOnce()> TrackedGuard<F> {
             self.release_profile();
             return event;
         }
+        // Same single-settle invariant as the commit arm above.
+        #[allow(clippy::expect_used)]
         let guard = self.guard.take().expect("guard already settled");
         let event = guard.abort(reason);
         self.settled = true;
@@ -5649,6 +5663,8 @@ fn refill_tokens(rate_last_ms: u64, tokens: f64, now: u64, rate: u32) -> (u64, f
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// tests exercise the panic paths on purpose; the unwinds ARE the contract
 mod admission_math_tests {
     use super::{elapsed_since_stamp, needs_stamp, refill_tokens};
 
@@ -5686,6 +5702,8 @@ mod admission_math_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// tests exercise the panic paths on purpose; the unwinds ARE the contract
 mod async_poison_tests {
     use super::*;
     use std::future::Future;

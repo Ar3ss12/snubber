@@ -508,6 +508,8 @@ impl<S, D> Future for ResumeFuture<S, D> {
 }
 
 #[cfg(all(test, feature = "std"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// tests exercise the panic paths on purpose; the unwinds ARE the contract
 mod poison_tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};

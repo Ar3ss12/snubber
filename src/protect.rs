@@ -62,6 +62,9 @@ impl<T, F: FnOnce()> Protected<T, F> {
     /// Access the underlying resource (read-only).
     #[inline]
     #[must_use]
+    // INVARIANT: only `get`/`get_mut`/`commit` consume `resource`, each at
+    // most once per instance, so the `Some` holds structurally.
+    #[allow(clippy::expect_used)]
     pub fn get(&self) -> &T {
         // INVARIANT: Guaranteed Some by Protected::new(); only consumed by commit() or Drop.
         self.resource
@@ -72,6 +75,9 @@ impl<T, F: FnOnce()> Protected<T, F> {
     /// Access the underlying resource (read-write).
     #[inline]
     #[must_use]
+    // Same structural invariant as `get`: the slot is taken only by
+    // `commit`/`Drop`, which consume `self`.
+    #[allow(clippy::expect_used)]
     pub fn get_mut(&mut self) -> &mut T {
         // INVARIANT: Guaranteed Some by Protected::new(); only consumed by commit() or Drop.
         self.resource
@@ -83,6 +89,9 @@ impl<T, F: FnOnce()> Protected<T, F> {
     ///
     /// This is the sole method to reclaim ownership of `T`.
     #[inline]
+    // Same structural invariant as `get`: `new` fills both slots and only
+    // this method or `Drop` takes `resource`.
+    #[allow(clippy::expect_used)]
     pub fn commit(mut self) -> T {
         if let Some(guard) = self.guard.take() {
             guard.commit();

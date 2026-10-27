@@ -119,20 +119,23 @@ if ($Gate3Missing.Count -gt 0) {
     Write-Host " FAIL: could not extract lock-path bodies from src\node.rs: $($Gate3Missing -join ', ') (renamed or moved?)" -ForegroundColor Red
     $Failures++
 } else {
-    $SyncHits = $SyncBodies | Select-String -CaseSensitive -Pattern 'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
-    # enter_async_attempt legitimately uses `expect` for the pre-lock
-    # rollback.take(); everything else must stay non-panicking.
-    $AsyncHits = $AsyncBody | Select-String -CaseSensitive -Pattern 'format!|println!|eprintln!|panic!|\.unwrap\(\)'
+    # Panic-macro discipline (unwrap/expect/panic!) moved to the compiler
+    # oracle `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`
+    # in src/lib.rs -- it covers every lib function, not just these bodies.
+    # This scan keeps only the allocation/formatting half, which has no
+    # stable lint for "no format!/print while the node lock is held".
+    $SyncHits = $SyncBodies | Select-String -CaseSensitive -Pattern 'format!|println!|eprintln!'
+    $AsyncHits = $AsyncBody | Select-String -CaseSensitive -Pattern 'format!|println!|eprintln!'
     if ($SyncHits) {
-        Write-Host " FAIL: panicking/formatting call inside the sync lock path:" -ForegroundColor Red
+        Write-Host " FAIL: formatting/print call inside the sync lock path:" -ForegroundColor Red
         $SyncHits | ForEach-Object { Write-Host "   body line $($_.LineNumber): $($_.Line.Trim())" }
         $Failures++
     } elseif ($AsyncHits) {
-        Write-Host " FAIL: panicking/formatting call inside the async lock path:" -ForegroundColor Red
+        Write-Host " FAIL: formatting/print call inside the async lock path:" -ForegroundColor Red
         $AsyncHits | ForEach-Object { Write-Host "   body line $($_.LineNumber): $($_.Line.Trim())" }
         $Failures++
     } else {
-        Write-Host " OK (no format!/panic! in enter_inner, enter_async_attempt, record_locked)" -ForegroundColor Green
+        Write-Host " OK (no format!/print in enter_inner, enter_async_attempt, record_locked)" -ForegroundColor Green
     }
 }
 

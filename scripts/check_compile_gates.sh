@@ -107,11 +107,16 @@ fi
 
 # Gate 3: Lock-hygiene audit in Phase A/C
 echo -n "[3/7] Auditing zero-panic mutex discipline in src/node.rs... "
-# Scan the three functions that run with (or immediately around) the node
-# mutex held, not just `record_locked`: a `format!`/`panic!` introduced in
-# the admission fast path must fail this gate. Bodies are extracted from
-# the signature line to the closing brace at the SIGNATURE's indent
-# (portable POSIX awk: `match` + RLENGTH, no gawk `gensub`).
+# Division of labour since the 0.6.11 audit: panic-macro discipline
+# (`unwrap`/`expect`/`panic!`) is carried by the compiler oracle
+# `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]` in
+# src/lib.rs — it covers EVERY lib function, including helpers called
+# under the same mutex, which this text scan could not see. What remains
+# here is the allocation/formatting half: no stable lint expresses "no
+# format!/print while the node lock is held", so it stays a loud scan of
+# the three lock-path bodies. Bodies are extracted from the signature
+# line to the closing brace at the SIGNATURE's indent (portable POSIX
+# awk: `match` + RLENGTH, no gawk `gensub`).
 extract_fn() { # $1 = literal signature fragment
     awk -v pat="$1" '
         { match($0, /^[[:space:]]*/); ind = RLENGTH }
@@ -129,8 +134,9 @@ GATE3_BAD=""
 for body in GATE3_SYNC GATE3_ASYNC GATE3_RECORD; do
     [ -n "${!body}" ] || GATE3_BAD="${GATE3_BAD}${body} (body not found); "
 done
-# `enter_async_attempt` legitimately uses `expect` for the pre-lock
-# `rollback.take()`; everything else must stay non-panicking.
+# `expect` on the pre-lock `rollback.take()` is permitted by the reviewed
+# `#[allow(clippy::expect_used)]` at its site in src/node.rs — the compiler
+# oracle owns that decision now, this scan does not re-lint panic macros.
 #
 # `grep` exit 2+ means the scan itself failed (unreadable input, bad
 # pattern). Collapsing that into "no match" used to print OK over a scan
@@ -143,9 +149,9 @@ if [ -n "$GATE3_BAD" ]; then
     FAILURES=$((FAILURES + 1))
 else
     scan_hits "$(printf '%s\n%s\n' "$GATE3_SYNC" "$GATE3_RECORD")" \
-        'format!|println!|eprintln!|panic!|\.unwrap\(\)|\.expect\('
+        'format!|println!|eprintln!'
     if [ "$SCAN_RC" -eq 0 ]; then
-        echo "FAIL: panicking/formatting call inside the sync lock path:"
+        echo "FAIL: formatting/print call inside the sync lock path:"
         printf '%s\n' "${SCAN_HITS}"
         FAILURES=$((FAILURES + 1))
     elif [ "$SCAN_RC" -ne 1 ]; then
@@ -153,9 +159,9 @@ else
         printf '%s\n' "${SCAN_HITS}"
         FAILURES=$((FAILURES + 1))
     else
-        scan_hits "$GATE3_ASYNC" 'format!|println!|eprintln!|panic!|\.unwrap\(\)'
+        scan_hits "$GATE3_ASYNC" 'format!|println!|eprintln!'
         if [ "$SCAN_RC" -eq 0 ]; then
-            echo "FAIL: panicking/formatting call inside the async lock path:"
+            echo "FAIL: formatting/print call inside the async lock path:"
             printf '%s\n' "${SCAN_HITS}"
             FAILURES=$((FAILURES + 1))
         elif [ "$SCAN_RC" -ne 1 ]; then
@@ -163,7 +169,7 @@ else
             printf '%s\n' "${SCAN_HITS}"
             FAILURES=$((FAILURES + 1))
         else
-            echo "OK (no format!/panic! in enter_inner, enter_async_attempt, record_locked)"
+            echo "OK (no format!/print in enter_inner, enter_async_attempt, record_locked)"
         fi
     fi
 fi

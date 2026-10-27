@@ -66,6 +66,13 @@
 // drop glue for every field and once leaked one `NodeInner` per settled
 // transaction. Gate 7 enforces the same rule for every file under src/.
 #![deny(clippy::mem_forget)]
+// Panic-free is a property of the whole library, not of three functions:
+// a rollback closure panicking while the node mutex is held poisons it
+// and strands every later caller, and an `unwrap` in a helper called under
+// the lock escapes every text scan that only reads the lock-path bodies.
+// The compiler is the oracle here (Gate 3 defers to it); the reviewed
+// exceptions carry their own `#[allow]` with the reason.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![deny(missing_docs)]
 
 #[cfg(feature = "alloc")]
@@ -705,6 +712,8 @@ impl<F: FnOnce()> Drop for SnubberGuard<F> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// tests exercise the panic paths on purpose; the unwinds ARE the contract
 mod unit_tests {
     use super::*;
     use core::sync::atomic::{AtomicBool, Ordering};

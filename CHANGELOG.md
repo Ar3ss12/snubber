@@ -12,6 +12,19 @@ surface, wire format and telemetry layout are untouched.
 
 ### Fixed
 
+- Panic-macro discipline is a compiler oracle now: `src/lib.rs` carries
+  `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`, so
+  an `unwrap`/`expect`/`panic!` in ANY library function — including
+  helpers called while the node mutex is held — fails the clippy gate.
+  The old Gate 3 text scan saw only three function bodies; its scans for
+  those macros were removed (the remaining Gate 3 scan keeps the
+  allocation/formatting half — `format!`/`print*` under the lock — which
+  has no stable lint). The seven legitimate `expect` sites (protected
+  resource invariant, pre-lock rollback take, async single-settle) carry
+  `#[allow(clippy::expect_used)]` with their reason; the eight internal
+  test modules allow the panics they deliberately exercise. MSRV 1.70
+  library lanes (`cargo check --lib`, core/alloc/std) unaffected.
+
 - Gate 2's counter scan scope is derived at run time from `pub struct
   SnubberStats` (every `pub u64` / `pub [u64; N]` field) plus `in_flight`,
   in both the POSIX and PowerShell flavors; the hand-maintained 15-name

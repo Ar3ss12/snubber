@@ -1569,6 +1569,8 @@ pub fn take_stdin_digest() -> Option<StateDigest> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// tests exercise the panic paths on purpose; the unwinds ARE the contract
 mod wire_tests {
     use super::*;
 
