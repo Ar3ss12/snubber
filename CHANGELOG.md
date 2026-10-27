@@ -314,6 +314,33 @@ surface, wire format and telemetry layout are untouched.
   the no-nanoseconds tripwire keeps it that way. BENCHMARKS.md keeps
   the operation matrix and the contended group (the single numeric
   home); the `doc_sync` layer pins read the guide's table.
+- A README audit (readme-forge checklist) fixed four first-screen
+  defects: the version stamps `(0.6.0)` / `(0.6.1)` / `(0.6.2)` on the
+  Extensibility, Liveness and Audit-Hardened guarantee bullets are gone
+  (current state, not history — the same rule the User Guide already
+  follows); the `tests-N passed` badge now links to the CI workflow
+  instead of an empty `href`; and the demo GIF moved below the fold
+  (after Quickstart) off the first screen.
+- The termination-storm tables moved out of the README into
+  BENCHMARKS.md, and their numbers are re-derived instead of transcribed:
+  the old table quoted a 2026-10-22 console run whose raw JSON was never
+  committed (and the untracked `target/` copy is gone), so both storms
+  were re-run on the same machine (4 lanes × 2,500 = 10,000
+  `TerminateProcess`, release profile, 2026-10-27) and the raw
+  `multi_lineage_report.json` / `multi_lineage_stats.json` of each mode
+  are frozen verbatim under `docs/evidence/` (armed-hold: 23.96 s, 417.4
+  kills/s, p50 323.4 µs, 10,000/10,000 ambush; free-running: 14.48 s,
+  690.7 kills/s, 1,800 / 67 / 8,133). README keeps only a link;
+  BENCHMARKS.md carries the section, including the CI-runner table
+  (CI-log figures, marked as such). The guide's storm chapter drops the
+  un-derivable 2026-10-22 measured figures (single-lineage 63.7/78.6
+  kills/s, 4-lane 390.6/719.8 kills/s, CI rates) and now describes the
+  gates themselves, linking BENCHMARKS.md for the numbers. A new
+  `doc_sync` oracle derives every headline storm token from the
+  committed JSONs at test time and fails on divergence — proven by
+  injection (wrong `417.4` → TRIPWIRE → surgical revert → green). The
+  storm oracle is the 439th passing test (badge moved 438 → 439, 5
+  ignored).
 
 ### Tests
 

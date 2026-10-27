@@ -1,0 +1,405 @@
+﻿{
+    "timestamp_utc":  "2026-10-27T12:43:49.5496699Z",
+    "model":  "multi_lineage",
+    "lines":  4,
+    "kills_per_line":  2500,
+    "kills_requested":  10000,
+    "kills_completed":  10000,
+    "workload":  "spin",
+    "timer_resolution":  true,
+    "duration_ms":  14478.8,
+    "rate_per_sec":  690.7,
+    "peak_rate_per_sec":  822,
+    "tokens_rescued":  1800,
+    "clean_settles":  8200,
+    "armed_hold":  false,
+    "min_ambush_pct":  0,
+    "true_ambush":  1800,
+    "clean_escape":  67,
+    "stillborn":  8133,
+    "ambush_pct":  18,
+    "dispatch_us":  {
+                        "min":  125.8,
+                        "p50":  419.4,
+                        "p95":  676,
+                        "p99":  1890.6,
+                        "p999":  9656.2,
+                        "max":  72064.7,
+                        "count":  10000
+                    },
+    "max_growth_mb":  2,
+    "max_handle_growth":  16,
+    "lanes":  [
+                  {
+                      "index":  0,
+                      "supervisor_pid":  13280,
+                      "supervisor_exit":  0,
+                      "killed":  2500,
+                      "stale":  0,
+                      "duplicates":  410,
+                      "retries":  1942,
+                      "miss_polls":  164,
+                      "stalled":  false,
+                      "error":  null,
+                      "elapsed_ms":  14396.2,
+                      "dispatch_us":  {
+                                          "p50":  420.7,
+                                          "p95":  679.1,
+                                          "p99":  2034.9,
+                                          "max":  72064.7,
+                                          "count":  2500
+                                      },
+                      "classification":  {
+                                             "true_ambush":  459,
+                                             "escape":  15,
+                                             "stillborn":  2026,
+                                             "ambush_pct":  18.4
+                                         },
+                      "report":  {
+                                     "target_kills":  2500,
+                                     "total_reaped":  2500,
+                                     "tokens_rescued":  459,
+                                     "clean_settles":  2041,
+                                     "ambush_kills":  459,
+                                     "escape_kills":  15,
+                                     "stillborn_kills":  2026,
+                                     "armed_hold":  false,
+                                     "frames_sum":  979,
+                                     "arms_sum":  719,
+                                     "commits_sum":  260,
+                                     "misclassified_stillborn":  0,
+                                     "age_us":  {
+                                                    "min":  2147,
+                                                    "mean":  5613,
+                                                    "max":  221123
+                                                },
+                                     "final_generation":  2501,
+                                     "elapsed_ms":  14382
+                                 },
+                      "resources":  {
+                                        "ws_peak_mb":  4.328,
+                                        "private_growth_mb":  1.012,
+                                        "handles_first":  72,
+                                        "handles_peak":  78,
+                                        "handles_last":  72,
+                                        "handles_growth":  0,
+                                        "threads_peak":  5,
+                                        "samples":  113
+                                    }
+                  },
+                  {
+                      "index":  1,
+                      "supervisor_pid":  15172,
+                      "supervisor_exit":  0,
+                      "killed":  2500,
+                      "stale":  0,
+                      "duplicates":  374,
+                      "retries":  1969,
+                      "miss_polls":  113,
+                      "stalled":  false,
+                      "error":  null,
+                      "elapsed_ms":  14161,
+                      "dispatch_us":  {
+                                          "p50":  415.6,
+                                          "p95":  678.9,
+                                          "p99":  1877.9,
+                                          "max":  14101.4,
+                                          "count":  2500
+                                      },
+                      "classification":  {
+                                             "true_ambush":  428,
+                                             "escape":  19,
+                                             "stillborn":  2053,
+                                             "ambush_pct":  17.1
+                                         },
+                      "report":  {
+                                     "target_kills":  2500,
+                                     "total_reaped":  2500,
+                                     "tokens_rescued":  428,
+                                     "clean_settles":  2072,
+                                     "ambush_kills":  428,
+                                     "escape_kills":  19,
+                                     "stillborn_kills":  2053,
+                                     "armed_hold":  false,
+                                     "frames_sum":  910,
+                                     "arms_sum":  669,
+                                     "commits_sum":  241,
+                                     "misclassified_stillborn":  0,
+                                     "age_us":  {
+                                                    "min":  2151,
+                                                    "mean":  5551,
+                                                    "max":  207467
+                                                },
+                                     "final_generation":  2501,
+                                     "elapsed_ms":  14224
+                                 },
+                      "resources":  {
+                                        "ws_peak_mb":  4.039,
+                                        "private_growth_mb":  0.746,
+                                        "handles_first":  72,
+                                        "handles_peak":  78,
+                                        "handles_last":  73,
+                                        "handles_growth":  1,
+                                        "threads_peak":  5,
+                                        "samples":  111
+                                    }
+                  },
+                  {
+                      "index":  2,
+                      "supervisor_pid":  13724,
+                      "supervisor_exit":  0,
+                      "killed":  2500,
+                      "stale":  0,
+                      "duplicates":  415,
+                      "retries":  1974,
+                      "miss_polls":  141,
+                      "stalled":  false,
+                      "error":  null,
+                      "elapsed_ms":  14387.1,
+                      "dispatch_us":  {
+                                          "p50":  421,
+                                          "p95":  672,
+                                          "p99":  1789.3,
+                                          "max":  14355.5,
+                                          "count":  2500
+                                      },
+                      "classification":  {
+                                             "true_ambush":  454,
+                                             "escape":  15,
+                                             "stillborn":  2031,
+                                             "ambush_pct":  18.2
+                                         },
+                      "report":  {
+                                     "target_kills":  2500,
+                                     "total_reaped":  2500,
+                                     "tokens_rescued":  454,
+                                     "clean_settles":  2046,
+                                     "ambush_kills":  454,
+                                     "escape_kills":  15,
+                                     "stillborn_kills":  2031,
+                                     "armed_hold":  false,
+                                     "frames_sum":  966,
+                                     "arms_sum":  710,
+                                     "commits_sum":  256,
+                                     "misclassified_stillborn":  0,
+                                     "age_us":  {
+                                                    "min":  2269,
+                                                    "mean":  5634,
+                                                    "max":  205396
+                                                },
+                                     "final_generation":  2501,
+                                     "elapsed_ms":  14434
+                                 },
+                      "resources":  {
+                                        "ws_peak_mb":  4.242,
+                                        "private_growth_mb":  0.992,
+                                        "handles_first":  72,
+                                        "handles_peak":  78,
+                                        "handles_last":  77,
+                                        "handles_growth":  5,
+                                        "threads_peak":  5,
+                                        "samples":  113
+                                    }
+                  },
+                  {
+                      "index":  3,
+                      "supervisor_pid":  11360,
+                      "supervisor_exit":  0,
+                      "killed":  2500,
+                      "stale":  0,
+                      "duplicates":  408,
+                      "retries":  1978,
+                      "miss_polls":  148,
+                      "stalled":  false,
+                      "error":  null,
+                      "elapsed_ms":  14344.9,
+                      "dispatch_us":  {
+                                          "p50":  419.4,
+                                          "p95":  675.3,
+                                          "p99":  1890.6,
+                                          "max":  17121.4,
+                                          "count":  2500
+                                      },
+                      "classification":  {
+                                             "true_ambush":  459,
+                                             "escape":  18,
+                                             "stillborn":  2023,
+                                             "ambush_pct":  18.4
+                                         },
+                      "report":  {
+                                     "target_kills":  2500,
+                                     "total_reaped":  2500,
+                                     "tokens_rescued":  459,
+                                     "clean_settles":  2041,
+                                     "ambush_kills":  459,
+                                     "escape_kills":  18,
+                                     "stillborn_kills":  2023,
+                                     "armed_hold":  false,
+                                     "frames_sum":  933,
+                                     "arms_sum":  696,
+                                     "commits_sum":  237,
+                                     "misclassified_stillborn":  0,
+                                     "age_us":  {
+                                                    "min":  2195,
+                                                    "mean":  5603,
+                                                    "max":  201452
+                                                },
+                                     "final_generation":  2501,
+                                     "elapsed_ms":  14352
+                                 },
+                      "resources":  {
+                                        "ws_peak_mb":  3.957,
+                                        "private_growth_mb":  0.703,
+                                        "handles_first":  72,
+                                        "handles_peak":  78,
+                                        "handles_last":  72,
+                                        "handles_growth":  0,
+                                        "threads_peak":  4,
+                                        "samples":  112
+                                    }
+                  }
+              ],
+    "checks":  [
+                   {
+                       "Name":  "lane 0 reaped == 2500",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 0 rescue + clean == reaped",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 0 ambush + escape + stillborn == reaped",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 0 final_generation == kills + 1",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 0 supervisor exit == 0",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 0 killer reported no error/stall",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 0 private growth +1.01 MB \u003c= 2.0 MB",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 0 handle growth 0 \u003c= 16",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 1 reaped == 2500",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 1 rescue + clean == reaped",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 1 ambush + escape + stillborn == reaped",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 1 final_generation == kills + 1",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 1 supervisor exit == 0",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 1 killer reported no error/stall",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 1 private growth +0.75 MB \u003c= 2.0 MB",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 1 handle growth +1 \u003c= 16",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 2 reaped == 2500",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 2 rescue + clean == reaped",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 2 ambush + escape + stillborn == reaped",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 2 final_generation == kills + 1",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 2 supervisor exit == 0",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 2 killer reported no error/stall",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 2 private growth +0.99 MB \u003c= 2.0 MB",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 2 handle growth +5 \u003c= 16",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 3 reaped == 2500",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 3 rescue + clean == reaped",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 3 ambush + escape + stillborn == reaped",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 3 final_generation == kills + 1",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 3 supervisor exit == 0",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 3 killer reported no error/stall",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 3 private growth +0.70 MB \u003c= 2.0 MB",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "lane 3 handle growth 0 \u003c= 16",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "aggregate reaped 10000 == 10000",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "aggregate rescue + clean == reaped",
+                       "Ok":  true
+                   },
+                   {
+                       "Name":  "aggregate no cross-lineage accounting drift",
+                       "Ok":  true
+                   }
+               ],
+    "verdict":  "PASS"
+}

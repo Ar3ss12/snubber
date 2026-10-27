@@ -4,18 +4,14 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-438%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-439%20passed-brightgreen.svg)](https://github.com/Ar3ss12/snubber/actions/workflows/ci.yml)
 
-<!-- Badge provenance: `bash scripts/check_test_count.sh` (all features, 5 ignored), last verified 2026-10-26. -->
+<!-- Badge provenance: `bash scripts/check_test_count.sh` (all features, 5 ignored), last verified 2026-10-27. -->
 
 > **Transactional safety fuse and failure-recovery engine for Rust.**  
 > Guarantees that if your function fails — through a panic, an early return `?`, or unexpected process termination — physical pins, database locks, and memory resources automatically reset to a safe state via `Drop`.
 
 Zero external dependencies. `#![forbid(unsafe_code)]`. Compatible from bare-metal embedded firmware (`core`-only) to high-throughput multi-threaded servers (`std`).
-
-<p align="center">
-  <img src="assets/demo.gif" alt="snubber Terminal Stress Demo" width="480"/>
-</p>
 
 ---
 
@@ -44,6 +40,10 @@ let receipt = node.scoped_checked(
     |req| gateway.charge(req),     // protected work unit
 )?;
 ```
+
+<p align="center">
+  <img src="assets/demo.gif" alt="snubber Terminal Stress Demo" width="480"/>
+</p>
 
 ---
 
@@ -78,10 +78,10 @@ drain.finish();                                        // EOF → rescue classif
 * **SPIN vs SLEEP Classification:** A hot `loop {}` settles as `SpinDetected`, a blocked syscall as `TimedOut` — identical rollback, distinct verdict, no thread ever killed. A one-atomic-word `WorkerPulse` heartbeat (8 B on 64-bit, 4 B on 32-bit targets) strokes the hardware WDT on firmware.
 * **Zero-Allocation Telemetry:** 512-byte diagnostic snapshots with CRC32 integrity, zero heap allocations on the hot path, and CI validation via `assert_no_anomalies!()`.
 * **Selective Pass-Through (Canary Law):** Builder-sealed `passthrough(true)` runs open-doors transit for differential proof — naked leaks counted lock-free, guarded rescues; wire frame stays 512 B.
-* **Extensible by Contract:** Public error/classification enums are `#[non_exhaustive]` (0.6.0), so new verdicts are additive — downstream matches must keep a `_` arm, and the crate's own internal matches stay exhaustive. `friction_fn` / `pressure_fn` accept capturing closures stored in `Arc<dyn Fn>` and run outside the node lock; `snub_check_map!` maps invariant breaches into your error type; `NodeName::{Static, Owned}` names nodes at runtime without touching the `Copy` telemetry frames (owned-name nodes export the marker `<owned>` in metric/anomaly rows; read `FaultRecord::node` or `node.name()` for the exact label); supervisor entry points have explicit `_argv` variants (`run_supervised_guard_argv`, `run_supervised_guard_with_lease_argv`, `run_supervised_guard_with_memory_argv`) so embedders that don't own `std::env::args` can pass their own argument vector; format ceilings (3 priority lanes, 4 profile stages, 16 ISR slots, 28 B token payload, 512 B snapshot, 250 ms EOF grace) are published constants.
+* **Extensible by Contract:** Public error/classification enums are `#[non_exhaustive]`, so new verdicts are additive — downstream matches must keep a `_` arm, and the crate's own internal matches stay exhaustive. `friction_fn` / `pressure_fn` accept capturing closures stored in `Arc<dyn Fn>` and run outside the node lock; `snub_check_map!` maps invariant breaches into your error type; `NodeName::{Static, Owned}` names nodes at runtime without touching the `Copy` telemetry frames (owned-name nodes export the marker `<owned>` in metric/anomaly rows; read `FaultRecord::node` or `node.name()` for the exact label); supervisor entry points have explicit `_argv` variants (`run_supervised_guard_argv`, `run_supervised_guard_with_lease_argv`, `run_supervised_guard_with_memory_argv`) so embedders that don't own `std::env::args` can pass their own argument vector; format ceilings (3 priority lanes, 4 profile stages, 16 ISR slots, 28 B token payload, 512 B snapshot, 250 ms EOF grace) are published constants.
 * **Published Helpers & Constants:** `DrainCounters` (frames/arms/commits per drain), `TokenRollback` (emergency `fn` handler), `ProfiledEnterFuture`, `backpressure_of(&EnterError)`, `GatewaySender`/`GatewayHost`, `TOKEN_MAGIC`/`SNAPSHOT_MAGIC`, `LANE_SHIFT`/`TASK_LOCAL_MASK`, `STATE_LEN` — all re-exported and documented in the API table of `docs/USER_GUIDE.md` (`STATE_LEN`, token/snapshot layouts in their layer chapters).
-* **Liveness-Correct Concurrency (0.6.1):** every parked async waiter either gets woken or is deregistered (`EvictOldest` resolves the victim to `QueueFull`, never a zombie); the gateway depth counter balances every send with exactly one take (signed arithmetic — the throttle latch can never wedge on an empty queue); a timed-out half-open probe re-opens the breaker instead of wedging; a new generation re-handshakes even at epoch 0; lane generations bump before the EOF grace window, so successors never inherit a dead child's generation; conduit resume/cancel notifications are issued under the waiter's mutex (no lost wakeups).
-* **Audit-Hardened Semantics (0.6.2):** shedding never masquerades as success — `BulkheadFull` defaults to counted silent discard (an explicit per-kind `FaultAction::BreakerOpen` still sheds immediately); erased-entry probes settle with the guard, not at admission; a bulkhead rejection no longer burns the epoch (retry works); watchdog timeouts feed the streak breaker; `IsrBridge::try_pop` drains malformed cells; supervisor logs state intent (`LINEAGE_BUMP`, `no_kill_self_drain_expected`) instead of implying actions the one-shot call never takes.
+* **Liveness-Correct Concurrency:** every parked async waiter either gets woken or is deregistered (`EvictOldest` resolves the victim to `QueueFull`, never a zombie); the gateway depth counter balances every send with exactly one take (signed arithmetic — the throttle latch can never wedge on an empty queue); a timed-out half-open probe re-opens the breaker instead of wedging; a new generation re-handshakes even at epoch 0; lane generations bump before the EOF grace window, so successors never inherit a dead child's generation; conduit resume/cancel notifications are issued under the waiter's mutex (no lost wakeups).
+* **Audit-Hardened Semantics:** shedding never masquerades as success — `BulkheadFull` defaults to counted silent discard (an explicit per-kind `FaultAction::BreakerOpen` still sheds immediately); erased-entry probes settle with the guard, not at admission; a bulkhead rejection no longer burns the epoch (retry works); watchdog timeouts feed the streak breaker; `IsrBridge::try_pop` drains malformed cells; supervisor logs state intent (`LINEAGE_BUMP`, `no_kill_self_drain_expected`) instead of implying actions the one-shot call never takes.
 * **Bulkhead Scope (erased guards):** the erased path (`enter_erased_auto`, `spawn_guarded`) commits its admission probe at entry, so the slot is released immediately: `max_in_flight(N)` bounds concurrent *admissions*, not live erased transactions. It is the same mechanism that lets a bulkhead rejection retry without burning the epoch — and it means two live erased workers are never serialized by the node. Serialize at the application layer (mutex, dedicated pool) if you need a lease for the worker's lifetime; the typed `enter`/`scoped` guards hold their slot until settlement and are unaffected.
 * **Impedance Bridge:** A 10 000 msg/s producer feeding a 60 FPS consumer gets a one-slot `ConflateSender` — latest wins, replacements counted, backlog stays at 0 or 1. A 16-byte `ExecutionEnvelope` also guards the other wall: work that returns too fast (stale cache, skipped loop) ticks `envelope_underflows` without feeding the breaker. `ProfileHarness` measures min/median/max/jitter/burst and derives the envelope from real numbers.
 
@@ -95,50 +95,11 @@ isolated node per bench; full 50-sample run of 2026-10-26, committed as
 [`docs/evidence/2026-10-26_bench_snapshot.md`](docs/evidence/2026-10-26_bench_snapshot.md)).
 Sub-2 ns deltas are run-to-run noise and are not claimed as wins.
 
-The full 52-operation matrix with per-row Criterion notes and the
-contended group: **[BENCHMARKS.md](BENCHMARKS.md)**. The API & cost
+The full 52-operation matrix with per-row Criterion notes, the
+contended group and the termination-storm tables:
+**[BENCHMARKS.md](BENCHMARKS.md)**. The API & cost
 quick reference (signatures, layers and footprints, no measurements):
 [docs/USER_GUIDE.md](docs/USER_GUIDE.md#api--cost-quick-reference).
-
-### ⚡ Multi-Lineage Termination Storm
-
-`scripts/stress_multi_lineage.ps1` runs N supervisors in parallel, each with its own worker, pid file, pipe and raw Win32 killer. One supervisor = one lineage: isolation needs no library changes because each lane runs in its own working directory. `--armed-hold` parks the worker armed and publishes its pid only after the arm frame, so an ambush-rate gate cannot be satisfied by shooting processes that never armed.
-
-`scripts/stress_multi_lineage.py` is the same harness for Linux and macOS: `SIGKILL` instead of `TerminateProcess`, process identity from `/proc/<pid>/stat` starttime (Linux) or `ps -o lstart` (macOS), so a recycled pid is never mistaken for the live worker. Python 3 standard library only, no dependencies. `.github/workflows/stress.yml` runs both the armed-hold and free-running storms on `ubuntu-latest` and `macos-latest` on every push.
-
-Measured on AMD Ryzen 5 4600H, release build, 4 lanes × 2,500 = 10,000 `TerminateProcess`:
-
-| Mode | Wall | Kills/s (avg / peak) | Dispatch p50 | Ambush | Escape | Stillborn |
-|---|---|---|---|---|---|---|
-| `-Aggressive -ArmedHold` | 25.60 s | 390.6 / 462.7 | 360 µs | 10,000 (100%) | 0 | 0 |
-| `-Aggressive` (free-running) | 13.89 s | 719.8 / 822.2 | 376 µs | 2,023 (20.2%) | 91 (0.9%) | 7,886 (78.9%) |
-
-Armed-hold run: per-lane dispatch p50 354–366 µs, private-memory growth +0.61…+1.01 MB, handle growth 0…+1, final generation = kills + 1 on every lane, no pipe deadlock. Free-running shows what the rate costs: at 720 kills/s most shots land during process startup, not in the armed window.
-
-The same gates run in CI (`.github/workflows/stress.yml`, `--aggressive`, dispatch latency = `SIGKILL`/`TerminateProcess` call only):
-
-| Runner | Mode | Kills | Wall | Kills/s | Ambush | Escape | Stillborn | p50 / p99 |
-|---|---|---|---|---|---|---|---|---|
-| ubuntu-latest (2 vCPU) | armed-hold | 1,000 | 0.91 s | 1,095 | 100% | 0 | 0 | 5 / 11–14 µs |
-| ubuntu-latest (2 vCPU) | free-running | 2,000 | 1.11 s | 1,803 | 93.2% | 2.4% | 4.5% | 4 / 12–17 µs |
-| macos-latest (arm64) | armed-hold | 1,000 | 7.19 s | 139.1 | 100% | 0 | 0 | 22–24 / 344–554 µs |
-| macos-latest (arm64) | free-running | 2,000 | 31.82 s | 62.9 | 61.9% | 38.1% | 0 | 13–14 / 57–84 µs |
-
-Per-lane RSS growth ≤ 0.45 MB on both runners; Linux handle growth 0…+1 (macOS now samples descriptors with `lsof -p` and gates the same limit). The macOS rate is lower because identity verification spawns `ps` for every new pid and process spawn is slower, so free-running kills mostly land after the commit (escape) instead of during startup (stillborn).
-
-```powershell
-# Single-lineage release gate (10,000 kills)
-powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 10000 -Launch -RawKill -Aggressive
-# Armed-hold rescue proof (true ambush >= 70%)
-powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 1000 -Launch -RawKill -Aggressive -ArmedHold
-# 4 independent lineages, 2,500 kills each
-powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold
-```
-
-```bash
-# Linux / macOS: same storm, SIGKILL path, JSON gates
-python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggressive --armed-hold
-```
 
 ### ⚡ Worker Pool (`WorkerPool`): N lineages in one process
 
@@ -172,7 +133,7 @@ Per-reap cost scales with lanes, not with the pool: each lane locks only its own
 
 ## 📖 Documentation & Architecture Layers
 
-* 📊 **[Benchmarks (`BENCHMARKS.md`)](BENCHMARKS.md)** — the full 52-operation Criterion matrix and the contended group; the only public doc that quotes latency figures. The API & cost quick reference (no measurements) closes the [User Guide](docs/USER_GUIDE.md#api--cost-quick-reference).
+* 📊 **[Benchmarks (`BENCHMARKS.md`)](BENCHMARKS.md)** — the full 52-operation Criterion matrix, the contended group and the termination-storm tables; the only public doc that quotes measured figures. The API & cost quick reference (no measurements) closes the [User Guide](docs/USER_GUIDE.md#api--cost-quick-reference).
 * 📘 **[Invariants & Verification Protocol (`docs/INVARIANTS.md`)](docs/INVARIANTS.md)** — Formal mathematical guarantees, admission conservation, zero slot leak proofs.
 * 📘 **[User Guide (`docs/USER_GUIDE.md`)](docs/USER_GUIDE.md)** — Comprehensive architecture manual:
   * **Layer 1: Core RAII Guard:** Rollback is structural: an admitted guard reverts unless it is committed. Stack rollback, `EpochGate`, and universal ergonomics (`scoped`, `scoped_checked`, `snub_check!`).

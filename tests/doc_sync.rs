@@ -796,3 +796,166 @@ fn test_guide_anchors_resolve_to_headings() {
          a green result here means nothing"
     );
 }
+
+/// The termination-storm tables in BENCHMARKS.md quote the committed
+/// multi-lineage report JSONs in docs/evidence/. Every headline token is
+/// derived from the artifact at test time — the docs never carry an
+/// independent copy of a storm number. The JSONs are read with a tiny
+/// key-number extractor (the crate has no serde in the dev graph); a
+/// changed report shape must fail loudly here, not pass vacuously.
+#[test]
+fn test_storm_tables_match_committed_reports() {
+    fn report_number(text: &str, key: &str) -> f64 {
+        let needle = format!("\"{key}\":");
+        let pos = text.find(&needle).unwrap_or_else(|| {
+            panic!(
+                "storm report lost key `{key}` — the harness report shape \
+                 changed; refresh docs/evidence and this oracle together"
+            )
+        });
+        let rest = text[pos + needle.len()..].trim_start();
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+            .unwrap_or(rest.len());
+        rest[..end]
+            .parse::<f64>()
+            .unwrap_or_else(|_| panic!("storm report key `{key}` is not a plain number"))
+    }
+
+    fn dispatch_p50(text: &str) -> f64 {
+        let pos = text
+            .find("\"dispatch_us\":")
+            .expect("storm report lost `dispatch_us`");
+        report_number(&text[pos..], "p50")
+    }
+
+    fn thousands(n: u64) -> String {
+        let digits = n.to_string();
+        let mut out = String::new();
+        for (i, c) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    fn assert_in_doc(doc: &str, token: &str, artifact: &str) {
+        assert!(
+            doc.contains(token),
+            "TRIPWIRE FIRED: BENCHMARKS.md storm table lost '{token}' but \
+             {artifact} still carries it. Re-run the storm, refresh the \
+             artifact, and update every storm citation to the artifact \
+             value — never the artifact to the docs."
+        );
+    }
+
+    let bench_doc = read_doc("BENCHMARKS.md");
+
+    let armed = read_doc("docs/evidence/2026-10-27_multi_lineage_armedhold_report.json");
+    let hold_pos = armed
+        .find("\"armed_hold\":")
+        .expect("armed-hold artifact lost the `armed_hold` key");
+    let value = armed[hold_pos + "\"armed_hold\":".len()..]
+        .trim_start()
+        .chars()
+        .take(4)
+        .collect::<String>();
+    assert!(
+        value == "true",
+        "armed-hold artifact lost `armed_hold: true` (found `{value}`)"
+    );
+    assert_in_doc(
+        &bench_doc,
+        &format!("{:.2} s", report_number(&armed, "duration_ms") / 1000.0),
+        "armed-hold",
+    );
+    assert_in_doc(
+        &bench_doc,
+        &format!("{:.1}", report_number(&armed, "rate_per_sec")),
+        "armed-hold",
+    );
+    assert_in_doc(
+        &bench_doc,
+        &format!("{:.1}", report_number(&armed, "peak_rate_per_sec")),
+        "armed-hold",
+    );
+    assert_in_doc(
+        &bench_doc,
+        &format!("{} µs", dispatch_p50(&armed).round() as u64),
+        "armed-hold",
+    );
+    assert_in_doc(
+        &bench_doc,
+        &format!(
+            "{} ({:.0}%)",
+            thousands(report_number(&armed, "true_ambush") as u64),
+            report_number(&armed, "ambush_pct")
+        ),
+        "armed-hold",
+    );
+
+    let free = read_doc("docs/evidence/2026-10-27_multi_lineage_freerun_report.json");
+    assert_in_doc(
+        &bench_doc,
+        &format!("{:.2} s", report_number(&free, "duration_ms") / 1000.0),
+        "free-running",
+    );
+    assert_in_doc(
+        &bench_doc,
+        &format!("{:.1}", report_number(&free, "rate_per_sec")),
+        "free-running",
+    );
+    assert_in_doc(
+        &bench_doc,
+        &format!("{:.1}", report_number(&free, "peak_rate_per_sec")),
+        "free-running",
+    );
+    assert_in_doc(
+        &bench_doc,
+        &format!("{} µs", dispatch_p50(&free).round() as u64),
+        "free-running",
+    );
+    let kills = report_number(&free, "kills_completed");
+    let pct = |n: f64| n * 100.0 / kills;
+    assert_in_doc(
+        &bench_doc,
+        &format!(
+            "{} ({:.1}%)",
+            thousands(report_number(&free, "true_ambush") as u64),
+            pct(report_number(&free, "true_ambush"))
+        ),
+        "free-running",
+    );
+    assert_in_doc(
+        &bench_doc,
+        &format!(
+            "{} ({:.1}%)",
+            thousands(report_number(&free, "clean_escape") as u64),
+            pct(report_number(&free, "clean_escape"))
+        ),
+        "free-running",
+    );
+    assert_in_doc(
+        &bench_doc,
+        &format!(
+            "{} ({:.1}%)",
+            thousands(report_number(&free, "stillborn") as u64),
+            pct(report_number(&free, "stillborn"))
+        ),
+        "free-running",
+    );
+
+    for (name, text) in [("armed-hold", &armed), ("free-running", &free)] {
+        let sum = report_number(text, "true_ambush")
+            + report_number(text, "clean_escape")
+            + report_number(text, "stillborn");
+        assert_eq!(
+            sum,
+            report_number(text, "kills_completed"),
+            "{name} artifact buckets do not conserve kills — the artifact \
+             itself is broken, the docs cannot be checked against it"
+        );
+    }
+}

@@ -1,8 +1,9 @@
 # Benchmarks
 
 The single home for measured latency figures in the public docs. This file
-carries the full operation matrix and the contended group; README.md and
-docs/USER_GUIDE.md link here and quote no measured numbers. The API & cost
+carries the full operation matrix, the contended group and the
+termination-storm tables; README.md and docs/USER_GUIDE.md link here and
+quote no numbers. The API & cost
 quick reference — signatures, layers and footprints, no measurements —
 lives at the end of docs/USER_GUIDE.md. `tests/doc_sync.rs::test_bench_numbers_match_evidence_artifact`
 checks every `~<number>` citation below against the committed snapshot
@@ -128,3 +129,39 @@ Measured with half of available hardware cores active (6 concurrent threads unde
 | `cross_thread_isr_bridge_push_pop` | 2 threads | **~40 ns** | Lock-free SPSC ring: cache-line handoff between threads |
 
 The two full 50-sample runs of 2026-10-26 read 924–971 / 922–923 / 184–204 / 39–40 ns for the same four rows — the contended group moves between runs by design; quote full-run artifacts, not smoke checks. A saturated node admits **~1.1M admissions/sec** under 6-thread contention (uncontended admission is several times faster).
+
+## Multi-Lineage Termination Storm (out-of-process rescue)
+
+`scripts/stress_multi_lineage.ps1` runs N supervisors in parallel, each with its own worker, pid file, pipe and raw Win32 killer. One supervisor = one lineage: isolation needs no library changes because each lane runs in its own working directory. `--armed-hold` parks the worker armed and publishes its pid only after the arm frame, so an ambush-rate gate cannot be satisfied by shooting processes that never armed. `scripts/stress_multi_lineage.py` is the same harness for Linux and macOS: `SIGKILL` instead of `TerminateProcess`, process identity from `/proc/<pid>/stat` starttime (Linux) or `ps -o lstart` (macOS), so a recycled pid is never mistaken for the live worker. Python 3 standard library only, no dependencies.
+
+Both runs below are the 2026-10-27 Win32 storms on AMD Ryzen 5 4600H, release build, 4 lanes × 2,500 = 10,000 `TerminateProcess` each, quoted from the committed reports [`docs/evidence/2026-10-27_multi_lineage_armedhold_report.json`](docs/evidence/2026-10-27_multi_lineage_armedhold_report.json) and [`docs/evidence/2026-10-27_multi_lineage_freerun_report.json`](docs/evidence/2026-10-27_multi_lineage_freerun_report.json) (raw JSON copies, verdict `PASS` on every per-lane and aggregate gate):
+
+| Mode | Wall | Kills/s (avg / peak) | Dispatch p50 | Ambush | Escape | Stillborn |
+|---|---|---|---|---|---|---|
+| `-Aggressive -ArmedHold` | 23.96 s | 417.4 / 462.2 | 323 µs | 10,000 (100%) | 0 | 0 |
+| `-Aggressive` (free-running) | 14.48 s | 690.7 / 822.0 | 419 µs | 1,800 (18.0%) | 67 (0.7%) | 8,133 (81.3%) |
+
+Armed-hold run: per-lane dispatch p50 313.9–328.0 µs, private-memory growth +0.93…+1.08 MB, handle growth −3…+6, final generation = kills + 1 (2501) on every lane, no pipe deadlock. Free-running shows what the rate costs: at ~691 kills/s most shots land during process startup, not in the armed window (per-lane p50 415.6–421.0 µs, growth +0.70…+1.01 MB, handles 0…+5, generation 2501). The bucket counters and generations are deterministic; `wall`, `kills/s` and dispatch percentiles are wall-clock observations that move with load.
+
+The same gates run in CI (`.github/workflows/stress.yml`, `--aggressive`, dispatch latency = `SIGKILL`/`TerminateProcess` call only; runner-local CI-log figures, not repository artifacts):
+
+| Runner | Mode | Kills | Wall | Kills/s | Ambush | Escape | Stillborn | p50 / p99 |
+|---|---|---|---|---|---|---|---|---|
+| ubuntu-latest (2 vCPU) | armed-hold | 1,000 | 0.91 s | 1,095 | 100% | 0 | 0 | 5 / 11–14 µs |
+| ubuntu-latest (2 vCPU) | free-running | 2,000 | 1.11 s | 1,803 | 93.2% | 2.4% | 4.5% | 4 / 12–17 µs |
+| macos-latest (arm64) | armed-hold | 1,000 | 7.19 s | 139.1 | 100% | 0 | 0 | 22–24 / 344–554 µs |
+| macos-latest (arm64) | free-running | 2,000 | 31.82 s | 62.9 | 61.9% | 38.1% | 0 | 13–14 / 57–84 µs |
+
+```powershell
+# Single-lineage release gate (10,000 kills)
+powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 10000 -Launch -RawKill -Aggressive
+# Armed-hold rescue proof (true ambush >= 70%)
+powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 1000 -Launch -RawKill -Aggressive -ArmedHold
+# 4 independent lineages, 2,500 kills each
+powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold
+```
+
+```bash
+# Linux / macOS: same storm, SIGKILL path, JSON gates
+python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggressive --armed-hold
+```
