@@ -237,20 +237,21 @@ fn test_layer_map_is_identical_across_public_docs() {
     }
 }
 
-/// The quick-reference table in BENCHMARKS.md has a `Layer` column that
-/// must agree with the chapter map of docs/USER_GUIDE.md: each row's layer
-/// is the guide chapter that owns the API plus what the row requires
-/// (`core`/`alloc`/`std`/`cold`/`contended`). This pins the corrected
-/// mappings so the column cannot rot back to stale draft numbers (a row
-/// may gain detail, but never move chapters silently).
+/// The quick-reference table at the end of docs/USER_GUIDE.md has a
+/// `Layer` column that must agree with the chapter map of the same
+/// guide: each row's layer is the guide chapter that owns the API plus
+/// what the row requires (`core`/`alloc`/`std`/`cold`/`contended`).
+/// This pins the corrected mappings so the column cannot rot back to
+/// stale draft numbers (a row may gain detail, but never move chapters
+/// silently).
 #[test]
 fn test_quick_ref_layer_column_matches_chapters() {
-    let bench = read_doc("BENCHMARKS.md");
-    const HEADER: &str = "| Operation | Layer | Latency / Footprint | When to Use |";
-    let header = bench
+    let guide = read_doc("docs/USER_GUIDE.md");
+    const HEADER: &str = "| Operation | Layer | Cost / Footprint | When to Use |";
+    let header = guide
         .find(HEADER)
-        .expect("quick-reference table header missing from BENCHMARKS.md");
-    let table: Vec<&str> = bench[header..]
+        .expect("quick-reference table header missing from docs/USER_GUIDE.md");
+    let table: Vec<&str> = guide[header..]
         .lines()
         .skip(2) // header + separator
         .take_while(|line| line.starts_with('|'))
@@ -480,48 +481,38 @@ fn test_bench_numbers_match_evidence_artifact() {
     );
 
     let bench_doc = read_doc("BENCHMARKS.md");
-    let cut = bench_doc
-        .find("## API & Cost Quick Reference")
-        .expect("quick-reference section header missing from BENCHMARKS.md");
-    let sections: [(&str, &str); 2] = [
-        ("BENCHMARKS.md operation matrix", &bench_doc[..cut]),
-        ("BENCHMARKS.md quick reference", &bench_doc[cut..]),
-    ];
 
     let mut checked = 0usize;
-    let mut skipped: Vec<String> = Vec::new();
-    let mut section_citations: Vec<(&str, Vec<Citation>)> = Vec::new();
-    for (name, text) in sections {
-        let citations = tilde_citations(text);
-        for c in &citations {
-            if let Some(reason) = c.skip {
-                skipped.push(format!("{name}: {} ({reason})", c.raw));
-                continue;
-            }
-            assert!(
-                rows.iter()
-                    .any(|(m, m_micros, _)| citation_matches(c, *m, *m_micros)),
-                "TRIPWIRE FIRED: {name} cites '{}' but no row of {} \
-                 rounds or truncates to it. Re-run `cargo bench`, refresh the \
-                 artifact from target/bench/snapshot.md, and update every \
-                 BENCHMARKS.md citation to the artifact value — never the \
-                 artifact to the docs.",
-                c.raw,
-                ARTIFACT
-            );
-            checked += 1;
+    let citations = tilde_citations(&bench_doc);
+    for c in &citations {
+        if c.skip.is_some() {
+            continue;
         }
-        section_citations.push((name, citations));
+        assert!(
+            rows.iter()
+                .any(|(m, m_micros, _)| citation_matches(c, *m, *m_micros)),
+            "TRIPWIRE FIRED: BENCHMARKS.md cites '{}' but no row of {} \
+             rounds or truncates to it. Re-run `cargo bench`, refresh the \
+             artifact from target/bench/snapshot.md, and update every \
+             BENCHMARKS.md citation to the artifact value — never the \
+             artifact to the docs.",
+            c.raw,
+            ARTIFACT
+        );
+        checked += 1;
     }
     assert!(
         checked >= 40,
-        "only {checked} bench citations were checked across the BENCHMARKS.md \
-         sections — the token scan broke (units or table shapes renamed?) and \
+        "only {checked} bench citations were checked in BENCHMARKS.md — \
+         the token scan broke (units or table shapes renamed?) and \
          a green result here means nothing"
     );
 
     // The numbers must not migrate back: other public docs link to
-    // BENCHMARKS.md and quote no latency figure themselves.
+    // BENCHMARKS.md and quote no latency figure themselves. The guide's
+    // quick reference carries structural costs (footprints, lock and
+    // atomic counts) — those parse as no citation, and any measured
+    // `~<number> ns|µs` value in it fails here.
     for doc in ["README.md", "docs/USER_GUIDE.md"] {
         let stolen: Vec<String> = tilde_citations(&read_doc(doc))
             .into_iter()
@@ -533,32 +524,6 @@ fn test_bench_numbers_match_evidence_artifact() {
             "TRIPWIRE FIRED: {doc} quotes latency figures {stolen:?} — \
              measured numbers live in BENCHMARKS.md only; replace them \
              with a link to it"
-        );
-    }
-
-    // Cross-section agreement per artifact row: a row cited by both
-    // BENCHMARKS.md sections must be cited with at least one common value.
-    // Catches the same row rendered from two different runs (one section
-    // refreshed, the other left at the previous number) even when a future
-    // artifact would make both renderings individually valid.
-    for (idx, (m, m_micros, raw)) in rows.iter().enumerate() {
-        let values_for = |(_name, cs): &(&str, Vec<Citation>)| -> Vec<f64> {
-            cs.iter()
-                .filter(|c| c.skip.is_none() && citation_matches(c, *m, *m_micros))
-                .map(|c| c.value)
-                .collect::<Vec<_>>()
-        };
-        let a = values_for(&section_citations[0]);
-        let b = values_for(&section_citations[1]);
-        if a.is_empty() || b.is_empty() {
-            continue; // cited by one section only — no cross-section contract
-        }
-        assert!(
-            a.iter().any(|v| b.iter().any(|w| (v - w).abs() < 1e-9)),
-            "TRIPWIRE FIRED: the operation matrix and the quick reference \
-             cite artifact row `{raw}` (#{idx}) with disjoint values: matrix \
-             {a:?}, quick reference {b:?} — one section was re-measured and \
-             the other kept the old citation",
         );
     }
 }

@@ -95,9 +95,10 @@ isolated node per bench; full 50-sample run of 2026-10-26, committed as
 [`docs/evidence/2026-10-26_bench_snapshot.md`](docs/evidence/2026-10-26_bench_snapshot.md)).
 Sub-2 ns deltas are run-to-run noise and are not claimed as wins.
 
-The full 52-operation matrix with per-row Criterion notes, the contended
-group and the API & cost quick reference:
-**[BENCHMARKS.md](BENCHMARKS.md)**.
+The full 52-operation matrix with per-row Criterion notes and the
+contended group: **[BENCHMARKS.md](BENCHMARKS.md)**. The API & cost
+quick reference (signatures, layers and footprints, no measurements):
+[docs/USER_GUIDE.md](docs/USER_GUIDE.md#api--cost-quick-reference).
 
 ### ⚡ Multi-Lineage Termination Storm
 
@@ -171,7 +172,7 @@ Per-reap cost scales with lanes, not with the pool: each lane locks only its own
 
 ## 📖 Documentation & Architecture Layers
 
-* 📊 **[Benchmarks (`BENCHMARKS.md`)](BENCHMARKS.md)** — the full 52-operation Criterion matrix, the contended group and the API & cost quick reference; the only public doc that quotes latency figures.
+* 📊 **[Benchmarks (`BENCHMARKS.md`)](BENCHMARKS.md)** — the full 52-operation Criterion matrix and the contended group; the only public doc that quotes latency figures. The API & cost quick reference (no measurements) closes the [User Guide](docs/USER_GUIDE.md#api--cost-quick-reference).
 * 📘 **[Invariants & Verification Protocol (`docs/INVARIANTS.md`)](docs/INVARIANTS.md)** — Formal mathematical guarantees, admission conservation, zero slot leak proofs.
 * 📘 **[User Guide (`docs/USER_GUIDE.md`)](docs/USER_GUIDE.md)** — Comprehensive architecture manual:
   * **Layer 1: Core RAII Guard:** Rollback is structural: an admitted guard reverts unless it is committed. Stack rollback, `EpochGate`, and universal ergonomics (`scoped`, `scoped_checked`, `snub_check!`).

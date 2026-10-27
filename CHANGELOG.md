@@ -308,6 +308,12 @@ surface, wire format and telemetry layout are untouched.
   Layer 2). A `doc_sync` tripwire fails the suite if the guide carries
   a `Fixed in …` heading, a version-labelled Extensibility heading, a
   `v0.…` header teaser or any mention of `CHANGELOG` again.
+- The API & cost quick reference moved back into the User Guide as a
+  signature, layer and footprint dictionary with no measurements: the
+  measured cost cells were replaced with their structural costs, and
+  the no-nanoseconds tripwire keeps it that way. BENCHMARKS.md keeps
+  the operation matrix and the contended group (the single numeric
+  home); the `doc_sync` layer pins read the guide's table.
 
 ### Tests
 
