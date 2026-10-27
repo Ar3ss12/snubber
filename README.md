@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-430%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-431%20passed-brightgreen.svg)]()
 
 <!-- Badge provenance: `bash scripts/check_test_count.sh` (all features, 5 ignored), last verified 2026-10-26. -->
 
@@ -82,6 +82,7 @@ drain.finish();                                        // EOF → rescue classif
 * **Published Helpers & Constants:** `DrainCounters` (frames/arms/commits per drain), `TokenRollback` (emergency `fn` handler), `ProfiledEnterFuture`, `backpressure_of(&EnterError)`, `GatewaySender`/`GatewayHost`, `TOKEN_MAGIC`/`SNAPSHOT_MAGIC`, `LANE_SHIFT`/`TASK_LOCAL_MASK`, `STATE_LEN` — all re-exported and documented in the API table of `docs/USER_GUIDE.md` (`STATE_LEN`, token/snapshot layouts in their layer chapters).
 * **Liveness-Correct Concurrency (0.6.1):** every parked async waiter either gets woken or is deregistered (`EvictOldest` resolves the victim to `QueueFull`, never a zombie); the gateway depth counter balances every send with exactly one take (signed arithmetic — the throttle latch can never wedge on an empty queue); a timed-out half-open probe re-opens the breaker instead of wedging; a new generation re-handshakes even at epoch 0; lane generations bump before the EOF grace window, so successors never inherit a dead child's generation; conduit resume/cancel notifications are issued under the waiter's mutex (no lost wakeups).
 * **Audit-Hardened Semantics (0.6.2):** shedding never masquerades as success — `BulkheadFull` defaults to counted silent discard (an explicit per-kind `FaultAction::BreakerOpen` still sheds immediately); erased-entry probes settle with the guard, not at admission; a bulkhead rejection no longer burns the epoch (retry works); watchdog timeouts feed the streak breaker; `IsrBridge::try_pop` drains malformed cells; supervisor logs state intent (`LINEAGE_BUMP`, `no_kill_self_drain_expected`) instead of implying actions the one-shot call never takes.
+* **Bulkhead Scope (erased guards):** the erased path (`enter_erased_auto`, `spawn_guarded`) commits its admission probe at entry, so the slot is released immediately: `max_in_flight(N)` bounds concurrent *admissions*, not live erased transactions. It is the same mechanism that lets a bulkhead rejection retry without burning the epoch — and it means two live erased workers are never serialized by the node. Serialize at the application layer (mutex, dedicated pool) if you need a lease for the worker's lifetime; the typed `enter`/`scoped` guards hold their slot until settlement and are unaffected.
 * **Impedance Bridge:** A 10 000 msg/s producer feeding a 60 FPS consumer gets a one-slot `ConflateSender` — latest wins, replacements counted, backlog stays at 0 or 1. A 16-byte `ExecutionEnvelope` also guards the other wall: work that returns too fast (stale cache, skipped loop) ticks `envelope_underflows` without feeding the breaker. `ProfileHarness` measures min/median/max/jitter/burst and derives the envelope from real numbers.
 
 ---

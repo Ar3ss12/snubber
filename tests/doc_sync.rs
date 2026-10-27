@@ -96,6 +96,35 @@ fn test_low_level_entries_point_at_canonical() {
     );
 }
 
+/// The erased-guard bulkhead boundary must stay at preset level in the
+/// README: the erased path releases its slot at admission, so
+/// `max_in_flight` bounds admissions, not live erased transactions.
+#[test]
+fn test_readme_states_erased_bulkhead_scope() {
+    let readme = std::fs::read_to_string("README.md")
+        .expect("Failed to read README.md for bulkhead-scope audit");
+    assert!(
+        readme.contains("**Bulkhead Scope (erased guards):**"),
+        "TRIPWIRE FIRED: README lost the 'Bulkhead Scope (erased guards)' \
+         paragraph — the erased-guard slot boundary must stay documented."
+    );
+    assert!(
+        readme.contains("bounds concurrent *admissions*, not live erased transactions"),
+        "TRIPWIRE FIRED: README bulkhead-scope paragraph lost its boundary \
+         statement."
+    );
+    let source = std::fs::read_to_string("src/node.rs")
+        .expect("Failed to read src/node.rs for bulkhead-scope audit");
+    let pos = source
+        .find("pub fn enter_erased_auto<")
+        .expect("Canonical entry missing");
+    let doc_window = &source[pos.saturating_sub(1200)..pos];
+    assert!(
+        doc_window.contains("Bulkhead scope"),
+        "TRIPWIRE FIRED: enter_erased_auto doc lost the bulkhead-scope note."
+    );
+}
+
 /// The one true layer map. Every public document names each layer with the
 /// same bytes; only the surrounding heading syntax differs per file.
 const CANONICAL_LAYERS: [&str; 5] = [

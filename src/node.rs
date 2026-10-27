@@ -2747,6 +2747,11 @@ impl SnubberNode {
     /// iterations, and settles exactly once in the epilogue.
     ///
     /// Arm a nameable erased guard with automatic monotonic sequence minting.
+    ///
+    /// Bulkhead scope: the admission probe is committed at entry, so the
+    /// slot is released immediately — `max_in_flight(N)` bounds concurrent
+    /// admissions, not live erased transactions (see "Bulkhead Scope" in
+    /// the crate README).
     #[track_caller]
     #[cfg(feature = "alloc")]
     pub fn enter_erased_auto<F: FnOnce() + Send + 'static>(

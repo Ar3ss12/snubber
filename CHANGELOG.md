@@ -180,6 +180,15 @@ surface, wire format and telemetry layout are untouched.
   `stats()`), and `scripts/bench.{sh,ps1}` map all 52 Criterion rows to
   operation labels instead of exporting 34 of them as snake_case names.
 
+### Documentation
+
+- The erased-guard bulkhead boundary is stated at preset level: the
+  README gained a "Bulkhead Scope (erased guards)" guarantee entry —
+  `max_in_flight(N)` bounds concurrent admissions, not live erased
+  transactions (`enter_erased_auto`/`spawn_guarded` release the slot at
+  admission) — the `enter_erased_auto` doc carries the same note, and a
+  `doc_sync` tripwire fails the suite if either disappears.
+
 ### Tests
 
 - New `isr_bridge` cross-thread FIFO test pushes 10,000 pulse signals
