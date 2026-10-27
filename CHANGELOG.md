@@ -4,7 +4,7 @@ All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.
 the audit-batch fix tables live at the bottom of this file, and the
 current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
-## Unreleased
+## 0.6.12 (2026-10-27)
 
 Rollback bodies are named, budgeted and observable from outside the node
 lock; the false "rollback re-entry deadlocks" law is gone. No existing
