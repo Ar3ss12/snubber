@@ -17,8 +17,9 @@ no `--release`), 2026-10-26.
 
 `2026-10-26_bench_snapshot.md` is a different kind of artifact: it comes
 from `cargo bench` (release profile, Criterion), not from a test-written
-report, and its rows are the latencies cited in README.md and
-docs/USER_GUIDE.md. `tests/doc_sync.rs::test_bench_numbers_match_evidence_artifact`
+report, and its rows are the latencies cited in BENCHMARKS.md (the single
+numeric home; README.md and docs/USER_GUIDE.md link to it).
+`tests/doc_sync.rs::test_bench_numbers_match_evidence_artifact`
 checks every `~<number>` latency citation in those docs against it.
 
 `wall_ms` and `monitor_checks` are wall-clock observations: they move with

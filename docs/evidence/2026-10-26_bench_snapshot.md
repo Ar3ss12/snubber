@@ -2,7 +2,8 @@
 
 Frozen copy of `target/bench/snapshot.md` — the per-operation mean point
 estimates (ns/op) that `scripts/bench.sh` assembles from the Criterion
-summaries. README.md and docs/USER_GUIDE.md cite these numbers and
+summaries. BENCHMARKS.md — the single numeric home of the public docs —
+cites these numbers and
 `tests/doc_sync.rs::test_bench_numbers_match_evidence_artifact` checks
 every `~<number>` latency citation against this file, so the table below
 is committed verbatim.

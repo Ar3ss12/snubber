@@ -1,7 +1,9 @@
 //! Doc tripwires: the FLOOR MAP anchors in `src/node.rs` must never rot,
 //! the L1–L5 layer map must keep its headings, order and canonical
 //! one-line tagline across the three public docs, and every module path
-//! quoted in prose must exist on disk.
+//! quoted in prose must exist on disk. Measured latencies have exactly one
+//! home — BENCHMARKS.md, pinned to the committed bench artifact; README and
+//! the User Guide quote no numbers.
 //!
 //! Line numbers in comments die the day someone adds an import. Text tags
 //! don't. If a refactor deletes or renames an anchor, this test goes red
@@ -235,19 +237,20 @@ fn test_layer_map_is_identical_across_public_docs() {
     }
 }
 
-/// The quick-reference table's `Layer` column must agree with the chapter
-/// map: each row's layer is the guide chapter that owns the API plus what
-/// the row requires (`core`/`alloc`/`std`/`cold`/`contended`). This pins
-/// the corrected mappings so the column cannot rot back to stale draft
-/// numbers (a row may gain detail, but never move chapters silently).
+/// The quick-reference table in BENCHMARKS.md has a `Layer` column that
+/// must agree with the chapter map of docs/USER_GUIDE.md: each row's layer
+/// is the guide chapter that owns the API plus what the row requires
+/// (`core`/`alloc`/`std`/`cold`/`contended`). This pins the corrected
+/// mappings so the column cannot rot back to stale draft numbers (a row
+/// may gain detail, but never move chapters silently).
 #[test]
 fn test_quick_ref_layer_column_matches_chapters() {
-    let guide = read_doc("docs/USER_GUIDE.md");
+    let bench = read_doc("BENCHMARKS.md");
     const HEADER: &str = "| Operation | Layer | Latency / Footprint | When to Use |";
-    let header = guide
+    let header = bench
         .find(HEADER)
-        .expect("quick-reference table header missing from docs/USER_GUIDE.md");
-    let table: Vec<&str> = guide[header..]
+        .expect("quick-reference table header missing from BENCHMARKS.md");
+    let table: Vec<&str> = bench[header..]
         .lines()
         .skip(2) // header + separator
         .take_while(|line| line.starts_with('|'))
@@ -458,13 +461,13 @@ fn artifact_measurements(text: &str) -> Vec<(f64, bool, String)> {
     out
 }
 
-/// Every `~<number>` latency citation in README.md and docs/USER_GUIDE.md
-/// must round or truncate from a row of the committed bench evidence
-/// artifact — the docs carry no independent copy of the numbers. The old
-/// test compared the two docs against 20 duplicated literals and went blind
-/// the moment both docs were updated to the same stale value; this oracle
-/// compares both docs against one artifact and additionally fails when the
-/// two docs cite the same artifact row with disjoint value sets.
+/// Measured latencies have exactly one home in the public docs:
+/// BENCHMARKS.md. Every `~<number>` citation there must round or truncate
+/// from the committed bench evidence artifact — no doc carries an
+/// independent copy of the numbers. A second rule keeps it that way:
+/// README.md and docs/USER_GUIDE.md must quote no latency figure at all,
+/// only a link. The two BENCHMARKS.md sections that cite the same artifact
+/// row must also share a value, so one section cannot be refreshed alone.
 #[test]
 fn test_bench_numbers_match_evidence_artifact() {
     const ARTIFACT: &str = "docs/evidence/2026-10-26_bench_snapshot.md";
@@ -476,61 +479,86 @@ fn test_bench_numbers_match_evidence_artifact() {
         rows.len()
     );
 
+    let bench_doc = read_doc("BENCHMARKS.md");
+    let cut = bench_doc
+        .find("## API & Cost Quick Reference")
+        .expect("quick-reference section header missing from BENCHMARKS.md");
+    let sections: [(&str, &str); 2] = [
+        ("BENCHMARKS.md operation matrix", &bench_doc[..cut]),
+        ("BENCHMARKS.md quick reference", &bench_doc[cut..]),
+    ];
+
     let mut checked = 0usize;
     let mut skipped: Vec<String> = Vec::new();
-    let mut doc_citations: Vec<(&'static str, Vec<Citation>)> = Vec::new();
-    for doc in ["README.md", "docs/USER_GUIDE.md"] {
-        let citations = tilde_citations(&read_doc(doc));
+    let mut section_citations: Vec<(&str, Vec<Citation>)> = Vec::new();
+    for (name, text) in sections {
+        let citations = tilde_citations(text);
         for c in &citations {
             if let Some(reason) = c.skip {
-                skipped.push(format!("{doc}: {} ({reason})", c.raw));
+                skipped.push(format!("{name}: {} ({reason})", c.raw));
                 continue;
             }
             assert!(
                 rows.iter()
                     .any(|(m, m_micros, _)| citation_matches(c, *m, *m_micros)),
-                "TRIPWIRE FIRED: {doc} cites '{}' but no row of {} \
+                "TRIPWIRE FIRED: {name} cites '{}' but no row of {} \
                  rounds or truncates to it. Re-run `cargo bench`, refresh the \
-                 artifact from target/bench/snapshot.md, and update BOTH docs \
-                 to the artifact value — never the artifact to the docs.",
+                 artifact from target/bench/snapshot.md, and update every \
+                 BENCHMARKS.md citation to the artifact value — never the \
+                 artifact to the docs.",
                 c.raw,
                 ARTIFACT
             );
             checked += 1;
         }
-        doc_citations.push((doc, citations));
+        section_citations.push((name, citations));
     }
     assert!(
         checked >= 40,
-        "only {checked} bench citations were checked across README.md and \
-         docs/USER_GUIDE.md — the token scan broke (units or table shapes \
-         renamed?) and a green result here means nothing"
+        "only {checked} bench citations were checked across the BENCHMARKS.md \
+         sections — the token scan broke (units or table shapes renamed?) and \
+         a green result here means nothing"
     );
 
-    // Cross-doc agreement per artifact row: a row cited by both docs must be
-    // cited with at least one common value in each. Catches the same row
-    // rendered from two different runs (one doc at the artifact's value,
-    // the other still at the previous run's) even when a
-    // future artifact would make both sides individually valid.
+    // The numbers must not migrate back: other public docs link to
+    // BENCHMARKS.md and quote no latency figure themselves.
+    for doc in ["README.md", "docs/USER_GUIDE.md"] {
+        let stolen: Vec<String> = tilde_citations(&read_doc(doc))
+            .into_iter()
+            .filter(|c| c.skip.is_none())
+            .map(|c| c.raw)
+            .collect();
+        assert!(
+            stolen.is_empty(),
+            "TRIPWIRE FIRED: {doc} quotes latency figures {stolen:?} — \
+             measured numbers live in BENCHMARKS.md only; replace them \
+             with a link to it"
+        );
+    }
+
+    // Cross-section agreement per artifact row: a row cited by both
+    // BENCHMARKS.md sections must be cited with at least one common value.
+    // Catches the same row rendered from two different runs (one section
+    // refreshed, the other left at the previous number) even when a future
+    // artifact would make both renderings individually valid.
     for (idx, (m, m_micros, raw)) in rows.iter().enumerate() {
-        let values_for = |(_doc, cs): &(&'static str, Vec<Citation>)| -> Vec<f64> {
+        let values_for = |(_name, cs): &(&str, Vec<Citation>)| -> Vec<f64> {
             cs.iter()
                 .filter(|c| c.skip.is_none() && citation_matches(c, *m, *m_micros))
                 .map(|c| c.value)
                 .collect::<Vec<_>>()
         };
-        let a = values_for(&doc_citations[0]);
-        let b = values_for(&doc_citations[1]);
+        let a = values_for(&section_citations[0]);
+        let b = values_for(&section_citations[1]);
         if a.is_empty() || b.is_empty() {
-            continue; // cited by one doc only — no cross-doc contract
+            continue; // cited by one section only — no cross-section contract
         }
         assert!(
             a.iter().any(|v| b.iter().any(|w| (v - w).abs() < 1e-9)),
-            "TRIPWIRE FIRED: README.md and docs/USER_GUIDE.md cite artifact row \
-             `{raw}` (#{idx}) with disjoint values: README {:?}, GUIDE {:?} — one \
-             side was re-measured and the other kept the old citation",
-            a,
-            b
+            "TRIPWIRE FIRED: the operation matrix and the quick reference \
+             cite artifact row `{raw}` (#{idx}) with disjoint values: matrix \
+             {a:?}, quick reference {b:?} — one section was re-measured and \
+             the other kept the old citation",
         );
     }
 }

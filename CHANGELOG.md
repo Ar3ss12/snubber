@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `snubber`. Benchmarks live in [README.md](README.md);
+All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.md);
 the deeper contract tables live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 ("Fixed in …" sections) and [docs/INVARIANTS.md](docs/INVARIANTS.md).
 
@@ -285,6 +285,17 @@ surface, wire format and telemetry layout are untouched.
   scripts and `tests/doc_sync.rs` headers point at the section. No gate,
   threshold or assertion changed; nothing was deleted — tripwires stay
   because where no oracle exists, a loud drift alarm IS the protection.
+
+- The bench matrices moved out of the selling docs into
+  [BENCHMARKS.md](BENCHMARKS.md): the 52-operation table, the contended
+  group and the USER_GUIDE quick reference now live in one file, and
+  README.md / docs/USER_GUIDE.md keep a link plus the measurement
+  conditions. No latency figure remains in README or the User Guide —
+  `test_bench_numbers_match_evidence_artifact` now fails the suite if a
+  citation reappears there, still checks every BENCHMARKS.md citation
+  against the committed snapshot, and compares the two BENCHMARKS.md
+  sections against each other per artifact row. The quick-reference
+  `Layer` column pin reads the moved table.
 
 ### Tests
 
