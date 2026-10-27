@@ -189,6 +189,15 @@ surface, wire format and telemetry layout are untouched.
 
 ### Documentation
 
+- The API & Cost Quick Reference table's `Layer` column is re-audited
+  against the guide's own chapter map: 48 rows moved (hang/ISR/pulse
+  rows to 1.5, memory/`StateDigest`/orphan/`RestartTracker` rows to 4,
+  async admission and `ResumeFuture` to 3, the pool and drain rows to
+  4, diagnostics rows to 5, `ClosurePolicy` back to 1/`alloc`). A
+  legend above the table defines the column, and a new
+  `doc_sync` tripwire pins 19 representative rows to their layer so the
+  column cannot silently rot again.
+
 - The erased-guard bulkhead boundary is stated at preset level: the
   README gained a "Bulkhead Scope (erased guards)" guarantee entry —
   `max_in_flight(N)` bounds concurrent admissions, not live erased

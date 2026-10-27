@@ -232,6 +232,67 @@ fn test_layer_map_is_identical_across_public_docs() {
     }
 }
 
+/// The quick-reference table's `Layer` column must agree with the chapter
+/// map: each row's layer is the guide chapter that owns the API plus what
+/// the row requires (`core`/`alloc`/`std`/`cold`/`contended`). This pins
+/// the corrected mappings so the column cannot rot back to stale draft
+/// numbers (a row may gain detail, but never move chapters silently).
+#[test]
+fn test_quick_ref_layer_column_matches_chapters() {
+    let guide = read_doc("docs/USER_GUIDE.md");
+    const HEADER: &str = "| Operation | Layer | Latency / Footprint | When to Use |";
+    let header = guide
+        .find(HEADER)
+        .expect("quick-reference table header missing from docs/USER_GUIDE.md");
+    let table: Vec<&str> = guide[header..]
+        .lines()
+        .skip(2) // header + separator
+        .take_while(|line| line.starts_with('|'))
+        .collect();
+
+    let required: &[(&str, &str)] = &[
+        ("`snub_check!(cond, reason)`", "1 / core"),
+        ("classify_stall(wall, cpu, wb, cb)", "1.5 / core"),
+        ("WorkerPulse::kick", "1.5 / core"),
+        ("IsrBridge::try_push", "1.5 / core"),
+        ("ClosurePolicy::new", "1 / alloc"),
+        ("`node.enter_auto` |", "2 / std"),
+        ("gateway::<T>(cap)", "2 / std"),
+        ("`TaskConduit` / `TaskHandle`", "2 / std"),
+        ("node.note_memory_kb", "3 / std"),
+        ("node.enter_async_auto` |", "3 / std"),
+        ("guard.settle_async", "3 / std"),
+        ("MemoryPolicy::new", "4 / std"),
+        ("Supervisor::run_supervised_guard_with_memory", "4 / std"),
+        ("`PipeDrain` + `ProcessToken`", "4 / std"),
+        ("lane.attach", "4 / std"),
+        ("DEFAULT_EOF_GRACE_MS` (250 ms)", "4 / std"),
+        ("run_supervised_guard_with_grace(worker_flag", "4 / std"),
+        ("`NodeSet` set", "5 / cold"),
+        ("write_triage(&mut out, node, &snap)", "5 / cold"),
+    ];
+
+    for (prefix, want) in required {
+        let mut hits = table.iter().filter(|line| line.contains(prefix));
+        let row = hits
+            .next()
+            .unwrap_or_else(|| panic!("quick-reference row {prefix} missing"));
+        assert!(
+            hits.next().is_none(),
+            "quick-reference row {prefix} appears more than once"
+        );
+        let layer = row
+            .split(" | ")
+            .nth(1)
+            .unwrap_or_else(|| panic!("quick-reference row {prefix} has no Layer cell: {row}"));
+        assert_eq!(
+            layer, *want,
+            "TRIPWIRE FIRED: quick-reference row {prefix} claims layer '{layer}', \
+             the chapter map says '{want}' — fix the row or move the API"
+        );
+    }
+}
+
 /// Collects `src/...` tokens from prose so a renamed module cannot survive
 /// as a stale pointer in the docs.
 fn documented_source_paths(text: &str) -> Vec<&str> {
