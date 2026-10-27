@@ -27,38 +27,60 @@ Wrap critical work in **`scoped`**: two closures, rollback and action. It
 commits on `Ok` and runs the rollback on `Err`, on `panic!` and on early
 return:
 
-```rust
+```rust,no_run
 use snubber::SnubberNode;
 
-let node = SnubberNode::desktop("orders");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let node = SnubberNode::desktop("orders");
+    let amount = 4_900;
 
-let receipt = node.scoped(
-    || ledger.unlock_funds(),   // rollback: runs on Err, on panic!, on early return
-    || gateway.charge(amount),  // work: returns Result<T, E>
-)?;
+    let receipt = node.scoped(
+        || println!("rollback: refund {amount}"), // runs on Err, on panic!, on early return
+        || Ok::<i64, std::io::Error>(amount),     // work: returns Result<T, E>
+    )?;
+
+    println!("committed: {receipt}");
+    Ok(())
+}
 ```
 
 <p align="center">
-  <img src="assets/demo.gif" alt="snubber Terminal Stress Demo" width="480"/>
+  <img src="https://raw.githubusercontent.com/Ar3ss12/snubber/main/assets/demo.gif" alt="snubber Terminal Stress Demo" width="480"/>
 </p>
 
 ---
 
 ## The delta
 
-```rust
+```rust,ignore
 // WITHOUT snubber: the rollback is a second path you maintain by hand
 ledger.lock_funds(req);
 let outcome = charge(req);                 // panics here -> funds stay locked
 if outcome.is_ok() { ledger.commit(); } else { ledger.unlock(); }
+```
 
+```rust,no_run
 // WITH snubber: the same scope, plus an invariant checked before anything runs
-node.scoped_checked(
-    req,
-    |r| { snub_check!(r.amount > 0, "bad amount"); Ok(()) },
-    || ledger.unlock_funds(), // emergency rollback: Err, panic!, early return
-    charge,                   // protected work unit
-)?;
+use snubber::{snub_check, SnubberNode};
+
+struct Request {
+    amount: i64,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let node = SnubberNode::desktop("orders");
+    let req = Request { amount: 4_900 };
+
+    let receipt = node.scoped_checked(
+        &req,
+        |r| { snub_check!(r.amount > 0, "bad amount"); Ok(()) },
+        || println!("rollback: unlock funds"),   // emergency rollback: Err, panic!, early return
+        |r| Ok::<i64, std::io::Error>(r.amount), // protected work unit
+    )?;
+
+    println!("settled: {receipt}");
+    Ok(())
+}
 ```
 
 ---
@@ -136,12 +158,19 @@ snapshot, 250 ms EOF grace) are published constants, not tunables.
 transport push bytes from a UART/DMA task and declare EOF yourself; on
 `core`-only targets the same bytes go straight into the `core` `SnubScanner`.
 
-```rust
+```rust,no_run
+use snubber::PipeDrain;
+
 // std transport layered on the core scanner
 fn app_tick_ms() -> u64 { 0 /* firmware SysTick, ms */ }
-let drain = PipeDrain::manual_with_clock(app_tick_ms); // ClockFn = fn() -> u64, not a number
-let frames = drain.feed(uart_chunk);                   // any chunking, any size
-drain.finish();                                        // EOF -> rescue classification
+
+fn main() {
+    let uart_chunk = [0x53, 0x4e, 0x55, 0x42];
+    let drain = PipeDrain::manual_with_clock(app_tick_ms); // ClockFn = fn() -> u64, not a number
+    let frames = drain.feed(&uart_chunk);                  // any chunking, any size
+    println!("complete frames: {frames}");
+    drain.finish();                                        // EOF -> rescue classification
+}
 ```
 
 `ProcessToken::write_to(&mut sink)` and `StateDigest::write_to(&mut sink)`
@@ -215,7 +244,8 @@ Every file in [`examples/`](examples) runs with `cargo run --example <name>`.
 * **[docs.rs/snubber](https://docs.rs/snubber)** — the generated API reference.
 * **[CHANGELOG.md](CHANGELOG.md)** — release history and the audit-batch fix tables.
 * **[`.github/workflows/ci.yml`](.github/workflows/ci.yml)** — the gates this
-  README quotes: MSRV lanes, bare-metal builds, storm lanes, test-count badge.
+  README quotes: MSRV lanes, bare-metal builds, storm lanes, and the doctest
+  pass that compiles the `scoped` snippets shown in this file.
 
 ---
 

@@ -11,8 +11,8 @@ description = "Transactional safety fuse and failure-recovery engine for Rust: D
 readme = "README.md"
 repository = "https://github.com/Ar3ss12/snubber"
 documentation = "https://docs.rs/snubber"
-keywords = ["transactions", "guard", "raii", "epoch", "bulkhead"]
-categories = ["concurrency", "no-std", "data-structures"]
+keywords = ["transactions", "guard", "raii", "bulkhead", "no_std"]
+categories = ["concurrency", "no-std", "data-structures", "embedded"]
 exclude = [
     "scripts/",
     "AGENTS.md",
@@ -20,6 +20,12 @@ exclude = [
     "docs/DECISION_MATRIX.md",
     "assets/",
 ]
+
+# docs.rs builds with every feature so the `std`/`alloc` surfaces are all
+# documented; `--cfg docsrs` is inert until a `#[cfg(docsrs)]` gate consumes it.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["std", "alloc"]

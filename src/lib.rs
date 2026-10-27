@@ -81,6 +81,14 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+// README.md is a doctest source: `cargo test --doc` compiles its runnable Rust
+// blocks, so a renamed method or a wrong arity fails CI instead of shipping a
+// snippet a reader cannot paste. `cfg(doctest)` keeps it out of `cargo doc`.
+// The fence inventory and this hook are pinned by tests/doc_sync.rs.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 /// Universal invariant assertion macro for semantic admission boundary gates.
 ///
 /// Evaluates a boolean expression; if false, returns early with `Err(reason)`.

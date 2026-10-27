@@ -1,7 +1,10 @@
 //! Doc tripwires: the FLOOR MAP anchors in `src/node.rs` must never rot,
 //! the L1–L5 layer map must keep its headings, order and canonical
 //! one-line tagline across the three public docs, and every module path
-//! quoted in prose must exist on disk. Measured latencies have exactly one
+//! quoted in prose must exist on disk. README snippets are compiled by
+//! `cargo test --doc` through a `#[cfg(doctest)]` hook in `src/lib.rs`, and
+//! this file guards that hook, each fence's compile verdict and the absolute
+//! asset hrefs the registry page needs. Measured latencies have exactly one
 //! home — BENCHMARKS.md, pinned to the committed bench artifact; README and
 //! the User Guide quote no numbers.
 //!
@@ -185,6 +188,104 @@ fn test_readme_badges_are_instruments() {
             "TRIPWIRE FIRED: the README publishes a test count again — the CI \
              badge already proves the suite is green: {badge}"
         );
+    }
+}
+
+/// README.md is a doctest source: src/lib.rs folds it in behind
+/// `#[cfg(doctest)]`, so `cargo test --doc` compiles its snippets against the
+/// real API. This test guards the mechanism, not the prose — delete the hook
+/// and every fence silently stops being checked.
+#[test]
+fn test_readme_is_wired_into_doctests() {
+    let lib = read_doc("src/lib.rs");
+    assert!(
+        lib.contains("#[cfg(doctest)]") && lib.contains("include_str!(\"../README.md\")"),
+        "TRIPWIRE FIRED: src/lib.rs lost the README doctest hook — README.md \
+         snippets are no longer compiled by `cargo test --doc`"
+    );
+}
+
+/// Every Rust fence in README.md carries a compile verdict: `no_run` proves it
+/// compiles without executing, and `ignore` is allowed only for the hand-rolled
+/// WITHOUT half — an illustrative pattern with no types behind it. A rust fence
+/// with no modifier would run on every CI pass, so it fails here instead.
+#[test]
+fn test_readme_fences_have_a_compile_verdict() {
+    let readme = read_doc("README.md");
+    let lines: Vec<&str> = readme.lines().collect();
+    let mut compiled = 0usize;
+    let mut ignored_lines = Vec::new();
+    let mut bare_lines = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let Some(info) = line.strip_prefix("```rust") else {
+            continue;
+        };
+        if info.is_empty() {
+            bare_lines.push(idx + 1);
+        } else if info.contains("ignore") {
+            ignored_lines.push(idx + 1);
+        } else if info.contains("no_run") {
+            compiled += 1;
+        } else {
+            bare_lines.push(idx + 1);
+        }
+    }
+
+    assert!(
+        bare_lines.is_empty(),
+        "TRIPWIRE FIRED: README.md line(s) {bare_lines:?} open a Rust fence with \
+         no compile verdict — mark it rust,no_run (or rust,ignore for prose \
+         pseudo-code that must be registered below)"
+    );
+    assert_eq!(
+        compiled, 3,
+        "TRIPWIRE FIRED: expected 3 rust,no_run README fences (quick start, \
+         WITH-delta, PipeDrain feed), found {compiled} — a snippet was added \
+         or removed; update this pin and the README doctest inventory"
+    );
+    assert_eq!(
+        ignored_lines.len(),
+        1,
+        "TRIPWIRE FIRED: {ignored_lines:?} rust,ignore README fences, expected \
+         exactly 1 (the hand-rolled WITHOUT block). Every ignore is unproven \
+         code; adding one is a decision, not a refactor artifact"
+    );
+    let body = lines[ignored_lines[0]];
+    assert!(
+        body.contains("WITHOUT snubber"),
+        "TRIPWIRE FIRED: the ignored README fence is no longer the WITHOUT-half; \
+         it must compile instead of being excused: {body}"
+    );
+}
+
+/// `cargo package` excludes `assets/`, and crates.io / docs.rs render this file
+/// with no repository tree behind it, so a relative image path is a broken
+/// picture there. Absolute HTTPS href, and the local file must still exist for
+/// the GitHub view.
+#[test]
+fn test_readme_assets_are_absolute() {
+    for (idx, line) in read_doc("README.md").lines().enumerate() {
+        let Some(rest) = line.split("src=\"").nth(1) else {
+            continue;
+        };
+        let href = rest.split('"').next().unwrap_or("");
+        assert!(
+            href.starts_with("https://"),
+            "TRIPWIRE FIRED: README.md line {} embeds '{href}' — the registry \
+             page cannot resolve a relative asset; use the \
+             raw.githubusercontent.com URL",
+            idx + 1,
+        );
+        if let Some(path) =
+            href.strip_prefix("https://raw.githubusercontent.com/Ar3ss12/snubber/main/")
+        {
+            assert!(
+                std::path::Path::new(path).exists(),
+                "TRIPWIRE FIRED: README.md line {} points at '{path}', which is \
+                 not in the tree at the branch the URL names",
+                idx + 1,
+            );
+        }
     }
 }
 

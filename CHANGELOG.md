@@ -397,6 +397,35 @@ surface, wire format and telemetry layout are untouched.
   five hrefs verified live over HTTPS (crates.io returns 403 to `curl` by bot
   policy, the badge itself is 200). The `#![forbid(unsafe_code)]` / MSRV / `std`
   facts stay in the prose hygiene line rather than becoming a sixth pill.
+- The README snippets are now compiled, not eyeballed. `src/lib.rs` gained
+  `#[cfg(doctest)] #[doc = include_str!("../README.md")] struct ReadmeDoctests;`,
+  so `cargo test --doc` type-checks every runnable Rust block in README.md
+  against the real API — the mechanism that would have caught doc bug H5 (a
+  snippet with a wrong arity) at build time instead of at reader time. Three
+  fences were rewritten to pass it: the Quick start `scoped` block and The
+  delta `WITH` block are self-contained `no_run` programs over plain locals and
+  one `struct Request { amount: i64 }`, and the `PipeDrain` transport block now
+  imports `snubber::PipeDrain` and declares its byte chunk (it previously called
+  `feed(uart_chunk)` with no import and no binding). The hand-rolled `WITHOUT`
+  half stays illustrative pseudo-code and is the one registered `rust,ignore`
+  fence. `cfg(doctest)` keeps the README out of `cargo doc` / docs.rs output;
+  docs.rs already builds 0.6.10 at 100% coverage, so the new badge reports a
+  live status rather than a new failure. Prose is flat under this change
+  (104 → 105 lines, 7,603 → 7,661 characters, measuring non-fence / non-table /
+  non-badge lines); the +30 file lines are all inside code fences.
+- Registry-side metadata fixed, because the README is only half the landing
+  page. `<img src="assets/demo.gif">` rendered on GitHub and nowhere else:
+  `cargo package` excludes `assets/` (the GIF is 1.8 MB) and crates.io / docs.rs
+  have no repository tree to resolve a relative path against, so the demo went
+  to an absolute `raw.githubusercontent.com/Ar3ss12/snubber/main/...` href. The
+  manifest's discovery fields were re-tuned against the live crates.io category
+  list (`/api/v1/categories`, 58 slugs): `epoch` → `no_std` in keywords (five,
+  the cap), and the verified `embedded` category added (four of five) next to
+  the crate's bare-metal story. `[package.metadata.docs.rs]` now asks for
+  `all-features = true` and `--cfg docsrs`; that cfg is inert until a
+  `#[cfg(docsrs)]` gate consumes it, and `feature(doc_cfg)` / `doc_auto_cfg`
+  were deliberately NOT added: they are nightly-only, and turning a passing
+  docs.rs build red would falsify the badge shipped above.
 
 ### Tests
 
@@ -414,6 +443,27 @@ surface, wire format and telemetry layout are untouched.
   has 6 badges"; script → "FAIL: README.md publishes a test count again";
   surgical string revert → 14/14 and `OK: suite green and the README publishes
   no test count`.
+- The doctest run grew from 27 to 31 fences (30 pass, 1 registered `ignore`):
+  the four new ones are the README's Quick start, WITH-delta and `PipeDrain`
+  blocks compiling, plus the WITHOUT half standing down.
+- Three new `doc_sync` tripwires guard that mechanism rather than its prose,
+  because a silently deleted hook costs nothing to notice:
+  `test_readme_is_wired_into_doctests` (the `#[cfg(doctest)]` +
+  `include_str!("../README.md")` pair must survive in `src/lib.rs`),
+  `test_readme_fences_have_a_compile_verdict` (exactly 3 `rust,no_run` fences,
+  `rust,ignore` capped at one and still the WITHOUT block, no modifier-free
+  fence — a bare fence would execute in CI, and every ignore is unproven code),
+  `test_readme_assets_are_absolute` (every embedded `src="…"` is `https://`, and
+  a raw.githubusercontent path must exist in the tree at the branch the URL
+  names). `doc_sync` 14 → 17.
+  Negative proofs, one injection each, surgical string revert after:
+  `node.scoped(` → `node.scoped_typo(` in Quick start → doctest E0599
+  "no method named `scoped_typo` found for struct `SnubberNode`", `test result:
+  FAILED. 29 passed; 1 failed`; absolute GIF href → `assets/demo.gif` and
+  `rust,no_run` → `rust` on the transport fence → both gates fire by name with
+  their line numbers; `#[cfg(doctest)]` → `#[cfg(anydoc)]` in `src/lib.rs` →
+  "TRIPWIRE FIRED: src/lib.rs lost the README doctest hook". After the reverts:
+  17/17 doc_sync, 30+1 doctests, full suite green.
 
 - `doc_sync::test_readme_states_erased_bulkhead_scope` became
   `test_erased_bulkhead_scope_stays_documented`: it pinned the README, and the
