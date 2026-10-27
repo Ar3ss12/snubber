@@ -1820,10 +1820,10 @@ The `Layer` column is the chapter number of this guide plus what the row require
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | 2 / std | 1 `Box` at arm + 1 clock read/stage | Stage wall/CPU breakdown (opt-in; default path untouched) |
 | `enter_async_auto_profiled` | 3 / std | 1 `Box` + 2 clock reads | Profiled async admission; arms on the admitting poll |
 | `guard.profile_snapshot()` | 2 / std | 1 wall + 1 CPU read | Mid-flight profile without settling |
-| `ConflateSender::pair()` + `publish` / `take_latest` | 2 / std | **~21.6 ns** pair; ~16.0 ns replace | Latest-value channel (queue 0 or 1), coalescing counted, no `Clone` bound on payload |
-| `ExecutionEnvelope::new(..)` + `execution_envelope(env)` + `commit_enveloped(bytes)` | 2 / std | 16 B `Copy` header; **~142 ns** settle with payload judge | Corridor catches too slow/too big and too fast/too small; underflow/overflow in own stats columns, breaker untouched |
-| `ExecutionEnvelope::{off, is_off, is_inside, has_underflow, has_overflow, time_verdict, payload_verdict}` | 2 / std | `const fn` header math on one `Copy` value | Inspect a corridor without admitting: `off()`/`is_off()` disable it, `is_inside()` answers the four-bound question, `time_verdict(wall_us)` / `payload_verdict(bytes)` classify one measurement into `TimeVerdict` / `PayloadVerdict` |
-| `ProfileHarness` + `HarnessReport` / `run_boundary_harness` | 2 / std | one `Vec` of samples + sort | Deterministic PRNG, min/median/max/jitter/burst matrix, `report.envelope(headroom)`; accessors: `HarnessReport::mean_us()`, `ProfileHarness::{samples, burst_len}`; `FastPrng` is the xorshift32 payload generator behind `run` |
+| `ConflateSender::pair()` + `publish` / `take_latest` | 4 / std | **~21.6 ns** pair; ~16.0 ns replace | Latest-value channel (queue 0 or 1), coalescing counted, no `Clone` bound on payload |
+| `ExecutionEnvelope::new(..)` + `execution_envelope(env)` + `commit_enveloped(bytes)` | 4 / std | 16 B `Copy` header; **~142 ns** settle with payload judge | Corridor catches too slow/too big and too fast/too small; underflow/overflow in own stats columns, breaker untouched |
+| `ExecutionEnvelope::{off, is_off, is_inside, has_underflow, has_overflow, time_verdict, payload_verdict}` | 4 / std | `const fn` header math on one `Copy` value | Inspect a corridor without admitting: `off()`/`is_off()` disable it, `is_inside()` answers the four-bound question, `time_verdict(wall_us)` / `payload_verdict(bytes)` classify one measurement into `TimeVerdict` / `PayloadVerdict` |
+| `ProfileHarness` + `HarnessReport` / `run_boundary_harness` | 4 / std | one `Vec` of samples + sort | Deterministic PRNG, min/median/max/jitter/burst matrix, `report.envelope(headroom)`; accessors: `HarnessReport::mean_us()`, `ProfileHarness::{samples, burst_len}`; `FastPrng` is the xorshift32 payload generator behind `run` |
 | `snapshot.diff(&later)` + `write_summary` | 5 / cold | pure `Copy` math | Counter deltas + memory/queue window (`SnapshotDiff`) |
 | `write_triage(&mut out, node, &snap)` | 5 / cold | `fmt::Write`, no alloc | One ASCII verdict card per node |
 | `node_passthrough_enter` | 2 / std canary | **~55 ns** | Open-doors transit: lock-free count + unstamped dummy guard, no slots/breaker/`EpochGate`/clock |
@@ -1840,8 +1840,8 @@ The `Layer` column is the chapter number of this guide plus what the row require
 | `node.snapshot_v1()` + `encode()` | 5 / cold | 512 B, CRC32 | Crash-safe persistence, app-owned flush thread |
 | `find_anomalies()` / `assert_no_anomalies!` | 5 / cold | pure `u128` math | CI gate + diagnostics console + `[DIAG 0x…]` bug reports |
 | `NodeSet` set | 5 / cold | explicit `&Node` list + saturating aggregates | Multi-node pulse, never a `static` |
-| `SafeLockExt` (`Mutex::safe_lock(&node)`) | 2 / std | structural: 1 counter on recovery | Poison-tolerant locking: foreign panic recovers the lock, `poison_recoveries` counts each recovery |
-| `ClosurePolicy::new(closure)` + `run()` | 1 / alloc | 1 `Box` at construction | Capturing self-healing command: `run()` executes the boxed closure outside the node lock |
+| `SafeLockExt` (`Mutex::safe_lock(&node)`) | 1 / std | structural: 1 counter on recovery | Poison-tolerant locking: foreign panic recovers the lock, `poison_recoveries` counts each recovery |
+| `ClosurePolicy::new(closure)` + `run()` | 2 / alloc | 1 `Box` at construction | Capturing self-healing command: `run()` executes the boxed closure outside the node lock |
 | `TransactionHeader { generation, epoch, task_id }` | 1 / core | 24 B `Copy` | Stamped header for trust boundaries; `task_id` doubles as the reply-correlation check |
 | `GatewayStats` | 2 / std | plain `Copy` counters | Gateway channel books: `sent` / `admitted` / `shed` / `throttled` (saturating) |
 | `ResumeFuture` | 3 / std | 0% CPU waker park | Future resolved by the next directive (pause/resume/cancel); reads the directive under the wakers lock, never duplicates a payload |
