@@ -206,6 +206,65 @@ fn test_rollback_reentry_law_matches_the_code() {
     );
 }
 
+/// The host-runtime laws are the part readers get wrong most often, and a
+/// doc that drifts back to "snubber replaces Mutex" or "cancellation is a
+/// free abort" would ship a false promise. The section must keep: the
+/// cancelled future books `ImplicitDrop`, a blocking rollback has a budget
+/// and an outside poller, Rayon's rollback runs after the join, and
+/// `SafeLockExt` wraps the same lock instead of replacing it.
+#[test]
+fn test_host_runtime_laws_are_stated() {
+    let guide = read_doc("docs/USER_GUIDE.md");
+    let readme = read_doc("README.md");
+
+    const HEADING: &str = "### 9. Host runtimes:";
+    let start = guide
+        .find(HEADING)
+        .expect("TRIPWIRE FIRED: docs/USER_GUIDE.md lost the Host runtimes section");
+    let after = start + HEADING.len();
+    let end = guide[after..]
+        .find("\n## ")
+        .map(|n| after + n)
+        .unwrap_or(guide.len());
+    let section = &guide[start..end];
+
+    for token in [
+        "TrackedGuard",
+        "FaultKind::ImplicitDrop",
+        "checkpoint",
+        "state_snapshot",
+        "rollback_budget_ms",
+        "snubber::watchdog::poll_rollback",
+        "scoped",
+        "has joined",
+        "best-effort",
+        "revalidate",
+        "adds no dependency",
+        "does not replace `Mutex`",
+    ] {
+        assert!(
+            section.contains(token),
+            "TRIPWIRE FIRED: the Host runtimes section no longer states `{token}` — \
+             a cancelled await books ImplicitDrop, a blocking rollback is budgeted \
+             and polled from outside, Rayon rolls back after the join, and \
+             SafeLockExt keeps the same Mutex"
+        );
+    }
+
+    for (name, doc) in [("README.md", &readme), ("docs/USER_GUIDE.md", &guide)] {
+        assert!(
+            doc.contains("does not replace `Mutex`"),
+            "TRIPWIRE FIRED: {name} must keep the law that SafeLockExt is not a \
+             lock implementation — it wraps the same std Mutex and counts recoveries"
+        );
+        assert!(
+            !doc.contains("replaces `Mutex`"),
+            "TRIPWIRE FIRED: {name} now claims SafeLockExt replaces Mutex — it does \
+             not: same lock, counted poison recovery, data still needs revalidation"
+        );
+    }
+}
+
 /// The badge row is a set of working instruments, not decoration: exactly
 /// five badges, each answering one landing-page question, each with a real
 /// target — and no numeric test count. The `tests-N passed` pill was deleted

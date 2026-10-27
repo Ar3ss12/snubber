@@ -73,6 +73,17 @@ live on `RollbackPhase` instead of growing that struct.
   (layer column pinned by `tests/doc_sync.rs`), and Invariant 12 states
   "append enum variants last" and "never add a field to a constructible
   struct — publish a new `#[non_exhaustive]` view".
+- The guide gained a "Host runtimes" section stating the four integration
+  laws without metaphors or numbers: a cancelled await books
+  `FaultKind::ImplicitDrop` (cancellation is not a clean abort — expected
+  timeouts are decided inside the guarded future, and `checkpoint` names
+  the stage if one still unwinds), a blocking rollback is budgeted and
+  polled from outside, Rayon's rollback runs after the join and the panic
+  still reaches the caller, and `SafeLockExt` keeps the same `Mutex` with
+  a best-effort counted recovery whose data needs revalidation. A
+  doc_sync oracle pins the whole section plus the "does not replace
+  `Mutex`" law in README and guide; the negative proof (an extra
+  "replaces `Mutex`" line) fails with the cross-doc tripwire.
 
 ### Tests
 
@@ -85,7 +96,7 @@ live on `RollbackPhase` instead of growing that struct.
   `enum_no_repr_variant_discriminant_changed`: moving `RollbackStall` back
   between `CpuSpin` and `DeadlockStall` fails it with `[0, 1, 2, 4, 3]`
   (injected, observed, reverted byte-for-byte).
-- Suite 446 → 464 passed (67 result lines); `scripts/release.sh` runs the
+- Suite 446 → 465 passed (67 result lines); `scripts/release.sh` runs the
   rollback canary as an ignored release lane, and a lane that executes
   0 tests fails the release.
 

@@ -803,6 +803,34 @@ match gate.admit_auto(|| rollback()) {
 }
 ```
 
+### 9. Host runtimes: Tokio, Rayon, and the lock you already hold
+
+`snubber` adds no dependency and replaces no runtime: it bounds the entry
+points and gives every unwinding path one deterministic exit, while the
+runtime underneath keeps doing its own job.
+
+**Tokio.** A cancelled future is dropped, and the admitted `TrackedGuard`
+runs its rollback from `Drop` exactly as it does on `Err` or `panic!`. The
+ledger books that drop as `FaultKind::ImplicitDrop` (`Error`, catastrophic
+for the triage verdict): cancellation is not reclassified as a clean abort.
+When a timeout is normal control flow, decide it inside the guarded future
+and return `Err`; when it still unwinds, `checkpoint` names the last
+completed stage on the fault record and `state_snapshot` gives the live
+view. The rollback body runs on the executor thread: keep it short, and
+when it can block, arm `rollback_budget_ms` and poll
+`snubber::watchdog::poll_rollback` from a supervisor tick.
+
+**Rayon.** Wrap one batch in one `scoped`: the rollback runs after Rayon
+has joined the workers, so it never races in-flight items, and a panic
+continues to the caller of the parallel operation after the rollback. The
+closure cannot undo memory — only the compensating action you pass in
+makes the batch transactional.
+
+**The lock you already hold.** `SafeLockExt::safe_lock` is the same lock
+with a counted poison recovery; it does not replace `Mutex`. That tick is
+best-effort (skipped when the ledger is held), and the recovered value may
+be inconsistent — revalidate it at the boundary instead of trusting it.
+
 ---
 
 ## Layer 2 Subsystem: Bi-directional Task Steering (`TaskConduit` & `TaskHandle`)
