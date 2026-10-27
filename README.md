@@ -17,53 +17,6 @@ Zero deps · `#![forbid(unsafe_code)]` · MSRV 1.70 · one crate from `core`-onl
 
 ---
 
-## What it guarantees
-
-* **Rollback is structural.** An admitted guard reverts unless it commits — an
-  error return and a panic leave through the same door. `scoped_sealed` adds a
-  `!Send` seal: leaking a scope across threads fails at compile.
-* **It survives the process, not only the function.** A supervised child emits a
-  framed 44-byte token when it arms; if it dies (`kill -9`, `TerminateProcess`,
-  OOM euthanasia) the parent reads the pipe to EOF and classifies every reap as
-  **true ambush**, **clean escape** or **stillborn**, with
-  `ambush + escape + stillborn == reaped` gated on every run.
-* **Refusals carry telemetry.** Bulkhead, sliding-window breaker and three
-  priority lanes answer with `retry_after_ms` and queue depth; shedding is
-  counted as silent discard, never a fake success, and under the default
-  policies capacity pressure never trips a breaker.
-* **Async without a runtime.** `enter_async_auto` parks on `core::task::Waker`:
-  0% CPU while waiting, no Tokio or async-std dependency.
-* **A hang gets a verdict.** A monotonic clock plus a CPU-sample fold settles a
-  hot `loop {}` as `SpinDetected` and a blocked syscall as `TimedOut` —
-  identical rollback, distinct diagnosis, no thread killed. One
-  `WorkerPulse::kick()` strokes a hardware watchdog on firmware.
-* **State outlives the process.** A 64-byte `StateDigest` is a ticket, not
-  storage: a worker near its soft memory limit streams its checkpoint through a
-  fixed buffer and hands the digest to its successor.
-* **Health is one fixed frame.** A 512-byte, zero-allocation `SnapshotV1` with
-  CRC32 answers whether the system is healthy, and `assert_no_anomalies!()`
-  turns that into a CI gate.
-* **Impedance is bounded both ways.** A 10 000 msg/s producer into a 60 FPS
-  consumer gets a one-slot `ConflateSender` (latest wins, replacements counted,
-  backlog 0 or 1), and the 16-byte `ExecutionEnvelope` also catches work that
-  returns *too fast* as `envelope_underflows`.
-* **N lineages in one process.** `WorkerPool` gives every lane its own
-  `PipeDrain`, generation clock, restart tracker and memory watch; a lane whose
-  pipe never reaches EOF gets its own bucket (`ReapClass::Deadlocked`) instead
-  of being guessed into another.
-* **Extensible by contract.** Public enums are `#[non_exhaustive]`, so new
-  verdicts are additive; `friction_fn` / `pressure_fn` take capturing closures
-  and run outside the node lock; `snub_check_map!` maps breaches into your error
-  type.
-* **Bulkhead Scope (erased guards):** the erased path (`enter_erased_auto`,
-  `spawn_guarded`) commits its admission probe at entry, so `max_in_flight(N)`
-  bounds concurrent *admissions*, not live erased transactions; two live erased
-  workers are never serialized by the node. Serialize at the application layer
-  if you need a lease for the worker's lifetime — the typed `enter` / `scoped`
-  guards hold their slot until settlement and are unaffected.
-
----
-
 ## Quick start (10 seconds)
 
 ```toml
@@ -108,6 +61,53 @@ if outcome.is_ok() { ledger.commit(); } else { ledger.unlock(); }
 node.scoped_checked(req, |r| { snub_check!(r.amount > 0, "bad amount"); Ok(()) },
     || ledger.unlock_funds(), charge)?;
 ```
+
+---
+
+## What it guarantees
+
+* **Rollback is structural.** An admitted guard reverts unless it commits — an
+  error return and a panic leave through the same door. `scoped_sealed` adds a
+  `!Send` seal: leaking a scope across threads fails at compile.
+* **It survives the process, not only the function.** A supervised child emits a
+  framed 44-byte token when it arms; if it dies (`kill -9`, `TerminateProcess`,
+  OOM euthanasia) the parent reads the pipe to EOF and classifies every reap as
+  **true ambush**, **clean escape** or **stillborn**, with
+  `ambush + escape + stillborn == reaped` gated on every run.
+* **Refusals carry telemetry.** Bulkhead, sliding-window breaker and three
+  priority lanes answer with `retry_after_ms` and queue depth; shedding is
+  counted as silent discard, never a fake success, and under the default
+  policies capacity pressure never trips a breaker.
+* **Async without a runtime.** `enter_async_auto` parks on `core::task::Waker`:
+  0% CPU while waiting, no Tokio or async-std dependency.
+* **A hang gets a verdict.** A monotonic clock plus a CPU-sample fold settles a
+  hot `loop {}` as `SpinDetected` and a blocked syscall as `TimedOut` —
+  identical rollback, distinct diagnosis, no thread killed. One
+  `WorkerPulse::kick()` strokes a hardware watchdog on firmware.
+* **State outlives the process.** A 64-byte `StateDigest` is a ticket, not
+  storage: a worker near its soft memory limit streams its checkpoint through a
+  fixed buffer and hands the digest to its successor.
+* **Health is one fixed frame.** A 512-byte, zero-allocation `SnapshotV1` with
+  CRC32 answers whether the system is healthy, and `assert_no_anomalies!()`
+  turns that into a CI gate.
+* **Impedance is bounded both ways.** A 10 000 msg/s producer into a 60 FPS
+  consumer gets a one-slot `ConflateSender` (latest wins, replacements counted,
+  backlog 0 or 1), and the 16-byte `ExecutionEnvelope` also catches work that
+  returns *too fast* as `envelope_underflows`.
+* **N lineages in one process.** `WorkerPool` gives every lane its own
+  `PipeDrain`, generation clock, restart tracker and memory watch; a lane whose
+  pipe never reaches EOF gets its own bucket (`ReapClass::Deadlocked`) instead
+  of being guessed into another.
+* **Extensible by contract.** Public enums are `#[non_exhaustive]`, so new
+  verdicts are additive; `friction_fn` / `pressure_fn` take capturing closures
+  and run outside the node lock; `snub_check_map!` maps breaches into your error
+  type.
+* **Bulkhead Scope (erased guards):** the erased path (`enter_erased_auto`,
+  `spawn_guarded`) commits its admission probe at entry, so `max_in_flight(N)`
+  bounds concurrent *admissions*, not live erased transactions; two live erased
+  workers are never serialized by the node. Serialize at the application layer
+  if you need a lease for the worker's lifetime — the typed `enter` / `scoped`
+  guards hold their slot until settlement and are unaffected.
 
 ---
 

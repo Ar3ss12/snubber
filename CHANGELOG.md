@@ -363,6 +363,14 @@ surface, wire format and telemetry layout are untouched.
   `SnubberNode::scoped_checked` (`params, invariant, rollback, work`), the
   `doc_sync` pins (erased-bulkhead scope, layer map, guide anchors) pass
   unchanged at 13/13, and the badge stays 439.
+- The first screen now leads with syntax, not with laws: Quick start (demo
+  GIF under the snippet) and The delta sit above the eleven guarantee
+  bullets. Measured on the rendered file — the first fenced block moved from
+  line 69 to line 22, the first `rust` fence from line 77 to line 30, and the
+  list lines a reader had to scroll past before any code went 42 → 0. Prose
+  weight is unchanged (104 lines / 7,680 characters), and the `doc_sync`
+  layer-map and erased-bulkhead pins still pass 13/13: they pin wording and
+  format, so reordering a section costs nothing.
 
 ### Tests
 
