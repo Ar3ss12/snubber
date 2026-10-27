@@ -12,6 +12,13 @@ surface, wire format and telemetry layout are untouched.
 
 ### Fixed
 
+- The release-tag gate only accepts "marked Unreleased" when the
+  `## Unreleased` heading sits above the version's own section with no
+  other section heading between the two: a stale marker below the
+  section (or inside an old section's body) no longer satisfies the
+  gate. The `.ps1` compile-gates battery scans metaphors
+  case-sensitively, matching the POSIX gate's `grep`.
+
 - A guard with no watchdog armed takes no admission stamp
   (`needs_stamp`): `armed_at_ms` is written only when a deadline exists,
   and the passthrough dummy never reads the clock. `node.enter + commit`
@@ -191,6 +198,17 @@ surface, wire format and telemetry layout are untouched.
 
 ### Tests
 
+- New `channel` test closes the senders and asserts the receive side
+  settles as `GatewayRecvError::Disconnected`; the snapshot tamper test
+  matches the exact `SnapshotError` variants (`BadCrc{want,got}`,
+  `BadMagic`, `BadVersion(read)`) instead of a bare `is_err()`.
+- Four formerly flaky suites are deterministic now: `checkpoint_budget`
+  counts allocations thread-locally (a parallel test thread can no
+  longer inflate another measurement's peak); `profiling` replaces the
+  1 ms sleep handshake with an AtomicBool handshake;
+  `async_gate`'s no-park bound is 500 ms; `affordances` joins the
+  paused worker behind a 5 s `recv_timeout` (a deadlock fails in
+  seconds, verified by a withheld-resume probe).
 - New `isr_bridge` cross-thread FIFO test pushes 10,000 pulse signals
   from one thread through the 16-slot SPSC ring while another pops them,
   asserting opcode/reason/16-bit-sequence order end to end (Miri-scaled
