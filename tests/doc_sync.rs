@@ -101,22 +101,29 @@ fn test_low_level_entries_point_at_canonical() {
     );
 }
 
-/// The erased-guard bulkhead boundary must stay at preset level in the
-/// README: the erased path releases its slot at admission, so
-/// `max_in_flight` bounds admissions, not live erased transactions.
+/// The erased-guard bulkhead boundary must stay documented: the erased path
+/// releases its slot at admission, so `max_in_flight` bounds admissions, not
+/// live erased transactions.
+///
+/// Home of the statement: `docs/USER_GUIDE.md` (Layer 2, "Scope correction")
+/// and the `enter_erased_auto` doc comment — NOT the README. On 2026-10-27 the
+/// owner had the six-line caveat deleted from the README's guarantee list,
+/// where it read as a legal disclaimer at the end of the wins; the pin moved
+/// with the text instead of being dropped, so the correction is still guarded.
 #[test]
-fn test_readme_states_erased_bulkhead_scope() {
-    let readme = std::fs::read_to_string("README.md")
-        .expect("Failed to read README.md for bulkhead-scope audit");
+fn test_erased_bulkhead_scope_stays_documented() {
+    let guide = std::fs::read_to_string("docs/USER_GUIDE.md")
+        .expect("Failed to read docs/USER_GUIDE.md for bulkhead-scope audit");
     assert!(
-        readme.contains("**Bulkhead Scope (erased guards):**"),
-        "TRIPWIRE FIRED: README lost the 'Bulkhead Scope (erased guards)' \
-         paragraph — the erased-guard slot boundary must stay documented."
+        guide.contains("not a lease on the slot for the worker's lifetime"),
+        "TRIPWIRE FIRED: the User Guide lost the erased-path 'Scope correction' \
+         — `max_in_flight` on the erased path bounds admissions, and a reader \
+         must still be told that."
     );
     assert!(
-        readme.contains("bounds concurrent *admissions*, not live erased transactions"),
-        "TRIPWIRE FIRED: README bulkhead-scope paragraph lost its boundary \
-         statement."
+        guide.contains("serialize two live erased workers"),
+        "TRIPWIRE FIRED: the User Guide's bulkhead-scope correction lost its \
+         boundary statement."
     );
     let source = std::fs::read_to_string("src/node.rs")
         .expect("Failed to read src/node.rs for bulkhead-scope audit");

@@ -10,8 +10,8 @@
 > **Transactional safety fuse and failure-recovery engine for Rust.** If a
 > protected section fails — `panic!`, an early-return `?`, or the process
 > being killed — physical pins, database locks and memory settle back to a
-> safe state through `Drop`, and whoever supervises the work gets a
-> classification of what actually happened.
+> safe state through `Drop`, and the supervising process receives an exact
+> post-mortem diagnosis of the failure.
 
 Zero deps · `#![forbid(unsafe_code)]` · MSRV 1.70 · one crate from `core`-only bare metal to multi-threaded `std`.
 
@@ -24,22 +24,18 @@ Zero deps · `#![forbid(unsafe_code)]` · MSRV 1.70 · one crate from `core`-onl
 snubber = "0.6"
 ```
 
-Wrap critical work in **`scoped_checked`**: commits on `Ok`, rolls back on `Err`,
-on `panic!` and on early return:
+Wrap critical work in **`scoped`**: two closures, rollback and action. It
+commits on `Ok` and runs the rollback on `Err`, on `panic!` and on early
+return:
 
 ```rust
-use snubber::{snub_check, SnubberNode};
+use snubber::SnubberNode;
 
 let node = SnubberNode::desktop("orders");
 
-let receipt = node.scoped_checked(
-    &payment_request,
-    |req| {
-        snub_check!(req.amount > 0, "amount must be positive");
-        Ok(())
-    },
-    || ledger.unlock_funds(),      // emergency rollback if work fails
-    |req| gateway.charge(req),     // protected work unit
+let receipt = node.scoped(
+    || ledger.unlock_funds(),   // rollback: runs on Err, on panic!, on early return
+    || gateway.charge(amount),  // work: returns Result<T, E>
 )?;
 ```
 
@@ -57,9 +53,13 @@ ledger.lock_funds(req);
 let outcome = charge(req);                 // panics here -> funds stay locked
 if outcome.is_ok() { ledger.commit(); } else { ledger.unlock(); }
 
-// WITH snubber: one call, both exits covered, panic included
-node.scoped_checked(req, |r| { snub_check!(r.amount > 0, "bad amount"); Ok(()) },
-    || ledger.unlock_funds(), charge)?;
+// WITH snubber: the same scope, plus an invariant checked before anything runs
+node.scoped_checked(
+    req,
+    |r| { snub_check!(r.amount > 0, "bad amount"); Ok(()) },
+    || ledger.unlock_funds(), // emergency rollback: Err, panic!, early return
+    charge,                   // protected work unit
+)?;
 ```
 
 ---
@@ -102,12 +102,6 @@ node.scoped_checked(req, |r| { snub_check!(r.amount > 0, "bad amount"); Ok(()) }
   verdicts are additive; `friction_fn` / `pressure_fn` take capturing closures
   and run outside the node lock; `snub_check_map!` maps breaches into your error
   type.
-* **Bulkhead Scope (erased guards):** the erased path (`enter_erased_auto`,
-  `spawn_guarded`) commits its admission probe at entry, so `max_in_flight(N)`
-  bounds concurrent *admissions*, not live erased transactions; two live erased
-  workers are never serialized by the node. Serialize at the application layer
-  if you need a lease for the worker's lifetime — the typed `enter` / `scoped`
-  guards hold their slot until settlement and are unaffected.
 
 ---
 
@@ -124,11 +118,6 @@ node.scoped_checked(req, |r| { snub_check!(r.amount > 0, "bad amount"); Ok(()) }
   one pipe frame, there is no two-phase commit. Not a lock implementation —
   `SafeLockExt` wraps locks in guard ergonomics, it does not replace `Mutex`. Not
   a thread scheduler — pool lanes restart children, they do not place threads.
-* **`std` is a real boundary:** `SnubberNode`, the async engine, supervisor,
-  pool, gateway, conduit, conflate and harness layers own OS threads, pipes and
-  process trees. Format ceilings (3 priority lanes, 4 profile stages, 16 ISR
-  slots, 28 B token payload, 512 B snapshot, 250 ms EOF grace) are published
-  constants, not tunables.
 
 ---
 
@@ -138,7 +127,11 @@ node.scoped_checked(req, |r| { snub_check!(r.amount > 0, "bad amount"); Ok(()) }
 (`#![cfg_attr(not(feature = "std"), no_std)]`). CI builds **both** `core` and
 `core + alloc` for `thumbv7em-none-eabihf`. `core`-only targets get the guard,
 epoch gate, pulse, ISR bridge, clock, envelope, policy, drain scanner and memory
-watch; `alloc` upgrades those layers in place rather than adding one.
+watch; `alloc` upgrades those layers in place rather than adding one. The `std`
+side owns OS threads, pipes and process trees — `SnubberNode`, the async engine,
+supervisor, pool, gateway, conduit, conflate and harness. Format ceilings (3
+priority lanes, 4 profile stages, 16 ISR slots, 28 B token payload, 512 B
+snapshot, 250 ms EOF grace) are published constants, not tunables.
 
 `PipeDrain` is `std` because it owns EOF state and counters, so on a `std`
 transport push bytes from a UART/DMA task and declare EOF yourself; on

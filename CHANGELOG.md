@@ -371,8 +371,33 @@ surface, wire format and telemetry layout are untouched.
   weight is unchanged (104 lines / 7,680 characters), and the `doc_sync`
   layer-map and erased-bulkhead pins still pass 13/13: they pin wording and
   format, so reordering a section costs nothing.
+- The README sells instead of arguing (owner's copy review, 2026-10-27). Four
+  edits: the hook's loose "whoever supervises the work gets a classification of
+  what actually happened" is now "the supervising process receives an exact
+  post-mortem diagnosis of the failure"; Quick start leads with the two-closure
+  `scoped` (`rollback`, `work` — signature verified at `src/node.rs:2490`)
+  instead of `scoped_checked` + `snub_check!`, and the invariant-checking form
+  is shown one step later in The delta, whose `WITH` block is now one argument
+  per line; the six-line erased-guard scope disclaimer is out of the guarantee
+  list (it duplicated USER_GUIDE §2.5 "Scope correction"); and the
+  "`std` is a real boundary" lecture left "When to use / when not" for the
+  `Embedded & no_std` chapter, where the module split and the format ceilings
+  (3 lanes, 4 stages, 16 ISR slots, 28 B payload, 512 B snapshot, 250 ms grace
+  — all re-checked in source) already live. Prose 104 → 98 lines /
+  7,680 → 7,260 characters, guarantee bullets 11 → 10, first `rust` fence still
+  line 30, 27/27 local links resolve, banned-fluff and tilde-citation scans 0.
 
 ### Tests
+
+- `doc_sync::test_readme_states_erased_bulkhead_scope` became
+  `test_erased_bulkhead_scope_stays_documented`: it pinned the README, and the
+  owner ordered that paragraph out of the README, so the pin moved with the
+  text rather than being dropped — it now requires the same correction in
+  `docs/USER_GUIDE.md` ("not a lease on the slot for the worker's lifetime",
+  "serialize two live erased workers") plus the unchanged
+  `enter_erased_auto` doc window. Negative proof: guide wording changed to
+  "…worker's run" → TRIPWIRE FIRED → surgical string revert → 13/13. Suite
+  count is untouched (13 → 13, badge 439 passed / 5 ignored).
 
 - New `channel` test closes the senders and asserts the receive side
   settles as `GatewayRecvError::Disconnected`; the snapshot tamper test
