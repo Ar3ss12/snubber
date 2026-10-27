@@ -66,7 +66,8 @@ node from a rollback returns instead of deadlocking (`scoped` refuses at
 capacity with `BulkheadFull`, async parks as `Pending`, erased scopes are
 granted because their slot was released at admission). The invariant is
 about OUR lock; a rollback that re-takes a FOREIGN mutex the caller's
-`work()` already holds hangs anyway, and no node counter can see it.
+`work()` already holds hangs anyway: no counter books it, and only an
+external `watchdog::poll_rollback` names the still-active body.
 The open-call window itself is observable from any thread without the
 lock: `SnubberNode::rollback_phase()` reads plain atomics (two writes per
 body, a clock stamp only when `rollback_budget_ms` is armed) and names the
@@ -304,6 +305,35 @@ silently abandoned:
 
 Verification: `cargo test --test channel --test async_primitives --test circuit_breaker --test conduit --test supervisor_pool`
 
+### Invariant 14: A Rollback Phase Is Never Silent When a Budget Is Armed
+
+The node cannot cancel a rollback body (`#![forbid(unsafe_code)]`; no
+library may kill a caller thread), so the guarantee is detect-and-report:
+- While the body runs, `SnubberNode::rollback_phase()` answers from any
+  thread with no lock and no allocation (`active`, `epoch`, `task_id`,
+  and — when `rollback_budget_ms` is armed — `elapsed_ms`, `max_ms`,
+  `stalls`).
+- When the body RETURNS past its budget, the node books the overrun as
+  `FaultKind::RollbackStall` (Invariant 6).
+- While the body is STILL running past an observer's budget,
+  `watchdog::poll_rollback(node, budget_ms)` returns
+  `RollbackStall { epoch, task_id, elapsed_ms, budget_ms }`. It is a pure
+  read: it books no counter, appends no flight entry and mints no fault.
+  The observer supplies the cadence; the node supplies the clock.
+- The clock has one owner: without `rollback_budget_ms` the phase reports
+  `active` but `elapsed_ms == 0`, and `poll_rollback` returns `None`
+  instead of inventing age. The `no_std` build keeps the same law; the
+  observer itself lives under `std` (it needs no more than a thread the
+  caller already has).
+- Honest limit — the guarantee is a name, not a cure: nothing here
+  prevents the wedge. `tests/rollback_guardrails.rs`
+  (`wedged_rollback_wedges_the_node_forever`) proves a child process can
+  name its own wedge from a second thread while the wedged thread never
+  returns, and that the parent still has to kill it.
+
+Verification: `cargo test --test rollback_guardrails` (plus the ignored
+subprocess lane under `-- --ignored`).
+
 ## 2. Verification Protocol
 
 The continuous integration suite validates these invariants under sustained chaos testing:
@@ -328,7 +358,7 @@ cargo test --lib isr
 # Verify zero-nesting lock law (deadlock impossibility)
 cargo test --test lock_hierarchy
 
-# Verify the rollback phase, budget verdict and re-entrancy policy
+# Verify the rollback phase, budget verdict, re-entrancy policy and outside watchdog
 cargo test --test rollback_guardrails
 
 # Verify pulse black-box (stall verdicts in the current-version snapshot + anomaly)
@@ -419,6 +449,7 @@ flavor) and `tests/doc_sync.rs` classify as follows:
 | `scripts/check_test_count.sh` | The suite that ran is green, its parsed counts clear the floor, and README.md publishes no test count | Oracle | Parses `cargo test` output; fails on any failure, on a suspiciously low parse, or on a `tests-N passed` badge / "N passing tests" claim returning to the README (0.6.11: the vanity badge was deleted, so the gate guards its absence) |
 | README snippets compile | Every runnable Rust block in README.md type-checks against the real API, so a pasted quick start cannot be stale | Oracle (the compile) with tripwire anchors | `cargo test --doc` compiles the fences through the `#[cfg(doctest)] #[doc = include_str!("../README.md")]` hook in `src/lib.rs` — the compiler is the oracle, so no assertion text is needed (0.6.11, after doc-bug H5: a README snippet carried a wrong arity). Two tripwires keep the mechanism itself from vanishing: `test_readme_is_wired_into_doctests` (a deleted hook would silently drop the README out of the doctest run) and `test_readme_fences_have_a_compile_verdict` (3 `rust,no_run` fences, `rust,ignore` capped at the one registered WITHOUT block, no modifier-free fence at all) |
 | README assets resolve off-GitHub | The README renders identically on crates.io / docs.rs, not only on GitHub | Tripwire | `cargo package` excludes `assets/` and the registry pages have no repository tree behind them, so a relative `src="assets/…"` is a broken picture there; `test_readme_assets_are_absolute` requires an `https://` href and checks that a raw.githubusercontent.com path still exists in the tree at the named branch (0.6.11) |
+| `rollback_guardrails` wedge canary | A rollback body that never returns is nameable from outside and never finishes | Oracle (real subprocess run) | The child arms `rollback_budget_ms`; a second thread of the child calls `watchdog::poll_rollback`; the parent requires the `RollbackStall` verdict BEFORE it kills the process. A child that only hangs fails the gate, so the assertion got stronger when the verdict arrived (0.6.12) |
 
 Two rules follow for the next refactor: do not add a hand-maintained list of
 names or numbers to a tripwire when the list can be derived at run time

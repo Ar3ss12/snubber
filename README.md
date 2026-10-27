@@ -236,6 +236,7 @@ Every file in [`examples/`](examples) runs with `cargo run --example <name>`.
 | 17 | [Impedance bridge](examples/17_impedance_bridge.rs) | Raw stream vs conflation vs paced gateway |
 | 18 | [Impedance calibration](examples/18_impedance_calibration.rs) | `ProfileHarness` derives the envelope from samples |
 | 19 | [Worker pool](examples/19_worker_pool.rs) | N lineages per pool, `--mixed` and `--lease-ms` storms |
+| 20 | [Rollback budget](examples/20_rollback_budget.rs) | A wedged rollback body named from outside the lock |
 
 ---
 

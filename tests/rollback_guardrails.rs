@@ -19,6 +19,7 @@
 //! rollback body: bodies publish a verdict code into an `AtomicU8`, and the
 //! test thread — whose panic is NOT swallowed — reads it.
 
+use snubber::watchdog::poll_rollback;
 use snubber::{
     classify, classify_rollback, classify_stall_ceiling, EnterError, FaultAction, FaultKind,
     LogLevel, Refusal, RollbackReentrancy, SnubberError, SnubberNode, StallKind, DEFAULT_POLICIES,
@@ -831,6 +832,151 @@ fn rollback_stall_kind_is_named_last_and_never_a_deadlock_verdict() {
     );
 }
 
+/// Stage 5: the external observer names a body that never returned, and the
+/// read books nothing. The node's own `RollbackStall` record is minted only
+/// when a body RETURNS, so this verdict is the only one available while it
+/// is still running.
+#[test]
+fn poll_rollback_names_a_body_from_outside_without_touching_the_books() {
+    const BUDGET_MS: u64 = 40;
+    let node = SnubberNode::builder("guardrails/watchdog/poll")
+        .max_in_flight(1)
+        .rollback_budget_ms(BUDGET_MS)
+        .build();
+    let entered = Arc::new(AtomicBool::new(false));
+    let (gate_tx, gate_rx) = channel::<()>();
+    let (done_tx, done_rx) = channel::<()>();
+
+    let worker = {
+        let node = node.clone();
+        let entered = Arc::clone(&entered);
+        std::thread::spawn(move || {
+            let guard = node
+                .enter(4, 9, move || {
+                    entered.store(true, Ordering::SeqCst);
+                    let _ = gate_rx.recv();
+                })
+                .expect("the first admission takes the only slot");
+            drop(guard);
+            let _ = done_tx.send(());
+        })
+    };
+
+    spin_until_started(&entered);
+    assert_eq!(poll_rollback(&node, 0), None, "no threshold, no verdict");
+    assert!(
+        poll_rollback(&node, 10_000).is_none(),
+        "a body inside the budget is not a stall"
+    );
+
+    std::thread::sleep(Duration::from_millis(BUDGET_MS + 120));
+    let stall = poll_rollback(&node, BUDGET_MS).expect("the body outlived the budget");
+    assert_eq!(
+        (stall.epoch, stall.task_id),
+        (4, 9),
+        "the verdict names the transaction: {stall:?}"
+    );
+    assert!(
+        stall.elapsed_ms > BUDGET_MS,
+        "the verdict reports the measured age: {stall:?}"
+    );
+    assert_eq!(stall.budget_ms, BUDGET_MS);
+    assert_eq!(
+        node.stats().rollback_stalls,
+        0,
+        "observing a stall must not book one"
+    );
+    assert!(
+        node.stats().last_fault.is_none(),
+        "the reader is not a fault source"
+    );
+
+    drop(gate_tx);
+    done_rx
+        .recv_timeout(Duration::from_millis(3_000))
+        .expect("rollback body returned once released");
+    worker.join().expect("worker thread finished");
+    assert_eq!(
+        node.stats().rollback_stalls,
+        1,
+        "the returned body books its own overrun exactly once"
+    );
+    assert_eq!(node.rollback_phase().stalls, 1);
+}
+
+/// Honest limit: the verdict's clock belongs to the node. Without
+/// `rollback_budget_ms(..)` the phase stays `active: true, elapsed_ms: 0`
+/// by design, and `poll_rollback` returns `None` instead of inventing age.
+#[test]
+fn poll_rollback_needs_the_node_clock_armed() {
+    let node = SnubberNode::builder("guardrails/watchdog/unarmed")
+        .max_in_flight(1)
+        .build();
+    let entered = Arc::new(AtomicBool::new(false));
+    let (gate_tx, gate_rx) = channel::<()>();
+    let (done_tx, done_rx) = channel::<()>();
+
+    let worker = {
+        let node = node.clone();
+        let entered = Arc::clone(&entered);
+        std::thread::spawn(move || {
+            let guard = node
+                .enter(1, 1, move || {
+                    entered.store(true, Ordering::SeqCst);
+                    let _ = gate_rx.recv();
+                })
+                .expect("the first admission takes the only slot");
+            drop(guard);
+            let _ = done_tx.send(());
+        })
+    };
+
+    spin_until_started(&entered);
+    std::thread::sleep(Duration::from_millis(120));
+    assert!(node.rollback_phase().active, "the body is visible");
+    assert_eq!(node.rollback_phase().elapsed_ms, 0);
+    assert_eq!(
+        poll_rollback(&node, 1),
+        None,
+        "an unarmed node clock cannot age a body, so no verdict is minted"
+    );
+
+    drop(gate_tx);
+    done_rx
+        .recv_timeout(Duration::from_millis(3_000))
+        .expect("rollback body returned once released");
+    worker.join().expect("worker thread finished");
+}
+
+/// Kills the wedge child even when an assertion fires first: a failing
+/// canary must not leave a deliberately wedged process running.
+struct WedgeChild {
+    child: std::process::Child,
+    scratch: [std::path::PathBuf; 2],
+}
+
+impl WedgeChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn kill_and_wait(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for WedgeChild {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            self.kill_and_wait();
+        }
+        for path in &self.scratch {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// The cost of one wedged rollback, measured out of process.
 ///
 /// The child holds a foreign `Mutex` across the whole scope and re-locks it
@@ -844,11 +990,34 @@ fn rollback_stall_kind_is_named_last_and_never_a_deadlock_verdict() {
 fn wedged_rollback_wedges_the_node_forever() {
     const CHILD_ENV: &str = "SNUB_ROLLBACK_WEDGE_CHILD";
     const MARKER_ENV: &str = "SNUB_ROLLBACK_WEDGE_MARKER";
+    const VERDICT_ENV: &str = "SNUB_ROLLBACK_WEDGE_VERDICT";
+    const WEDGE_BUDGET_MS: u64 = 200;
     if std::env::var_os(CHILD_ENV).is_some() {
         let marker = std::env::var(MARKER_ENV).expect("child gets its marker path");
+        let verdict = std::env::var(VERDICT_ENV).expect("child gets its verdict path");
         let node = SnubberNode::builder("guardrails/wedge/child")
             .max_in_flight(1)
+            .rollback_budget_ms(WEDGE_BUDGET_MS)
             .build();
+        // The wedged thread must NOT be the reporter: a second thread of the
+        // same child reads the phase atomics and writes the verdict.
+        let observer = {
+            let node = node.clone();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_millis(5_000);
+                while std::time::Instant::now() < deadline {
+                    if let Some(stall) = snubber::watchdog::poll_rollback(&node, WEDGE_BUDGET_MS) {
+                        let line = format!(
+                            "RollbackStall epoch={} task_id={} elapsed_ms={} budget_ms={}\n",
+                            stall.epoch, stall.task_id, stall.elapsed_ms, stall.budget_ms
+                        );
+                        std::fs::write(&verdict, line).expect("child writes the verdict");
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
         let lock = Arc::new(std::sync::Mutex::new(0u32));
         let held = lock.lock().expect("child takes its own lock");
         let rollback_lock = Arc::clone(&lock);
@@ -862,26 +1031,34 @@ fn wedged_rollback_wedges_the_node_forever() {
             || Err::<i32, &'static str>("work failed"),
         );
         drop(held);
+        let _ = observer.join();
         return;
     }
 
     let marker = std::path::PathBuf::from("target")
         .join(format!("rollback_wedge_marker_{}.txt", std::process::id()));
+    let verdict = std::path::PathBuf::from("target")
+        .join(format!("rollback_wedge_verdict_{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&verdict);
     let exe = std::env::current_exe().expect("test exe path");
-    let mut child = std::process::Command::new(&exe)
-        .env(CHILD_ENV, "1")
-        .env(MARKER_ENV, &marker)
-        .args([
-            "--exact",
-            "wedged_rollback_wedges_the_node_forever",
-            "--ignored",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("wedge child spawns");
+    let mut child = WedgeChild {
+        child: std::process::Command::new(&exe)
+            .env(CHILD_ENV, "1")
+            .env(MARKER_ENV, &marker)
+            .env(VERDICT_ENV, &verdict)
+            .args([
+                "--exact",
+                "wedged_rollback_wedges_the_node_forever",
+                "--ignored",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("wedge child spawns"),
+        scratch: [marker.clone(), verdict.clone()],
+    };
 
     // The child must reach the rollback body (the scenario is live), then must
     // never leave it (the wedge is real).
@@ -898,12 +1075,30 @@ fn wedged_rollback_wedges_the_node_forever() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    std::thread::sleep(Duration::from_millis(500));
+    // Stage 5: hanging is no longer enough — the child must NAME its own
+    // wedge from a second thread before the parent kills it.
+    let verdict_deadline = std::time::Instant::now() + Duration::from_millis(5_000);
+    while !verdict.exists() {
+        assert!(
+            std::time::Instant::now() < verdict_deadline,
+            "the child never named its own wedge (verdict: {})",
+            verdict.display()
+        );
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            let _ = std::fs::remove_file(&marker);
+            panic!("wedge child exited early with {status} — the observer broke");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let named = std::fs::read_to_string(&verdict).expect("read the child verdict");
+    assert!(
+        named.starts_with("RollbackStall") && named.contains("budget_ms=200"),
+        "the outside verdict must name the stall: {named:?}"
+    );
+    // Naming the body did not free it: the wedge is still the finding.
     assert!(
         child.try_wait().expect("try_wait").is_none(),
         "a rollback that re-locks a held mutex must not finish — that wedge is the finding"
     );
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = std::fs::remove_file(&marker);
+    child.kill_and_wait();
 }

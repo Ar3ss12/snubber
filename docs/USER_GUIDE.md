@@ -91,7 +91,7 @@ How it works: the guard owns your rollback closure. `commit()` disarms it (succe
 ### Rules for the rollback closure:
 1. **Safe to run twice:** Releasing a button twice is fine; sending money twice is not — put terminal forward actions in `commit()`.
 2. **Fast and non-blocking:** Atomic stores, event flags, non-blocking sends.
-3. **Re-entrancy is allowed, not free:** the rollback body runs *outside* the node lock (Invariant 6, open-call), so calling back into the same node's admission from it does **not** deadlock — measured in `tests/rollback_guardrails.rs`. What actually happens: `scoped`/`scoped_checked` re-admission succeeds while a slot is free and returns `SnubberError::Admission(EnterError::BulkheadFull)` when the node is at capacity, because **your own rollback still holds its slot until it returns**; the async path returns `Poll::Pending` and wakes only when the body finishes. So a retry loop inside a rollback is a livelock of your thread, not a hang of the node. What is forbidden: re-locking a mutex that `work()` already holds (same thread → real hang, and the node reports nothing), and assuming the erased path will refuse you — `enter_erased_auto` releases admission at arm time, so nested erased scopes are granted by design.
+3. **Re-entrancy is allowed, not free:** the rollback body runs *outside* the node lock (Invariant 6, open-call), so calling back into the same node's admission from it does **not** deadlock — measured in `tests/rollback_guardrails.rs`. What actually happens: `scoped`/`scoped_checked` re-admission succeeds while a slot is free and returns `SnubberError::Admission(EnterError::BulkheadFull)` when the node is at capacity, because **your own rollback still holds its slot until it returns**; the async path returns `Poll::Pending` and wakes only when the body finishes. So a retry loop inside a rollback is a livelock of your thread, not a hang of the node. What is forbidden: re-locking a mutex that `work()` already holds (same thread → real hang, and the node books no verdict on its own — an outside `watchdog::poll_rollback` names the still-active body), and assuming the erased path will refuse you — `enter_erased_auto` releases admission at arm time, so nested erased scopes are granted by design.
 4. **Memory ordering:** The node's mutex protects node books only. Every guard runs a `SeqCst` fence before the rollback body (free on x86/x64) — but a fence pairs with NOTHING. If your rollback publishes to shared state that another thread reads, pair it yourself: store with `Release`, load with `Acquire` (or guard the state with your own lock). `Relaxed`×2 reads stale data.
 5. **Bind resource to guard:** Wrap the handle in `Protected::new(res, guard)` — `commit()` disarms the guard and returns the resource; any other exit executes rollback and drops the resource. Post-crash access becomes a compile error, not a forgotten `if`.
 6. **Seal the scope:** Prefer `node.scoped_sealed(rb, work)` where thread-leakage is the threat — the `!Send` `ScopeToken` makes `spawn` with context a compile error (E0277).
@@ -109,6 +109,31 @@ if phase.active && phase.elapsed_ms > my_budget_ms {
     // your reaction: alarm, drain, restart the worker
 }
 ```
+
+`watchdog::poll_rollback(node, budget_ms)` packages that read into a typed
+verdict for the "it never returned" case — still no lock, no thread, no
+allocation, and it books nothing:
+
+```rust
+use snubber::watchdog::poll_rollback;
+if let Some(stall) = poll_rollback(&node, 200) {
+    // stall.epoch / stall.task_id / stall.elapsed_ms / stall.budget_ms
+}
+```
+
+You choose where to poll from (a supervisor tick, a `main` loop) and how
+often. The elapsed clock belongs to the node, so `rollback_budget_ms(..)`
+must be armed as well; otherwise `elapsed_ms` stays `0` and the function
+returns `None` instead of inventing age.
+
+**What to do instead of re-locking the foreign mutex.** Queue the
+compensating action (a lock-free send, an atomic flag) and let the thread
+that owns the lock apply it after your body returns. If the lock is truly
+required, use `try_lock()` and report the miss instead of waiting. The
+crate does not cancel your body and does not kill your thread: the kill
+switch belongs to your supervisor (`Supervisor`), and the in-process
+alternative is this verdict. Worked example:
+`examples/20_rollback_budget.rs` (finishes while its worker stays wedged).
 
 * `active`, `epoch`, `task_id` always work: two atomic writes per body, no
   clock read, nothing to configure.
@@ -1655,6 +1680,7 @@ The `Layer` column is the chapter number of [docs/USER_GUIDE.md](docs/USER_GUIDE
 | `node.cpu_budget_ms(n)` + `node.stall_ceiling_ms(n)` + `guard.with_cpu_sampler(f)` | 1.5 / std | 1 fn call at arming | CPU-spin budget + silence ceiling; `check_timeout` settles spin/deadlock distinctly |
 | `guard.stall_kind()` | 1.5 / std | 1 clock + 1 sample | Non-destructive hang verdict (no settle) |
 | `guard.check_timeout()` | 1.5 / std | 1 clock + 1 sample | Cooperative watchdog: `WithinBudget` / `TimedOut` / `SpinDetected` / `DeadlockSuspected` |
+| `snubber::watchdog::poll_rollback(&node, budget_ms)` | 2 / std | 1 pass over phase atomics, no lock/alloc | Outside verdict: a rollback body older than `budget_ms`, with `epoch`/`task_id`; books nothing |
 | `IsrBridge::try_push/pop` + `trip/take_trips` + `IsrSignal` | 1.5 / core | 80 B, ~2 bus cycles | ISR signal into main loop; trip latch bypasses a full ring; no mutex/alloc/`unsafe` (M0-safe byte atomics); `head`/`tail` separated by 64 B cells, no `align(64)` pads |
 | `IsrSignal::new(opc, reason, value)` | 1.5 / core | 4 B, const | Pack `OP_EMERGENCY_TRIP` / `OP_PULSE` / `OP_PAUSE` |
 | `IdlePark::park` (`SpinPark`/firmware `wfi`/`wfe`) | 1.5 / core | structural: 0% CPU by design | 0%-CPU park: `Condvar` on `std`, `wfi`/`wfe` impl on firmware (`wfe` needs `SEVONPEND=1` at boot) |
