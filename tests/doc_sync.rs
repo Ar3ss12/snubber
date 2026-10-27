@@ -297,6 +297,48 @@ fn test_quick_ref_layer_column_matches_chapters() {
     }
 }
 
+/// Shared bench numbers must not diverge between the README table and the
+/// USER_GUIDE quick reference: both quote the same Criterion run, so a
+/// number updated in one file and left stale in the other fails here.
+#[test]
+fn test_bench_numbers_agree_across_readme_and_guide() {
+    let readme = read_doc("README.md");
+    let guide = read_doc("docs/USER_GUIDE.md");
+
+    let shared: &[&str] = &[
+        "~5.4 ns", "~2.6 ns", "~2.0 ns", "~50.8 ns", "~21.7 ns", "~15.7 ns", "~142 ns", "~94 ns",
+        "~87 ns", "~90 ns", "~55 ns", "~52 ns", "~971 ns", "~923 ns", "~184 ns", "~40 ns",
+    ];
+
+    for token in shared {
+        assert!(
+            readme.contains(token),
+            "TRIPWIRE FIRED: README lost the bench number '{token}' — \
+             re-measure and update both docs from the same Criterion run"
+        );
+        assert!(
+            guide.contains(token),
+            "TRIPWIRE FIRED: docs/USER_GUIDE.md lost the bench number '{token}' \
+             (README still quotes it) — the two docs quote one run, update both"
+        );
+    }
+    // Numbers that live in BOTH a table row and a prose sentence per doc:
+    // require two occurrences — a one-site update drops the count to one
+    // and fails, which a bare `contains` cannot catch.
+    let dual_site: &[&str] = &["~225 ns", "~187 ns", "~107 ns", "~519 ns"];
+    for token in dual_site {
+        for (doc, text) in [("README.md", &readme), ("docs/USER_GUIDE.md", &guide)] {
+            let hits = text.matches(token).count();
+            assert!(
+                hits >= 2,
+                "TRIPWIRE FIRED: {doc} quotes '{token}' {hits} time(s), want >= 2 \
+                 (table row + prose) — one site was updated from the Criterion run \
+                 and the other still carries the old measurement"
+            );
+        }
+    }
+}
+
 /// Collects `src/...` tokens from prose so a renamed module cannot survive
 /// as a stale pointer in the docs.
 fn documented_source_paths(text: &str) -> Vec<&str> {

@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/snubber.svg)](https://crates.io/crates/snubber)
 [![Documentation](https://docs.rs/snubber/badge.svg)](https://docs.rs/snubber)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Tests](https://img.shields.io/badge/tests-433%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-434%20passed-brightgreen.svg)]()
 
 <!-- Badge provenance: `bash scripts/check_test_count.sh` (all features, 5 ignored), last verified 2026-10-26. -->
 
@@ -274,7 +274,7 @@ Every number in the three paragraphs above is copied from the committed reports 
 
 All three storms plus `stress_breaker_churn` run in the `release-ignored` job of `.github/workflows/ci.yml` on every push and pull request (4 lanes × 8 / 6 / 8 kills and 8 threads × 1500 churn ops, ~2 s of test time); the heavier supervisor and multi-lineage harnesses stay scheduled or dispatch-only.
 
-Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~192 ns (ambush) / ~173 ns (escape), a four-lane `report()` is ~111 ns, a four-lane lease sweep is ~517 ns, and `namespace_task` is ~1 ns — each lane locks only its own state.
+Per-reap cost scales with lanes, not with the pool: `attach + note_death` is ~225 ns (ambush) / ~187 ns (escape), a four-lane `report()` is ~107 ns, a four-lane lease sweep is ~519 ns, and `namespace_task` is ~1 ns — each lane locks only its own state.
 
 ---
 

@@ -189,6 +189,19 @@ surface, wire format and telemetry layout are untouched.
 
 ### Documentation
 
+- Bench numbers no longer diverge between docs. The README prose
+  (`attach + note_death` ~192/~173 ns, `report()` ~111 ns, lease sweep
+  ~517 ns) and 14 USER_GUIDE rows (contended 925/899/146/34 ns, storm
+  `wall_ms=486`, transition/priority/auto ~126/~126/~130 ns, gateway
+  ~50.5 ns, conflation ~21.6/~16.0 ns, pool rows ~192/~173/~111/~517 ns)
+  were stale against the 2026-10-26 Criterion run; every figure now
+  quotes that run (`971/923/184/40` contended, `225/187` ambush/escape,
+  `107` report, `519` expired_lanes, `474 ms` mixed storm, `90/87/94`
+  post-`needs_stamp` entries). A new `doc_sync` tripwire pins 16 shared
+  tokens across README and the guide and requires the four dual-site
+  numbers (table + prose) twice per doc, so a one-site update fails the
+  suite.
+
 - The API & Cost Quick Reference table's `Layer` column is re-audited
   against the guide's own chapter map: 52 rows moved (hang/ISR/pulse
   rows to 1.5, memory/`StateDigest`/orphan/`RestartTracker` rows to 4,
