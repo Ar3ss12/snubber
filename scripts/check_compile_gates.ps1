@@ -48,18 +48,35 @@ if ($UnsafeMatches) {
 
 # Gate 2: Saturating arithmetic on counters in src/node.rs
 Write-Host "[2/7] Auditing saturating counters in src/node.rs..." -NoNewline
-# Every monotonic counter the node books -- parity with the .sh gate. A new
-# bucket (rate/breaker/memory/evicted/preempted/implicit drops/trips) must
-# not be writable with a bare `+=`.
-$CounterPattern = 'in_flight|total_started|committed|explicit_aborts|implicit_drops|bulkhead_rejections|poison_recoveries|stale_epochs_rejected|rate_rejected|breaker_rejections|memory_rejections|evicted|preempted|breaker_trips|reported'
-$CounterViolations = Select-String -Path "$RepoRoot\src\node.rs" -CaseSensitive -Pattern "(^|[^_a-zA-Z0-9])($CounterPattern)\s*\+=" |
-    Where-Object { $_.Line -notmatch '^\s*//' }
-if ($CounterViolations) {
-    Write-Host " FAIL: Direct += found on counter:" -ForegroundColor Red
-    $CounterViolations | ForEach-Object { Write-Host "   $($_.Filename):$($_.LineNumber): $($_.Line.Trim())" }
+# Scope is DERIVED at run time, not hand-listed: every pub u64 / pub [u64; N]
+# field of the SnubberStats ledger plus NodeInner's in_flight. Parity with
+# the .sh gate: both derive the same set from the same struct, so a new
+# bucket cannot be added to the ledger without falling under the ban. Why
+# bare += is banned: plain u64/usize increments under the node mutex; in
+# release a wrap falsifies the 512 B snapshot, the only field diagnostic.
+$CounterNames = @()
+$InStats = $false
+foreach ($Line in Get-Content "$RepoRoot\src\node.rs") {
+    if (-not $InStats -and $Line -cmatch '^pub struct SnubberStats\b') { $InStats = $true; continue }
+    if ($InStats -and $Line -cmatch '^\}') { break }
+    if ($InStats -and $Line -cmatch '^\s*pub ([a-z_0-9]+): (u64|\[u64)') { $CounterNames += $Matches[1] }
+}
+$CounterNames = @($CounterNames + 'in_flight' | Sort-Object -Unique)
+if ($CounterNames.Count -le 1) {
+    Write-Host " FAIL: could not derive counter scope from pub struct SnubberStats in src\node.rs (renamed or reformatted?)" -ForegroundColor Red
     $Failures++
+    $CounterPattern = ''
 } else {
-    Write-Host " OK (saturating math preserved)" -ForegroundColor Green
+    $CounterPattern = $CounterNames -join '|'
+    $CounterViolations = Select-String -Path "$RepoRoot\src\node.rs" -CaseSensitive -Pattern "(^|[^_a-zA-Z0-9])($CounterPattern)\s*\+=" |
+        Where-Object { $_.Line -notmatch '^\s*//' }
+    if ($CounterViolations) {
+        Write-Host " FAIL: Direct += found on counter:" -ForegroundColor Red
+        $CounterViolations | ForEach-Object { Write-Host "   $($_.Filename):$($_.LineNumber): $($_.Line.Trim())" }
+        $Failures++
+    } else {
+        Write-Host " OK (saturating math preserved)" -ForegroundColor Green
+    }
 }
 
 # Gate 3: Lock-hygiene audit in Phase A/C (no foreign calls / formatting under lock)
@@ -267,7 +284,7 @@ if ($ForgetMatches) {
 Write-Host "---------------------------------------------"
 # Cross-language parity fingerprint: CI runs this and check_compile_gates.sh
 # on the same tree and requires both lines to match.
-$CounterCount = $CounterPattern.Split('|').Count
+$CounterCount = $CounterNames.Count
 Write-Host "PARITY: gates=7 counters=$CounterCount functions=$($Gate3Bodies.Count) metaphors=$($ForbiddenPatterns.Count)"
 if ($Skips -gt 0) {
     # A skip is a hole, not a pass: reduced coverage must fail the gate.

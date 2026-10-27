@@ -12,6 +12,17 @@ surface, wire format and telemetry layout are untouched.
 
 ### Fixed
 
+- Gate 2's counter scan scope is derived at run time from `pub struct
+  SnubberStats` (every `pub u64` / `pub [u64; N]` field) plus `in_flight`,
+  in both the POSIX and PowerShell flavors; the hand-maintained 15-name
+  list it replaces had already drifted (`poisoned_rejected` is written by
+  the node but was not listed, so a bare `+=` there passed silently). The
+  derived set is 31 names — `PARITY: ... counters=31 ...` now follows the
+  struct, so a new ledger bucket is covered without editing any script.
+  Proven by injection: `pulse_stalls += 1` fails (the old list missed it),
+  a fresh `pub fuzz_probe: u64` field with a bare `+=` fails with no list
+  edit anywhere, both revert green.
+
 - The release-tag gate only accepts "marked Unreleased" when the
   `## Unreleased` heading sits above the version's own section with no
   other section heading between the two: a stale marker below the

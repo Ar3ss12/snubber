@@ -58,33 +58,51 @@ fi
 # (scoped to node.rs on purpose: the fields are private to it — tests,
 # benches, and examples define their own unrelated `in_flight`s.)
 echo -n "[2/7] Auditing saturating counters in src/node.rs... "
-# Every monotonic counter the node books, not just the six that existed
-# when this gate was written. A new bucket (rate/breaker/memory/evicted/
-# preempted/implicit drops/trips) must not be writable with a bare `+=`.
-COUNTERS='in_flight|total_started|committed|explicit_aborts|implicit_drops|bulkhead_rejections|poison_recoveries|stale_epochs_rejected|rate_rejected|breaker_rejections|memory_rejections|evicted|preempted|breaker_trips|reported'
-# `|| rc=$?`: a bare assignment under `set -e` aborts the script when
-# grep exits 1 (clean tree), which made the `rc -eq 1 -> OK` branch
-# unreachable and silently skipped the gate (and PARITY) instead of
-# reporting a clean scan.
-rc=0
-PLUS_EQ_HITS="$(grep -En "(^|[^_[:alnum:]])(${COUNTERS})[[:space:]]*\+=" "${REPO_ROOT}/src/node.rs" 2>&1)" || rc=$?
-if [ "$rc" -eq 0 ]; then
-    # Doc/comment lines are not code: `committed += 1` in a contract
-    # comment must not trip a scan for direct counter writes.
-    CODE_HITS="$(printf '%s\n' "${PLUS_EQ_HITS}" | grep -vE '^[0-9]+:[[:space:]]*//' || true)"
-    if [ -n "${CODE_HITS}" ]; then
-        echo "FAIL: Direct += found on counter:"
-        printf '%s\n' "${CODE_HITS}"
-        FAILURES=$((FAILURES + 1))
-    else
-        echo "OK (saturating math preserved)"
-    fi
-elif [ "$rc" -eq 1 ]; then
-    echo "OK (saturating math preserved)"
-else
-    echo "FAIL: saturating-counter scan could not run (grep exit ${rc}):"
-    printf '%s\n' "${PLUS_EQ_HITS}"
+# Scope is DERIVED at run time, not hand-listed: every `pub u64` /
+# `pub [u64; N]` field of the SnubberStats ledger plus NodeInner's
+# `in_flight`. The hand-maintained list this replaces had already drifted
+# (`poisoned_rejected` was written by the node but absent from the list,
+# so a bare `+=` there passed silently). Why bare `+=` is banned at all:
+# these are plain u64/usize increments under the node mutex — in release
+# a wrap falsifies the 512 B snapshot, the only field diagnostic.
+COUNTER_NAMES="$( { sed -n '/^pub struct SnubberStats/,/^}/p' "${REPO_ROOT}/src/node.rs" |
+    grep -oE 'pub [a-z_0-9]+: (u64|\[u64)' |
+    sed -E 's/^pub ([a-z_0-9]+): .*$/\1/';
+    echo in_flight; } | sort -u )"
+COUNTER_COUNT=0
+if [ "${COUNTER_NAMES}" = "in_flight" ]; then
+    echo "FAIL: could not derive counter scope from pub struct SnubberStats in src/node.rs (renamed or reformatted?)"
     FAILURES=$((FAILURES + 1))
+    COUNTER_NAMES=""
+fi
+if [ -n "${COUNTER_NAMES}" ]; then
+    COUNTERS="$(printf '%s|' ${COUNTER_NAMES})"
+    COUNTERS="${COUNTERS%|}"
+    COUNTER_COUNT=$(( $(printf '%s\n' "${COUNTER_NAMES}" | grep -c .) ))
+    # `|| rc=$?`: a bare assignment under `set -e` aborts the script when
+    # grep exits 1 (clean tree), which made the `rc -eq 1 -> OK` branch
+    # unreachable and silently skipped the gate (and PARITY) instead of
+    # reporting a clean scan.
+    rc=0
+    PLUS_EQ_HITS="$(grep -En "(^|[^_[:alnum:]])(${COUNTERS})[[:space:]]*\+=" "${REPO_ROOT}/src/node.rs" 2>&1)" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        # Doc/comment lines are not code: `committed += 1` in a contract
+        # comment must not trip a scan for direct counter writes.
+        CODE_HITS="$(printf '%s\n' "${PLUS_EQ_HITS}" | grep -vE '^[0-9]+:[[:space:]]*//' || true)"
+        if [ -n "${CODE_HITS}" ]; then
+            echo "FAIL: Direct += found on counter:"
+            printf '%s\n' "${CODE_HITS}"
+            FAILURES=$((FAILURES + 1))
+        else
+            echo "OK (saturating math preserved)"
+        fi
+    elif [ "$rc" -eq 1 ]; then
+        echo "OK (saturating math preserved)"
+    else
+        echo "FAIL: saturating-counter scan could not run (grep exit ${rc}):"
+        printf '%s\n' "${PLUS_EQ_HITS}"
+        FAILURES=$((FAILURES + 1))
+    fi
 fi
 
 # Gate 3: Lock-hygiene audit in Phase A/C
@@ -261,7 +279,7 @@ echo "---------------------------------------------"
 # Cross-language parity fingerprint: the Windows CI lane runs this script
 # and check_compile_gates.ps1 on the same tree and requires both lines to
 # match. If the PS flavor scans fewer counters or functions, parity fails.
-COUNTER_COUNT=$(( $(printf '%s' "$COUNTERS" | tr -cd '|' | wc -c) + 1 ))
+# The counter count is the size of the set derived from SnubberStats above.
 printf 'PARITY: gates=7 counters=%s functions=3 metaphors=5\n' "${COUNTER_COUNT}"
 if [ "$SKIPS" -gt 0 ]; then
     # A skip is a hole, not a pass: reduced coverage must fail the gate.
