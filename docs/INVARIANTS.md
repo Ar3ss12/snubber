@@ -60,6 +60,13 @@ wakers fire outside the node lock, the conduit never arms guards.
 Nested locks (ABBA) are the only remaining deadlock class, so the law
 is enforced by `tests/lock_hierarchy.rs` as a grep-gate (doc-comments
 stripped, code hits trip).
+The same open-call discipline covers ROLLBACK bodies: every `rollback()`
+call site runs with the ledger released, which is why re-entering the
+node from a rollback returns instead of deadlocking (`scoped` refuses at
+capacity with `BulkheadFull`, async parks as `Pending`, erased scopes are
+granted because their slot was released at admission). The invariant is
+about OUR lock; a rollback that re-takes a FOREIGN mutex the caller's
+`work()` already holds hangs anyway, and no node counter can see it.
 
 ### Invariant 7: Pulse Lag Is Never Silent (Black-Box Trace)
 Every missed `WorkerPulse` verdict recorded via

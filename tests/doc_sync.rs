@@ -140,6 +140,72 @@ fn test_erased_bulkhead_scope_stays_documented() {
     );
 }
 
+/// Rollback re-entrancy must be documented as MEASURED behavior, not as the
+/// old folklore.
+///
+/// The guide used to forbid calling back into the node from a rollback with
+/// the reason "(that deadlocks)". Probes and `tests/rollback_guardrails.rs`
+/// (2026-10-27) say otherwise: rollback bodies run outside the node lock
+/// (Invariant 6, open-call), so re-entry returns — `BulkheadFull` when the
+/// node is full because the rolling-back guard still holds its slot,
+/// `Poll::Pending` on the async path, granted on the erased path. A law that
+/// names the wrong failure sends responders hunting for a deadlock that
+/// cannot happen while the real wedge (a re-taken FOREIGN mutex) stays
+/// invisible. This oracle pins the corrected wording and bans the myth.
+#[test]
+fn test_rollback_reentry_law_matches_the_code() {
+    let guide = std::fs::read_to_string("docs/USER_GUIDE.md")
+        .expect("Failed to read docs/USER_GUIDE.md for rollback re-entrancy audit");
+    let at = guide
+        .find("**Re-entrancy is allowed, not free:**")
+        .expect("TRIPWIRE FIRED: docs/USER_GUIDE.md lost the rollback re-entrancy rule");
+    let rule = guide[at..guide[at..]
+        .find("\n4. ")
+        .map(|n| at + n)
+        .unwrap_or(guide.len())]
+        .to_owned();
+    for token in [
+        "does **not** deadlock",
+        "BulkheadFull",
+        "holds its slot until it returns",
+        "Poll::Pending",
+        "re-locking a mutex",
+        "enter_erased_auto",
+    ] {
+        assert!(
+            rule.contains(token),
+            "TRIPWIRE FIRED: the rollback re-entrancy rule lost `{token}` — the \
+             measured behavior is: sync refuses at capacity, async parks, erased \
+             is granted, and the slot is held for the whole body. Rule reads: {rule}"
+        );
+    }
+    let deadlocks_myth = rule.to_lowercase().contains("that deadlocks")
+        || rule.to_lowercase().contains("(deadlocks)");
+    assert!(
+        !deadlocks_myth,
+        "TRIPWIRE FIRED: the rollback re-entrancy rule is back to claiming a \
+         deadlock. Measured 2026-10-27 in tests/rollback_guardrails.rs: it does \
+         not deadlock."
+    );
+
+    let invariants = std::fs::read_to_string("docs/INVARIANTS.md")
+        .expect("Failed to read docs/INVARIANTS.md for rollback re-entrancy audit");
+    let at = invariants
+        .find("### Invariant 6:")
+        .expect("Invariant 6 heading missing from docs/INVARIANTS.md");
+    let window = &invariants[at..invariants.len().min(at + 1600)];
+    assert!(
+        window.contains("ROLLBACK bodies"),
+        "TRIPWIRE FIRED: Invariant 6 no longer states that rollback call sites \
+         run with the ledger released — that is the reason re-entry returns."
+    );
+    assert!(
+        window.contains("FOREIGN mutex"),
+        "TRIPWIRE FIRED: Invariant 6 lost the honest limit: a caller's re-taken \
+         mutex still hangs, and no node counter sees it."
+    );
+}
+
 /// The badge row is a set of working instruments, not decoration: exactly
 /// five badges, each answering one landing-page question, each with a real
 /// target — and no numeric test count. The `tests-N passed` pill was deleted
