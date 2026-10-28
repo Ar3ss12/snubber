@@ -1382,6 +1382,27 @@ never kills and never knows a pid — a `Dead` verdict is returned to the
 owner, which runs `kill`/`TokenRollback`. `tests/sentinel.rs` pins the
 rules; the unit tests run in the `core`-only lane.
 
+The pipe side is one call each: `PipeDrain::sentinel_sample()` fills the
+sample from drain state (`witness_alive: None` — the drain sees traffic,
+not the process table), and `await_post_mortem` is the EOF-grace rule
+`run_loop` itself uses:
+
+```rust
+use snubber::{await_post_mortem, PipeDrain, Sentinel, SentinelConfig};
+
+// After the child was reaped: wait out the grace, then take what is armed.
+let token = await_post_mortem(&drain, 250); // `None` = clean exit
+
+// The liveness side of the same pipe.
+let mut sentinel = Sentinel::new(SentinelConfig::new(250));
+let verdict = sentinel.observe(drain.sentinel_sample());
+```
+
+Waiting is not optional: a bare `take_armed()` races the reader thread and
+reports CLEAN while the child's last frame is still in flight — the
+hardware stays armed after the crash. `tests/sentinel_pipe.rs` fails that
+injection.
+
 ### 4.8 Impedance bridge (Phase 4): conflation, envelope, harness
 
 A 10 000 msg/s producer feeding a 60 FPS consumer is a 166:1 mismatch. There

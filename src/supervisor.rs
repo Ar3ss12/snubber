@@ -21,6 +21,7 @@
 
 use super::{SnubberEvent, TransactionHeader};
 use crate::memory::{MemoryVerdict, MemoryWatch};
+use crate::sentinel::SentinelSample;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -979,6 +980,32 @@ impl PipeDrain {
             .take()
     }
 
+    /// `true` while a token is armed and has not been settled by a commit.
+    ///
+    /// Non-consuming twin of [`PipeDrain::take_armed`] — the rescue token
+    /// stays available for the post-mortem path.
+    #[must_use]
+    pub fn armed(&self) -> bool {
+        match self.inner.state.lock() {
+            Ok(state) => state.armed.is_some(),
+            Err(poisoned) => poisoned.into_inner().armed.is_some(),
+        }
+    }
+
+    /// One observation for [`crate::Sentinel`].
+    ///
+    /// `witness_alive` is `None` by construction: the drain sees traffic,
+    /// not the process table. An application that owns an OS witness fills
+    /// that field itself and feeds the result to `classify_liveness`.
+    #[must_use]
+    pub fn sentinel_sample(&self) -> SentinelSample {
+        SentinelSample {
+            idle_ms: self.idle_ms(),
+            armed: self.armed(),
+            witness_alive: None,
+        }
+    }
+
     /// Parsed-frame counters (cheap snapshot under one short lock).
     #[must_use]
     pub fn counters(&self) -> DrainCounters {
@@ -1055,6 +1082,26 @@ impl PipeDrain {
     pub fn expired(&self, lease_ms: u64) -> bool {
         !self.eof() && self.idle_ms() > lease_ms
     }
+}
+
+/// Wait out the bounded EOF grace, then take the un-settled rescue token.
+///
+/// A bare yield-spin never observes a pipe that still holds buffered
+/// bytes — the rescue token would be missed and the death reported CLEAN
+/// while the child's last words are still in flight. The loop keeps
+/// waiting while `elapsed <= eof_grace_ms`; past the grace it gives up and
+/// takes whatever is armed. `None` means "nothing was armed": a clean exit.
+///
+/// The crate does not kill and does not know a pid: the caller runs
+/// `kill`/`TokenRollback` on the returned token. `run_loop` and any
+/// application-side supervisor share this one rule.
+#[must_use]
+pub fn await_post_mortem(drain: &PipeDrain, eof_grace_ms: u64) -> Option<ProcessToken> {
+    let started = drain.now_ms();
+    while !drain.eof() && drain.now_ms().saturating_sub(started) <= eof_grace_ms {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    drain.take_armed()
 }
 
 /// Apply one parsed token to drain state under the caller's lock.
@@ -1474,19 +1521,9 @@ impl Supervisor {
             // Bounded EOF grace (default ceiling: the pool reaper's
             // `crate::pool::DEFAULT_EOF_GRACE_MS`; configurable via
             // `run_supervised_guard_with_grace`, same role as the pool's
-            // `with_eof_grace`): a bare yield-spin never observes a pipe
-            // that still holds buffered bytes — the rescue token would be
-            // missed and the death reported CLEAN while the child's last
-            // words are still in flight. Same boundary as the pool
-            // (`elapsed > grace` = give up): spelled here as `<= grace` =
-            // keep waiting, in pool/lane.rs as `> grace` = stop —
-            // equivalent, kept so both grep alike.
-            let eof_started = drain.now_ms();
-            while !drain.eof() && drain.now_ms().saturating_sub(eof_started) <= eof_grace_ms {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-
-            if let Some(token) = drain.take_armed() {
+            // `with_eof_grace`). The rule lives in one public function so
+            // an application-side supervisor cannot miss the grace.
+            if let Some(token) = await_post_mortem(&drain, eof_grace_ms) {
                 println!(
                     "[SUPERVISOR:RECOVER] child_pid={pid} rescue_token=0x{:X} opcode={} task={}",
                     token.task, token.opcode, token.task

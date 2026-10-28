@@ -27,6 +27,13 @@ current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
   (`idle_ms == grace` is still `Alive`) and `idle_grace_ms = 0` disables
   `Silent` only. Core-only: no clock, no allocation, no `std`. Unit tests
   run in the `--no-default-features --lib` lane.
+- `PipeDrain::armed()` (non-consuming peek at the rescue slot) and
+  `PipeDrain::sentinel_sample()` (one `SentinelSample`, `witness_alive`
+  is `None`), plus the public `await_post_mortem(&drain, eof_grace_ms)`
+  that `run_loop` now calls instead of its inline loop. An application
+  with its own supervisor no longer re-derives the EOF-grace rule — and
+  can no longer lose the last `RECOVER` token by taking the slot too
+  early. `tests/sentinel_pipe.rs` proves the late-token rescue.
 
 ## 0.6.13 (2026-10-27)
 
