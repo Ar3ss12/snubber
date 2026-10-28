@@ -16,7 +16,7 @@ manifest are unchanged.
 
 ### Added
 
-- `TrackedGuard::with_cpu_sampler_shared(Arc<dyn Fn() -> u64 + Send + Sync>)`:
+- `TrackedGuard::with_cpu_sampler_shared(Arc<dyn Fn() -> u64 + Send + Sync + UnwindSafe + RefUnwindSafe>)`:
   the CPU sampler may now capture state (a thread handle, a worker's own
   counter) instead of being a plain `fn() -> u64`. Same arming law — the
   sample is taken on attach and every verdict measures a delta — and the
@@ -25,7 +25,10 @@ manifest are unchanged.
   `core`/`alloc` lanes never see the field; `TrackedGuard<fn()>` grows
   304 → 320 B (measured, `tests/guard_sampler.rs`), the price of one fat
   pointer. Tests: capture-aware SPIN and SLEEP verdicts, the size ceiling,
-  and a text tripwire that no unguarded `pub use node` enters `src/lib.rs`.
+  a compile-time assertion that `TrackedGuard` keeps `UnwindSafe` +
+  `RefUnwindSafe` (the auto-trait bounds are part of the sampler type — a
+  bare `dyn Fn` strips both), and a text tripwire that no unguarded
+  `pub use node` enters `src/lib.rs`.
 - `sentinel` module (core): `ProcessWitness` / `NoWitness`, `SentinelSample`,
   `SentinelConfig` and `Sentinel`, plus the pure rule `classify_liveness`.
   A supervised process can now report `Alive`, `Silent { idle_ms }` or

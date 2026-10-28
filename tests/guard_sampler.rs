@@ -82,6 +82,16 @@ fn track_guard_stays_within_the_size_ceiling() {
     );
 }
 
+/// `TrackedGuard` was `UnwindSafe + RefUnwindSafe` through 0.6.x. The
+/// shared sampler stores a trait object, and a bare `dyn Fn` strips both
+/// auto traits from the guard; the semver gate caught that, this test
+/// keeps it caught at compile time.
+#[test]
+fn tracked_guard_keeps_its_auto_traits() {
+    fn assert_both<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+    assert_both::<TrackedGuard<fn()>>();
+}
+
 /// The alloc-typed sampler lives in `node`, which is `#[cfg(feature = "std")]`.
 /// An unguarded root re-export would compile the field into the `core`
 /// build and break the bare-metal lane — pin the gate in text.

@@ -70,11 +70,21 @@ if [ "$(git -C "${REPO_ROOT}" rev-parse "${BASELINE}^{commit}" 2>/dev/null || tr
 fi
 
 CRATE="$(sed -n 's/^name *= *\"\([^\"]*\)\".*/\1/p' "${REPO_ROOT}/Cargo.toml" | head -1)"
-echo " baseline=${BASELINE} package=${CRATE}"
+# `--release-type auto` derives the classification from the version bump,
+# and for a pre-1.0 crate a 0.x -> 0.y bump counts as MAJOR: the verifier
+# then skips every check (0 of 202) and the gate passes vacuously — which
+# is exactly how the 0.7.0 `TrackedGuard` auto-trait break slipped past a
+# green local run. Inside 0.x the compatible unit is the minor bump, so
+# name it explicitly; 1.0+ keeps the version-derived classification.
+CURRENT_VERSION="$(sed -n 's/^version *= *\"\([^\"]*\)\".*/\1/p' "${REPO_ROOT}/Cargo.toml" | head -1)"
+RELEASE_TYPE="auto"
+case "${CURRENT_VERSION}" in
+    0.*) RELEASE_TYPE="minor" ;;
+esac
+echo " baseline=${BASELINE} package=${CRATE} release-type=${RELEASE_TYPE}"
 cd "${REPO_ROOT}"
 # `--package` limits both sides to this crate (one build, not the
-# whole workspace). `--release-type auto` lets the crate version (0.6.x
-# minor) classify the change; explicit breaking removals still fail.
+# whole workspace). `--release-type` is explicit for 0.x (see above).
 # `cargo-semver-checks` exposes no `--locked` flag, so a resolve can
 # rewrite Cargo.lock behind the gate's back. Snapshot it and fail if the
 # tool mutated the lockfile (reproducibility hole the CI gate cannot see).
@@ -86,7 +96,7 @@ LOCK_BEFORE="$(git -C "${REPO_ROOT}" hash-object Cargo.lock 2>/dev/null || true)
 SEMVER_LOG="$(mktemp)"
 trap 'rm -f "${SEMVER_LOG}"' EXIT
 set +e
-cargo semver-checks check-release --baseline-rev "${BASELINE}" --package "${CRATE}" 2>&1 | tee "${SEMVER_LOG}"
+cargo semver-checks check-release --baseline-rev "${BASELINE}" --package "${CRATE}" --release-type "${RELEASE_TYPE}" 2>&1 | tee "${SEMVER_LOG}"
 SEMVER_RC=${PIPESTATUS[0]}
 set -e
 LOCK_AFTER="$(git -C "${REPO_ROOT}" hash-object Cargo.lock 2>/dev/null || true)"

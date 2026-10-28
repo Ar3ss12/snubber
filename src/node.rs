@@ -43,6 +43,8 @@ use crate::NodeName;
 #[cfg(feature = "std")]
 use std::collections::VecDeque;
 #[cfg(feature = "std")]
+use std::panic::{RefUnwindSafe, UnwindSafe};
+#[cfg(feature = "std")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "std")]
 use std::sync::{Arc, Mutex};
@@ -5625,8 +5627,10 @@ pub struct TrackedGuard<F: FnOnce()> {
     stall_ceiling_ms: u64,
     cpu_sampler: Option<fn() -> u64>,
     /// Capture-capable sampler (thread handle, worker `AtomicU64`). Wins
-    /// over the plain `fn` pointer when both are attached.
-    cpu_sampler_shared: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    /// over the plain `fn` pointer when both are attached. The auto-trait
+    /// bounds are part of the type: a bare `dyn Fn` would strip
+    /// `UnwindSafe`/`RefUnwindSafe` from every `TrackedGuard` user.
+    cpu_sampler_shared: Option<Arc<dyn Fn() -> u64 + Send + Sync + UnwindSafe + RefUnwindSafe>>,
     armed_cpu_ms: u64,
     stage: u32,
     stage_label: Option<&'static str>,
@@ -5932,9 +5936,14 @@ impl<F: FnOnce()> TrackedGuard<F> {
     /// (the `Arc` already exists; the guard stores one fat pointer) and
     /// it lives in `node`, which is `std`-gated: `core`/`alloc` layers
     /// never see this field. Takes precedence over the plain `fn` when
-    /// both are attached.
+    /// both are attached. The `UnwindSafe + RefUnwindSafe` bounds keep
+    /// `TrackedGuard`'s auto traits intact (they were part of the 0.6
+    /// surface and the semver gate holds them).
     #[inline]
-    pub fn with_cpu_sampler_shared(mut self, sampler: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+    pub fn with_cpu_sampler_shared(
+        mut self,
+        sampler: Arc<dyn Fn() -> u64 + Send + Sync + UnwindSafe + RefUnwindSafe>,
+    ) -> Self {
         self.armed_cpu_ms = sampler();
         self.cpu_sampler_shared = Some(sampler);
         self
