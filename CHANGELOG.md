@@ -4,7 +4,15 @@ All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.
 the audit-batch fix tables live at the bottom of this file, and the
 current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
-## Unreleased
+## 0.7.0 (2026-10-28)
+
+Four seams the first consumer had already worked around in application
+code, now typed by the crate: a CPU sampler that can read per-thread
+state, a core liveness witness with no OS handle, an opt-in preemption
+policy, and an erased admission that can actually hold the ceiling. The
+API is additive except for the erased names, which keep their old
+spellings as deprecated aliases; core/bare-metal and the zero-dependency
+manifest are unchanged.
 
 ### Added
 

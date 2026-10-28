@@ -1,6 +1,6 @@
 [package]
 name = "snubber"
-version = "0.6.13"
+version = "0.7.0"
 edition = "2021"
 # Library floor. Proven by the `msrv` CI lane (`cargo check --lib`, core /
 # core+alloc / std). Tests and benches are outside this floor: the dev
