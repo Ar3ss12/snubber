@@ -130,6 +130,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   and run outside the node lock; `snub_check_map!` maps breaches into your error
   type.
 
+### Bulkhead Scope
+
+`max_in_flight(N)` bounds **admissions** — and the two erased entries define
+what an admission means:
+
+* `probe_erased_auto` commits the admission probe at arm time. Its slot is
+  released before your worker runs, so `N` limits concurrent arm attempts,
+  not live guarded transactions.
+* `enter_erased_holding_auto` keeps the slot booked until `commit()`,
+  `abort()` or `Drop`, so `N` bounds live erased transactions. Use it when
+  the ceiling is protecting a finite resource.
+
+The sync (`enter_*`) and async (`enter_async_*`) entries hold their slot for
+the whole body in both cases.
+
 ---
 
 ## When to use / when not

@@ -22,7 +22,7 @@
 //! =========================================================================
 //!
 //! CANONICAL ENTRIES (take one of these two, ignore the rest):
-//!   1. Daemon/thread: `enter_erased_auto(rollback)` — nameable guard for
+//!   1. Daemon/thread: `probe_erased_auto(rollback)` — nameable guard for
 //!      a struct field (`Option<ErasedGuard>`), lives across awaits.
 //!   2. Micro-transaction: `scoped(rollback, work)` /
 //!      `scoped_checked(params, invariant, rollback, work)` — one call,
@@ -1815,6 +1815,10 @@ pub struct SnubberNode {
 struct ErasedTransaction<F> {
     node: SnubberNode,
     was_probe: bool,
+    /// `Some(lane)` for a HOLDING admission: the bulkhead slot stays booked
+    /// until settle, which releases it exactly once. `None` for a probe
+    /// admission (released at entry).
+    held_lane: Option<usize>,
     /// Admission identity: the phase view names it while the body runs.
     epoch: u64,
     task_id: u64,
@@ -1848,7 +1852,8 @@ impl<F: FnOnce() + Send + 'static> crate::erased::ErasedSettle for ErasedTransac
                 self.node.rollback_budget_ms,
             );
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
-            self.node.settle_erased_rollback(self.was_probe);
+            self.node
+                .settle_erased_rollback(self.was_probe, self.held_lane.take());
             // Only a body that RETURNED earns a verdict: a panic resumes
             // below, and the stamp's Drop still bills the counters.
             let stalled_ms = if outcome.is_ok() {
@@ -1884,7 +1889,8 @@ impl<F: FnOnce() + Send + 'static> crate::erased::ErasedSettle for ErasedTransac
         let _ = self.rollback.take();
         // The node-ledger lock in `settle_erased_commit` is the ordering
         // edge; a lone SeqCst fence before it synchronized with nothing.
-        self.node.settle_erased_commit(self.was_probe);
+        self.node
+            .settle_erased_commit(self.was_probe, self.held_lane.take());
         if let Some(token) = self.token {
             crate::ProcessToken::commit(token.task).emit_if_supervised();
         }
@@ -2578,7 +2584,7 @@ impl SnubberNode {
     // [ANCHOR: LOW_LEVEL_ENTRY] — thin low-level wrappers: explicit epoch /
     // explicit task-id / no_alloc flavours over the same enter_inner.
     /// ⚠️ *Low-level primitive.* If you are building a background worker or
-    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    /// daemon, prefer the canonical [`Self::probe_erased_auto`].
     ///
     /// Arm a tracked guard: breaker + epoch + bulkhead checks, then arm.
     ///
@@ -2601,7 +2607,7 @@ impl SnubberNode {
     /// Arm a tracked guard on an explicit priority lane (Phase 1).
     ///
     /// ⚠️ *Low-level primitive.* If you are building a background worker or
-    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    /// daemon, prefer the canonical [`Self::probe_erased_auto`].
     ///
     /// Same breaker → epoch → bulkhead → queue → commit pipeline as
     /// [`enter`](Self::enter); the lane is stamped on the guard
@@ -2705,7 +2711,7 @@ impl SnubberNode {
     }
 
     /// ⚠️ *Low-level primitive.* If you are building a background worker or
-    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    /// daemon, prefer the canonical [`Self::probe_erased_auto`].
     ///
     /// Arm a tracked guard in an EXPLICIT generation (Path-1 supervisor).
     ///
@@ -2743,17 +2749,17 @@ impl SnubberNode {
     }
 
     /// ⚠️ *Low-level primitive.* If you are building a background worker or
-    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    /// daemon, prefer the canonical [`Self::probe_erased_auto`].
     ///
     /// Arm a NAMEABLE guard: same breaker + epoch + bulkhead pipeline as
     /// [`SnubberNode::enter`], but the rollback is boxed once at arming
     /// time and the returned [`ErasedGuard`](crate::ErasedGuard) fits
     /// struct fields (`struct App { hold: Option<ErasedGuard> }`).
     ///
-    /// How it works: the slot + epoch are reserved through the REAL
-    /// pipeline; the admission guard releases its slot WITHOUT booking a
-    /// success, and the returned erased guard owns ONLY the user's
-    /// rollback. Consequences (honest, not hidden):
+    /// PROBE admission: the slot + epoch are reserved through the REAL
+    /// pipeline and the slot is released AT ENTRY, without booking a
+    /// success. The returned erased guard owns ONLY the user's rollback.
+    /// Consequences (honest, not hidden):
     /// * `commit()` on the erased guard disarms the rollback and books
     ///   the outcome THEN: `committed += 1`, one window outcome, failure
     ///   streak reset. Nothing is booked at admission, so a guard that
@@ -2768,14 +2774,30 @@ impl SnubberNode {
     ///   downstream was NOT healthy).
     /// * The bulkhead ceiling applies at ADMISSION only: the slot is
     ///   released there, so LIVE erased guards are not bounded by
-    ///   `max_in_flight`. A daemon holding many erased guards must
-    ///   enforce its own in-flight ceiling (semaphore / owned counter) —
-    ///   the node cannot see the guards it no longer tracks.
+    ///   `max_in_flight`. Use [`Self::enter_erased_holding`] when the
+    ///   ceiling must bound live transactions.
     ///
     /// Use `enter` when you need typed per-guard settle accounting; use
-    /// `enter_erased` when the guard must LIVE in a struct.
+    /// `probe_erased` when the guard must LIVE in a struct but must not
+    /// hold a slot.
     ///
     /// Requires `alloc` (the box). Coordinates are THIS call site.
+    #[track_caller]
+    #[cfg(feature = "alloc")]
+    pub fn probe_erased<F: FnOnce() + Send + 'static>(
+        &self,
+        epoch: u64,
+        task_id: u64,
+        rollback: F,
+    ) -> Result<crate::ErasedGuard, EnterError> {
+        self.arm_erased(epoch, task_id, rollback, false)
+    }
+
+    /// Deprecated alias of [`Self::probe_erased`] (0.6 name).
+    #[deprecated(
+        since = "0.7.0",
+        note = "use probe_erased: the slot is released at entry; use enter_erased_holding to keep it"
+    )]
     #[track_caller]
     #[cfg(feature = "alloc")]
     pub fn enter_erased<F: FnOnce() + Send + 'static>(
@@ -2783,6 +2805,48 @@ impl SnubberNode {
         epoch: u64,
         task_id: u64,
         rollback: F,
+    ) -> Result<crate::ErasedGuard, EnterError> {
+        self.probe_erased(epoch, task_id, rollback)
+    }
+
+    /// Arm a NAMEABLE guard that HOLDS its bulkhead slot until settle.
+    ///
+    /// Same breaker + epoch + bulkhead pipeline, same boxed rollback and
+    /// same deferred probe settlement as [`Self::probe_erased`] — the one
+    /// difference is the slot: it is NOT released at entry. Consequences:
+    /// * `max_in_flight` becomes a real ceiling for LIVE erased
+    ///   transactions: a second admission past it is refused with
+    ///   [`EnterError::BulkheadFull`] (the caller is the queue, exactly as
+    ///   on the sync path).
+    /// * `commit()`, `abort()` and `Drop` each release exactly ONE slot
+    ///   and wake one parked `enter_async` waiter; the release is booked
+    ///   in the same lock as the outcome, so `in_flight` never leaks and
+    ///   never double-books.
+    /// * A panicking user rollback still settles first (the guard's
+    ///   `catch_unwind` swallows the panic; the slot comes home).
+    ///
+    /// Requires `alloc` (the box). Coordinates are THIS call site.
+    #[track_caller]
+    #[cfg(feature = "alloc")]
+    pub fn enter_erased_holding<F: FnOnce() + Send + 'static>(
+        &self,
+        epoch: u64,
+        task_id: u64,
+        rollback: F,
+    ) -> Result<crate::ErasedGuard, EnterError> {
+        self.arm_erased(epoch, task_id, rollback, true)
+    }
+
+    /// Shared admission for both erased flavours: `hold` decides whether
+    /// the bulkhead slot is kept (`Some(lane)`) or released at entry.
+    #[track_caller]
+    #[cfg(feature = "alloc")]
+    fn arm_erased<F: FnOnce() + Send + 'static>(
+        &self,
+        epoch: u64,
+        task_id: u64,
+        rollback: F,
+        hold: bool,
     ) -> Result<crate::ErasedGuard, EnterError> {
         // Pass-through transit: count lock-free, drop the user rollback
         // UNINVOKED, hand back an empty erased guard (its Drop runs `|| {}`,
@@ -2794,7 +2858,7 @@ impl SnubberNode {
             let _ = (epoch, task_id);
             return Ok(crate::ErasedGuard::new(|| {}));
         }
-        // Single admission: reserve slot + epoch, commit the probe so the
+        // Single admission: reserve slot + epoch, settle the probe so the
         // books are clean, then hand the user a nameable rollback owner.
         // Rejection returns BEFORE boxing: zero cost on the cold path.
         // The admission guard's probe role is DEFERRED, not consumed
@@ -2803,16 +2867,17 @@ impl SnubberNode {
         // guard settles the breaker when ITS outcome lands (commit →
         // Closed, drop/abort → Open — a failed probe re-opens).
         let probed = self.enter_inner(epoch, task_id, None, || {})?;
-        let was_probe = {
+        let (was_probe, held_lane) = {
             let mut g = probed;
             let was_probe = g.is_probe;
             g.is_probe = false;
-            // Admission only: release the slot WITHOUT booking a success.
-            // A throwaway `commit()` used to write `committed += 1` and a
+            // Probe: release the slot now WITHOUT booking a success. A
+            // throwaway `commit()` used to write `committed += 1` and a
             // clean breaker outcome before any work ran, inflating
             // `success_rate_per_mille` and resetting the failure streak.
-            g.settle_admission_only();
-            was_probe
+            // Holding: keep the slot; the lane comes back for the settle.
+            let lane = g.settle_erased_arm(!hold);
+            (was_probe, if hold { Some(lane) } else { None })
         };
         let node = self.clone();
         let loc = core::panic::Location::caller();
@@ -2820,6 +2885,7 @@ impl SnubberNode {
             ErasedTransaction {
                 node,
                 was_probe,
+                held_lane,
                 epoch,
                 task_id,
                 loc,
@@ -2843,7 +2909,7 @@ impl SnubberNode {
     }
 
     /// ⚠️ *Low-level primitive.* If you are building a background worker or
-    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    /// daemon, prefer the canonical [`Self::probe_erased_auto`].
     ///
     /// Arm a tracked guard with automatic monotonic sequence minting.
     #[track_caller]
@@ -2912,7 +2978,7 @@ impl SnubberNode {
     }
 
     /// ⚠️ *Low-level primitive.* If you are building a background worker or
-    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    /// daemon, prefer the canonical [`Self::probe_erased_auto`].
     ///
     /// Arm a checked guard with automatic monotonic sequence minting.
     #[track_caller]
@@ -2930,7 +2996,8 @@ impl SnubberNode {
     }
 
     // [ANCHOR: CANONICAL_ENTRY] — take one of these two, ignore the rest:
-    // daemon/thread → enter_erased_auto, micro-transaction → scoped(_checked).
+    // daemon/thread → probe_erased_auto (or enter_erased_holding_auto),
+    // micro-transaction → scoped(_checked).
     /// Execute fallible work within a protected transaction scope.
     ///
     /// - If `work()` returns `Ok(T)`, automatically commits the transaction.
@@ -3219,23 +3286,54 @@ impl SnubberNode {
     ///
     /// Bulkhead scope: the admission probe is committed at entry, so the
     /// slot is released immediately — `max_in_flight(N)` bounds concurrent
-    /// admissions, not live erased transactions (see "Bulkhead Scope" in
-    /// the crate README).
+    /// admissions, not live erased transactions. Use
+    /// [`Self::enter_erased_holding_auto`] when the ceiling must bound live
+    /// transactions (see "Bulkhead Scope" in the crate README).
+    #[track_caller]
+    #[cfg(feature = "alloc")]
+    pub fn probe_erased_auto<F: FnOnce() + Send + 'static>(
+        &self,
+        rollback: F,
+    ) -> Result<crate::ErasedGuard, EnterError> {
+        let seq = self.next_sequence();
+        self.probe_erased(seq, seq, rollback)
+    }
+
+    /// Deprecated alias of [`Self::probe_erased_auto`] (0.6 name).
+    #[deprecated(
+        since = "0.7.0",
+        note = "use probe_erased_auto: the slot is released at entry; use enter_erased_holding_auto to keep it"
+    )]
     #[track_caller]
     #[cfg(feature = "alloc")]
     pub fn enter_erased_auto<F: FnOnce() + Send + 'static>(
         &self,
         rollback: F,
     ) -> Result<crate::ErasedGuard, EnterError> {
+        self.probe_erased_auto(rollback)
+    }
+
+    /// HOLDING erased guard with automatic monotonic sequence minting.
+    ///
+    /// Same as [`Self::enter_erased_holding`], but the `(epoch, task_id)`
+    /// pair is minted from the node's lock-free counter. The slot stays
+    /// booked until `commit()` / `abort()` / `Drop`, so `max_in_flight`
+    /// bounds LIVE erased transactions.
+    #[track_caller]
+    #[cfg(feature = "alloc")]
+    pub fn enter_erased_holding_auto<F: FnOnce() + Send + 'static>(
+        &self,
+        rollback: F,
+    ) -> Result<crate::ErasedGuard, EnterError> {
         let seq = self.next_sequence();
-        self.enter_erased(seq, seq, rollback)
+        self.enter_erased_holding(seq, seq, rollback)
     }
 
     /// Spawn a guarded worker: thread + guard + leash in ONE call.
     ///
     /// The anti-recipe killer: instead of `spawn` outside + `enter`
     /// inside remembered by heart, this binds all three at construction.
-    /// The worker arms `enter_erased_auto(rollback)` as its FIRST line
+    /// The worker arms `probe_erased_auto(rollback)` as its FIRST line
     /// (lane `Normal`), runs `work(conduit)` with the
     /// [`TaskConduit`](crate::TaskConduit) leash (checkpoints carry
     /// `Pause`/`Cancel`/`Preempted` from Phase 1), then `commit()`s.
@@ -3291,7 +3389,7 @@ impl SnubberNode {
         let (conduit, handle) = crate::TaskConduit::pair(initial_state);
         let node = self.clone();
         let join = std::thread::spawn(move || -> Result<(), SnubberError<()>> {
-            let guard = node.enter_erased_auto(rollback)?;
+            let guard = node.probe_erased_auto(rollback)?;
             work(conduit);
             guard.commit();
             Ok(())
@@ -3300,7 +3398,7 @@ impl SnubberNode {
     }
 
     /// ⚠️ *Low-level primitive.* If you are building a background worker or
-    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    /// daemon, prefer the canonical [`Self::probe_erased_auto`].
     ///
     /// Arm a nameable erased guard supervised across process boundaries.
     ///
@@ -3326,13 +3424,16 @@ impl SnubberNode {
         token.emit_if_supervised();
 
         // Probe settlement is DEFERRED to the erased guard's real
-        // outcome — see `enter_erased`.
+        // outcome — see `probe_erased`. The supervised path stays a PROBE
+        // admission on purpose: a slot that outlives a process generation
+        // change would block the replacement (see "Bulkhead Scope" in the
+        // crate README).
         let probed = self.enter_inner(seq, seq, None, || {})?;
         let was_probe = {
             let mut g = probed;
             let was_probe = g.is_probe;
             g.is_probe = false;
-            g.settle_admission_only();
+            g.settle_erased_arm(true);
             was_probe
         };
         let node = self.clone();
@@ -3341,6 +3442,7 @@ impl SnubberNode {
             ErasedTransaction {
                 node,
                 was_probe,
+                held_lane: None,
                 epoch: seq,
                 task_id: seq,
                 loc,
@@ -3351,7 +3453,7 @@ impl SnubberNode {
     }
 
     /// ⚠️ *Low-level primitive.* If you are building a background worker or
-    /// daemon, prefer the canonical [`Self::enter_erased_auto`].
+    /// daemon, prefer the canonical [`Self::probe_erased_auto`].
     ///
     /// Arm a tracked guard behind an admission boundary invariant gate.
     ///
@@ -4001,17 +4103,33 @@ impl SnubberNode {
     /// booked when the ERASED guard's `commit()` runs, never at
     /// admission. Mirrors the sync commit: `committed += 1`, one window
     /// outcome, failure streak reset, and a HalfOpen probe closes.
+    ///
+    /// A holding admission (`held_lane = Some(lane)`) releases its slot in
+    /// the same lock that books the outcome and wakes ONE parked waiter
+    /// outside it — exactly one release per transaction, as on the sync path.
     #[cfg(feature = "alloc")]
-    fn settle_erased_commit(&self, was_probe: bool) {
-        let mut inner = self.lock();
-        inner.stats.committed = inner.stats.committed.saturating_add(1);
-        note_outcome(&mut inner, false);
-        inner.stats.window_outcomes = inner.window_outcomes;
-        inner.stats.window_failures = inner.window_failures;
-        if was_probe {
-            inner.half_open_probe = false;
-            inner.breaker = BreakerState::Closed;
-            inner.stats.breaker_state = BreakerState::Closed;
+    fn settle_erased_commit(&self, was_probe: bool, held_lane: Option<usize>) {
+        let waker = {
+            let mut inner = self.lock();
+            inner.stats.committed = inner.stats.committed.saturating_add(1);
+            note_outcome(&mut inner, false);
+            inner.stats.window_outcomes = inner.window_outcomes;
+            inner.stats.window_failures = inner.window_failures;
+            if was_probe {
+                inner.half_open_probe = false;
+                inner.breaker = BreakerState::Closed;
+                inner.stats.breaker_state = BreakerState::Closed;
+            }
+            match held_lane {
+                Some(lane) => {
+                    release_slot_inner(&mut inner, lane);
+                    inner.waiters.pop_front()
+                }
+                None => None,
+            }
+        };
+        if let Some(w) = waker {
+            w.waker.wake();
         }
     }
 
@@ -4023,13 +4141,25 @@ impl SnubberNode {
     /// no permanently drifting depth gauge). Planned aborts do not feed
     /// the failure streak, matching the sync `abort()` path.
     #[cfg(feature = "alloc")]
-    fn settle_erased_rollback(&self, was_probe: bool) {
-        let mut inner = self.lock();
-        inner.stats.explicit_aborts = inner.stats.explicit_aborts.saturating_add(1);
-        if was_probe {
-            inner.half_open_probe = false;
-            inner.breaker = BreakerState::Open;
-            inner.stats.breaker_state = BreakerState::Open;
+    fn settle_erased_rollback(&self, was_probe: bool, held_lane: Option<usize>) {
+        let waker = {
+            let mut inner = self.lock();
+            inner.stats.explicit_aborts = inner.stats.explicit_aborts.saturating_add(1);
+            if was_probe {
+                inner.half_open_probe = false;
+                inner.breaker = BreakerState::Open;
+                inner.stats.breaker_state = BreakerState::Open;
+            }
+            match held_lane {
+                Some(lane) => {
+                    release_slot_inner(&mut inner, lane);
+                    inner.waiters.pop_front()
+                }
+                None => None,
+            }
+        };
+        if let Some(w) = waker {
+            w.waker.wake();
         }
     }
 
@@ -5914,23 +6044,31 @@ impl<F: FnOnce()> TrackedGuard<F> {
         }
     }
 
-    /// Admission-only settle used by the erased handoff: releases the
-    /// slot and wakes ONE parked waiter, but books NO success.
+    /// Admission-only settle used by the erased handoff: books NO success
+    /// and returns the lane the admission stamped.
+    ///
+    /// `release = true` (probe admissions) releases the slot now and wakes
+    /// ONE parked waiter. `release = false` (holding admissions) leaves the
+    /// slot booked: the erased transaction releases it at settle, exactly
+    /// once, through the same `release_slot_inner`.
     ///
     /// The erased guard owns the real outcome; a throwaway `commit()` here
     /// would fabricate `committed + 1` and a clean breaker outcome before
     /// the work ran. The inner rollback is the erased path's `|| {}`, so
     /// dropping it has no hardware effect.
-    pub(crate) fn settle_admission_only(mut self) {
+    pub(crate) fn settle_erased_arm(mut self, release: bool) -> usize {
+        let lane = (self.priority.code() as usize).min(Priority::MAX_INDEX);
         if self.settled {
-            return;
+            return lane;
         }
         self.settled = true;
-        let lane = (self.priority.code() as usize).min(Priority::MAX_INDEX);
         if let Some(g) = self.guard.take() {
             drop(g); // `|| {}` — no hardware effect
         }
         self.release_profile();
+        if !release {
+            return lane;
+        }
         let waker = {
             let mut inner = lock_ledger(&self.node);
             release_slot_inner(&mut inner, lane);
@@ -5939,6 +6077,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         if let Some(w) = waker {
             w.waker.wake();
         }
+        lane
     }
 
     /// Success path: hardware rollback disarmed, books settled.

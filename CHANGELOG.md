@@ -47,6 +47,32 @@ current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
   `tests/priority_preemption.rs` (4 added, the three Phase 1 tests
   unchanged).
 
+### Changed
+
+- **Erased admissions split by name.** The probe path is now
+  `probe_erased` / `probe_erased_auto`: it releases the bulkhead slot at
+  entry, exactly as `enter_erased_auto` always did — same code path, an
+  honest name. A slot that is held until settle is a separate entry,
+  `enter_erased_holding` / `enter_erased_holding_auto`, so
+  `max_in_flight(N)` becomes a real ceiling over LIVE erased
+  transactions and `commit()` / `abort()` / `Drop` each release exactly
+  one slot and wake one parked `enter_async` waiter. Before → after:
+
+  | 0.6 name | 0.7 name | Behavior |
+  |---|---|---|
+  | `enter_erased(epoch, task_id, rb)` | `probe_erased(epoch, task_id, rb)` | unchanged: slot released at entry |
+  | `enter_erased_auto(rollback)` | `probe_erased_auto(rollback)` | unchanged: slot released at entry |
+  | — | `enter_erased_holding(epoch, task_id, rb)` | new: slot held until settle |
+  | — | `enter_erased_holding_auto(rollback)` | new: slot held until settle |
+
+  `enter_erased` / `enter_erased_auto` stay as `#[deprecated(since =
+  "0.7.0")]` aliases. README gained a "Bulkhead Scope" section,
+  `tests/doc_sync.rs` pins `probe_erased_auto` as the canonical target,
+  and `tests/erased_holding.rs` (6 tests) pins the holding path:
+  ceiling, one release on commit, on drop and on a panicking rollback,
+  the probe path unchanged, and conservation. `tests/guard_alloc_budget.rs`
+  now storms the holding path too (300k guards per phase, still 0 B net).
+
 ## 0.6.13 (2026-10-27)
 
 A patch release of the verification machinery, one teardown ordering and the

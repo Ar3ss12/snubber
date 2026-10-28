@@ -91,7 +91,7 @@ How it works: the guard owns your rollback closure. `commit()` disarms it (succe
 ### Rules for the rollback closure:
 1. **Safe to run twice:** Releasing a button twice is fine; sending money twice is not — put terminal forward actions in `commit()`.
 2. **Fast and non-blocking:** Atomic stores, event flags, non-blocking sends.
-3. **Re-entrancy is allowed, not free:** the rollback body runs *outside* the node lock (Invariant 6, open-call), so calling back into the same node's admission from it does **not** deadlock — measured in `tests/rollback_guardrails.rs`. What actually happens: `scoped`/`scoped_checked` re-admission succeeds while a slot is free and returns `SnubberError::Admission(EnterError::BulkheadFull)` when the node is at capacity, because **your own rollback still holds its slot until it returns**; the async path returns `Poll::Pending` and wakes only when the body finishes. So a retry loop inside a rollback is a livelock of your thread, not a hang of the node. What is forbidden: re-locking a mutex that `work()` already holds (same thread → real hang, and the node books no verdict on its own — an outside `watchdog::poll_rollback` names the still-active body), and assuming the erased path will refuse you — `enter_erased_auto` releases admission at arm time, so nested erased scopes are granted by design.
+3. **Re-entrancy is allowed, not free:** the rollback body runs *outside* the node lock (Invariant 6, open-call), so calling back into the same node's admission from it does **not** deadlock — measured in `tests/rollback_guardrails.rs`. What actually happens: `scoped`/`scoped_checked` re-admission succeeds while a slot is free and returns `SnubberError::Admission(EnterError::BulkheadFull)` when the node is at capacity, because **your own rollback still holds its slot until it returns**; the async path returns `Poll::Pending` and wakes only when the body finishes. So a retry loop inside a rollback is a livelock of your thread, not a hang of the node. What is forbidden: re-locking a mutex that `work()` already holds (same thread → real hang, and the node books no verdict on its own — an outside `watchdog::poll_rollback` names the still-active body), and assuming the erased path will refuse you — `probe_erased_auto` releases admission at arm time, so nested erased scopes are granted by design.
 4. **Memory ordering:** The node's mutex protects node books only. Every guard runs a `SeqCst` fence before the rollback body (free on x86/x64) — but a fence pairs with NOTHING. If your rollback publishes to shared state that another thread reads, pair it yourself: store with `Release`, load with `Acquire` (or guard the state with your own lock). `Relaxed`×2 reads stale data.
 5. **Bind resource to guard:** Wrap the handle in `Protected::new(res, guard)` — `commit()` disarms the guard and returns the resource; any other exit executes rollback and drops the resource. Post-crash access becomes a compile error, not a forgotten `if`.
 6. **Seal the scope:** Prefer `node.scoped_sealed(rb, work)` where thread-leakage is the threat — the `!Send` `ScopeToken` makes `spawn` with context a compile error (E0277).
@@ -395,7 +395,7 @@ click_node.scoped_checked(&params, validate, || {}, |_| {
 
     std::thread::spawn(move || {
         // 2. The newborn worker thread attempts admission on the SAME node:
-        let _guard = click_node.enter_erased_auto(..)?;
+        let _guard = click_node.probe_erased_auto(..)?;
         // ❌ REJECTED: The node observes in_flight == 1 and returns BulkheadFull!
         // The worker never started — it aborts immediately.
     });
@@ -413,7 +413,7 @@ Millisecond physics of the race condition:
    background thread).
 3. **ms 2:** while the main thread has not left its braces yet, the
    newborn clicker thread starts and makes its first call:
-   `click_node.enter_erased_auto()`.
+   `click_node.probe_erased_auto()`.
 4. **ms 3:** the node looks at its counter: limit 1, occupied 1. **It
    bounces the worker off the wall.** The worker panics or quietly closes
    with an error.
@@ -457,23 +457,25 @@ The function that merely creates the thread (`thread::spawn`) must not
 touch the node's slots — it is just a dispatcher. The slot is taken by
 **the worker itself from the inside**, once awake in the OS:
 
-> **Scope correction.** The erased path (`enter_erased_auto`) is an
-> admission probe, not a lease on the slot for the worker's lifetime:
-> the probe is committed at admission, so the slot is free again while
-> the worker keeps running. `max_in_flight(1)` therefore does NOT
-> serialize two live erased workers — it only bounds how many are being
-> *admitted* at once. If "at most one live clicker" is a hardware
-> invariant, enforce it with your own semaphore/flag around the spawn
-> (the `Err` arm below still fires, but a plain bulkhead-full race is
-> not a mutual-exclusion guarantee). For a true lifetime slot on a
-> non-erased worker, keep the typed `TrackedGuard` alive for the whole
-> loop and commit in the epilogue.
+> **Scope correction.** The PROBE path (`probe_erased_auto`, formerly
+> `enter_erased_auto`) is an admission probe.
+> It is not a lease on the slot for the worker's lifetime: the probe is
+> committed at admission, so the
+> slot is free again while the worker keeps running. `max_in_flight(1)`
+> on the probe path therefore does NOT serialize two live erased workers
+> — it only bounds how many are being *admitted* at once. When the
+> ceiling MUST bound live transactions, use the HOLDING path
+> (`enter_erased_holding_auto`): the slot stays booked until `commit()`,
+> `abort()` or `Drop`, a second admission past the ceiling is refused
+> with `BulkheadFull`, and every settle releases exactly one slot. For a
+> lifetime slot without the heap box, keep the typed `TrackedGuard` alive
+> for the whole loop and commit in the epilogue.
 
 ```rust
 // Main thread just spawns, holding NO snubber slots:
 std::thread::spawn(move || {
     // The worker woke up and takes the probe admission for its own telemetry:
-    let guard = match click_node.enter_erased_auto(|| emergency_release_all_hardware()) {
+    let guard = match click_node.probe_erased_auto(|| emergency_release_all_hardware()) {
         Ok(g) => g,
         Err(_) => {
             // Bulkhead full, breaker open, rate limited, memory pressure —
@@ -490,7 +492,7 @@ std::thread::spawn(move || {
 });
 ```
 
-### Canonical recipe: `enter_erased_auto` + commit in the epilogue
+### Canonical recipe: `probe_erased_auto` + commit in the epilogue
 
 ```rust
 use snubber::{ErasedGuard, SnubberNode};
@@ -504,7 +506,7 @@ struct ClickDaemon {
 
 fn spawn_worker(node: &SnubberNode) -> Result<(), snubber::EnterError> {
     // 1. Arm at spawn. Rollback = emergency hardware release.
-    let guard = node.enter_erased_auto(|| hardware::release_all())?;
+    let guard = node.probe_erased_auto(|| hardware::release_all())?;
     // 2. Run the loop (clicks, polls, waits — whatever the daemon does).
     // 3. Settle EXACTLY once in the epilogue:
     //    clean stop  → guard.commit()   (disarm, no rollback)
@@ -524,6 +526,22 @@ Rules:
 3. **Validate BEFORE arming.** Run invariant checks first; on breach call
    `node.report(FaultKind::PoisonedPayload, epoch, task_id)` and start
    nothing — `total_started` stays untouched, no slot burned.
+
+### Holding recipe: `enter_erased_holding_auto` when the ceiling protects a resource
+
+The probe path proves nothing about how many workers are alive. When
+`max_in_flight` is what stands between you and two writers on one serial
+port, use the holding entry — the slot is booked for the guard's whole life:
+
+```rust
+let guard = node.enter_erased_holding_auto(|| hardware::release_all())?;
+// Slot held here. A second admission past max_in_flight is refused with
+// BulkheadFull, exactly like `enter`, and the caller is the queue.
+guard.commit(); // or guard.abort("stop") / Drop — each releases exactly one slot
+```
+
+Everything else matches the probe recipe: one guard per run, settle once,
+validate before arming. The difference is only the ceiling.
 
 ### Where `scoped` DOES belong (short stack-local transactions)
 
@@ -553,7 +571,7 @@ let (join, handle) = node.spawn_guarded(
     || hardware::release_all(), // rollback if the worker dies
     0u64,                       // initial conduit state
     |conduit: TaskConduit<u64, ()>| {
-        // The worker armed enter_erased_auto FIRST (lane Normal),
+        // The worker armed probe_erased_auto FIRST (lane Normal),
         // publishes liveness, parks cooperatively on directives:
         loop {
             match conduit.check_directive() {

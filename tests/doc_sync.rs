@@ -56,7 +56,7 @@ fn test_node_floor_map_anchors_exist() {
 
 /// Every low-level entry must carry the Canonical Indirection Warning pointing at the
 /// canonical worker entry. A newcomer hovering over `enter` in an IDE must
-/// see "prefer enter_erased_auto" before invoking low-level primitives.
+/// see "prefer probe_erased_auto" before invoking low-level primitives.
 #[test]
 fn test_low_level_entries_point_at_canonical() {
     let source =
@@ -66,14 +66,14 @@ fn test_low_level_entries_point_at_canonical() {
         "pub fn enter<F: FnOnce()>(",
         "pub fn enter_with_priority<F: FnOnce()>(",
         "pub fn enter_with_generation<F: FnOnce()>(",
-        "pub fn enter_erased<F: FnOnce() + Send + 'static>(",
+        "pub fn probe_erased<F: FnOnce() + Send + 'static>(",
         "pub fn enter_auto<F: FnOnce()>(",
         "pub fn enter_checked_auto<P, V, F: FnOnce()>(",
         "pub fn enter_checked<P, V, F: FnOnce()>(",
         "pub fn enter_supervised_erased<F>(",
     ];
 
-    let warning = "prefer the canonical [`Self::enter_erased_auto`]";
+    let warning = "prefer the canonical [`Self::probe_erased_auto`]";
 
     for method in LOW_LEVEL_METHODS {
         let pos = source
@@ -86,9 +86,9 @@ fn test_low_level_entries_point_at_canonical() {
         );
     }
 
-    // `enter_erased_auto` is the canonical target and must NOT carry the redirection itself.
+    // `probe_erased_auto` is the canonical target and must NOT carry the redirection itself.
     let canonical_pos = source
-        .find("pub fn enter_erased_auto<")
+        .find("pub fn probe_erased_auto<")
         .expect("Canonical entry missing");
     let canonical_doc = &source[canonical_pos.saturating_sub(600)..canonical_pos];
 
@@ -100,43 +100,56 @@ fn test_low_level_entries_point_at_canonical() {
     // The canonical entry advertises itself with the canonical header.
     assert!(
         source.contains("# 🟢 CANONICAL APPLICATION ENTRY"),
-        "TRIPWIRE FIRED: canonical header missing from enter_erased_auto.",
+        "TRIPWIRE FIRED: canonical header missing from probe_erased_auto.",
     );
 }
 
-/// The erased-guard bulkhead boundary must stay documented: the erased path
-/// releases its slot at admission, so `max_in_flight` bounds admissions, not
-/// live erased transactions.
+/// The erased-guard bulkhead boundary must stay documented: the erased PROBE
+/// path releases its slot at admission, so `max_in_flight` bounds admissions,
+/// not live erased transactions — a ceiling over live transactions belongs to
+/// `enter_erased_holding_auto`.
 ///
 /// Home of the statement: `docs/USER_GUIDE.md` (Layer 2, "Scope correction")
-/// and the `enter_erased_auto` doc comment — NOT the README. On 2026-10-27 the
+/// and the `probe_erased_auto` doc comment — NOT the README. On 2026-10-27 the
 /// owner had the six-line caveat deleted from the README's guarantee list,
 /// where it read as a legal disclaimer at the end of the wins; the pin moved
 /// with the text instead of being dropped, so the correction is still guarded.
 #[test]
-fn test_erased_bulkhead_scope_stays_documented() {
+fn test_erased_probe_bulkhead_scope_stays_documented() {
     let guide = std::fs::read_to_string("docs/USER_GUIDE.md")
         .expect("Failed to read docs/USER_GUIDE.md for bulkhead-scope audit");
     assert!(
         guide.contains("not a lease on the slot for the worker's lifetime"),
         "TRIPWIRE FIRED: the User Guide lost the erased-path 'Scope correction' \
-         — `max_in_flight` on the erased path bounds admissions, and a reader \
-         must still be told that."
+         — `max_in_flight` on the erased probe path bounds admissions, and a \
+         reader must still be told that."
     );
     assert!(
         guide.contains("serialize two live erased workers"),
         "TRIPWIRE FIRED: the User Guide's bulkhead-scope correction lost its \
          boundary statement."
     );
+    assert!(
+        guide.contains("enter_erased_holding_auto"),
+        "TRIPWIRE FIRED: the User Guide stopped naming the HOLDING entry \
+         (`enter_erased_holding_auto`) as the ceiling over live transactions."
+    );
     let source = std::fs::read_to_string("src/node.rs")
         .expect("Failed to read src/node.rs for bulkhead-scope audit");
     let pos = source
-        .find("pub fn enter_erased_auto<")
+        .find("pub fn probe_erased_auto<")
         .expect("Canonical entry missing");
     let doc_window = &source[pos.saturating_sub(1200)..pos];
     assert!(
         doc_window.contains("Bulkhead scope"),
-        "TRIPWIRE FIRED: enter_erased_auto doc lost the bulkhead-scope note."
+        "TRIPWIRE FIRED: probe_erased_auto doc lost the bulkhead-scope note."
+    );
+    let readme = std::fs::read_to_string("README.md")
+        .expect("Failed to read README.md for bulkhead-scope audit");
+    assert!(
+        readme.contains("### Bulkhead Scope"),
+        "TRIPWIRE FIRED: README lost the 'Bulkhead Scope' section that the \
+         probe_erased_auto doc comment links to."
     );
 }
 
@@ -170,7 +183,7 @@ fn test_rollback_reentry_law_matches_the_code() {
         "holds its slot until it returns",
         "Poll::Pending",
         "re-locking a mutex",
-        "enter_erased_auto",
+        "probe_erased_auto",
     ] {
         assert!(
             rule.contains(token),

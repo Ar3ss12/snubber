@@ -14,7 +14,7 @@ use std::sync::Arc;
 fn run_worker(node: &SnubberNode, clicks: &Arc<AtomicU32>) -> Result<(), EnterError> {
     // `enter_erased_auto` needs `Send + 'static`: clone the Arc in.
     let rescue = Arc::clone(clicks);
-    let guard = node.enter_erased_auto(move || {
+    let guard = node.probe_erased_auto(move || {
         // Emergency rollback: would release hardware in a real daemon.
         rescue.fetch_add(1000, Ordering::SeqCst);
     })?;
@@ -63,7 +63,7 @@ fn worker_panic_rolls_back_and_frees_the_slot() {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = Arc::clone(&rolled);
         let _guard = node
-            .enter_erased_auto(move || {
+            .probe_erased_auto(move || {
                 c.fetch_add(1, Ordering::SeqCst);
             })
             .expect("panic-run must be admitted");

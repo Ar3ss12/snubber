@@ -29,7 +29,7 @@ fn erased_guard_lives_in_struct_field() {
         .build();
     let mut app = App { hold: None };
     app.hold = Some(
-        node.enter_erased(1, 7, || {
+        node.probe_erased(1, 7, || {
             RELEASES.fetch_add(1, Ordering::SeqCst);
         })
         .expect("slot free"),
@@ -64,7 +64,7 @@ fn erased_guard_captures_context() {
     let c = fired.clone();
     let node = SnubberNode::builder("erased/capture").build();
     let g = node
-        .enter_erased(1, 1, move || {
+        .probe_erased(1, 1, move || {
             c.fetch_add(41, Ordering::SeqCst);
         })
         .expect("admit");
@@ -77,7 +77,7 @@ fn erased_guard_rejection_boxes_nothing() {
     let node = SnubberNode::builder("erased/full")
         .max_in_flight(0) // always full
         .build();
-    let r = node.enter_erased(1, 1, || panic!("must never box"));
+    let r = node.probe_erased(1, 1, || panic!("must never box"));
     assert!(r.is_err(), "rejection before boxing");
 }
 
@@ -231,7 +231,7 @@ fn erased_admission_does_not_close_half_open_breaker() {
     } // implicit drop -> trip -> HalfOpen
     assert_eq!(node.stats().breaker_state, snubber::BreakerState::HalfOpen);
 
-    let g = node.enter_erased(2, 2, || {}).expect("probe admitted");
+    let g = node.probe_erased(2, 2, || {}).expect("probe admitted");
     // The throwaway commit must NOT have closed the breaker: a second
     // call is refused while the erased guard holds the probe.
     assert!(
@@ -258,7 +258,7 @@ fn erased_drop_reopens_breaker_like_a_failed_probe() {
     {
         let _g = node.enter(1, 1, || {}).expect("enter");
     } // HalfOpen
-    let g = node.enter_erased(2, 2, || {}).expect("probe admitted");
+    let g = node.probe_erased(2, 2, || {}).expect("probe admitted");
     drop(g); // rollback without commit: downstream still degraded
     assert_eq!(
         node.stats().breaker_state,
@@ -281,7 +281,7 @@ fn erased_drop_reopens_breaker_like_a_failed_probe() {
 fn erased_rollback_books_an_abort_and_clears_the_depth_gauge() {
     let node = SnubberNode::builder("erased/rollback-books").build();
     {
-        let _g = node.enter_erased(1, 1, || {}).expect("admitted");
+        let _g = node.probe_erased(1, 1, || {}).expect("admitted");
     } // rollback without commit
     let stats = node.stats();
     assert_eq!(stats.total_started, 1, "admission was booked");
@@ -319,7 +319,7 @@ fn panicking_rollback_still_settles_the_erased_probe() {
 
     // Probe armed via the erased path; the user rollback panics on Drop.
     let guard = node
-        .enter_erased(10, 10, || panic!("rollback explodes"))
+        .probe_erased(10, 10, || panic!("rollback explodes"))
         .expect("probe admitted");
     drop(guard); // panic swallowed by the guard's catch_unwind; settle must run
 
@@ -343,7 +343,7 @@ fn panicking_rollback_still_settles_the_erased_probe() {
     // settles. A planned abort never escalates into a process abort.
     node.report(FaultKind::Panic, 4, 4);
     let guard = node
-        .enter_erased(12, 12, || panic!("rollback explodes again"))
+        .probe_erased(12, 12, || panic!("rollback explodes again"))
         .expect("probe admitted");
     guard.abort("boom");
     assert_eq!(

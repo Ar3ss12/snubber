@@ -80,7 +80,7 @@ impl core::fmt::Debug for ClosurePolicy {
 /// let node = SnubberNode::builder("worker").build();
 /// let mut state = DaemonState { hold: None };
 ///
-/// state.hold = Some(node.enter_erased(1, 1, || release_hardware()).unwrap());
+/// state.hold = Some(node.probe_erased(1, 1, || release_hardware()).unwrap());
 /// // If the task fails or drops here, hardware is released via Drop.
 /// state.hold.take().map(|g| g.commit()); // Clean completion
 ///

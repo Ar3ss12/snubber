@@ -184,9 +184,9 @@ fn reentrant_admission_from_erased_rollback_is_granted_by_design() {
     let (v, s) = (Arc::clone(&verdict), Arc::clone(&started));
     bounded("erased re-entry", move || {
         let guard = caller
-            .enter_erased_auto(move || {
+            .probe_erased_auto(move || {
                 s.store(true, Ordering::SeqCst);
-                let nested = rollback_node.enter_erased_auto(|| {});
+                let nested = rollback_node.probe_erased_auto(|| {});
                 v.store(
                     match nested {
                         Ok(_) => NESTED_ADMITTED,

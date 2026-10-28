@@ -285,7 +285,7 @@ fn bench_layer3(c: &mut Criterion) {
 
     g.bench_function("erased_enter_auto_commit", |b| {
         b.iter(|| {
-            let guard = node.enter_erased_auto(|| {}).expect("a");
+            let guard = node.probe_erased_auto(|| {}).expect("a");
             guard.commit();
         });
     });

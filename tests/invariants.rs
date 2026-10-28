@@ -184,7 +184,7 @@ fn verify_slot_containment_and_single_shot_rollback() {
             let mut refused = 0u64;
             for i in 0..ATTEMPTS_PER_THREAD {
                 let rb_local = Arc::clone(&rb);
-                let guard = match n.enter_erased_auto(move || {
+                let guard = match n.probe_erased_auto(move || {
                     rb_local.fetch_add(1, Ordering::SeqCst);
                 }) {
                     Ok(g) => {

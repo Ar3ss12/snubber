@@ -42,7 +42,7 @@ fn main() {
         // The worker claims its slot internally.
         // If the thread dies or encounters a panic, the rollback closure executes.
         let s_cleanup = Arc::clone(&s);
-        let guard = match n.enter_erased_auto(move || {
+        let guard = match n.probe_erased_auto(move || {
             println!("[Daemon Rollback] Worker exited or aborted. Disarming hardware...");
             s_cleanup.device_active.store(false, Ordering::SeqCst);
         }) {

@@ -114,7 +114,7 @@ fn erased_dummy_never_rolls_back() {
         .build();
     HELD.fetch_add(1, Ordering::SeqCst);
     let guard = naked
-        .enter_erased_auto(|| real_release(&RELEASED))
+        .probe_erased_auto(|| real_release(&RELEASED))
         .expect("transit never refuses");
     drop(guard);
     assert_eq!(HELD.load(Ordering::SeqCst), 1, "erased dummy leaks");
@@ -128,7 +128,7 @@ fn erased_dummy_never_rolls_back() {
     let armed = SnubberNode::builder("canary/erased-armed").build();
     HELD.fetch_add(1, Ordering::SeqCst);
     let guard = armed
-        .enter_erased_auto(|| real_release(&RELEASED))
+        .probe_erased_auto(|| real_release(&RELEASED))
         .expect("slot free");
     drop(guard);
     assert_eq!(

@@ -23,7 +23,7 @@ fn simulate_database_query(
     fail: bool,
 ) -> Result<(), &'static str> {
     // Attempt admission with max concurrency enforced
-    let guard = match node.enter_erased_auto(move || {
+    let guard = match node.probe_erased_auto(move || {
         // Real release: the handle is checked back into the pool.
         OPEN_CONNS.fetch_sub(1, Ordering::SeqCst);
         ROLLBACKS.fetch_add(1, Ordering::SeqCst);
