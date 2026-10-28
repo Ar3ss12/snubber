@@ -187,6 +187,30 @@ const _: () = assert!(
     "Priority::COUNT is a published wire contract (3 priority lanes)"
 );
 
+/// Victim set for a cooperative preempt request.
+///
+/// [`Priority::may_preempt`] names the aggressor under the default
+/// policy; a policy only changes WHO counts as a victim:
+///
+/// * [`Self::BackgroundOnly`] (default) — knock only when every held slot
+///   is `Background`; `Critical` vs `Normal` never preempts.
+/// * [`Self::StrictSenior`] — knock whenever every held slot is strictly
+///   junior to the aggressor: `Normal` may knock `Background`, `Critical`
+///   may knock `Background` + `Normal`. Equal-or-senior occupancy never
+///   preempts (no inversion).
+///
+/// The node never forces: victims observe `Directive::Preempted` on their
+/// own conduit and settle themselves (R5 — zero deadlock).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreemptPolicy {
+    /// `Critical` over pure-`Background` occupancy only.
+    #[default]
+    BackgroundOnly,
+    /// Knock any strictly junior occupancy, from `Normal` upward.
+    StrictSenior,
+}
+
 /// Dynamic or static error context accompanying fault events.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FaultDetail {

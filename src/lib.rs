@@ -206,7 +206,7 @@ pub use name::NodeName;
 
 pub use policy::{
     Backpressure, BackpressurePolicy, FaultAction, FaultDetail, FaultKind, FaultPolicy, FrictionFn,
-    LogLevel, MetricSample, PressureFn, Priority,
+    LogLevel, MetricSample, PreemptPolicy, PressureFn, Priority,
 };
 
 pub use clock::{

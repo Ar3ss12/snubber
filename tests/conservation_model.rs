@@ -195,9 +195,12 @@ fn mixed_policy_columns_conserve_every_attempt() {
         Ok(_) => panic!("20 ms of silence must blow a 1 ms lease"),
     }
     assert_eq!(node.lane_in_flight(), [2, 0, 0]);
+    // The flag outlives a partial settle: `bg_b` and `bg_c` still hold
+    // slots and have not polled their conduits, so the request waits for
+    // a full drain instead of being swallowed by the first victim.
     assert!(
-        !node.preempt_requested(),
-        "a Background settle clears the request"
+        node.preempt_requested(),
+        "a partial Background settle keeps the request"
     );
 
     // 7. Commit frees a slot; the next admission passes with no side-event.
@@ -224,6 +227,10 @@ fn mixed_policy_columns_conserve_every_attempt() {
     drop(late);
     model.drops += 1;
     assert_eq!(node.lane_in_flight(), [0, 0, 0], "every slot came home");
+    assert!(
+        !node.preempt_requested(),
+        "the full drain is what clears the request"
+    );
 
     // 10. Telemetry-only report: the alert ledger grows, the conservation
     //     arithmetic does not move.

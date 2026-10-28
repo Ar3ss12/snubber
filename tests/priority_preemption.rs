@@ -6,7 +6,7 @@
 //! their own `TaskConduit` (`Directive::Preempted`) and settle
 //! themselves (R5 — never forced, never waited-on under the lock).
 
-use snubber::{Directive, EnterError, Priority, SnubberNode, TaskConduit};
+use snubber::{Directive, EnterError, PreemptPolicy, Priority, SnubberNode, TaskConduit};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -293,4 +293,160 @@ fn critical_never_forces_uncooperative_worker() {
     assert_eq!(s.preempted, 1, "no duplicate filing while flag was up");
     assert_eq!(ROLLBACKS.load(Ordering::SeqCst), 0, "clean, no rollback");
     assert_eq!(s.poison_recoveries, 0, "zero-panic holds");
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: opt-in `PreemptPolicy::StrictSenior`. The default victim set
+// (Critical over pure Background) is unchanged; the policy only widens WHO
+// counts as a victim, and never inverts a lane (equal-or-senior occupancy
+// always bounces as a plain `BulkheadFull`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn strict_senior_preempts_normal() {
+    let node = SnubberNode::builder("preempt/strict-senior")
+        .max_in_flight(1)
+        .queue_limit(16)
+        .trip_after_failures(0)
+        .preempt_policy(PreemptPolicy::StrictSenior)
+        .build();
+    assert_eq!(node.preempt_policy(), PreemptPolicy::StrictSenior);
+
+    let normal = node
+        .enter_with_priority(Priority::Normal, 1, 1, || {})
+        .expect("normal arms the slot");
+    assert_eq!(node.lane_in_flight(), [0, 1, 0]);
+
+    let err = match node.enter_with_priority(Priority::Critical, 2, 2, || {}) {
+        Ok(_) => panic!("critical must bounce off the held slot"),
+        Err(e) => e,
+    };
+    assert_eq!(err, EnterError::BulkheadFull);
+    assert!(
+        node.preempt_requested(),
+        "strict-senior may ask a strictly junior lane to yield"
+    );
+    let s = node.stats();
+    assert_eq!(s.preempted, 1, "exactly one request for one knock");
+    assert_eq!(s.bulkhead_rejections, 1);
+
+    normal.commit();
+    assert!(!node.preempt_requested(), "full drain clears the request");
+}
+
+#[test]
+fn strict_senior_never_inverts() {
+    let node = SnubberNode::builder("preempt/strict-senior-no-inversion")
+        .max_in_flight(1)
+        .queue_limit(16)
+        .trip_after_failures(0)
+        .preempt_policy(PreemptPolicy::StrictSenior)
+        .build();
+
+    let critical = node
+        .enter_with_priority(Priority::Critical, 1, 1, || {})
+        .expect("critical arms the slot");
+
+    // The held lane is equal-or-senior to both knockers: no victim exists.
+    for (epoch, priority) in [(2u64, Priority::Normal), (3u64, Priority::Background)] {
+        let err = match node.enter_with_priority(priority, epoch, epoch, || {}) {
+            Ok(_) => panic!("{priority:?} must not be admitted past a held slot"),
+            Err(e) => e,
+        };
+        assert_eq!(err, EnterError::BulkheadFull);
+        assert!(
+            !node.preempt_requested(),
+            "no inversion: {priority:?} never asks a senior lane to yield"
+        );
+    }
+    let s = node.stats();
+    assert_eq!(s.preempted, 0, "strict column stays clean");
+    assert_eq!(s.bulkhead_rejections, 2);
+
+    critical.commit();
+}
+
+#[test]
+fn strict_senior_flag_survives_partial_yield() {
+    let node = SnubberNode::builder("preempt/strict-senior-partial")
+        .max_in_flight(2)
+        .queue_limit(16)
+        .trip_after_failures(0)
+        .preempt_policy(PreemptPolicy::StrictSenior)
+        .build();
+
+    let bg = node
+        .enter_with_priority(Priority::Background, 1, 1, || {})
+        .expect("background arms");
+    let normal = node
+        .enter_with_priority(Priority::Normal, 2, 2, || {})
+        .expect("normal arms");
+    assert_eq!(node.lane_in_flight(), [1, 1, 0]);
+
+    let err = match node.enter_with_priority(Priority::Critical, 3, 3, || {}) {
+        Ok(_) => panic!("critical must bounce off the saturated node"),
+        Err(e) => e,
+    };
+    assert_eq!(err, EnterError::BulkheadFull);
+    assert!(node.preempt_requested());
+
+    // The Background victim settles first; the Normal victim has not
+    // polled its conduit yet, so the request must outlive the partial
+    // yield (a per-victim clear would silently drop it here).
+    bg.commit();
+    assert_eq!(node.lane_in_flight(), [0, 1, 0]);
+    assert!(
+        node.preempt_requested(),
+        "flag survives a partial yield, cleared only on full drain"
+    );
+
+    normal.commit();
+    assert_eq!(node.lane_in_flight(), [0, 0, 0]);
+    assert!(!node.preempt_requested(), "full drain clears the flag");
+    assert_eq!(node.stats().preempted, 1);
+}
+
+#[test]
+fn default_policy_unchanged() {
+    let node = SnubberNode::builder("preempt/default-policy")
+        .max_in_flight(1)
+        .queue_limit(16)
+        .trip_after_failures(0)
+        .build();
+    assert_eq!(
+        node.preempt_policy(),
+        PreemptPolicy::BackgroundOnly,
+        "default is the Phase 1 law"
+    );
+
+    // (1) Critical over pure Background still knocks.
+    let bg = node
+        .enter_with_priority(Priority::Background, 1, 1, || {})
+        .expect("background arms");
+    let err = match node.enter_with_priority(Priority::Critical, 2, 2, || {}) {
+        Ok(_) => panic!("critical must bounce off background"),
+        Err(e) => e,
+    };
+    assert_eq!(err, EnterError::BulkheadFull);
+    assert!(node.preempt_requested(), "knock files a request");
+    bg.commit();
+    assert!(!node.preempt_requested(), "drain clears the flag");
+
+    // (2) Critical vs Normal still never preempts.
+    let normal = node
+        .enter_with_priority(Priority::Normal, 3, 3, || {})
+        .expect("normal arms");
+    let err = match node.enter_with_priority(Priority::Critical, 4, 4, || {}) {
+        Ok(_) => panic!("critical must not be admitted past normal"),
+        Err(e) => e,
+    };
+    assert_eq!(err, EnterError::BulkheadFull);
+    assert!(!node.preempt_requested(), "no request vs non-background");
+    normal.commit();
+
+    // (3) Books agree with the pre-policy behaviour.
+    let s = node.stats();
+    assert_eq!(s.preempted, 1, "one knock wave = one filed request");
+    assert_eq!(s.bulkhead_rejections, 2);
+    assert_eq!(node.lane_in_flight(), [0, 0, 0]);
 }

@@ -34,7 +34,7 @@
 
 use super::{
     Backpressure, BackpressurePolicy, FaultAction, FaultDetail, FaultKind, FaultPolicy, FrictionFn,
-    LogLevel, Priority,
+    LogLevel, PreemptPolicy, Priority,
 };
 use super::{EpochGate, SnubberEvent, TransactionHeader};
 use crate::envelope::{EnvelopeVerdict, ExecutionEnvelope, TimeVerdict};
@@ -553,6 +553,7 @@ pub struct SnubberNodeBuilder {
     passthrough: bool,
     memory_soft_kb: u64,
     memory_hard_kb: u64,
+    preempt_policy: PreemptPolicy,
 }
 
 // [ANCHOR: BUILDER] — node builder, presets (desktop/embedded/server).
@@ -588,6 +589,7 @@ impl SnubberNodeBuilder {
             friction_fn: None,
             pressure_fn: None,
             passthrough: false,
+            preempt_policy: PreemptPolicy::BackgroundOnly,
         }
     }
 
@@ -595,6 +597,19 @@ impl SnubberNodeBuilder {
     #[must_use]
     pub fn max_in_flight(mut self, n: usize) -> Self {
         self.max_in_flight = n;
+        self
+    }
+
+    /// Victim set for a cooperative preempt request. Default
+    /// [`PreemptPolicy::BackgroundOnly`]: only `Critical` knocks, and only
+    /// against pure-`Background` occupancy. [`PreemptPolicy::StrictSenior`]
+    /// lets any lane knock every strictly junior lane (`Normal` over
+    /// `Background`, `Critical` over `Background` + `Normal`) — still
+    /// cooperative, still zero-deadlock: the node files one request and
+    /// the caller retries after the victims yield.
+    #[must_use]
+    pub fn preempt_policy(mut self, policy: PreemptPolicy) -> Self {
+        self.preempt_policy = policy;
         self
     }
 
@@ -1081,6 +1096,7 @@ impl SnubberNodeBuilder {
                     in_flight: 0,
                     queued: 0,
                     lane_in_flight: [0, 0, 0],
+                    preempt_policy: self.preempt_policy,
                     preempt_requested: false,
                     consecutive_failures: 0,
                     window_outcomes: 0,
@@ -1164,10 +1180,14 @@ struct NodeInner {
     queued: usize,
     /// Live priority histogram: how many armed guards sit in each lane.
     /// Index = `Priority::code` (0 = Background, 1 = Normal, 2 = Critical).
-    /// `Copy` integers only — PHASE A/C safe. The strict Phase 1 rule
-    /// reads it: preempt ONLY when `in_flight > 0` and every slot is
-    /// `Background` (`lanes[0] == in_flight`).
+    /// `Copy` integers only — PHASE A/C safe. The preemption victim set
+    /// (`preempt_victims`) reads it: `BackgroundOnly` demands
+    /// `in_flight > 0 && lanes[0] == in_flight`; `StrictSenior` demands an
+    /// empty `lanes[senior..]` slice.
     lane_in_flight: [usize; 3],
+    /// Who counts as a victim when a senior admission knocks. Immutable
+    /// after `build()`; `BackgroundOnly` keeps the Phase 1 law.
+    preempt_policy: PreemptPolicy,
     /// Cooperative preempt request (Phase 1): set by a `Critical`
     /// admission that found pure-`Background` occupancy, cleared when a
     /// victim settles (`commit`/`abort`/drop) or a `Critical` is admitted.
@@ -2585,8 +2605,9 @@ impl SnubberNode {
     ///
     /// Same breaker → epoch → bulkhead → queue → commit pipeline as
     /// [`enter`](Self::enter); the lane is stamped on the guard
-    /// (`TrackedGuard::priority`). `Critical` over pure-`Background`
-    /// occupancy files a cooperative preempt request instead of
+    /// (`TrackedGuard::priority`). Occupancy that matches the configured
+    /// [`PreemptPolicy`] victim set (default: `Critical` over pure
+    /// `Background`) files a cooperative preempt request instead of
     /// bouncing: the node flips `preempt_requested` (lock released!),
     /// counts one `Preempted`, and the caller retries — the victims
     /// observe `Directive::Preempted` on their own `TaskConduit` and
@@ -2636,22 +2657,33 @@ impl SnubberNode {
         self.lock().lane_in_flight
     }
 
-    /// Ask the `Background` occupants to yield (Phase 1, cooperative).
+    /// Configured preemption victim set (Phase 1 diagnostics).
+    #[must_use]
+    pub fn preempt_policy(&self) -> PreemptPolicy {
+        self.lock().preempt_policy
+    }
+
+    /// Ask the junior occupants to yield (Phase 1, cooperative).
     ///
     /// Sets `preempt_requested` + counts one `Preempted` (own column,
-    /// operational shedding, never trips the breaker) when the node holds ONLY
-    /// `Background` guards. Otherwise a no-op returning `false`.
-    /// The caller (a `Critical` admission path) releases the lock and
-    /// retries — victims settle themselves via their own conduits.
+    /// operational shedding, never trips the breaker) when the node's
+    /// occupancy matches the configured [`PreemptPolicy`] victim set.
+    /// Otherwise a no-op returning `false`. The caller (a senior
+    /// admission path) releases the lock and retries — victims settle
+    /// themselves via their own conduits.
     pub fn request_preempt(&self) -> bool {
         let mut inner = self.lock();
-        if inner.in_flight == 0 || inner.lane_in_flight[0] != inner.in_flight {
+        if !preempt_victims(&inner, Priority::Critical) {
             return false;
         }
         if inner.preempt_requested {
             return true;
         }
         inner.preempt_requested = true;
+        let detail = match inner.preempt_policy {
+            PreemptPolicy::BackgroundOnly => "critical over background",
+            PreemptPolicy::StrictSenior => "strictly senior over junior lanes",
+        };
         let mut outcome = Self::record_locked(&mut inner, FaultKind::Preempted, 7);
         drop(inner);
         let record = FaultRecord {
@@ -2660,7 +2692,7 @@ impl SnubberNode {
             file: file!(),
             line: line!(),
             header: TransactionHeader::new(0, 0),
-            detail: Some(FaultDetail::Static("critical over background")),
+            detail: Some(FaultDetail::Static(detail)),
             stage: 0,
             stage_label: None,
             queue_wait_ms: 0,
@@ -3577,17 +3609,15 @@ impl SnubberNode {
         // min(friction(in_flight, max), max_wait_ms), shed past depth cap.
         //
         // Phase 1 preemption (strict, cooperative, zero-deadlock): a
-        // `Critical` admission over pure-`Background` occupancy files ONE
-        // `Preempted` request (flag + counter, lock released!) and then
-        // falls through to the normal `BulkheadFull` refusal — the CALLER
-        // retries after its victims yield. `Critical` vs `Normal` never
-        // preempts (no inversion). The node never waits holding the lock.
+        // senior admission whose victim set matches `preempt_victims`
+        // files ONE `Preempted` request (flag + counter, lock released!)
+        // and then falls through to the normal `BulkheadFull` refusal —
+        // the CALLER retries after its victims yield. Under the default
+        // `BackgroundOnly` only `Critical` knocks, and only pure
+        // `Background` occupancy; equal-or-senior lanes never preempt
+        // (no inversion). The node never waits holding the lock.
         if inner.in_flight >= inner.max_in_flight {
-            if priority.may_preempt()
-                && inner.in_flight > 0
-                && inner.lane_in_flight[0] == inner.in_flight
-                && !inner.preempt_requested
-            {
+            if !inner.preempt_requested && preempt_victims(&inner, priority) {
                 inner.preempt_requested = true;
                 let mut outcome = Self::record_locked(&mut inner, FaultKind::Preempted, 7);
                 drop(inner);
@@ -4976,20 +5006,50 @@ fn push_flight_inner(inner: &mut NodeInner, slot: FlightSlot) {
     }
 }
 
+/// Victim set for a cooperative preempt request (policy-dependent).
+///
+/// `BackgroundOnly` keeps the Phase 1 law: only a `Critical` aggressor,
+/// and only when every held slot is `Background`. `StrictSenior` widens
+/// it to every STRICTLY junior lane: the `senior..COUNT` slice must be
+/// empty, so an equal-or-senior occupant can never be asked to yield
+/// (no inversion). `Background` is never an aggressor — the full slice
+/// would have to be empty, which `in_flight > 0` forbids.
+#[inline]
+fn preempt_victims(inner: &NodeInner, priority: Priority) -> bool {
+    if inner.in_flight == 0 || priority.code() == 0 {
+        return false;
+    }
+    match inner.preempt_policy {
+        PreemptPolicy::BackgroundOnly => {
+            priority.may_preempt() && inner.lane_in_flight[0] == inner.in_flight
+        }
+        PreemptPolicy::StrictSenior => {
+            let senior = (priority.code() as usize).min(Priority::MAX_INDEX);
+            inner.lane_in_flight[senior..Priority::COUNT]
+                .iter()
+                .fold(0usize, |sum, &n| sum.saturating_add(n))
+                == 0
+        }
+    }
+}
+
 /// Release one armed slot on a settle path (Phase 1 preemption books).
 ///
 /// Integers only, cannot panic: `in_flight`/`queued` come home exactly
-/// once, the guard's lane is subtracted from the live histogram, and a
-/// settling victim clears a pending cooperative `preempt_requested`.
-/// Every `commit` / `abort` / `check_timeout` / `settle_implicit` funnels
-/// here — one owner, no drift, no double-bookkeeping.
+/// once, the guard's lane is subtracted from the live histogram, and the
+/// last settling victim clears a pending cooperative `preempt_requested`
+/// — the flag lives until the node fully drains, so a victim that only
+/// settles late or never polls its conduit does not silently drop the
+/// request. Every `commit` / `abort` / `check_timeout` /
+/// `settle_implicit` funnels here — one owner, no drift, no
+/// double-bookkeeping.
 #[inline]
 fn release_slot_inner(inner: &mut NodeInner, lane: usize) {
     inner.in_flight = inner.in_flight.saturating_sub(1);
     inner.queued = inner.queued.saturating_sub(1);
     let lane = lane.min(Priority::MAX_INDEX);
     inner.lane_in_flight[lane] = inner.lane_in_flight[lane].saturating_sub(1);
-    if lane == 0 {
+    if inner.in_flight == 0 {
         inner.preempt_requested = false;
     }
     hard_clamp_slots(inner);

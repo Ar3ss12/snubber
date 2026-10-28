@@ -603,12 +603,30 @@ match node.enter_with_priority(Priority::Critical, 2, 2, || release_all()) {
 }
 ```
 
-Strict rule (no inversion): `Critical` preempts ONLY pure-`Background`
-occupancy (`lane_in_flight == [n, 0, 0]`). `Critical` vs `Normal` never
-preempts — plain `BulkheadFull`, no flag, `preempted` column stays clean.
+Victim set (`PreemptPolicy`, default `BackgroundOnly` — no inversion):
+`BackgroundOnly` lets only `Critical` knock, and only when every held
+slot is `Background` (`lane_in_flight == [n, 0, 0]`); `Critical` vs
+`Normal` is a plain `BulkheadFull`, no flag, `preempted` column clean.
+`StrictSenior` widens the victim set to every strictly junior lane
+(`Normal` may knock `Background`, `Critical` may knock `Background` +
+`Normal`); equal-or-senior occupancy still never preempts:
+
+```rust
+use snubber::{PreemptPolicy, SnubberNode};
+
+let node = SnubberNode::builder("clicker")
+    .max_in_flight(1)
+    .preempt_policy(PreemptPolicy::StrictSenior) // opt-in; default is BackgroundOnly
+    .build();
+```
+
+The request flag lives until the node fully drains (`in_flight == 0`), not
+until the first victim settles: a victim that settles late, or never polls
+its conduit, does not silently drop the request.
 The node never forces (R5): who never checkpoints `check_directive()`
 is its own enemy — the request waits until the worker yields itself.
-Diagnostics: `node.preempt_requested()`, `node.lane_in_flight()`,
+Diagnostics: `node.preempt_requested()`, `node.preempt_policy()`,
+`node.lane_in_flight()`,
 `stats().preempted` / `shed_preempted()` (own column, operational shedding, never
 trips the breaker, never counted in `admission_total`).
 

@@ -34,6 +34,18 @@ current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
   with its own supervisor no longer re-derives the EOF-grace rule — and
   can no longer lose the last `RECOVER` token by taking the slot too
   early. `tests/sentinel_pipe.rs` proves the late-token rescue.
+- `PreemptPolicy` on the builder: `BackgroundOnly` (default, the Phase 1
+  law — only `Critical` knocks, only pure-`Background` occupancy) or
+  `StrictSenior` (any lane knocks every strictly junior lane: `Normal`
+  over `Background`, `Critical` over `Background` + `Normal`). Both stay
+  cooperative: one request, caller retries, victims yield through their
+  own conduit. One default-behaviour fix rides along —
+  `preempt_requested` now clears when the node fully drains
+  (`in_flight == 0`) instead of on the first `Background` settle, so a
+  late or unpolled victim cannot silently swallow the request. New
+  diagnostics: `SnubberNode::preempt_policy()`. Tests:
+  `tests/priority_preemption.rs` (4 added, the three Phase 1 tests
+  unchanged).
 
 ## 0.6.13 (2026-10-27)
 
