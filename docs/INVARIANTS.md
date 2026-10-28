@@ -359,6 +359,10 @@ cargo test --test concurrency_stress
 # Verify process death handling and supervisor pipe recovery
 cargo test --test supervisor
 
+# Verify the liveness witness rules (death outranks silence, None != dead, strict grace)
+cargo test --test sentinel
+cargo test --no-default-features --lib sentinel
+
 # Verify bulkhead pushback and rate limits
 cargo test --test bulkhead_capacity
 cargo test --test circuit_breaker

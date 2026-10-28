@@ -1347,6 +1347,41 @@ let guard = NoOrphanGuard; // honest no-op; real Win32 Job Objects implemented i
 assert!(!guard.arm(child_pid));
 ```
 
+### 4.7b Liveness witness (`Sentinel`): naming death without a syscall
+
+`Sentinel` answers one question for a process the crate does not own:
+*is it still there, and is anything still armed?* The OS call
+(`OpenProcess`, `pidfd_open`, a Job Object handle) is application code
+behind `ProcessWitness`; the crate keeps the arithmetic in `core` — no
+clock, no allocation, no system call.
+
+```rust
+use snubber::{classify_liveness, NoWitness, Sentinel, SentinelConfig, SentinelSample};
+
+let cfg = SentinelConfig::new(250); // idle grace in ms; 0 disables `Silent`
+let sample = SentinelSample {
+    idle_ms: 40,
+    armed: true,
+    witness_alive: NoWitness.alive(), // `None` = cannot observe
+};
+assert_eq!(classify_liveness(cfg, sample), snubber::SentinelVerdict::Alive);
+
+let mut sentinel = Sentinel::new(cfg);
+let verdict = sentinel.observe(sample);
+assert_eq!(sentinel.last(), verdict);
+```
+
+| Witness says | Token silence | Verdict |
+|---|---|---|
+| `Some(false)` | any | `Dead { armed }` — death outranks silence |
+| `None` | `idle_ms > grace` | `Silent { idle_ms }` — never `Dead` |
+| `Some(true)` / `None` | `idle_ms <= grace` | `Alive` |
+
+The comparison is strict: `idle_ms == grace` is still `Alive`. The crate
+never kills and never knows a pid — a `Dead` verdict is returned to the
+owner, which runs `kill`/`TokenRollback`. `tests/sentinel.rs` pins the
+rules; the unit tests run in the `core`-only lane.
+
 ### 4.8 Impedance bridge (Phase 4): conflation, envelope, harness
 
 A 10 000 msg/s producer feeding a 60 FPS consumer is a 166:1 mismatch. There

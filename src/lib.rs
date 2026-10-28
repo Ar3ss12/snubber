@@ -187,6 +187,8 @@ pub mod envelope;
 
 pub mod watchdog;
 
+pub mod sentinel;
+
 pub mod diagnostics;
 
 pub mod memory;
@@ -213,6 +215,11 @@ pub use clock::{
 };
 
 pub use envelope::{EnvelopeVerdict, ExecutionEnvelope, PayloadVerdict, TimeVerdict};
+
+pub use sentinel::{
+    classify_liveness, NoWitness, ProcessWitness, Sentinel, SentinelConfig, SentinelSample,
+    SentinelVerdict,
+};
 
 pub use isr::{
     IsrBridge, IsrPushError, IsrSignal, ISR_RING_CAP, ISR_RING_MASK, OP_EMERGENCY_TRIP, OP_PAUSE,

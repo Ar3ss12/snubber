@@ -18,6 +18,15 @@ current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
   304 → 320 B (measured, `tests/guard_sampler.rs`), the price of one fat
   pointer. Tests: capture-aware SPIN and SLEEP verdicts, the size ceiling,
   and a text tripwire that no unguarded `pub use node` enters `src/lib.rs`.
+- `sentinel` module (core): `ProcessWitness` / `NoWitness`, `SentinelSample`,
+  `SentinelConfig` and `Sentinel`, plus the pure rule `classify_liveness`.
+  A supervised process can now report `Alive`, `Silent { idle_ms }` or
+  `Dead { armed }` without the crate opening a handle: the OS adapter is
+  application code, like `OrphanGuard`. `None` from a witness means
+  "cannot observe", never "dead"; the grace comparison is strict
+  (`idle_ms == grace` is still `Alive`) and `idle_grace_ms = 0` disables
+  `Silent` only. Core-only: no clock, no allocation, no `std`. Unit tests
+  run in the `--no-default-features --lib` lane.
 
 ## 0.6.13 (2026-10-27)
 
