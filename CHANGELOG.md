@@ -4,6 +4,21 @@ All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.
 the audit-batch fix tables live at the bottom of this file, and the
 current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
+## Unreleased
+
+### Added
+
+- `TrackedGuard::with_cpu_sampler_shared(Arc<dyn Fn() -> u64 + Send + Sync>)`:
+  the CPU sampler may now capture state (a thread handle, a worker's own
+  counter) instead of being a plain `fn() -> u64`. Same arming law — the
+  sample is taken on attach and every verdict measures a delta — and the
+  shared sampler wins when both are attached. `with_cpu_sampler(fn)` is
+  unchanged and still allocates nothing. `node` is `std`-gated, so the
+  `core`/`alloc` lanes never see the field; `TrackedGuard<fn()>` grows
+  304 → 320 B (measured, `tests/guard_sampler.rs`), the price of one fat
+  pointer. Tests: capture-aware SPIN and SLEEP verdicts, the size ceiling,
+  and a text tripwire that no unguarded `pub use node` enters `src/lib.rs`.
+
 ## 0.6.13 (2026-10-27)
 
 A patch release of the verification machinery, one teardown ordering and the

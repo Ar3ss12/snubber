@@ -239,6 +239,27 @@ match guard.check_timeout() {
 no lock); the arming sample is captured at attach time so deltas are
 measured from arming, not from boot.
 
+When the reading needs captured state — a thread handle, a worker's own
+counter — attach a shared closure instead. It is the same contract and
+the same arming law, but the closure owns its context:
+
+```rust
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+
+let worker_cpu_ms = Arc::new(AtomicU64::new(0));
+let sampler = {
+    let worker_cpu_ms = Arc::clone(&worker_cpu_ms);
+    move || worker_cpu_ms.load(Ordering::Relaxed)
+};
+let guard = node.enter(1, 1, || laser_off())?.with_cpu_sampler_shared(Arc::new(sampler));
+```
+
+`with_cpu_sampler_shared` is the only sampler path that allocates (the
+`Arc` you pass is the allocation); the guard stores one fat pointer and
+`TrackedGuard<fn()>` stays 320 B. When both samplers are attached, the
+shared one wins. `node` is a `std` module, so `core`/`alloc` builds do
+not see this method at all.
+
 ### Heartbeat: `WorkerPulse` (8 B, 4 B without 64-bit CAS) + `PulseWatch`
 
 ```rust
@@ -1674,7 +1695,7 @@ impl snubber::OrphanGuard for LinuxPdeathsigGuard {
 
 ### 2. CPU Time Samplers for Hang Classification
 
-`with_cpu_sampler(sampler: fn() -> u64)` accepts a raw monotonic tick counter. The crate calculates differential math in pure `core`:
+`with_cpu_sampler(sampler: fn() -> u64)` accepts a raw monotonic tick counter. The crate calculates differential math in pure `core`. When the backend must read a per-thread handle or a captured worker counter, use `with_cpu_sampler_shared(Arc<dyn Fn() -> u64 + Send + Sync>)` — same arming law, `std`-only:
 
 | Target Platform | Syscall / Instruction | App-Side Sampler Implementation |
 |---|---|---|
@@ -1705,6 +1726,7 @@ never disagree with the chapter map above.
 | `WorkerPulse::kick` + `PulseWatch::observe` | 1.5 / core | 8 B, 1 atomic store | Heartbeat: missed pulse = de-energize past thread, never kill it |
 | `SystemClock` (`MonotonicMs`) | 1.5 / `std` | 1 `Instant` read | Boot-relative monotonic ms; NTP/DST edits never move deadlines |
 | `node.cpu_budget_ms(n)` + `node.stall_ceiling_ms(n)` + `guard.with_cpu_sampler(f)` | 1.5 / std | 1 fn call at arming | CPU-spin budget + silence ceiling; `check_timeout` settles spin/deadlock distinctly |
+| `guard.with_cpu_sampler_shared(Arc<dyn Fn>)` | 1.5 / std | +16 B on the guard (304 → 320); caller's `Arc` is the only allocation | Same verdicts for per-thread state (thread handle, worker counter); wins over the plain `fn` when both are attached |
 | `guard.stall_kind()` | 1.5 / std | 1 clock + 1 sample | Non-destructive hang verdict (no settle) |
 | `guard.check_timeout()` | 1.5 / std | 1 clock + 1 sample | Cooperative watchdog: `WithinBudget` / `TimedOut` / `SpinDetected` / `DeadlockSuspected` |
 | `snubber::watchdog::poll_rollback(&node, budget_ms)` | 1 / std | 1 pass over phase atomics, no lock/alloc | Outside verdict: a rollback body older than `budget_ms`, with `epoch`/`task_id`; books nothing |

@@ -3910,6 +3910,7 @@ impl SnubberNode {
             cpu_budget_ms: cpu_budget,
             stall_ceiling_ms: stall_ceiling,
             cpu_sampler: None,
+            cpu_sampler_shared: None,
             armed_cpu_ms: 0,
             stage: 0,
             stage_label: None,
@@ -3945,6 +3946,7 @@ impl SnubberNode {
             cpu_budget_ms: 0,
             stall_ceiling_ms: 0,
             cpu_sampler: None,
+            cpu_sampler_shared: None,
             armed_cpu_ms: 0,
             stage: 0,
             stage_label: None,
@@ -4444,6 +4446,7 @@ impl SnubberNode {
             cpu_budget_ms,
             stall_ceiling_ms,
             cpu_sampler: None,
+            cpu_sampler_shared: None,
             armed_cpu_ms: 0,
             armed_at_ms: if needs_stamp(deadline_ms) { now } else { 0 },
             rollback_budget_ms: self.rollback_budget_ms,
@@ -5431,6 +5434,9 @@ pub struct TrackedGuard<F: FnOnce()> {
     cpu_budget_ms: u64,
     stall_ceiling_ms: u64,
     cpu_sampler: Option<fn() -> u64>,
+    /// Capture-capable sampler (thread handle, worker `AtomicU64`). Wins
+    /// over the plain `fn` pointer when both are attached.
+    cpu_sampler_shared: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     armed_cpu_ms: u64,
     stage: u32,
     stage_label: Option<&'static str>,
@@ -5718,11 +5724,41 @@ impl<F: FnOnce()> TrackedGuard<F> {
     /// lock): ms the current thread spent on-CPU. Armed once — the
     /// arming sample is taken NOW so `check_timeout` measures deltas.
     /// Without a sampler the guard runs wall-only (as before).
+    ///
+    /// Use [`Self::with_cpu_sampler_shared`] when the reading needs
+    /// captured state (a thread handle, a worker's own counter).
     #[inline]
     pub fn with_cpu_sampler(mut self, sampler: fn() -> u64) -> Self {
         self.armed_cpu_ms = sampler();
         self.cpu_sampler = Some(sampler);
         self
+    }
+
+    /// Attach a CPU-time sampler that captures state.
+    ///
+    /// Same contract as [`Self::with_cpu_sampler`] — armed on attach,
+    /// delta measured on every check — but the closure may own the
+    /// per-thread counter it reads. This is the only path that allocates
+    /// (the `Arc` already exists; the guard stores one fat pointer) and
+    /// it lives in `node`, which is `std`-gated: `core`/`alloc` layers
+    /// never see this field. Takes precedence over the plain `fn` when
+    /// both are attached.
+    #[inline]
+    pub fn with_cpu_sampler_shared(mut self, sampler: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.armed_cpu_ms = sampler();
+        self.cpu_sampler_shared = Some(sampler);
+        self
+    }
+
+    /// One CPU-time read: the capture-capable sampler wins, then the
+    /// plain `fn`, else 0 (wall-only guard).
+    #[inline]
+    fn cpu_now(&self) -> u64 {
+        match (self.cpu_sampler, self.cpu_sampler_shared.as_deref()) {
+            (Some(sample), _) => sample(),
+            (None, Some(sample)) => sample(),
+            (None, None) => 0,
+        }
     }
 
     /// Stall verdict right now without settling: wall-only when no CPU
@@ -5735,10 +5771,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
             return crate::StallKind::WithinBudget;
         }
         let wall_delta = now_ms().saturating_sub(self.armed_at_ms);
-        let cpu_delta = match self.cpu_sampler {
-            Some(sample) => sample().saturating_sub(self.armed_cpu_ms),
-            None => 0,
-        };
+        let cpu_delta = self.cpu_now().saturating_sub(self.armed_cpu_ms);
         crate::classify_stall_ceiling(
             wall_delta,
             cpu_delta,
@@ -5917,10 +5950,7 @@ impl<F: FnOnce()> TrackedGuard<F> {
         if self.deadline_ms == 0 || wall_delta <= self.deadline_ms {
             return Ok(self);
         }
-        let cpu_delta = match self.cpu_sampler {
-            Some(sample) => sample().saturating_sub(self.armed_cpu_ms),
-            None => 0,
-        };
+        let cpu_delta = self.cpu_now().saturating_sub(self.armed_cpu_ms);
         let verdict = crate::classify_stall_ceiling(
             wall_delta,
             cpu_delta,
