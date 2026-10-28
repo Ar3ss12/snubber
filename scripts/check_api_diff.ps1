@@ -93,7 +93,13 @@ if ($BaselineCommit -and $BaselineCommit -eq $HeadCommit) {
 
 $Crate = (Select-String -Path "$RepoRoot\Cargo.toml" -Pattern '^name\s*=\s*"(.+)"' |
     Select-Object -First 1).Matches[0].Groups[1].Value
-Write-Host " baseline=$Baseline package=$Crate"
+# `--release-type auto` classifies a 0.x -> 0.y bump as MAJOR and then
+# runs zero checks -- a vacuous green. Inside 0.x the compatible unit is
+# the minor bump, so name it explicitly. Parity with check_api_diff.sh.
+$CurrentVersion = (Select-String -Path "$RepoRoot\Cargo.toml" -Pattern '^version\s*=\s*"(.+)"' |
+    Select-Object -First 1).Matches[0].Groups[1].Value
+$ReleaseType = if ($CurrentVersion -like "0.*") { "minor" } else { "auto" }
+Write-Host " baseline=$Baseline package=$Crate release-type=$ReleaseType"
 Push-Location $RepoRoot
 $SemverLog = [System.IO.Path]::GetTempFileName()
 try {
@@ -103,7 +109,7 @@ try {
     $LockBefore = if (Test-Path $LockPath) { (Get-FileHash $LockPath -Algorithm SHA256).Hash } else { "" }
     $PrevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    & cargo semver-checks check-release --baseline-rev $Baseline --package $Crate 2>&1 |
+    & cargo semver-checks check-release --baseline-rev $Baseline --package $Crate --release-type $ReleaseType 2>&1 |
         Tee-Object -FilePath $SemverLog
     $SemverExit = $LASTEXITCODE
     $ErrorActionPreference = $PrevEap
