@@ -9,3 +9,4 @@ MemoryTrendVerdict
 growth_crosses
 ::leaks
 SnubberNode::enter_erased
+SnapshotV1.tape

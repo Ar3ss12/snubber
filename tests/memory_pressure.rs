@@ -148,9 +148,9 @@ fn queue_gauges_ride_the_snapshot() {
     assert_eq!(snap.memory_rejections, 0);
 
     let bytes = snap.encode();
-    assert_eq!(SNAPSHOT_VERSION, 6);
-    assert_eq!(&bytes[4..8], &6u32.to_le_bytes());
-    assert_eq!(SnapshotV1::decode(&bytes).expect("v6 roundtrip"), snap);
+    assert_eq!(SNAPSHOT_VERSION, 7);
+    assert_eq!(&bytes[4..8], &7u32.to_le_bytes());
+    assert_eq!(SnapshotV1::decode(&bytes).expect("v7 roundtrip"), snap);
 
     holder.commit();
 }

@@ -1249,9 +1249,13 @@ fn test_declared_api_breaks_are_in_the_changelog() {
         .unwrap_or(changelog.len());
     let section = &changelog[start..end];
 
+    // cargo-semver-checks names a removed item as `Type::method` but a new
+    // field as `Type.field`; the CHANGELOG writes paths with `::`. Compare
+    // with the separator normalised so the entry still has to be named.
+    let section_dotted = section.replace("::", ".");
     for name in names {
         assert!(
-            section.contains(name),
+            section.contains(name) || section_dotted.contains(&name.replace("::", ".")),
             "TRIPWIRE FIRED: {manifest_path} declares `{name}` as removed, but \
              the CHANGELOG section `{heading}` never names it — a consumer \
              upgrading reads silence where the break is"

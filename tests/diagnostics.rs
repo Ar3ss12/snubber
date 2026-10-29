@@ -5,10 +5,11 @@
 //! Admission stays ZERO-PANIC; these tests never touch the hot pipeline.
 
 use snubber::{
-    assert_no_anomalies, diagnostic_line, find_anomalies, find_anomalies_for_snapshot,
+    assert_no_anomalies, crc32_ieee, diagnostic_line, find_anomalies, find_anomalies_for_snapshot,
     print_health, write_diagnostic_line, write_health, write_triage, AnomalyKind, AnomalyPolicy,
     FaultKind, FaultPolicy, FaultRecord, NodeSet, SnapshotError, SnapshotV1, SnubberNode,
-    SnubberStats, TelemetrySink, SNAPSHOT_LEN, SNAPSHOT_VERSION,
+    SnubberStats, TelemetrySink, SNAPSHOT_CRC_RANGE, SNAPSHOT_LEN, SNAPSHOT_TAPE_CAP,
+    SNAPSHOT_TAPE_OFFSET, SNAPSHOT_VERSION,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -42,6 +43,64 @@ fn snapshot_codec_round_trips() {
     assert_eq!(&bytes[0..4], b"SNUB");
     let back = SnapshotV1::decode(&bytes).expect("decode own frame");
     assert_eq!(back, snap);
+}
+
+/// The tape is the one part of the frame the app fills by hand, so the codec
+/// must carry it exactly: a post-mortem that silently dropped the sequence
+/// would still decode clean and tell a smaller story than what happened.
+#[test]
+fn the_flight_tape_survives_the_frame_round_trip() {
+    let mut wrapped = SnapshotV1::default();
+    for code in 1u32..=8 {
+        wrapped
+            .tape
+            .record_code(u64::from(code), 100 + u64::from(code), code);
+    }
+    let back = SnapshotV1::decode(&wrapped.encode()).expect("v7 round-trip");
+    assert_eq!(back, wrapped, "the frame restores the tape byte-for-byte");
+    assert_eq!(
+        back.tape.iter().map(|e| e.code).collect::<Vec<u32>>(),
+        vec![3, 4, 5, 6, 7, 8],
+        "a wrapped tape keeps event order, oldest first"
+    );
+    assert_eq!(back.tape.newest().map(|e| e.code), Some(8));
+
+    let mut partial = SnapshotV1::default();
+    partial.tape.record_code(4, 77, 12);
+    let back = SnapshotV1::decode(&partial.encode()).expect("partial-tape round-trip");
+    assert_eq!(back.tape.len(), 1);
+    assert_eq!(
+        back.tape.oldest().map(|e| (e.epoch, e.task_id, e.code)),
+        Some((4, 77, 12))
+    );
+}
+
+/// The frame is a file format: a CRC-valid tape block may still claim a length
+/// or cursor outside the ring. Decode clamps instead of trusting the bytes.
+#[test]
+fn a_hostile_tape_cursor_stays_inside_the_ring() {
+    let mut snap = SnapshotV1::default();
+    snap.tape.record_code(1, 1, 1);
+    let mut bytes = snap.encode();
+    bytes[SNAPSHOT_TAPE_OFFSET] = 200;
+    bytes[SNAPSHOT_TAPE_OFFSET + 1] = 250;
+    let crc = crc32_ieee(&bytes[..SNAPSHOT_CRC_RANGE]);
+    bytes[SNAPSHOT_CRC_RANGE..].copy_from_slice(&crc.to_le_bytes());
+
+    let mut back = SnapshotV1::decode(&bytes).expect("a CRC-valid frame decodes");
+    assert_eq!(
+        back.tape.len(),
+        SNAPSHOT_TAPE_CAP,
+        "len is clamped to the ring"
+    );
+    assert_eq!(back.tape.iter().count(), SNAPSHOT_TAPE_CAP);
+    back.tape.record_code(9, 9, 9);
+    assert_eq!(
+        back.tape.newest().map(|e| e.code),
+        Some(9),
+        "the ring still records"
+    );
+    assert_eq!(back.tape.len(), SNAPSHOT_TAPE_CAP);
 }
 
 #[test]
@@ -388,6 +447,19 @@ fn triage_card_renders_verdicts() {
     write_triage(&mut text, "burned", &burned).expect("fmt::Write");
     assert!(text.contains("verdict=CRIT"));
     assert!(text.contains("drops=3"));
+}
+
+#[test]
+fn triage_card_shows_the_flight_tape_tail() {
+    let mut snap = SnapshotV1::default();
+    snap.tape.record_code(4, 77, 12);
+    let mut text = String::new();
+    write_triage(&mut text, "tape", &snap).expect("fmt::Write");
+    assert!(text.contains("tape     events=1 last=4/77@12"), "{text}");
+
+    text.clear();
+    write_triage(&mut text, "tape", &SnapshotV1::default()).expect("fmt::Write");
+    assert!(text.contains("tape     events=0 last=none"), "{text}");
 }
 
 #[test]

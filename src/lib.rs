@@ -249,13 +249,14 @@ pub use node::{
 pub use diagnostics::{
     diagnostic_line, find_anomalies, print_health, Anomaly, AnomalyKind, AnomalyPolicy, NodeSet,
     SnapshotDiff, SnapshotError, SnapshotV1, SNAPSHOT_CRC_RANGE, SNAPSHOT_LEN, SNAPSHOT_MAGIC,
-    SNAPSHOT_VERSION,
+    SNAPSHOT_TAPE_CAP, SNAPSHOT_TAPE_OFFSET, SNAPSHOT_VERSION,
 };
 
 #[cfg(not(feature = "std"))]
 pub use diagnostics::{
     Anomaly, AnomalyKind, AnomalyPolicy, SnapshotDiff, SnapshotError, SnapshotV1,
-    SNAPSHOT_CRC_RANGE, SNAPSHOT_LEN, SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
+    SNAPSHOT_CRC_RANGE, SNAPSHOT_LEN, SNAPSHOT_MAGIC, SNAPSHOT_TAPE_CAP, SNAPSHOT_TAPE_OFFSET,
+    SNAPSHOT_VERSION,
 };
 
 pub use diagnostics::{

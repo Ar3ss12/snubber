@@ -125,6 +125,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 * **The last events before a fault are kept.** `FlightTape<N>` records a fixed
   number of packed events in a plain array — no allocation, no clock — so a
   post-mortem can read the sequence that led to the fault, not only the totals.
+  The 512-byte cold frame carries six of those cells itself: fill
+  `snapshot.tape` before `encode()` and the file keeps the order, not just the
+  counts.
 * **Teardown order is a type, not a convention.** `RankedSet<CAP>` takes
   `RankedNode::<RANK>` entries and runs them highest rank first; a full set
   refuses instead of evicting a stop step.

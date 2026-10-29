@@ -17,6 +17,8 @@ use core::fmt;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+use crate::tape::{FlightTape, TapeEntry};
+
 #[cfg(feature = "std")]
 use super::{SnubberNode, SnubberStats};
 
@@ -28,24 +30,44 @@ pub const SNAPSHOT_LEN: usize = 512;
 
 const _: () = assert!(SNAPSHOT_LEN == 512, "snapshot frame is a 512 B contract");
 /// Snapshot format version (bytes 4..8, LE).
+/// v7: carries the flight tape after the flag bytes (offset 330: `len`
+/// u8, `next` u8, then six `TapeEntry` cells) — the frame now holds the
+/// order events happened in, not only their totals.
 /// v6: the per-kind `reported` tail grew 13 -> 14 for `RollbackStall`
 /// (a rollback body overran its budget — own kind, own column).
 /// v5 grew the tail 12 -> 13 for `RateLimited`; v4 added memory
 /// bounds/sample/peak/rejections + waiter queue gauges (Phase 2 memory
 /// control); v3 added `pulse_stalls` + `max_pulse_lag_ms`. Older
 /// frames refuse as `BadVersion`, never half-parse.
-pub const SNAPSHOT_VERSION: u32 = 6;
+pub const SNAPSHOT_VERSION: u32 = 7;
 /// Snapshot magic: `b"SNUB"` (bytes 0..4).
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SNUB";
 /// CRC covers bytes `0..508`; stored LE at `508..512`.
 pub const SNAPSHOT_CRC_RANGE: usize = 508;
+
+/// Flight-tape cells carried by one cold frame.
+///
+/// Six is the most that fits: `330 + 2 + 6 × 24 = 476 ≤ 508`. Eight cells
+/// would end at 524 B and push the tape into the CRC — the frame size is
+/// a published contract, so the tape is sized to it, not the other way.
+pub const SNAPSHOT_TAPE_CAP: usize = 6;
+
+/// Byte offset of the tape block: `len` u8, `next` u8, then
+/// [`SNAPSHOT_TAPE_CAP`] cells of 24 B (epoch 8 + task_id 8 + code 4 +
+/// 4 zero bytes).
+pub const SNAPSHOT_TAPE_OFFSET: usize = 330;
+
+/// Wire bytes per tape cell. Fixed on every target: the encoder writes the
+/// three fields plus zero padding, never a `memcpy` of the Rust layout.
+const SNAPSHOT_TAPE_CELL: usize = 24;
 
 // COMPILE-TIME GATES (cold-frame wire math, always compiled):
 // the 512 B frame = 508 B payload + 4 B CRC; the `reported` tail must
 // track `FaultKind::COUNT` (v2 grew 11 -> 12 for Preempted; v5 grew
 // 12 -> 13 for RateLimited; v6 grew 13 -> 14 for RollbackStall);
 // v3 appended `pulse_stalls` + `max_pulse_lag_ms` (Front 4);
-// v4 appends memory + queue gauges (Phase 2); v6 still fits: 330/508 B.
+// v4 appends memory + queue gauges (Phase 2); v7 appends the tape,
+// which still fits: 476/508 B.
 const _: () = {
     assert!(
         SNAPSHOT_LEN == 512,
@@ -64,6 +86,14 @@ const _: () = {
     assert!(
         8 + 8 * (26 + crate::FaultKind::COUNT) + 2 <= SNAPSHOT_CRC_RANGE,
         "CRITICAL: snapshot flag bytes would collide with the CRC region — extend SNAPSHOT_LEN contract first"
+    );
+    assert!(
+        SNAPSHOT_TAPE_OFFSET == 8 + 8 * (26 + crate::FaultKind::COUNT) + 2,
+        "CRITICAL: SNAPSHOT_TAPE_OFFSET must start where the flag bytes end"
+    );
+    assert!(
+        SNAPSHOT_TAPE_OFFSET + 2 + SNAPSHOT_TAPE_CAP * SNAPSHOT_TAPE_CELL <= SNAPSHOT_CRC_RANGE,
+        "CRITICAL: the flight tape would run into the CRC region — shrink SNAPSHOT_TAPE_CAP"
     );
     // The struct layout is NOT the wire contract (only `encode()`'s 512 B
     // output is), but a struct that outgrew the payload means a field was
@@ -140,6 +170,11 @@ pub struct SnapshotV1 {
     pub breaker_state: u8,
     /// Memory pressure: 0 = Ok, 1 = soft/hard sample in force.
     pub memory_pressure: u8,
+    /// Last events before the crash, oldest first. The app fills this
+    /// before `encode` ([`Self::from_stats`] leaves it empty — the node
+    /// keeps its own recorder behind `std`); the frame carries it so a
+    /// post-mortem file shows the sequence, not only the totals.
+    pub tape: FlightTape<SNAPSHOT_TAPE_CAP>,
 }
 
 impl SnapshotV1 {
@@ -248,6 +283,16 @@ impl SnapshotV1 {
         w64!(self.queue_capacity);
         out[o] = self.breaker_state;
         out[o + 1] = self.memory_pressure;
+        let (cells, next, len) = self.tape.raw();
+        out[SNAPSHOT_TAPE_OFFSET] = len as u8;
+        out[SNAPSHOT_TAPE_OFFSET + 1] = next as u8;
+        let mut t = SNAPSHOT_TAPE_OFFSET + 2;
+        for cell in cells {
+            out[t..t + 8].copy_from_slice(&cell.epoch.to_le_bytes());
+            out[t + 8..t + 16].copy_from_slice(&cell.task_id.to_le_bytes());
+            out[t + 16..t + 20].copy_from_slice(&cell.code.to_le_bytes());
+            t += SNAPSHOT_TAPE_CELL;
+        }
         let crc = crc32_ieee(&out[..SNAPSHOT_CRC_RANGE]);
         out[SNAPSHOT_CRC_RANGE..SNAPSHOT_LEN].copy_from_slice(&crc.to_le_bytes());
         out
@@ -320,6 +365,7 @@ impl SnapshotV1 {
             queue_capacity: 0,
             breaker_state: 0,
             memory_pressure: 0,
+            tape: FlightTape::new(),
         };
         for v in snap.reported.iter_mut() {
             *v = r64!();
@@ -335,11 +381,28 @@ impl SnapshotV1 {
         snap.queue_capacity = r64!();
         snap.breaker_state = bytes[o];
         snap.memory_pressure = bytes[o + 1];
+        let mut cells = [TapeEntry::EMPTY; SNAPSHOT_TAPE_CAP];
+        let mut t = SNAPSHOT_TAPE_OFFSET + 2;
+        for cell in &mut cells {
+            *cell = TapeEntry::new(
+                read_u64(bytes, t),
+                read_u64(bytes, t + 8),
+                u32::from_le_bytes([bytes[t + 16], bytes[t + 17], bytes[t + 18], bytes[t + 19]]),
+            );
+            t += SNAPSHOT_TAPE_CELL;
+        }
+        snap.tape = FlightTape::from_raw(
+            cells,
+            usize::from(bytes[SNAPSHOT_TAPE_OFFSET + 1]),
+            usize::from(bytes[SNAPSHOT_TAPE_OFFSET]),
+        );
         Ok(snap)
     }
 
     /// Build from a live stats snapshot (cold path: call on a cached
     /// `stats()`, never per-CPS). `generation`: supervisor lineage or 0.
+    /// The tape comes back empty; the app records its own events into
+    /// [`SnapshotV1::tape`] before `encode`.
     #[cfg(feature = "std")]
     #[must_use]
     pub fn from_stats(stats: &super::SnubberStats, generation: u64) -> Self {
@@ -377,8 +440,26 @@ impl SnapshotV1 {
                 super::BreakerState::HalfOpen => 2,
             },
             memory_pressure: u8::from(stats.memory_pressure),
+            tape: FlightTape::new(),
         }
     }
+}
+
+/// Little-endian `u64` at a fixed frame offset. Every call site passes a
+/// constant offset below `SNAPSHOT_CRC_RANGE`, checked by the const block
+/// above.
+#[inline]
+fn read_u64(bytes: &[u8; SNAPSHOT_LEN], at: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[at],
+        bytes[at + 1],
+        bytes[at + 2],
+        bytes[at + 3],
+        bytes[at + 4],
+        bytes[at + 5],
+        bytes[at + 6],
+        bytes[at + 7],
+    ])
 }
 
 /// Snapshot decode refusal (hard, never half-parsed).
@@ -996,7 +1077,8 @@ fn pressure_name(code: u8) -> &'static str {
 
 /// ASCII triage card for one node's cold snapshot (no allocation).
 ///
-/// One verdict line + five counters lines, safe to `fmt::Write` into a
+/// One verdict line, then one line per counter group: breaker, admits,
+/// faults, shed, pulse, memory, queue, tape. Safe to `fmt::Write` into a
 /// stack buffer or a log sink on a cold path. Percentages use `u128`
 /// and a `total == 0` guard.
 pub fn write_triage(w: &mut impl fmt::Write, node: &str, snap: &SnapshotV1) -> fmt::Result {
@@ -1068,7 +1150,18 @@ pub fn write_triage(w: &mut impl fmt::Write, node: &str, snap: &SnapshotV1) -> f
         snap.queue_depth,
         snap.queue_capacity,
         percent_of(snap.queue_depth, snap.queue_capacity)
-    )
+    )?;
+    match snap.tape.newest() {
+        Some(last) => writeln!(
+            w,
+            "  tape     events={} last={}/{}@{}",
+            snap.tape.len(),
+            last.epoch,
+            last.task_id,
+            last.code
+        ),
+        None => writeln!(w, "  tape     events=0 last=none"),
+    }
 }
 
 /// Std convenience: print the pulse table to stderr (dev hotkey /

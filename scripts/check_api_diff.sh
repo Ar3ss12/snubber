@@ -123,8 +123,16 @@ if [ "${SEMVER_RC}" -eq 100 ] || grep -q '^--- failure ' "${SEMVER_LOG}"; then
     # Every "Failed in:" entry counts, not only those whose item kind is a
     # bare lowercase word: a removed inherent method is printed as
     # `HandleWatch::leaks, previously in file ...` with no kind prefix, and
-    # the narrower parse let exactly that class through undeclared.
-    REPORTED="$(sed -nE 's/^  (\S.*), previously in file .*$/\1/p' "${SEMVER_LOG}" | sed -E 's/^[a-z_]+ //' | sort -u)"
+    # the narrower parse let exactly that class through undeclared. A new
+    # field of an exhaustively constructible struct is printed in a third
+    # shape — `field SnapshotV1.tape in <path>:<line>` — with no
+    # "previously" clause at all.
+    REPORTED="$(
+        {
+            sed -nE 's/^  (\S.*), previously in file .*$/\1/p' "${SEMVER_LOG}"
+            sed -nE 's/^  (field \S+) in .*\.rs:[0-9]+$/\1/p' "${SEMVER_LOG}"
+        } | sed -E 's/^[a-z_]+ //' | sort -u
+    )"
     if [ -z "${REPORTED}" ]; then
         echo " verdict: cargo-semver-checks reported a semver violation (exit ${SEMVER_RC}) and no affected item could be parsed"
         exit 1

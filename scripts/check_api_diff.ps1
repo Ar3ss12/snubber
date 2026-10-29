@@ -136,10 +136,15 @@ try {
         $BreaksFile = Join-Path $RepoRoot "api-breaks\$CurrentVersion.txt"
         # Every "Failed in:" entry counts, not only those whose item kind is a
         # bare lowercase word: a removed inherent method is printed as
-        # `HandleWatch::leaks, previously in file ...` with no kind prefix.
+        # `HandleWatch::leaks, previously in file ...` with no kind prefix, and
+        # a new field of an exhaustively constructible struct arrives as
+        # `field SnapshotV1.tape in <path>:<line>` with no "previously" clause.
         $Reported = @($LogText -split "`r?`n" |
             ForEach-Object {
                 if ($_ -match '^  (\S.*), previously in file .*$') {
+                    ($Matches[1] -replace '^[a-z_]+ ', '')
+                }
+                elseif ($_ -match '^  (field \S+) in .*\.rs:[0-9]+$') {
                     ($Matches[1] -replace '^[a-z_]+ ', '')
                 }
             } |

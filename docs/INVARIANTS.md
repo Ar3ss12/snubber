@@ -330,6 +330,11 @@ The public verdict surface evolves additively and honestly:
   sizes the `SnapshotV1::reported` tail, so a new kind is a snapshot
   version bump (v6 grew the tail to 14 for `RollbackStall`; the frame
   stays 512 B and older frames refuse as `BadVersion`).
+- The cold frame carries the flight tape: `SNAPSHOT_TAPE_CAP` (6) cells at
+  `SNAPSHOT_TAPE_OFFSET` (330), `len` u8 + `next` u8 + 6 × 24 B, ending at
+  476 ≤ 508 and compile-asserted against both the CRC region and the flag
+  offset. The tape is the one field the app fills; a decode clamps a
+  hostile `len`/`next` to the ring instead of trusting the bytes.
 - `Supervisor::..._argv(&[String])` variants run the supervisor loop on
   an explicit argument vector; without `--supervisor` or with the worker
   flag present they return `false` before spawning anything.

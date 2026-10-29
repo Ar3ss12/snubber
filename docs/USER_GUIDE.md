@@ -912,9 +912,14 @@ match verdict {
   `MemoryTrend`, including the `Sawtooth` gap; `samples()` and `newest()` read
   the window's size and last count; `trip == 0` disables the verdict but
   keeps the window.
-* **Snapshot v6** carries `memory_used_kb`, `memory_peak_kb`,
+* **Snapshot v7** carries `memory_used_kb`, `memory_peak_kb`,
   `memory_soft_kb`, `memory_hard_kb`, `memory_rejections`, `memory_pressure`,
-  `queue_depth` and `queue_capacity`. Still 512 B (330/508 payload bytes used).
+  `queue_depth`, `queue_capacity`, and the flight tape: `len` + `next` +
+  six `TapeEntry` cells in 146 B starting at `SNAPSHOT_TAPE_OFFSET` (330).
+  Still 512 B (476/508 payload bytes used); the tape starts exactly where the
+  two flag bytes end, compile-asserted. The node leaves the ring empty — the
+  app records into `snap.tape` before `encode()`, because only the app knows
+  which events are worth the last six cells.
 * **Anomalies**: `AnomalyKind::MemoryGrowth` fires on any pressured sample
   (ignores `min_sample`), `AnomalyKind::QueueSaturation` fires when
   `queue_depth / queue_capacity > bottleneck_pct`.
@@ -1729,7 +1734,16 @@ print_health("click_worker", &snap, &policy);
 
 The crate never touches the filesystem — your app owns the flusher
 thread (e.g. `snapshot_v1_in(gen)` → `encode()` → tmp + rename every 10 s →
-`decode()` + `find_anomalies()` on boot). When a user reports *"it lags"*, ask for one line:
+`decode()` + `find_anomalies()` on boot). Fill the tape on the same pass, so
+the file keeps the sequence that led to the state:
+
+```rust
+let mut snap = node.snapshot_v1_in(generation);
+snap.tape.record_code(epoch, task_id, op_code); // last six events, order kept
+let frame = snap.encode();                      // 512 B, CRC covers the tape
+```
+
+When a user reports *"it lags"*, ask for one line:
 
 ```text
 [DIAG 0x8FA3 click_worker bulkhead_starvation 92%]
@@ -1776,11 +1790,14 @@ write_triage(&mut card, "click_worker", &snap)?;
 //   pulse    stalls=0 lag=0ms
 //   memory   used=4096kb peak=8192kb soft=65536kb hard=98304kb pressure=ok rejects=0
 //   queue    depth=0 cap=64 (0%)
+//   tape     events=6 last=4/77@12
 ```
 
 `verdict=CRIT` on any catastrophic fault, `WARN` on shedding, a missed
 pulse, a non-closed breaker, memory pressure, or a full waiter queue,
-`OK` otherwise. Pure `fmt::Write`, no allocation — works on firmware and
+`OK` otherwise. The `tape` line is the newest recorded event
+(`<epoch>/<task>@<code>`) or `last=none` — the card never invents an order
+the frame did not carry. Pure `fmt::Write`, no allocation — works on firmware and
 in a stack buffer.
 
 ### Multi-node set (explicit, never a `static`)
@@ -1861,6 +1878,11 @@ for entry in tape.iter() {                   // oldest → newest
   handler actually asks: "what was the last thing this task did".
   `newest()`, `oldest()`, `at(i)`, `len()`, `is_full()`, `capacity()`,
   `clear()` round it out.
+* **Six cells ride in the cold frame.** `SnapshotV1::tape` is a
+  `FlightTape<6>` at `SNAPSHOT_TAPE_OFFSET` — the largest ring the 508 B
+  payload can hold (eight would end at 524 B, and that is a compile error,
+  not a silent truncation). Fill it before `encode()`: a decode restores the
+  ring byte-for-byte, and `write_triage` prints the newest entry.
 
 ---
 

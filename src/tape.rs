@@ -64,7 +64,7 @@ impl TapeEntry {
 /// assert_eq!(codes, vec![2, 3, 4]);              // event 1 was overwritten
 /// assert_eq!(tape.newest().map(|e| e.code), Some(4));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlightTape<const N: usize> {
     slots: [TapeEntry; N],
     next: usize,
@@ -194,6 +194,27 @@ impl<const N: usize> FlightTape<N> {
         self.slots = [TapeEntry::EMPTY; N];
         self.next = 0;
         self.len = 0;
+    }
+
+    /// Raw cells in storage order plus the write cursor and live length.
+    /// The wire codec writes all three so a decode restores the ring
+    /// byte-for-byte — re-deriving the ring from event order would lose
+    /// the difference between two tapes that hold the same events.
+    pub(crate) const fn raw(&self) -> (&[TapeEntry; N], usize, usize) {
+        (&self.slots, self.next, self.len)
+    }
+
+    /// Rebuild from storage order. `next` is wrapped and `len` clamped to
+    /// `N`, so a hostile or corrupted frame cannot index outside the ring.
+    pub(crate) fn from_raw(slots: [TapeEntry; N], next: usize, len: usize) -> Self {
+        if N == 0 {
+            return Self::new();
+        }
+        Self {
+            slots,
+            next: next % N,
+            len: len.min(N),
+        }
     }
 }
 

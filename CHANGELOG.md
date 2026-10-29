@@ -10,6 +10,18 @@ One type per concept, typed erased slots, and the flight tape inside the
 cold frame. Breaking: the public surface loses the duplicate trend types and
 the 0.7 deprecated erased aliases; nothing is renamed for taste.
 
+### Added
+
+- `SnapshotV1::tape: FlightTape<6>` rides inside the 512 B cold frame at
+  offset 330 (`SNAPSHOT_TAPE_OFFSET`, `SNAPSHOT_TAPE_CAP`): `len` u8, `next`
+  u8, six 24 B cells, block ends at 476 ≤ 508 bytes. The frame is now
+  `SNAPSHOT_VERSION` 7 — v6 frames refuse as `BadVersion` — and the block
+  starts exactly where the two flag bytes end, compile-asserted against both
+  the CRC region and the flag offset. `from_stats` leaves the ring empty: the
+  app records into `snap.tape` before `encode()`, and a decode clamps a
+  hostile `len`/`next` instead of trusting the bytes. `write_triage` prints
+  `tape  events=N last=<epoch>/<task>@<code>`.
+
 ### Changed (breaking)
 
 - `MemoryTrend<N>::sample` now returns `MemoryReport { level, trend }`: the
