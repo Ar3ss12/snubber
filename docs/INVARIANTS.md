@@ -481,8 +481,9 @@ cargo test --test diagnostics pulse_stall
 # Verify extensibility contract (hooks outside the lock, names, ceilings, argv)
 cargo test --test extensibility
 
-# Verify memory refusal + snapshot v6 gauges (soft refuses, hard verdicts)
+# Verify memory refusal + snapshot v7 gauges (soft refuses, hard verdicts)
 cargo test --test memory_pressure
+cargo test --test diagnostics the_flight_tape_survives
 
 # Verify supervisor euthanasia decisions and the real soft-drain loop
 cargo test --test supervisor_memory
