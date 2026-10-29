@@ -11,6 +11,9 @@
 //!   cannot be held directly in struct fields due to unique anonymous closure types.
 //!   `ErasedGuard` boxes the rollback closure once at initialization, exposing a
 //!   concrete, nameable type suitable for long-lived workers and structs.
+//! - [`SlotKind`] (`ProbeSlot` / `HoldingSlot`): what the admission did with
+//!   the bulkhead slot, carried as a type parameter so a signature that needs
+//!   the slot cannot be satisfied by a guard whose slot was already released.
 //!
 //! Enabled by default via the `std` feature (`std = ["alloc"]`).
 //! Bare-metal firmware targets opt out via `default-features = false`.
@@ -20,6 +23,69 @@ extern crate alloc;
 
 #[cfg(feature = "alloc")]
 use alloc::boxed::Box;
+
+#[cfg(feature = "alloc")]
+use core::marker::PhantomData;
+
+/// Closed set of admission lifetimes: a caller can name one of the two kinds,
+/// never mint a third that lies about its slot.
+#[cfg(feature = "alloc")]
+mod sealed {
+    /// Implemented only by [`ProbeSlot`](super::ProbeSlot) and
+    /// [`HoldingSlot`](super::HoldingSlot).
+    pub trait Sealed {}
+}
+
+/// What an erased admission did with the bulkhead slot — the type parameter
+/// of [`ErasedGuard`].
+///
+/// The admission methods return the kind they actually take, so a signature
+/// that needs one lifetime cannot be satisfied by the other.
+#[cfg(feature = "alloc")]
+pub trait SlotKind: sealed::Sealed + 'static {
+    /// `true` when the slot stays booked until the guard settles.
+    const HOLDS_SLOT: bool;
+    /// Static text for diagnostics (`"probe"` / `"holding"`).
+    const CODE: &'static str;
+}
+
+/// The bulkhead slot was released at ADMISSION: `max_in_flight` bounds
+/// admissions, not live probe guards.
+///
+/// Returned by [`SnubberNode::probe_erased`](crate::SnubberNode::probe_erased),
+/// [`SnubberNode::probe_erased_auto`](crate::SnubberNode::probe_erased_auto)
+/// and [`SnubberNode::enter_supervised_erased`](crate::SnubberNode::enter_supervised_erased).
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProbeSlot {}
+
+#[cfg(feature = "alloc")]
+impl sealed::Sealed for ProbeSlot {}
+
+#[cfg(feature = "alloc")]
+impl SlotKind for ProbeSlot {
+    const HOLDS_SLOT: bool = false;
+    const CODE: &'static str = "probe";
+}
+
+/// The bulkhead slot stays booked until `commit()` / `abort()` / `Drop`:
+/// `max_in_flight` is a real ceiling for live transactions.
+///
+/// Returned by
+/// [`SnubberNode::enter_erased_holding`](crate::SnubberNode::enter_erased_holding)
+/// and [`SnubberNode::enter_erased_holding_auto`](crate::SnubberNode::enter_erased_holding_auto).
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HoldingSlot {}
+
+#[cfg(feature = "alloc")]
+impl sealed::Sealed for HoldingSlot {}
+
+#[cfg(feature = "alloc")]
+impl SlotKind for HoldingSlot {
+    const HOLDS_SLOT: bool = true;
+    const CODE: &'static str = "holding";
+}
 
 /// Boxed command with captured context.
 ///
@@ -71,10 +137,12 @@ impl core::fmt::Debug for ClosurePolicy {
 /// nameable type that fits into struct fields, collections, and state machines:
 ///
 /// ```rust,no_run
-/// use snubber::{ErasedGuard, SnubberNode};
+/// use snubber::{ErasedGuard, ProbeSlot, SnubberNode};
 ///
 /// struct DaemonState {
-///     hold: Option<ErasedGuard>, // Feasible without generic type parameters
+///     // Feasible without a closure type: one nameable type, and the
+///     // parameter says what the admission did with the slot.
+///     hold: Option<ErasedGuard<ProbeSlot>>,
 /// }
 ///
 /// let node = SnubberNode::builder("worker").build();
@@ -86,17 +154,52 @@ impl core::fmt::Debug for ClosurePolicy {
 ///
 /// # fn release_hardware() {}
 /// ```
+///
+/// The type parameter names what the admission did with the bulkhead slot;
+/// see [`SlotKind`]. A guard built by [`ErasedGuard::new`] carries the
+/// default, [`HoldingSlot`]: it owns its obligation until settled and books
+/// no admission.
+///
+/// A function that needs the slot to stay booked says so in its signature,
+/// and a probe guard no longer compiles there:
+///
+/// ```compile_fail
+/// use snubber::{ErasedGuard, HoldingSlot, SnubberNode};
+///
+/// fn keep_until_settle(_hold: ErasedGuard<HoldingSlot>) {}
+///
+/// let node = SnubberNode::builder("slots").build();
+/// let probe = node.probe_erased(1, 1, || {}).expect("admitted");
+/// keep_until_settle(probe);
+/// ```
+///
+/// The reverse pairing refuses too — a holding guard is not a probe:
+///
+/// ```compile_fail
+/// use snubber::{ErasedGuard, ProbeSlot, SnubberNode};
+///
+/// fn count_live_admissions(_probe: ErasedGuard<ProbeSlot>) {}
+///
+/// let node = SnubberNode::builder("slots").build();
+/// let holding = node.enter_erased_holding(1, 1, || {}).expect("admitted");
+/// count_live_admissions(holding);
+/// ```
 #[cfg(feature = "alloc")]
 #[must_use = "Dropping an ErasedGuard immediately executes rollback! Bind to a named variable: `let _guard = ...`, NEVER use `let _ = ...`"]
-pub struct ErasedGuard {
+pub struct ErasedGuard<K: SlotKind = HoldingSlot> {
     /// The whole settle path in one allocation: `new` / `with_commit_hook`
     /// box a `TwoSlots`, the node boxes one `ErasedTransaction`. Two
     /// separate boxed closures cost two allocations per erased admission.
     slots: Option<Box<dyn ErasedSettle>>,
+    /// `fn() -> K` keeps the guard `Send`/`Sync` for every kind and ties the
+    /// parameter to the type without claiming to own a `K`.
+    kind: PhantomData<fn() -> K>,
 }
 
+/// Guards you build yourself are [`HoldingSlot`]: they book no admission, so
+/// there is no probe to name — the obligation is yours until you settle.
 #[cfg(feature = "alloc")]
-impl ErasedGuard {
+impl ErasedGuard<HoldingSlot> {
     /// Creates a type-erased guard owning a single rollback closure.
     pub fn new<F>(rollback: F) -> Self
     where
@@ -107,6 +210,7 @@ impl ErasedGuard {
                 rollback: Some(rollback),
                 on_commit: None,
             })),
+            kind: PhantomData,
         }
     }
 
@@ -121,16 +225,36 @@ impl ErasedGuard {
                 rollback: Some(rollback),
                 on_commit: Some(on_commit),
             })),
+            kind: PhantomData,
         }
     }
+}
 
+#[cfg(feature = "alloc")]
+impl<K: SlotKind> ErasedGuard<K> {
     /// Wraps a pre-boxed settle path. Crate-internal: the node's erased
     /// admissions keep the node handle and the rollback in the same
     /// allocation instead of boxing two closures.
     #[cfg(feature = "std")]
     #[inline]
     pub(crate) fn from_settle(slots: Box<dyn ErasedSettle>) -> Self {
-        Self { slots: Some(slots) }
+        Self {
+            slots: Some(slots),
+            kind: PhantomData,
+        }
+    }
+
+    /// Settled guard with no rollback and no booked admission — what a
+    /// pass-through node hands back. Crate-internal: it is the one
+    /// constructor that owes nothing, so it must not be reachable from a
+    /// caller who believes a guard protects something.
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn settled_noop() -> Self {
+        Self {
+            slots: None,
+            kind: PhantomData,
+        }
     }
 
     /// Disarms the rollback, executes the optional commit hook, and consumes the guard.
@@ -183,7 +307,7 @@ impl ErasedGuard {
 }
 
 #[cfg(feature = "alloc")]
-impl Drop for ErasedGuard {
+impl<K: SlotKind> Drop for ErasedGuard<K> {
     fn drop(&mut self) {
         if let Some(slots) = self.slots.take() {
             #[cfg(feature = "std")]
@@ -201,11 +325,12 @@ impl Drop for ErasedGuard {
 }
 
 #[cfg(feature = "alloc")]
-impl core::fmt::Debug for ErasedGuard {
+impl<K: SlotKind> core::fmt::Debug for ErasedGuard<K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "ErasedGuard({})",
+            "ErasedGuard<{}>({})",
+            K::CODE,
             if self.slots.is_some() {
                 "armed"
             } else {

@@ -465,8 +465,8 @@ The function that merely creates the thread (`thread::spawn`) must not
 touch the node's slots — it is just a dispatcher. The slot is taken by
 **the worker itself from the inside**, once awake in the OS:
 
-> **Scope correction.** The PROBE path (`probe_erased_auto`, formerly
-> `enter_erased_auto`) is an admission probe.
+> **Scope correction.** The PROBE path (`probe_erased_auto`, returning
+> `ErasedGuard<ProbeSlot>`) is an admission probe.
 > It is not a lease on the slot for the worker's lifetime: the probe is
 > committed at admission, so the
 > slot is free again while the worker keeps running. `max_in_flight(1)`
@@ -503,13 +503,13 @@ std::thread::spawn(move || {
 ### Canonical recipe: `probe_erased_auto` + commit in the epilogue
 
 ```rust
-use snubber::{ErasedGuard, SnubberNode};
+use snubber::{ErasedGuard, ProbeSlot, SnubberNode};
 
 struct ClickDaemon {
     // Nameable guard: lives in the struct field across awaits and loop
     // iterations. A generic `TrackedGuard<F>` cannot do this — every
     // closure is a different anonymous type.
-    hold: Option<ErasedGuard>,
+    hold: Option<ErasedGuard<ProbeSlot>>,
 }
 
 fn spawn_worker(node: &SnubberNode) -> Result<(), snubber::EnterError> {
@@ -550,6 +550,23 @@ guard.commit(); // or guard.abort("stop") / Drop — each releases exactly one s
 
 Everything else matches the probe recipe: one guard per run, settle once,
 validate before arming. The difference is only the ceiling.
+
+The ceiling is also in the type. Each admission returns the kind of slot it
+actually took — `ErasedGuard<ProbeSlot>` from `probe_erased`,
+`ErasedGuard<HoldingSlot>` from `enter_erased_holding` — so a function that
+must not receive a released slot can say so and let the compiler refuse the
+wrong guard:
+
+```rust
+use snubber::{ErasedGuard, HoldingSlot};
+
+fn keep_until_settle(_hold: ErasedGuard<HoldingSlot>) {}
+
+let probe = node.probe_erased_auto(|| {})?;         // ErasedGuard<ProbeSlot>
+let hold = node.enter_erased_holding_auto(|| {})?;  // ErasedGuard<HoldingSlot>
+keep_until_settle(hold);                            // compiles
+// keep_until_settle(probe);                        // does not: the slot is gone
+```
 
 ### Where `scoped` DOES belong (short stack-local transactions)
 

@@ -28,6 +28,17 @@ $$\lim_{t \to \infty} \text{in\_flight} = 0 \quad (\text{quiescent state})$$
 
 No orphaned slot or leaked permit can permanently reduce node capacity.
 
+The erased path names its slot decision in the type. `probe_erased`,
+`probe_erased_auto` and `enter_supervised_erased` return
+`ErasedGuard<ProbeSlot>` (released at entry);
+`enter_erased_holding` / `enter_erased_holding_auto` return
+`ErasedGuard<HoldingSlot>` (booked until `commit()` / `abort()` /
+`Drop`). `SlotKind` is sealed, so no third kind can claim either lifetime,
+and one `arm_erased::<K>` reads `K::HOLDS_SLOT` — the returned type and the
+slot decision are the same fact, not two that can drift. A signature that
+needs the booked slot refuses a probe at compile time (`src/erased.rs`,
+the two `compile_fail` fences).
+
 ### Invariant 3: Single-Shot Rollback Guarantee
 For any acquired guard or lease:
 - The registered rollback routine is invoked **at most once**.

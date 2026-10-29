@@ -24,6 +24,19 @@ the 0.7 deprecated erased aliases; nothing is renamed for taste.
   question, instead of two types that could disagree.
 - `MemoryTrend<N>::leaks()` and `HandleWatch<N>::leaks()` are replaced by
   `samples()` and `newest()`; the ring itself is no longer public.
+- `ErasedGuard` carries its admission kind: `ErasedGuard<ProbeSlot>` from
+  `probe_erased`/`probe_erased_auto`/`enter_supervised_erased`,
+  `ErasedGuard<HoldingSlot>` from `enter_erased_holding`/
+  `enter_erased_holding_auto`. A function that needs the booked slot can say
+  so in its signature, and the compiler refuses a guard whose slot was
+  released at entry. `SlotKind` is sealed: only those two kinds exist.
+  `ErasedGuard::new`/`with_commit_hook` build `ErasedGuard<HoldingSlot>`;
+  `struct App { hold: Option<ErasedGuard> }` still names the holding shape.
+- The 0.7 deprecated aliases `SnubberNode::enter_erased` and
+  `SnubberNode::enter_erased_auto` are removed. They were the probe with the old name — a call that read as a
+  hold and released the slot at entry; `probe_erased` / `probe_erased_auto`
+  say what they do, and `enter_erased_holding` is the one that keeps the
+  slot.
 
 ## 0.7.1 (2026-10-29)
 

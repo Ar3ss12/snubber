@@ -10,7 +10,7 @@
 
 use snubber::{
     BreakerState, ClosurePolicy, EnterError, ErasedGuard, FaultAction, FaultDetail, FaultKind,
-    FaultPolicy, LogLevel, SnubberNode,
+    FaultPolicy, LogLevel, ProbeSlot, SnubberNode,
 };
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 // The struct-field shape that was impossible with TrackedGuard<F>:
 // every closure is a different anonymous type; ErasedGuard erases once.
 struct App {
-    hold: Option<ErasedGuard>,
+    hold: Option<ErasedGuard<ProbeSlot>>,
 }
 
 #[test]
@@ -56,6 +56,30 @@ fn erased_guard_commit_disarms() {
     });
     g.commit();
     assert_eq!(RELEASES.load(Ordering::SeqCst), before, "commit disarms");
+}
+
+/// The slot decision is part of the guard's identity, not a comment: each
+/// admission stamps its kind, and the two entries cannot report the same one.
+#[test]
+fn erased_guard_debug_names_the_admission_kind() {
+    let node = SnubberNode::builder("erased/kind").max_in_flight(2).build();
+    let probe = node.probe_erased_auto(|| {}).expect("admitted");
+    assert!(
+        format!("{probe:?}").contains("probe"),
+        "a probe admission must name its kind: {probe:?}"
+    );
+    probe.commit();
+
+    let hold = node
+        .enter_erased_holding_auto(|| {})
+        .expect("admitted in the freed slot");
+    assert!(
+        format!("{hold:?}").contains("holding"),
+        "a holding admission must name its kind: {hold:?}"
+    );
+    hold.commit();
+
+    assert_eq!(node.lane_in_flight(), [0, 0, 0], "both slots released");
 }
 
 #[test]

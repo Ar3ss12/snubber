@@ -160,6 +160,10 @@ what an admission means:
   `abort()` or `Drop`, so `N` bounds live erased transactions. Use it when
   the ceiling is protecting a finite resource.
 
+The kind is in the type: the probe returns `ErasedGuard<ProbeSlot>`, the
+holding entry `ErasedGuard<HoldingSlot>`, so a function that needs the
+booked slot cannot be handed a released one by mistake.
+
 The sync (`enter_*`) and async (`enter_async_*`) entries hold their slot for
 the whole body in both cases.
 

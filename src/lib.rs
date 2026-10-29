@@ -234,7 +234,7 @@ pub use isr::{
 };
 
 #[cfg(feature = "alloc")]
-pub use erased::{ClosurePolicy, ErasedGuard};
+pub use erased::{ClosurePolicy, ErasedGuard, HoldingSlot, ProbeSlot, SlotKind};
 
 #[cfg(feature = "std")]
 pub use node::{

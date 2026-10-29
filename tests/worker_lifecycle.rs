@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// One full worker run: arm at spawn, settle exactly once in the epilogue.
 /// Mirrors the Level 2.5 canonical recipe from `docs/USER_GUIDE.md`.
 fn run_worker(node: &SnubberNode, clicks: &Arc<AtomicU32>) -> Result<(), EnterError> {
-    // `enter_erased_auto` needs `Send + 'static`: clone the Arc in.
+    // `probe_erased_auto` needs `Send + 'static`: clone the Arc in.
     let rescue = Arc::clone(clicks);
     let guard = node.probe_erased_auto(move || {
         // Emergency rollback: would release hardware in a real daemon.
@@ -57,7 +57,7 @@ fn worker_panic_rolls_back_and_frees_the_slot() {
     let rolled = Arc::new(AtomicU32::new(0));
 
     // A run that dies mid-flight: Drop runs the USER rollback (hardware
-    // released). Honest snubber semantics (see `enter_erased` docs): the
+    // released). Honest snubber semantics (see `probe_erased` docs): the
     // node books were settled clean by the admission probe, so NO phantom
     // `implicit_drop` is counted — but the SLOT is free for the next run.
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

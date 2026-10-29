@@ -8,3 +8,4 @@ LeakWindow
 MemoryTrendVerdict
 growth_crosses
 ::leaks
+SnubberNode::enter_erased
