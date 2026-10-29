@@ -20,7 +20,7 @@ Zero deps · `#![forbid(unsafe_code)]` · MSRV 1.70 · one crate from `core`-onl
 
 ```toml
 [dependencies]
-snubber = "0.6"
+snubber = "0.7"
 ```
 
 Wrap critical work in **`scoped`**: two closures, rollback and action. It
@@ -114,6 +114,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 * **State outlives the process.** A 64-byte `StateDigest` is a ticket, not
   storage: a worker near its soft memory limit streams its checkpoint through a
   fixed buffer and hands the digest to its successor.
+* **Memory and handles are judged by their derivative.** `MemoryTrend<N>` folds a
+  level watch (`Ok` / `Soft` / `Hard`) together with a strictly rising sample
+  ring, so a slow leak is named by `LeakClassification::Rising { growth_kb,
+  rate_kb_sec }` long before a ceiling; `HandleWatch<N>` applies the same rule
+  to handle / fd counts, which RSS cannot see. One dip clears the window, and a
+  closed port records no sample instead of a false `0`.
+* **The last events before a fault are kept.** `FlightTape<N>` records a fixed
+  number of packed events in a plain array — no allocation, no clock — so a
+  post-mortem can read the sequence that led to the fault, not only the totals.
+* **Teardown order is a type, not a convention.** `RankedSet<CAP>` takes
+  `RankedNode::<RANK>` entries and runs them highest rank first; a full set
+  refuses instead of evicting a stop step.
+* **Pressure is capped and spread.** `AimdLimit` moves a ceiling by `+step` per
+  clean window and `keep%` on pressure, and `Backpressure::jittered(pct, salt)`
+  spreads retries inside a deterministic band so clients do not return in one
+  millisecond.
 * **Health is one fixed frame.** A 512-byte, zero-allocation `SnapshotV1` with
   CRC32 answers whether the system is healthy, and `assert_no_anomalies!()`
   turns that into a CI gate.
