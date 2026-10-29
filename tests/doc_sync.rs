@@ -970,21 +970,26 @@ fn test_bench_labels_name_what_the_bench_calls() {
 
 /// `<key> -> <label>` pairs from an exporter's label map, parsed without a
 /// regex crate: the block runs from `opener` to the first line that is `}`.
+///
+/// Offsets are summed from `split_inclusive('\n')` lengths, not from
+/// `lines()` plus a hard-coded `+ 1`: `lines()` strips `\r`, so that sum
+/// walks backwards one byte per line on a CRLF checkout, cuts the block
+/// short and drops the map's tail — the two exporters then disagree.
 fn exporter_labels(src: &str, opener: &str, sep: &str) -> Vec<(String, String)> {
     let start = src
         .find(opener)
         .unwrap_or_else(|| panic!("export label map `{opener}` missing"));
     let block = &src[start + opener.len()..];
-    let end = block
-        .lines()
-        .scan(0usize, |offset, line| {
-            let at = *offset;
-            *offset += line.len() + 1;
-            Some((at, line))
-        })
-        .find(|(_, line)| line.trim() == "}")
-        .map(|(at, _)| at)
-        .unwrap_or_else(|| panic!("export label map `{opener}` never closes"));
+    let mut end = None;
+    let mut offset = 0usize;
+    for line in block.split_inclusive('\n') {
+        if line.trim() == "}" {
+            end = Some(offset);
+            break;
+        }
+        offset += line.len();
+    }
+    let end = end.unwrap_or_else(|| panic!("export label map `{opener}` never closes"));
     let mut out = Vec::new();
     for line in block[..end].lines() {
         let line = line.trim();
@@ -1007,6 +1012,45 @@ fn exporter_labels(src: &str, opener: &str, sep: &str) -> Vec<(String, String)> 
         out.push((key.to_string(), label.to_string()));
     }
     out
+}
+
+/// The label parser must give the same map on a CRLF checkout as on LF;
+/// GitHub's Windows runner checks the tree out with CRLF while an LF host
+/// stays green. The fixture carries enough rows that a one-byte drift per
+/// line drops the last row whole: a two-row map only loses punctuation, and
+/// the parser tolerates a missing trailing comma, so it cannot see the
+/// defect at all.
+#[test]
+fn exporter_labels_read_a_crlf_checkout() {
+    const ROWS: [(&str, &str); 6] = [
+        ("a", "alpha"),
+        ("b", "beta"),
+        ("c", "charlie"),
+        ("d", "delta"),
+        ("e", "echo"),
+        ("f", "foxtrot"),
+    ];
+    fn map(eol: &str) -> String {
+        let mut src = String::from("labels = {");
+        src.push_str(eol);
+        for (key, label) in ROWS {
+            src.push_str(&format!("    \"{key}\" = \"{label}\","));
+            src.push_str(eol);
+        }
+        src.push('}');
+        src.push_str(eol);
+        src
+    }
+    let want: Vec<(String, String)> = ROWS
+        .iter()
+        .map(|(key, label)| (key.to_string(), label.to_string()))
+        .collect();
+    assert_eq!(exporter_labels(&map("\n"), "labels = {", "="), want);
+    assert_eq!(
+        exporter_labels(&map("\r\n"), "labels = {", "="),
+        want,
+        "TRIPWIRE FIRED: a CRLF checkout truncates the exporter label map"
+    );
 }
 
 /// `(key, closure body)` for every `bench_function("key", |b| { … })`, found
