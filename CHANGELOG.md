@@ -6,12 +6,47 @@ current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
 ## Unreleased
 
-Four follow-ups from the 2026-10-29 audit of the 0.7.0 integration. Two
-close a class of drift (a threshold and a label that could disagree with
-the code they describe), one publishes a measurement that was missing,
-and one moves a detector the consumer had already written twice.
+0.7.1. First, four follow-ups from the 2026-10-29 audit of the 0.7.0
+integration: two close a class of drift (a threshold and a label that could
+disagree with the code they describe), one publishes a measurement that was
+missing, and one moves a detector the consumer had already written twice.
+Then the memory-trend batch: the leak detector gains a shape, a rate and a
+composed verdict, so a consumer no longer keeps a ring and a level watch
+side by side and reconciles them by hand.
 
 ### Added
+
+- `MemoryTrendVerdict::Leaking { growth_rate_kb_sec }` — a verdict is no
+  longer only "over a limit": a full rising window under BOTH limits now
+  refuses new admissions with the growth it measured. It is a new type
+  rather than a variant of `MemoryVerdict` because that enum has no `repr`:
+  a field-carrying variant leaves every discriminant unspecified, which
+  `cargo-semver-checks` reports as a major change. `MemoryVerdict` is
+  untouched, and `MemoryTrendVerdict::level()` yields it, so a caller that
+  only understands levels keeps working.
+- `LeakWindow` + `LeakWatch::window()`: one read of the ring — samples,
+  full, rising, oldest, newest — without consuming evidence. `growth_kb()`
+  lives on the window, so `push` and every reader share one definition of
+  "a trend".
+- `LeakWatch::growth_rate_kb_sec(interval_ms)` + the free `rate_kb_sec`:
+  KiB/s over the span the caller owns, `growth * 1000 / ((N - 1) *
+  interval_ms)`, saturating instead of wrapping. `None` (or `0`) when the
+  caller supplied no interval or the window is one sample wide — the crate
+  never invents a clock.
+- `LeakClassification` + `LeakWatch::classify(trip_kb, interval_ms)`:
+  `Warming { samples }` / `Stable { growth_kb }` / `Rising { growth_kb,
+  rate_kb_sec }` / `Sawtooth`. The last one is the honest gap in the
+  monotonic rule — a window that climbs and drops never trips, and now it
+  is nameable instead of invisible. Naming a shape is not a verdict; the
+  caller decides whether that shape is a fault.
+- `MemoryTrend<const N: usize>`: level watch + leak ring as one cold-path
+  value with one verdict per sample. The level outranks the trend (`Hard`
+  is never relabelled `Leaking`, `Soft` stays `Soft`), and the ring is fed
+  even while a level verdict is reported, so a pressure episode does not
+  blind the trend. `levels_only` builds the level half with the trend
+  disabled. Tests: level priority, warming/stable/rising/sawtooth shapes,
+  rate over two intervals, saturation, a dip clearing the rate, and a
+  level-only trend that can never report a leak.
 
 - `SnubberNode::rollback_budget_ms()`: the budget the node was built
   with, `0` when the clock is unarmed. The observer no longer has to keep

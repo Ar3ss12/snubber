@@ -264,7 +264,10 @@ pub use drain::{
     TOKEN_MAGIC, TOKEN_PAYLOAD_LEN,
 };
 
-pub use memory::{growth_crosses, LeakWatch, MemoryVerdict, MemoryWatch};
+pub use memory::{
+    growth_crosses, rate_kb_sec, LeakClassification, LeakWatch, LeakWindow, MemoryTrend,
+    MemoryTrendVerdict, MemoryVerdict, MemoryWatch,
+};
 
 pub use protect::Protected;
 

@@ -130,6 +130,21 @@ only move a `Copy` verdict; the crate never measures memory itself.
   is not evidence, so neither `soft_kb` nor a single high sample can be
   dressed up as one. `N` and the trip mark (`growth_crosses`) are caller
   policy; `N = 0` and `trip_kb == 0` are disabled, not "zero bytes".
+- The composed verdict has one order: `MemoryTrend<N>::sample` reports the
+  level first — `Hard` and `Soft` are never relabelled `Leaking` — and only
+  under both limits reports `MemoryTrendVerdict::Leaking {
+  growth_rate_kb_sec }` for a full rising window that crossed the mark. The
+  ring is fed on every sample regardless, so a level episode cannot blind
+  the trend, and a rate is computed only from a span the caller supplied
+  (`interval_ms > 0`, `N >= 2`) — otherwise it is `0`, never invented.
+  The leak verdict is its own type, not a `MemoryVerdict` variant: adding a
+  field-carrying variant to an enum with no `repr` leaves its discriminants
+  unspecified, which the semver gate refuses; `level()` carries the level
+  half instead.
+- `LeakClassification::Sawtooth` is the honest gap in that rule: a window
+  that climbs and drops never trips a monotonic mark, and the shape is
+  named instead of invisible. Naming it is not a verdict — the crate says
+  what the window looks like, the caller decides whether that is a fault.
 
 ### Invariant 9: Impedance Is Explicit (One Slot, Two Walls)
 Mismatched producer/consumer rates are handled by named primitives, never

@@ -581,6 +581,8 @@ fn test_quick_ref_layer_column_matches_chapters() {
         ),
         ("MemoryPolicy::new", "4 / std"),
         ("LeakWatch<N>::push(sample)", "4 / core"),
+        ("LeakWatch<N>::window()", "4 / core"),
+        ("MemoryTrend<N>::sample(used_kb)", "4 / core"),
         ("Supervisor::run_supervised_guard_with_memory", "4 / std"),
         ("`PipeDrain` + `ProcessToken`", "4 / std"),
         ("lane.attach", "4 / std"),
