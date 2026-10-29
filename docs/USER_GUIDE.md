@@ -1745,6 +1745,37 @@ Cold paths only: snapshot rarely and cache; never call `stats()` per
 CPS in a hot loop (the `last_fault` clone shows up in the
 profiler at 160 CPS).
 
+### Ordered teardown (`RankedNode` / `RankedSet`)
+
+`NodeSet` aggregates; it does not order. A stop loop that walks
+registration order loses the last frames whenever a sink is stopped before
+the engine that writes to it — an ordering fact that no test can see,
+because both orders compile. The rank lives in the type:
+
+```rust
+use snubber::{RankedNode, RankedSet};
+
+let mut stop: RankedSet<'_, 4> = RankedSet::new();
+stop.insert(RankedNode::<1>::new(&log_sink))?;   // kept alive longest
+stop.insert(RankedNode::<9>::new(&engine))?;     // stopped first
+for entry in stop.iter() {
+    shutdown(entry.node());                       // highest rank first
+}
+```
+
+* **Higher `RANK` is stopped first**, ties keep insertion order. The set
+  sorts at insert (one backward shift inside a fixed array), so the loop
+  reads front to back — no `Vec`, no sort at read time, no allocation.
+* **The rank is a type parameter, not a field.** `RankedNode::<3>::new(..)`
+  says the same thing at every call site; a `rank: u8` argument is a number
+  any caller can get wrong. The set stores it as data only because one set
+  holds entries of different `RANK` types (`RankedEntry::rank`).
+* **A full set refuses with `RankedSetError::Full`** and keeps its order; it
+  never evicts, because the member that vanished is the node the loop
+  forgets to stop. Size `CAP` for the topology, not for the traffic.
+* `iter()`, `get(index)`, `len()`, `capacity()`, `clear()`; `RankedNode` and
+  `RankedEntry` forward `name()`, `snapshot_v1()` and `stats()`.
+
 ---
 
 ## Extensibility: hooks, names, gates
@@ -1753,7 +1784,7 @@ profiler at 160 CPS).
 
 `EnterError`, `FaultKind`, `AnomalyKind`, `ReapClass`, `RestartDecision`,
 `Directive`, `Refusal`, `GateError`, `MemoryVerdict`, `DeathCause`,
-`GatewaySendError`/`GatewayRecvError`, `PoolError`, `IsrPushError`,
+`GatewaySendError`/`GatewayRecvError`, `PoolError`, `IsrPushError`, `RankedSetError`,
 `StallKind`, `TimeVerdict`, `PayloadVerdict`, `SnapshotError`,
 `BreakerState`, `SnubberError`, `StageKind` and `TimeoutCheck` carry
 `#[non_exhaustive]`. Two consequences:
@@ -1968,6 +1999,7 @@ never disagree with the chapter map above.
 | `node.snapshot_v1()` + `encode()` | 5 / cold | 512 B, CRC32 | Crash-safe persistence, app-owned flush thread |
 | `find_anomalies()` / `assert_no_anomalies!` | 5 / cold | pure `u128` math | CI gate + diagnostics console + `[DIAG 0x…]` bug reports |
 | `NodeSet` set | 5 / cold | explicit `&Node` list + saturating aggregates | Multi-node pulse, never a `static` |
+| `RankedSet<CAP>::insert(RankedNode::<R>::new(node))` | 5 / cold | fixed `[Option<RankedEntry>; CAP]`, one backward shift per insert, no allocation | Teardown order pinned by `const RANK` (higher stops first, ties stable); a full set refuses rather than evicting a stop step |
 | `SafeLockExt` (`Mutex::safe_lock(&node)`) | 1 / std | structural: 1 counter on recovery | Poison-tolerant locking: foreign panic recovers the lock, `poison_recoveries` counts each recovery |
 | `ClosurePolicy::new(closure)` + `run()` | 2 / alloc | 1 `Box` at construction | Capturing self-healing command: `run()` executes the boxed closure outside the node lock |
 | `TransactionHeader { generation, epoch, task_id }` | 1 / core | 24 B `Copy` | Stamped header for trust boundaries; `task_id` doubles as the reply-correlation check |

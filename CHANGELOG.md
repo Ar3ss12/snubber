@@ -61,6 +61,17 @@ applied to handle counts, which RSS can never show.
   names its rate, an unreadable probe leaves the ring untouched, and a dip
   clears the evidence.
 
+- `RankedNode<const RANK: u8>` + `RankedSet<const CAP: usize>` +
+  `RankedEntry` (`rank`, `std`): teardown order carried by the type instead
+  of by a runtime `rank: u8` argument every call site can get wrong. Higher
+  `RANK` stops first, ties keep insertion order, and the set sorts at insert
+  (one backward shift in a fixed array) so a stop loop reads front to back
+  with no sort and no allocation. A full set refuses with
+  `RankedSetError::Full` and keeps its order — evicting would silently drop
+  a stop step. The rank becomes data only on admission (`RankedEntry::rank`),
+  because one set holds entries of many `RANK` types. Tests: ordering by
+  rank rather than registration, tie stability, refusal on a full set, and
+  the rank being a type parameter.
 - `SnubberNode::rollback_budget_ms()`: the budget the node was built
   with, `0` when the clock is unarmed. The observer no longer has to keep
   its own copy of a number the builder owns — that copy is how a watcher

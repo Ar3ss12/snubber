@@ -380,6 +380,28 @@ library may kill a caller thread), so the guarantee is detect-and-report:
 Verification: `cargo test --test rollback_guardrails` (plus the ignored
 subprocess lane under `-- --ignored`).
 
+### Invariant 15: Teardown Order Is a Type, Not a Loop Accident
+
+A stop loop is the one place where iteration order is a correctness
+property, and it is the one property a test of the loop cannot see: both
+orders compile and both "pass". So the order is carried by the type:
+- `RankedNode<'a, RANK: u8>` pins a node's stop position with a const
+  parameter. Higher `RANK` is stopped first; the rank has no setter, so no
+  call site can re-decide the position of a node that already declared one.
+- `RankedSet<CAP>` inserts each member at its rank position (highest
+  first, equal ranks in insertion order) and iterates front to back, so
+  reading the stop order costs no sort and no allocation. A tie keeps
+  registration order, because a tie means "independent" and any other rule
+  would make the order depend on how many members preceded it.
+- A full set returns `RankedSetError::Full` and changes nothing. It never
+  evicts: the member that vanished is exactly the node the loop forgets to
+  stop, which is a silent step loss rather than a visible refusal.
+- The rank is data once admitted (`RankedEntry::rank`), because one set
+  holds entries of different `RANK` types; the const parameter exists at
+  the declaration site, where the topology is known.
+
+Verification: `cargo test --lib rank` (ordering, tie stability, refusal).
+
 ## 2. Verification Protocol
 
 The continuous integration suite validates these invariants under sustained chaos testing:
@@ -568,7 +590,7 @@ gate instead of hanging the runner.
 
 ## 3. Reporting a Discrepancy
 
-If you identify a scenario where any of the thirteen invariants above fails using purely Safe Rust:
+If you identify a scenario where any of the fifteen invariants above fails using purely Safe Rust:
 
 1. **Minimal Reproduction:** Construct an isolated integration test demonstrating the violation (failing an explicit `assert!`).
 2. **Deterministic Trigger:** The test must run and fail within 30 seconds without requiring external infrastructure.

@@ -590,6 +590,10 @@ fn test_quick_ref_layer_column_matches_chapters() {
         ("DEFAULT_EOF_GRACE_MS` (250 ms)", "4 / std"),
         ("run_supervised_guard_with_grace(worker_flag", "4 / std"),
         ("`NodeSet` set", "5 / cold"),
+        (
+            "`RankedSet<CAP>::insert(RankedNode::<R>::new(node))",
+            "5 / cold",
+        ),
         ("write_triage(&mut out, node, &snap)", "5 / cold"),
     ];
 

@@ -195,6 +195,9 @@ pub mod memory;
 
 pub mod handles;
 
+#[cfg(feature = "std")]
+pub mod rank;
+
 pub mod protect;
 
 #[cfg(feature = "alloc")]
@@ -260,6 +263,9 @@ pub use diagnostics::{
 
 #[cfg(feature = "alloc")]
 pub use diagnostics::find_anomalies_for_snapshot;
+
+#[cfg(feature = "std")]
+pub use rank::{RankedEntry, RankedNode, RankedSet, RankedSetError};
 
 pub use drain::{
     ProcessToken, SnubScanner, OP_COMMIT, OP_HEARTBEAT, OP_SNAPSHOT, OP_STATE, TOKEN_BODY_LEN,
