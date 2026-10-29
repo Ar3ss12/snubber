@@ -579,6 +579,8 @@ fn test_quick_ref_layer_column_matches_chapters() {
             "snubber::watchdog::poll_rollback(&node, budget_ms)",
             "1 / std",
         ),
+        ("Backpressure::jittered(pct, salt)", "2 / core"),
+        ("AimdLimit::new(init, min, max, step, keep_pct)", "2 / core"),
         ("MemoryPolicy::new", "4 / std"),
         ("LeakWatch<N>::push(sample)", "4 / core"),
         ("LeakWatch<N>::window()", "4 / core"),

@@ -504,6 +504,186 @@ impl Backpressure {
             kind,
         }
     }
+
+    /// Same reading with `retry_after_ms` spread by [`jitter_ms`].
+    ///
+    /// Depth and kind are the diagnosis; only the advice moves. Pass a salt
+    /// that differs per waiter (task id, attempt counter, thread index) or
+    /// every waiter computes the same offset and the herd returns intact.
+    #[inline]
+    #[must_use]
+    pub const fn jittered(&self, spread_percent: u8, salt: u64) -> Self {
+        Self {
+            retry_after_ms: jitter_ms(self.retry_after_ms, spread_percent, salt),
+            depth: self.depth,
+            kind: self.kind,
+        }
+    }
+}
+
+/// Deterministic offset for one salt: the SplitMix64 finalizer, not an RNG.
+///
+/// It mixes the caller's salt into every bit, so two salts one apart land far
+/// apart. The crate owns no entropy source (`no_std`, no clock, no `getrandom`
+/// without a dependency), so the caller supplies the variation and gets the
+/// same answer for the same salt — which is what makes a jitter test possible.
+#[inline]
+const fn spread_hash(mut salt: u64) -> u64 {
+    salt ^= salt >> 30;
+    salt = salt.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    salt ^= salt >> 27;
+    salt = salt.wrapping_mul(0x94d0_49bb_1331_11eb);
+    salt ^ (salt >> 31)
+}
+
+/// `base_ms` moved by at most `spread_percent` in either direction.
+///
+/// The result lies in `[base − base·p/100, base + base·p/100]`, so the band
+/// is symmetric around the advice the node gave and its mean stays `base_ms`.
+/// `spread_percent == 0` (or `base_ms == 0`) returns the base unchanged;
+/// `spread_percent == 100` is full jitter, `[0, 2·base]`.
+///
+/// This is spread, not randomness: the same salt always yields the same
+/// millisecond count. `salt == 0` hashes to `0` and therefore always lands on
+/// the low edge of the band — treat it as "no jitter" (`spread_percent = 0`)
+/// rather than as a neutral value.
+///
+/// ```
+/// use snubber::jitter_ms;
+///
+/// assert_eq!(jitter_ms(1_000, 0, 7), 1_000);          // no spread, no motion
+/// assert_eq!(jitter_ms(1_000, 20, 7), jitter_ms(1_000, 20, 7));
+/// let v = jitter_ms(1_000, 20, 7);
+/// assert!((800..=1_200).contains(&v));                // ±20 % around the advice
+/// ```
+#[inline]
+#[must_use]
+pub const fn jitter_ms(base_ms: u64, spread_percent: u8, salt: u64) -> u64 {
+    if base_ms == 0 || spread_percent == 0 {
+        return base_ms;
+    }
+    let spread = ((base_ms as u128 * spread_percent as u128) / 100) as u64;
+    if spread == 0 {
+        return base_ms;
+    }
+    let span = spread.saturating_mul(2).saturating_add(1);
+    let low = base_ms - spread;
+    let offset = spread_hash(salt) % span;
+    low.saturating_add(offset)
+}
+
+/// Additive-increase / multiplicative-decrease concurrency ceiling.
+///
+/// The classic congestion-control law, applied to admissions: each good
+/// window buys one `step` of headroom, each pressure event keeps
+/// `keep_percent` of the current ceiling. It converges on the largest limit
+/// the downstream actually sustains instead of the one somebody guessed at
+/// build time, and it never goes below `min` (livelock) or above `max`.
+///
+/// Feed it **one outcome per window** — a second of traffic, a batch, a
+/// macro run — never one per admission: an additive step per admission makes
+/// the ceiling grow without bound between two samples, which is not AIMD.
+///
+/// ```
+/// use snubber::AimdLimit;
+///
+/// let mut limit = AimdLimit::new(4, 1, 16, 1, 50);
+/// assert_eq!(limit.on_success(), 5);      // +1 per clean window
+/// assert_eq!(limit.on_pressure(), 2);     // halve: 5 * 50 / 100
+/// assert_eq!(limit.limit(), 2);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AimdLimit {
+    limit: u32,
+    min: u32,
+    max: u32,
+    step: u32,
+    keep_percent: u8,
+}
+
+impl AimdLimit {
+    /// `keep_percent` is clamped to `1..=99` (a ceiling that never shrinks
+    /// is not AIMD; one that shrinks to `0` is just `min` with extra steps),
+    /// `max` to at least `1`, `step` to at least `1`, and `initial` into
+    /// `min..=max`.
+    #[must_use]
+    pub const fn new(initial: u32, min: u32, max: u32, step: u32, keep_percent: u8) -> Self {
+        let max = if max == 0 { 1 } else { max };
+        let min = if min < max { min } else { max };
+        let step = if step == 0 { 1 } else { step };
+        let keep_percent = if keep_percent < 1 {
+            1
+        } else if keep_percent > 99 {
+            99
+        } else {
+            keep_percent
+        };
+        let limit = if initial < min {
+            min
+        } else if initial > max {
+            max
+        } else {
+            initial
+        };
+        Self {
+            limit,
+            min,
+            max,
+            step,
+            keep_percent,
+        }
+    }
+
+    /// Current ceiling.
+    #[inline]
+    #[must_use]
+    pub const fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// Floor the ceiling may never cross.
+    #[inline]
+    #[must_use]
+    pub const fn min_limit(&self) -> u32 {
+        self.min
+    }
+
+    /// Ceiling the ceiling may never cross.
+    #[inline]
+    #[must_use]
+    pub const fn max_limit(&self) -> u32 {
+        self.max
+    }
+
+    /// Additive step applied per clean window.
+    #[inline]
+    #[must_use]
+    pub const fn step(&self) -> u32 {
+        self.step
+    }
+
+    /// Fraction of the ceiling kept by a multiplicative decrease.
+    #[inline]
+    #[must_use]
+    pub const fn keep_percent(&self) -> u8 {
+        self.keep_percent
+    }
+
+    /// One clean window: add `step`, clamped to `max`.
+    #[inline]
+    pub fn on_success(&mut self) -> u32 {
+        self.limit = self.limit.saturating_add(self.step).min(self.max);
+        self.limit
+    }
+
+    /// One pressure window: keep `keep_percent` of the ceiling, never below
+    /// `min`.
+    #[inline]
+    pub fn on_pressure(&mut self) -> u32 {
+        let kept = (u64::from(self.limit) * u64::from(self.keep_percent) / 100) as u32;
+        self.limit = if kept < self.min { self.min } else { kept };
+        self.limit
+    }
 }
 
 /// Custom friction calculation: `(in_flight, max_in_flight) -> wait_ms`.
@@ -546,5 +726,131 @@ impl BackpressurePolicy {
             Self::AdaptiveBlock { .. } => "AdaptiveBlock",
             Self::Custom(_) => "Custom",
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn additive_increase_stops_at_the_ceiling() {
+        let mut limit = AimdLimit::new(4, 1, 6, 1, 50);
+        assert_eq!(limit.on_success(), 5);
+        assert_eq!(limit.on_success(), 6);
+        assert_eq!(limit.on_success(), 6, "max is a wall, not a suggestion");
+        assert_eq!(limit.limit(), 6);
+        assert_eq!(limit.min_limit(), 1);
+        assert_eq!(limit.max_limit(), 6);
+        assert_eq!(limit.step(), 1);
+        assert_eq!(limit.keep_percent(), 50);
+    }
+
+    #[test]
+    fn multiplicative_decrease_keeps_the_configured_fraction() {
+        let mut limit = AimdLimit::new(8, 1, 16, 1, 50);
+        assert_eq!(limit.on_pressure(), 4);
+        assert_eq!(limit.on_pressure(), 2);
+        assert_eq!(limit.on_pressure(), 1);
+        assert_eq!(
+            limit.on_pressure(),
+            1,
+            "min is the floor: a ceiling of 0 would refuse everything forever"
+        );
+    }
+
+    #[test]
+    fn the_constructor_clamps_a_broken_policy() {
+        let mut cramped = AimdLimit::new(0, 5, 2, 0, 0);
+        assert_eq!(cramped.max_limit(), 2);
+        assert_eq!(
+            cramped.min_limit(),
+            2,
+            "a floor above the ceiling is the ceiling"
+        );
+        assert_eq!(cramped.limit(), 2);
+        assert_eq!(
+            cramped.step(),
+            1,
+            "a zero step is one, not a disabled increase"
+        );
+        assert_eq!(cramped.keep_percent(), 1);
+        assert_eq!(cramped.on_pressure(), 2, "already at the floor");
+
+        let wide = AimdLimit::new(100, 1, 8, 1, 250);
+        assert_eq!(wide.limit(), 8);
+        assert_eq!(wide.keep_percent(), 99, "a decrease that decreases");
+    }
+
+    #[test]
+    fn jitter_is_deterministic_for_one_salt() {
+        assert_eq!(jitter_ms(1_000, 20, 42), jitter_ms(1_000, 20, 42));
+        assert!(
+            (0..64).any(|salt| jitter_ms(1_000, 20, salt) != jitter_ms(1_000, 20, 42)),
+            "distinct salts must land on distinct milliseconds"
+        );
+    }
+
+    #[test]
+    fn jitter_spreads_symmetrically_inside_the_band() {
+        let mut below = 0u32;
+        let mut above = 0u32;
+        let mut seen = std::collections::HashSet::new();
+        for salt in 0..512u64 {
+            let v = jitter_ms(1_000, 20, salt);
+            assert!(
+                (800..=1_200).contains(&v),
+                "salt {salt} produced {v} ms, outside the ±20% band"
+            );
+            seen.insert(v);
+            if v < 1_000 {
+                below += 1;
+            } else if v > 1_000 {
+                above += 1;
+            }
+        }
+        assert!(
+            below > 0 && above > 0,
+            "the band is symmetric, not one-sided"
+        );
+        assert!(
+            seen.len() > 100,
+            "512 salts produced only {} distinct delays — a mixer that collapses is a herd",
+            seen.len()
+        );
+    }
+
+    #[test]
+    fn jitter_is_off_without_a_spread() {
+        assert_eq!(jitter_ms(1_000, 0, 7), 1_000);
+        assert_eq!(jitter_ms(0, 50, 7), 0);
+        assert_eq!(
+            jitter_ms(3, 10, 7),
+            3,
+            "a spread that rounds to zero returns the base"
+        );
+    }
+
+    #[test]
+    fn jitter_never_wraps_near_the_top_of_the_range() {
+        let spread = ((u64::MAX as u128 * 99) / 100) as u64;
+        for salt in [0u64, 1, 9_999, u64::MAX] {
+            let v = jitter_ms(u64::MAX, 99, salt);
+            assert!(
+                v >= u64::MAX - spread,
+                "salt {salt} left the band: {v} below {}",
+                u64::MAX - spread
+            );
+        }
+    }
+
+    #[test]
+    fn a_jittered_reading_moves_only_the_delay() {
+        let reading = Backpressure::new(1_000, 7, FaultKind::BulkheadFull);
+        let moved = reading.jittered(20, 3);
+        assert_eq!(moved.retry_after_ms, jitter_ms(1_000, 20, 3));
+        assert_eq!(moved.depth, 7);
+        assert_eq!(moved.kind, FaultKind::BulkheadFull);
     }
 }

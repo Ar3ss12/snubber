@@ -13,7 +13,10 @@ missing, and one moves a detector the consumer had already written twice.
 Then the memory-trend batch: the leak detector gains a shape, a rate and a
 composed verdict, so a consumer no longer keeps a ring and a level watch
 side by side and reconciles them by hand, and the same derivative is
-applied to handle counts, which RSS can never show.
+applied to handle counts, which RSS can never show. Then the ordering and
+pacing batch: teardown order becomes a type, the concurrency ceiling learns
+the sustainable limit instead of a build-time guess, and retries spread
+without an RNG.
 
 ### Added
 
@@ -61,6 +64,25 @@ applied to handle counts, which RSS can never show.
   names its rate, an unreadable probe leaves the ring untouched, and a dip
   clears the evidence.
 
+- `AimdLimit` (`policy`, core, `Copy`, 16 B): additive increase /
+  multiplicative decrease for a concurrency ceiling, so the limit converges
+  on what the downstream sustains instead of a build-time guess. `on_success`
+  adds `step` up to `max`, `on_pressure` keeps `keep_percent` of the ceiling
+  and never drops below `min`; the constructor clamps `keep_percent` to
+  `1..=99` (0 collapses to `min`, 100 never shrinks — neither is a
+  decrease), `max` to at least 1 and `step` to at least 1. Fed one outcome
+  per window, never one per admission. Tests: the ceiling, the floor, and a
+  broken policy being clamped.
+- `jitter_ms(base_ms, spread_percent, salt)` + `Backpressure::jittered(..)`
+  (`policy`, core, no RNG, no clock): a symmetric ±`spread_percent` band
+  around the node's advice, offset by the SplitMix64 finalizer over a
+  caller-supplied salt. Same salt, same delay — deterministic and testable;
+  distinct salts spread a herd. `spread_percent == 0` returns the base, and
+  `salt == 0` lands on the low edge (documented, not treated as neutral).
+  `Backpressure::jittered` moves only `retry_after_ms`; depth and kind stay
+  the diagnosis. Tests: determinism, band membership and symmetry, the
+  disabled cases, no wrap near `u64::MAX`, and a reading that moves only the
+  delay.
 - `RankedNode<const RANK: u8>` + `RankedSet<const CAP: usize>` +
   `RankedEntry` (`rank`, `std`): teardown order carried by the type instead
   of by a runtime `rank: u8` argument every call site can get wrong. Higher

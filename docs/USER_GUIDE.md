@@ -1813,6 +1813,48 @@ stays as the legacy variant. Measured cost of the dynamic dispatch and
 the full `friction_wait_ms` path (identical with either storage on the
 reference machine): [BENCHMARKS.md](../BENCHMARKS.md).
 
+### Adaptive ceiling (`AimdLimit`) and jittered retries (`jitter_ms`)
+
+A fixed `max_in_flight` is a guess made at build time; AIMD replaces the
+guess with the largest limit the downstream actually sustained:
+
+```rust
+use snubber::AimdLimit;
+
+let mut ceiling = AimdLimit::new(4, 1, 16, 1, 50);
+// once per window, not once per admission
+let limit = if window_was_clean {
+    ceiling.on_success()      // +step, clamped to max
+} else {
+    ceiling.on_pressure()     // keep 50 %, never below min
+};
+```
+
+* **One outcome per window.** An additive step per admission grows the
+  ceiling without bound between two samples — that is not AIMD, it is noise
+  with a counter.
+* **`keep_percent` is clamped to `1..=99`**: `0` collapses to `min` and
+  `100` never shrinks, and neither is a decrease. `min` is a floor for a
+  reason — a ceiling of `0` refuses everything forever.
+* **`Backpressure::jittered(spread_percent, salt)`** moves only
+  `retry_after_ms`; depth and kind stay the diagnosis. The offset comes from
+  the SplitMix64 finalizer over your `salt`, so the band is symmetric around
+  the node's advice and its mean stays put:
+
+  ```rust
+  use snubber::{jitter_ms, Backpressure, FaultKind};
+
+  let task_id = 42u64;                       // per waiter: id, attempt, thread index
+  let advice = Backpressure::new(1_000, 7, FaultKind::BulkheadFull);
+  let mine = advice.jittered(20, task_id);   // 800..=1200 ms, same salt → same value
+  assert_eq!(jitter_ms(1_000, 20, task_id), mine.retry_after_ms);
+  ```
+
+  No RNG and no clock: the crate owns no entropy source, so the caller
+  supplies variation and gets determinism back (that is what makes the band
+  testable). Pass a salt that differs per waiter — `salt == 0` hashes to `0`
+  and always lands on the low edge, i.e. no jitter at all.
+
 ### Runtime node names
 
 `SnubberNode::builder` accepts `impl Into<NodeName>`:
@@ -2024,6 +2066,8 @@ never disagree with the chapter map above.
 | `TokenRollback` (`fn(u32, [u8; TOKEN_PAYLOAD_LEN])`) | 4 / std | bare fn pointer | Emergency handler invoked in the supervisor when a dead child leaves an armed token; fast, idempotent, lock-free |
 | `ProfiledEnterFuture` | 3 / std (opt-in) | 1 `Box` + clock reads | Future returned by `enter_async_auto_profiled`: same waker parking; profile arms on the admitting poll |
 | `backpressure_of(&EnterError)` | 2 / std | pure | `Some(Backpressure)` (retry-after + queue depth) for capacity refusals, `None` when retrying cannot help |
+| `Backpressure::jittered(pct, salt)` + `jitter_ms(base, pct, salt)` | 2 / core | pure integer math (SplitMix64 finalizer), no RNG, no clock | Spreads retries inside a symmetric ±`pct`% band; same salt → same delay, `salt == 0` → low edge |
+| `AimdLimit::new(init, min, max, step, keep_pct)` + `on_success` / `on_pressure` | 2 / core | 16 B, two integer ops per window | Ceiling that finds the sustainable limit: `+step` per clean window, keep `pct`% per pressure window, floored at `min` |
 | `GatewaySender<T>` / `GatewayHost<T>` | 2 / std | sender `Clone`; host unique | Channel gateway endpoints from `gateway(capacity)`: signed depth books, HWM/LWM throttle; the host runs the consumer loop |
 | `TOKEN_MAGIC` / `SNAPSHOT_MAGIC` | 4 + 5 / core | `[u8; 4]` (`SNUB`) | Wire and snapshot magic constants. Same literal, separate contracts: token framing vs the 512-byte snapshot header |
 | `LANE_SHIFT` (48) / `TASK_LOCAL_MASK` | 4 / core | published consts | Task-id packing: `lane << LANE_SHIFT \| (local & TASK_LOCAL_MASK)`; use `namespace_task` / `task_lane` / `task_local` |
