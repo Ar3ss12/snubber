@@ -203,3 +203,62 @@ fn disabled_envelope_is_zero_cost_in_judgement() {
     assert_eq!(stats.envelope_underflows, 0);
     assert_eq!(stats.envelope_overflows, 0);
 }
+
+#[test]
+fn padding_a_measurement_clears_the_floor_verdict() {
+    let env = ExecutionEnvelope::new(500, 2_000, 64, 256);
+
+    let raw = env.judge(120, 10);
+    assert_eq!(
+        raw.time,
+        TimeVerdict::Under {
+            wall_us: 120,
+            min_us: 500
+        }
+    );
+    assert_eq!(raw.payload, PayloadVerdict::Under { bytes: 10, min: 64 });
+
+    let padded = env.judge(env.pad_to_floor(120), env.pad_payload_to_floor(10));
+    assert_eq!(padded.time, TimeVerdict::Inside);
+    assert_eq!(padded.payload, PayloadVerdict::Inside);
+    assert!(
+        !padded.has_underflow(),
+        "a floor-respecting wait must not read as too-little work"
+    );
+}
+
+#[test]
+fn padding_never_shortens_a_measurement_and_never_hides_a_ceiling() {
+    let env = ExecutionEnvelope::new(500, 1_000, 64, 128);
+
+    assert_eq!(env.pad_to_floor(900), 900, "above the floor: untouched");
+    assert_eq!(env.pad_payload_to_floor(255), 255);
+
+    let verdict = env.judge(env.pad_to_floor(5_000), env.pad_payload_to_floor(5_000));
+    assert_eq!(
+        verdict.time,
+        TimeVerdict::Over {
+            wall_us: 5_000,
+            max_us: 1_000
+        },
+        "raising to the floor must not launder an overrun"
+    );
+    assert_eq!(
+        verdict.payload,
+        PayloadVerdict::Over {
+            bytes: 5_000,
+            max: 128
+        }
+    );
+}
+
+#[test]
+fn a_disabled_floor_changes_nothing() {
+    let env = ExecutionEnvelope::off();
+    assert_eq!(env.pad_to_floor(123), 123);
+    assert_eq!(env.pad_payload_to_floor(456), 456);
+
+    let ceiling_only = ExecutionEnvelope::new(0, 1_000, 0, 128);
+    assert_eq!(ceiling_only.pad_to_floor(7), 7);
+    assert_eq!(ceiling_only.pad_payload_to_floor(9), 9);
+}

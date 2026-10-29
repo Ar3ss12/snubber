@@ -209,6 +209,43 @@ impl ExecutionEnvelope {
         PayloadVerdict::Inside
     }
 
+    /// Wall time raised to the declared floor (`0` floor = unchanged).
+    ///
+    /// This is for the caller that must not finish faster than its declared
+    /// floor — a pacer, a coalescing window — and pads its own WAIT with the
+    /// result. It is not a way to make a skipped unit of work look like a
+    /// completed one: padding the measurement instead of the work is exactly
+    /// the signal the floor exists to catch, so apply it to the wait, never
+    /// to the reported duration of work that did not happen.
+    ///
+    /// ```
+    /// use snubber::ExecutionEnvelope;
+    ///
+    /// let env = ExecutionEnvelope::new(500, 2_000, 0, 0);
+    /// assert_eq!(env.pad_to_floor(120), 500);   // floored up
+    /// assert_eq!(env.pad_to_floor(900), 900);   // already above, untouched
+    /// ```
+    #[must_use]
+    pub const fn pad_to_floor(&self, wall_us: u64) -> u64 {
+        if wall_us < self.min_wall_us as u64 {
+            self.min_wall_us as u64
+        } else {
+            wall_us
+        }
+    }
+
+    /// Payload size raised to the declared floor (`0` floor = unchanged).
+    /// The same rule as [`pad_to_floor`](Self::pad_to_floor), applied to the
+    /// payload half of the corridor.
+    #[must_use]
+    pub const fn pad_payload_to_floor(&self, bytes: u64) -> u64 {
+        if bytes < self.min_payload as u64 {
+            self.min_payload as u64
+        } else {
+            bytes
+        }
+    }
+
     /// Judge both halves in one call.
     #[must_use]
     pub const fn judge(&self, wall_us: u64, payload_bytes: u64) -> EnvelopeVerdict {

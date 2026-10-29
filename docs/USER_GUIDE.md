@@ -1591,6 +1591,13 @@ let (_event, profile, verdict) = guard.commit_enveloped(payload_bytes);
   `SnubberEvent`, neither enters `SnapshotV1` (the 512 B frame stays v6).
 * An underflow is the silent-skip signal: work returned faster or smaller
   than promised, so the cache was stale or the loop never ran.
+* `pad_to_floor(wall_us)` / `pad_payload_to_floor(bytes)` raise a value to
+  the declared floor and leave anything above it untouched. It exists for the
+  caller that must not finish faster than its floor — a pacer, a coalescing
+  window — which pads its own WAIT with the result. Padding the reported
+  duration of work that did not happen is the very signal the floor is there
+  to catch, so pad the wait, never the story; the ceiling is unaffected and
+  an overrun still reads `Over`.
 
 **Harness.** Measure first, promise second:
 
@@ -2054,6 +2061,7 @@ never disagree with the chapter map above.
 | `guard.profile_snapshot()` | 2 / std | 1 wall + 1 CPU read | Mid-flight profile without settling |
 | `ConflateSender::pair()` + `publish` / `take_latest` | 4 / std | queue 0 or 1, replacement counted | Latest-value channel (queue 0 or 1), coalescing counted, no `Clone` bound on payload |
 | `ExecutionEnvelope::new(..)` + `execution_envelope(env)` + `commit_enveloped(bytes)` | 4 / std | 16 B `Copy` header; settle judged at commit | Corridor catches too slow/too big and too fast/too small; underflow/overflow in own stats columns, breaker untouched |
+| `ExecutionEnvelope::pad_to_floor(us)` / `pad_payload_to_floor(bytes)` | 4 / core | one compare per call, `const` | Raise a value to the declared floor, never shorten one; for padding a WAIT (pacer, coalescing window), never the reported duration; the ceiling is untouched |
 | `ExecutionEnvelope::{off, is_off, is_inside, has_underflow, has_overflow, time_verdict, payload_verdict}` | 4 / std | `const fn` header math on one `Copy` value | Inspect a corridor without admitting: `off()`/`is_off()` disable it, `is_inside()` answers the four-bound question, `time_verdict(wall_us)` / `payload_verdict(bytes)` classify one measurement into `TimeVerdict` / `PayloadVerdict` |
 | `ProfileHarness` + `HarnessReport` / `run_boundary_harness` | 4 / std | one `Vec` of samples + sort | Deterministic PRNG, min/median/max/jitter/burst matrix, `report.envelope(headroom)`; accessors: `HarnessReport::mean_us()`, `ProfileHarness::{samples, burst_len}`; `FastPrng` is the xorshift32 payload generator behind `run` |
 | `snapshot.diff(&later)` + `write_summary` | 5 / cold | pure `Copy` math | Counter deltas + memory/queue window (`SnapshotDiff`) |

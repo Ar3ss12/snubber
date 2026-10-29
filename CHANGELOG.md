@@ -64,6 +64,15 @@ without an RNG.
   names its rate, an unreadable probe leaves the ring untouched, and a dip
   clears the evidence.
 
+- `ExecutionEnvelope::pad_to_floor(wall_us)` + `pad_payload_to_floor(bytes)`:
+  raise a measurement to the declared floor and leave anything above it
+  untouched, for the caller that must not finish faster than its floor (a
+  pacer, a coalescing window) and pads its own wait. The ceiling is not
+  touched, so an overrun still reads `Over`, and a `0` floor leaves the value
+  as it was. Documented limit: padding the reported duration of work that did
+  not happen is the silent-skip signal the floor exists to catch. Tests:
+  padding clears the floor verdict, never shortens and never launders an
+  overrun, and a disabled floor changes nothing.
 - `FlightTape<const N: usize>` + `TapeEntry` (`tape`, core, `Copy`, no
   allocation, no clock): the last `N` `(epoch, task_id, code)` events in a
   fixed array, in the node's `VecDeque` flight-recorder role but usable where

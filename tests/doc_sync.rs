@@ -566,6 +566,7 @@ fn test_quick_ref_layer_column_matches_chapters() {
         ("`TaskConduit` / `TaskHandle`", "2 / std"),
         ("ConflateSender::pair()", "4 / std"),
         ("ExecutionEnvelope::new(..)", "4 / std"),
+        ("ExecutionEnvelope::pad_to_floor(us)", "4 / core"),
         ("ProfileHarness` + `HarnessReport", "4 / std"),
         ("node.note_memory_kb", "3 / std"),
         ("node.enter_async_auto` |", "3 / std"),
