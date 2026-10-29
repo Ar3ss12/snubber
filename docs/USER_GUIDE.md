@@ -1776,6 +1776,37 @@ for entry in stop.iter() {
 * `iter()`, `get(index)`, `len()`, `capacity()`, `clear()`; `RankedNode` and
   `RankedEntry` forward `name()`, `snapshot_v1()` and `stats()`.
 
+### Flight tape (`FlightTape<N>`)
+
+The node's flight recorder is a `VecDeque` behind `std`, and the moment it
+is most wanted is the moment the process is out of memory — an allocator
+call on the way to a crash is the first thing to fail. `FlightTape<N>` is
+the same idea in a fixed array, so it also works on firmware:
+
+```rust
+use snubber::FlightTape;
+
+let mut tape: FlightTape<16> = FlightTape::new();
+tape.record_code(epoch, task_id, code);      // one event, no allocation
+// …the process dies here…
+for entry in tape.iter() {                   // oldest → newest
+    log(&entry.epoch, &entry.task_id, &entry.code);
+}
+```
+
+* **It records `(epoch, task_id, code)` and nothing else** — 24 B per cell,
+  `Copy`. No file, no line, no text: those are `&'static str` in
+  `FlightSlot` and belong to the `std` recorder. `code` is your vocabulary
+  (a `FaultKind::index()`, a transition number, an `OP_*` byte); the crate
+  never interprets it.
+* **A full tape overwrites its oldest cell**, so it always holds the LAST
+  `N` events in order. `N = 0` records nothing instead of panicking — a tape
+  sized from a config value must survive a zero.
+* `last_with_code(code)` walks newest first, which is the question an error
+  handler actually asks: "what was the last thing this task did".
+  `newest()`, `oldest()`, `at(i)`, `len()`, `is_full()`, `capacity()`,
+  `clear()` round it out.
+
 ---
 
 ## Extensibility: hooks, names, gates
@@ -2042,6 +2073,7 @@ never disagree with the chapter map above.
 | `find_anomalies()` / `assert_no_anomalies!` | 5 / cold | pure `u128` math | CI gate + diagnostics console + `[DIAG 0x…]` bug reports |
 | `NodeSet` set | 5 / cold | explicit `&Node` list + saturating aggregates | Multi-node pulse, never a `static` |
 | `RankedSet<CAP>::insert(RankedNode::<R>::new(node))` | 5 / cold | fixed `[Option<RankedEntry>; CAP]`, one backward shift per insert, no allocation | Teardown order pinned by `const RANK` (higher stops first, ties stable); a full set refuses rather than evicting a stop step |
+| `FlightTape<N>::record_code(epoch, task_id, code)` | 5 / core | 24 B per cell in a fixed array, no allocation, no clock | Last `N` events before a crash; a full tape overwrites its oldest cell, `last_with_code` walks newest first, `N = 0` records nothing |
 | `SafeLockExt` (`Mutex::safe_lock(&node)`) | 1 / std | structural: 1 counter on recovery | Poison-tolerant locking: foreign panic recovers the lock, `poison_recoveries` counts each recovery |
 | `ClosurePolicy::new(closure)` + `run()` | 2 / alloc | 1 `Box` at construction | Capturing self-healing command: `run()` executes the boxed closure outside the node lock |
 | `TransactionHeader { generation, epoch, task_id }` | 1 / core | 24 B `Copy` | Stamped header for trust boundaries; `task_id` doubles as the reply-correlation check |

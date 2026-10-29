@@ -195,6 +195,8 @@ pub mod memory;
 
 pub mod handles;
 
+pub mod tape;
+
 #[cfg(feature = "std")]
 pub mod rank;
 
@@ -266,6 +268,8 @@ pub use diagnostics::find_anomalies_for_snapshot;
 
 #[cfg(feature = "std")]
 pub use rank::{RankedEntry, RankedNode, RankedSet, RankedSetError};
+
+pub use tape::{FlightTape, TapeEntry};
 
 pub use drain::{
     ProcessToken, SnubScanner, OP_COMMIT, OP_HEARTBEAT, OP_SNAPSHOT, OP_STATE, TOKEN_BODY_LEN,

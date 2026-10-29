@@ -596,6 +596,10 @@ fn test_quick_ref_layer_column_matches_chapters() {
             "`RankedSet<CAP>::insert(RankedNode::<R>::new(node))",
             "5 / cold",
         ),
+        (
+            "FlightTape<N>::record_code(epoch, task_id, code)",
+            "5 / core",
+        ),
         ("write_triage(&mut out, node, &snap)", "5 / cold"),
     ];
 

@@ -64,6 +64,15 @@ without an RNG.
   names its rate, an unreadable probe leaves the ring untouched, and a dip
   clears the evidence.
 
+- `FlightTape<const N: usize>` + `TapeEntry` (`tape`, core, `Copy`, no
+  allocation, no clock): the last `N` `(epoch, task_id, code)` events in a
+  fixed array, in the node's `VecDeque` flight-recorder role but usable where
+  an allocation on the way to a crash is the first thing to fail (OOM,
+  firmware). A full tape overwrites its oldest cell, so it always holds the
+  last `N` events in order; `last_with_code` walks newest first; `N = 0`
+  records nothing instead of panicking. Tests: short tape in event order,
+  overwrite at capacity, `N = 0`, newest-match search direction, and `clear`
+  rewinding the cursor.
 - `AimdLimit` (`policy`, core, `Copy`, 16 B): additive increase /
   multiplicative decrease for a concurrency ceiling, so the limit converges
   on what the downstream sustains instead of a build-time guess. `on_success`

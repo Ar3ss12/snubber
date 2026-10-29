@@ -169,8 +169,8 @@ the whole body in both cases.
 (`#![cfg_attr(not(feature = "std"), no_std)]`). CI builds **both** `core` and
 `core + alloc` for `thumbv7em-none-eabihf`. `core`-only targets get the guard,
 epoch gate, pulse, ISR bridge, clock, envelope, policy, drain scanner, memory
-watch and handle watch; `alloc` upgrades those layers in place rather than adding
-one. The `std`
+watch, handle watch and the flight tape; `alloc` upgrades those layers in place
+rather than adding one. The `std`
 side owns OS threads, pipes and process trees — `SnubberNode`, the async engine,
 supervisor, pool, gateway, conduit, conflate and harness. Format ceilings (3
 priority lanes, 4 profile stages, 16 ISR slots, 28 B token payload, 512 B
