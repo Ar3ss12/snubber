@@ -114,8 +114,55 @@ if [ "${SEMVER_RC}" -eq 0 ]; then
     exit 0
 fi
 if [ "${SEMVER_RC}" -eq 100 ] || grep -q '^--- failure ' "${SEMVER_LOG}"; then
-    echo " verdict: cargo-semver-checks reported a semver violation (exit ${SEMVER_RC})"
-    exit 1
+    # A 0.x minor bump MAY break, but only by declaration: every reported
+    # item must be named by a substring in api-breaks/<version>.txt, and
+    # tests/doc_sync.rs requires each of those names to appear in the
+    # CHANGELOG. An undeclared break stays red, and a manifest entry that no
+    # longer breaks is red too, so the file cannot rot into a blanket waiver.
+    BREAKS_FILE="${REPO_ROOT}/api-breaks/${CURRENT_VERSION}.txt"
+    # Every "Failed in:" entry counts, not only those whose item kind is a
+    # bare lowercase word: a removed inherent method is printed as
+    # `HandleWatch::leaks, previously in file ...` with no kind prefix, and
+    # the narrower parse let exactly that class through undeclared.
+    REPORTED="$(sed -nE 's/^  (\S.*), previously in file .*$/\1/p' "${SEMVER_LOG}" | sed -E 's/^[a-z_]+ //' | sort -u)"
+    if [ -z "${REPORTED}" ]; then
+        echo " verdict: cargo-semver-checks reported a semver violation (exit ${SEMVER_RC}) and no affected item could be parsed"
+        exit 1
+    fi
+    if [ ! -f "${BREAKS_FILE}" ]; then
+        echo " verdict: breaking change vs ${BASELINE} with no api-breaks/${CURRENT_VERSION}.txt manifest"
+        printf '%s
+' "${REPORTED}" | sed 's/^/   undeclared: /'
+        exit 1
+    fi
+    DECLARED="$(grep -vE '^[[:space:]]*(#|$)' "${BREAKS_FILE}" | sort -u)"
+    UNDECLARED=""
+    while IFS= read -r item; do
+        hit=0
+        while IFS= read -r token; do
+            case "${item}" in *"${token}"*) hit=1 ;; esac
+        done <<< "${DECLARED}"
+        if [ "${hit}" -eq 0 ]; then
+            echo " FAIL (undeclared API break: ${item} — add it to api-breaks/${CURRENT_VERSION}.txt and CHANGELOG.md)"
+            UNDECLARED=1
+        fi
+    done <<< "${REPORTED}"
+    while IFS= read -r token; do
+        case "${REPORTED}" in
+            *"${token}"*) ;;
+            *)
+                echo " FAIL (api-breaks/${CURRENT_VERSION}.txt declares '${token}' but the diff no longer breaks it — prune the manifest)"
+                UNDECLARED=1
+                ;;
+        esac
+    done <<< "${DECLARED}"
+    if [ -n "${UNDECLARED}" ]; then
+        exit 1
+    fi
+    count="$(printf '%s
+' "${REPORTED}" | grep -c .)"
+    echo " verdict: ${count} affected item(s) vs ${BASELINE}, all declared in api-breaks/${CURRENT_VERSION}.txt"
+    exit 0
 fi
 echo " FAIL (verifier could not run: cargo-semver-checks exit ${SEMVER_RC} — tool/toolchain error, not an API verdict)"
 exit 3

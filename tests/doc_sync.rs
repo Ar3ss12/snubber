@@ -583,8 +583,6 @@ fn test_quick_ref_layer_column_matches_chapters() {
         ("Backpressure::jittered(pct, salt)", "2 / core"),
         ("AimdLimit::new(init, min, max, step, keep_pct)", "2 / core"),
         ("MemoryPolicy::new", "4 / std"),
-        ("LeakWatch<N>::push(sample)", "4 / core"),
-        ("LeakWatch<N>::window()", "4 / core"),
         ("MemoryTrend<N>::sample(used_kb)", "4 / core"),
         ("HandleWatch<N>::sample(probe)", "4 / core"),
         ("Supervisor::run_supervised_guard_with_memory", "4 / std"),
@@ -1207,6 +1205,58 @@ fn normalize_cell(cell: &str) -> String {
         }
     }
     out
+}
+
+/// `scripts/check_api_diff.sh` lets a deliberate break through only when the
+/// removed name is listed in `api-breaks/<version>.txt`. That manifest is a
+/// release artifact, not a scratch note: every name in it must be documented
+/// in the CHANGELOG section for the same version, or a consumer upgrading
+/// reads a changelog that never mentions what vanished.
+#[test]
+fn test_declared_api_breaks_are_in_the_changelog() {
+    let cargo = read_doc("Cargo.toml");
+    let version = cargo
+        .lines()
+        .filter_map(|line| line.strip_prefix("version = \""))
+        .next()
+        .and_then(|rest| rest.split('"').next())
+        .expect("Cargo.toml has no package version");
+
+    let manifest_path = format!("api-breaks/{version}.txt");
+    let Ok(manifest) = std::fs::read_to_string(&manifest_path) else {
+        return;
+    };
+    let names: Vec<&str> = manifest
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    assert!(
+        !names.is_empty(),
+        "TRIPWIRE FIRED: {manifest_path} declares nothing — an empty manifest \
+         turns the semver gate into a no-op; delete the file instead"
+    );
+
+    let changelog = read_doc("CHANGELOG.md");
+    let heading = format!("## {version}");
+    let start = changelog
+        .find(&heading)
+        .unwrap_or_else(|| panic!("TRIPWIRE FIRED: CHANGELOG.md has no `{heading}` section"));
+    let after = start + heading.len();
+    let end = changelog[after..]
+        .find("\n## ")
+        .map(|n| after + n)
+        .unwrap_or(changelog.len());
+    let section = &changelog[start..end];
+
+    for name in names {
+        assert!(
+            section.contains(name),
+            "TRIPWIRE FIRED: {manifest_path} declares `{name}` as removed, but \
+             the CHANGELOG section `{heading}` never names it — a consumer \
+             upgrading reads silence where the break is"
+        );
+    }
 }
 
 /// Any `manual_with_clock` snippet in the public docs must declare the

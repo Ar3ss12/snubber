@@ -827,65 +827,46 @@ match verdict {
   streak, never trips the breaker); `stats().memory_pressure` mirrors the flag.
 * **`MemoryWatch` / `MemoryVerdict`** are `core`-only and `Copy` (32 B), so
   firmware can reuse the verdict math without the `std` node.
-* **`LeakWatch<N>` is the derivative, not the level.** `MemoryWatch` answers
-  "over budget yet"; a leak is a working set that rises on every sample of a
-  full window without one dip. Feed it the same 1 Hz (or 30 s) sample:
+* **A leak is the derivative, not the level.** `MemoryWatch` answers "over
+  budget yet"; a leak is a working set that rises on every sample of a full
+  window without one dip. `MemoryTrend<N>` owns both halves — one ring, one
+  structure, and a verdict that never hides one behind the other:
 
   ```rust
-  use snubber::{growth_crosses, LeakWatch};
+  use snubber::{LeakClassification, MemoryTrend};
 
   // 10 samples = five minutes of evidence at 30 s.
-  let mut leak: LeakWatch<10> = LeakWatch::new();
-  if let Some(growth_kb) = leak.push(rss_kb) {
-      if growth_crosses(growth_kb, 120 * 1024) {
-          // strictly rising for the whole window and +120 MiB: name a leak
-      }
+  let mut trend: MemoryTrend<10> = MemoryTrend::new(soft_kb, hard_kb, 120 * 1024, 30_000);
+  let report = trend.sample(rss_kb);
+  if report.level.is_pressured() {
+      drain_and_restart();                       // over soft / hard
+  }
+  if let LeakClassification::Rising { rate_kb_sec, .. } = report.trend {
+      log_leak(rate_kb_sec);                     // full, rising, over the trip mark
+      refuse_new_starts();
   }
   ```
 
-  `push` returns `Some(newest - oldest)` only when the ring is FULL and every
-  sample beats its predecessor; one sample below its predecessor clears the
-  window, because a healthy process is allowed to oscillate. `N` is policy,
-  not the detector's; `N = 0` never reports. `growth_crosses` is the trip mark
-  (`trip_kb == 0` disables it) and stays caller policy: the crate names the
-  growth, your app names the threshold.
-* **`MemoryTrend<N>` joins the two, and the level outranks the trend.** One
-  ring, one verdict per sample: `Hard` is never softened into `Leaking`,
-  `Soft` stays `Soft`, and the ring is fed on every sample anyway, so a
-  level episode does not blind the trend.
+  `MemoryReport { level, trend }` is the whole answer: `level` is the
+  `MemoryVerdict` (32 B integer math) and `trend` is the window shape
+  (`Warming { samples }`, `Stable { growth_kb }`, `Rising { growth_kb,
+  rate_kb_sec }`, `Sawtooth`). Both are computed on every call, so a `Soft`
+  level can no longer mask a rising window — the 0.7 verdict that reported
+  one half is gone. `report.is_pressured()` is the OR of the two;
+  `report.code()` is `"hard"` / `"soft"` / `"leaking"` / `"ok"`.
+  `trend.verdict()` re-reads the same report without feeding the ring, and
+  `trend.classification()` returns just the `trend` half.
 
-  ```rust
-  use snubber::{MemoryTrend, MemoryTrendVerdict};
-
-  let mut trend: MemoryTrend<8> = MemoryTrend::new(soft_kb, hard_kb, 120 * 1024, 30_000);
-  match trend.sample(rss_kb) {
-      MemoryTrendVerdict::Hard => shut_down_now(),
-      MemoryTrendVerdict::Soft => drain_and_restart(),
-      MemoryTrendVerdict::Leaking { growth_rate_kb_sec } => {
-          // full, rising 30 s window that crossed the trip mark
-          log_leak(growth_rate_kb_sec);
-          refuse_new_starts();
-      }
-      MemoryTrendVerdict::Ok => {}
-      _ => {} // MemoryTrendVerdict is #[non_exhaustive]
-  }
-  ```
-
-  `MemoryTrendVerdict` is its own type, not a fourth `MemoryVerdict`
-  variant: `MemoryVerdict` has no `repr`, so a field-carrying variant would
-  leave every discriminant unspecified (a major change under the semver
-  gate). `level()` returns the `MemoryVerdict` half of any trend verdict —
-  a leak is `Ok` there, which is the truth: the process is under both
-  limits, it is only going up.
-
-  `trend.classification()` answers the shape question without a verdict:
-  `Warming { samples }` (not enough evidence), `Stable { growth_kb }` (full,
-  rising, under the mark), `Rising { growth_kb, rate_kb_sec }`, and
-  `Sawtooth` — full but not monotonic. That last one is the honest gap in
-  the derivative rule: a leak that climbs and drops never trips, and this
-  variant makes it nameable instead of invisible. Rates divide by the span
-  the caller owns: `growth * 1000 / ((N - 1) * interval_ms)`, `None` when
-  `interval_ms == 0` or `N < 2`.
+  The window only reports when it is FULL and every sample beats its
+  predecessor; one sample below its predecessor clears it, because a healthy
+  process is allowed to oscillate (a collection, a tray collapse, a pool
+  draining). `N` is policy, not the detector's; `N = 0` never reports. The
+  trip mark is a GROWTH (`trip_kb == 0` disables the verdict) and stays
+  caller policy: the crate names the growth, your app names the threshold.
+  `Sawtooth` is the honest gap in the monotonic rule — a leak that climbs and
+  drops never trips, and this variant makes it nameable instead of invisible.
+  Rates divide by the span the caller owns: `growth * 1000 / ((N - 1) *
+  interval_ms)`, `None` when `interval_ms == 0` or `N < 2`.
 * **`HandleWatch<N>` is that rule for counts, not bytes.** A leaked `HANDLE`,
   file descriptor or socket is kernel state — a few bytes of a table, never a
   resident page — so RSS stays flat while the process inches toward its
@@ -911,8 +892,9 @@ match verdict {
   detector on exactly the host whose probe failed. `note(count)` is the same
   step for callers that already hold the number (a snapshot, a replay).
   `classification()` / `is_leaking()` / `growth_rate_per_sec()` mirror
-  `MemoryTrend`, including the `Sawtooth` gap; `trip == 0` disables the
-  verdict but keeps the window.
+  `MemoryTrend`, including the `Sawtooth` gap; `samples()` and `newest()` read
+  the window's size and last count; `trip == 0` disables the verdict but
+  keeps the window.
 * **Snapshot v6** carries `memory_used_kb`, `memory_peak_kb`,
   `memory_soft_kb`, `memory_hard_kb`, `memory_rejections`, `memory_pressure`,
   `queue_depth` and `queue_capacity`. Still 512 B (330/508 payload bytes used).
@@ -2088,9 +2070,7 @@ never disagree with the chapter map above.
 | `node.note_pulse_stall(lag_ms)` | 1.5 / std | structural: 1 atomic max | Record missed pulse into `SnapshotV1` (pulse fields since v3; frame is v6) + `AnomalyKind::PulseStall` |
 | `node.note_memory_kb(used_kb)` + `memory_verdict()` | 3 / std | 1 lock + 1 atomic store | External RSS sample → `MemoryVerdict` (Ok/Soft/Hard); admissions refuse lock-free above soft |
 | `MemoryWatch` + `MemoryVerdict` | 4 / core | 32 B, `Copy` | Verdict math for firmware; `hard < soft` clamps up |
-| `LeakWatch<N>::push(sample)` + `growth_crosses(growth, trip)` | 4 / core | 96 B on 64-bit at `N = 10` (88 B on 32-bit), `Copy`, no clock | Leak as a derivative: `Some(newest − oldest)` only on a full, strictly rising window; one dip clears it |
-| `LeakWatch<N>::window()` / `classify(trip, interval_ms)` + `LeakClassification` | 4 / core | one pass over ≤ `N` samples, no allocation | Names the shape instead of a bare `Option`: `Warming` / `Stable` / `Rising { growth_kb, rate_kb_sec }` / `Sawtooth` (the leak a monotonic trip can never see) |
-| `MemoryTrend<N>::sample(used_kb)` + `classification()` | 4 / core | 32 B level watch + the ring; the level outranks the trend | One ring, one verdict: `Hard`/`Soft` stay themselves, a rising window under both limits is `MemoryTrendVerdict::Leaking { growth_rate_kb_sec }`; `level()` keeps the `MemoryVerdict` half |
+| `MemoryTrend<N>::sample(used_kb)` / `verdict()` | 4 / core | 32 B level watch + a `96` B ring at `N = 10`, `Copy`, no clock | One structure, both halves: `MemoryReport { level, trend }` — a `Soft` level never hides a `Rising { growth_kb, rate_kb_sec }` window (the 0.7 single-verdict trap), `Warming` / `Stable` / `Sawtooth` name the rest |
 | `HandleWatch<N>::sample(probe)` / `note(count)` | 4 / core | the ring plus two `u64`s, no clock, no allocation | Handle/fd/socket leak by derivative; an unreadable probe returns `None` and records **no** sample (a `0` would be a false dip that disarms the detector) |
 | `MemoryPolicy::new(soft, hard)` + `note(used)` | 4 / std | pure integer compares | Supervisor verdict: soft drains, hard kills; `death_cause()` names `MemoryLimit` |
 | `Supervisor::run_supervised_guard_with_memory(..)` | 4 / std | 1 sampler call / 10 ms tick | Lease + RSS watchdog; soft logs `MEMORY_DRAIN`, hard `kill()` without draining |

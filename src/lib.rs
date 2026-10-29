@@ -277,8 +277,7 @@ pub use drain::{
 };
 
 pub use memory::{
-    growth_crosses, rate_kb_sec, LeakClassification, LeakWatch, LeakWindow, MemoryTrend,
-    MemoryTrendVerdict, MemoryVerdict, MemoryWatch,
+    rate_kb_sec, LeakClassification, MemoryReport, MemoryTrend, MemoryVerdict, MemoryWatch,
 };
 
 pub use handles::HandleWatch;

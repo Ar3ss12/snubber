@@ -20,7 +20,7 @@ Zero deps · `#![forbid(unsafe_code)]` · MSRV 1.70 · one crate from `core`-onl
 
 ```toml
 [dependencies]
-snubber = "0.7"
+snubber = "0.8"
 ```
 
 Wrap critical work in **`scoped`**: two closures, rollback and action. It
@@ -116,10 +116,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   fixed buffer and hands the digest to its successor.
 * **Memory and handles are judged by their derivative.** `MemoryTrend<N>` folds a
   level watch (`Ok` / `Soft` / `Hard`) together with a strictly rising sample
-  ring, so a slow leak is named by `LeakClassification::Rising { growth_kb,
-  rate_kb_sec }` long before a ceiling; `HandleWatch<N>` applies the same rule
-  to handle / fd counts, which RSS cannot see. One dip clears the window, and a
-  closed port records no sample instead of a false `0`.
+  ring and answers both halves at once — `MemoryReport { level, trend }`, so a
+  level can never hide the trend; a slow leak is named by
+  `LeakClassification::Rising { growth_kb, rate_kb_sec }` long before a
+  ceiling. `HandleWatch<N>` applies the same rule to handle / fd counts, which
+  RSS cannot see. One dip clears the window, and a closed port records no
+  sample instead of a false `0`.
 * **The last events before a fault are kept.** `FlightTape<N>` records a fixed
   number of packed events in a plain array — no allocation, no clock — so a
   post-mortem can read the sequence that led to the fault, not only the totals.

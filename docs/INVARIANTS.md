@@ -123,24 +123,23 @@ only move a `Copy` verdict; the crate never measures memory itself.
   tmp + `sync_all` + `rename`, page-cache eviction (`posix_fadvise`) and
   validation of the file body are app-owned. A kill mid-write leaves no
   sealed file, hence no valid ticket.
-- A leak is judged by its derivative, never its level: `LeakWatch<N>::push`
-  returns a growth only for a FULL ring whose every sample beats its
-  predecessor, and one sample below its predecessor clears the window. A
-  rising 2 MiB step is not a leak at any absolute size, and an oscillation
-  is not evidence, so neither `soft_kb` nor a single high sample can be
-  dressed up as one. `N` and the trip mark (`growth_crosses`) are caller
-  policy; `N = 0` and `trip_kb == 0` are disabled, not "zero bytes".
-- The composed verdict has one order: `MemoryTrend<N>::sample` reports the
-  level first — `Hard` and `Soft` are never relabelled `Leaking` — and only
-  under both limits reports `MemoryTrendVerdict::Leaking {
-  growth_rate_kb_sec }` for a full rising window that crossed the mark. The
-  ring is fed on every sample regardless, so a level episode cannot blind
-  the trend, and a rate is computed only from a span the caller supplied
-  (`interval_ms > 0`, `N >= 2`) — otherwise it is `0`, never invented.
-  The leak verdict is its own type, not a `MemoryVerdict` variant: adding a
-  field-carrying variant to an enum with no `repr` leaves its discriminants
-  unspecified, which the semver gate refuses; `level()` carries the level
-  half instead.
+- A leak is judged by its derivative, never its level: `MemoryTrend<N>::sample`
+  records a sample and `MemoryTrend<N>::verdict` reports a growth only for a
+  FULL ring whose every sample beats its predecessor, and one sample below
+  its predecessor clears the window. A rising 2 MiB step is not a leak at any
+  absolute size, and an oscillation is not evidence, so neither `soft_kb` nor
+  a single high sample can be dressed up as one. `N` and the trip mark are
+  caller policy; `N = 0` and `trip_kb == 0` are disabled, not "zero bytes".
+- One type per concept: the ring is crate-internal. The public owners are
+  `MemoryTrend<N>` (bytes) and `HandleWatch<N>` (counts), and the one public
+  answer is `MemoryReport { level, trend }` — a `MemoryVerdict` and a
+  `LeakClassification`. Both halves are computed on every call, so the level
+  can never mask the trend (0.7's single verdict reported `Soft` before it
+  read the window); `is_pressured()` is the OR, `code()` picks the more
+  urgent half. A leaf is `Ok`, which is the truth: the process is under both
+  limits, it is only going up. Rates are computed only from a span the
+  caller supplied (`interval_ms > 0`, `N >= 2`) — otherwise `None`, never
+  invented.
 - `LeakClassification::Sawtooth` is the honest gap in that rule: a window
   that climbs and drops never trips a monotonic mark, and the shape is
   named instead of invisible. Naming it is not a verdict — the crate says

@@ -130,8 +130,51 @@ try {
     # is printed by both generations, so it decides the legacy mixed case.
     $LogText = if (Test-Path $SemverLog) { [string](Get-Content $SemverLog -Raw) } else { "" }
     if ($SemverExit -eq 100 -or $LogText -match '(?m)^--- failure ') {
-        Write-Host " verdict: cargo-semver-checks reported a semver violation (exit $SemverExit)"
-        exit 1
+        # A 0.x minor bump MAY break, but only by declaration. Parity with
+        # check_api_diff.sh: an undeclared break is red, a stale manifest
+        # entry is red, and tests/doc_sync.rs ties each name to CHANGELOG.md.
+        $BreaksFile = Join-Path $RepoRoot "api-breaks\$CurrentVersion.txt"
+        # Every "Failed in:" entry counts, not only those whose item kind is a
+        # bare lowercase word: a removed inherent method is printed as
+        # `HandleWatch::leaks, previously in file ...` with no kind prefix.
+        $Reported = @($LogText -split "`r?`n" |
+            ForEach-Object {
+                if ($_ -match '^  (\S.*), previously in file .*$') {
+                    ($Matches[1] -replace '^[a-z_]+ ', '')
+                }
+            } |
+            Where-Object { $_ } |
+            Sort-Object -Unique)
+        if ($Reported.Count -eq 0) {
+            Write-Host " verdict: cargo-semver-checks reported a semver violation (exit $SemverExit) and no affected item could be parsed"
+            exit 1
+        }
+        if (-not (Test-Path $BreaksFile)) {
+            Write-Host " verdict: breaking change vs $Baseline with no api-breaks\$CurrentVersion.txt manifest"
+            $Reported | ForEach-Object { Write-Host "   undeclared: $_" }
+            exit 1
+        }
+        $Declared = @(Get-Content $BreaksFile | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*#' })
+        $Undeclared = $false
+        foreach ($item in $Reported) {
+            $hit = $false
+            foreach ($token in $Declared) { if ($item.Contains($token)) { $hit = $true } }
+            if (-not $hit) {
+                Write-Host " FAIL (undeclared API break: $item -- add it to api-breaks\$CurrentVersion.txt and CHANGELOG.md)"
+                $Undeclared = $true
+            }
+        }
+        foreach ($token in $Declared) {
+            $hit = $false
+            foreach ($item in $Reported) { if ($item.Contains($token)) { $hit = $true } }
+            if (-not $hit) {
+                Write-Host " FAIL (api-breaks\$CurrentVersion.txt declares '$token' but the diff no longer breaks it -- prune the manifest)"
+                $Undeclared = $true
+            }
+        }
+        if ($Undeclared) { exit 1 }
+        Write-Host " verdict: $($Reported.Count) affected item(s) vs $Baseline, all declared in api-breaks\$CurrentVersion.txt"
+        exit 0
     }
     Write-Host " FAIL (verifier could not run: cargo-semver-checks exit $SemverExit -- tool/toolchain error, not an API verdict)" -ForegroundColor Red
     exit 3

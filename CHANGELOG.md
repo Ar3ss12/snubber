@@ -4,6 +4,27 @@ All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.
 the audit-batch fix tables live at the bottom of this file, and the
 current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
+## 0.8.0 — unreleased
+
+One type per concept, typed erased slots, and the flight tape inside the
+cold frame. Breaking: the public surface loses the duplicate trend types and
+the 0.7 deprecated erased aliases; nothing is renamed for taste.
+
+### Changed (breaking)
+
+- `MemoryTrend<N>::sample` now returns `MemoryReport { level, trend }`: the
+  `MemoryVerdict` and the `LeakClassification` of the same sample, computed
+  independently. The 0.7 verdict reported `Soft`/`Hard` before it read the
+  window, so a caller that trusted the single value never saw a rising ring
+  underneath; `MemoryTrend<N>::verdict()` re-reads the same report without
+  feeding the ring.
+- `LeakWatch`, `LeakWindow`, `growth_crosses` and `MemoryTrendVerdict` are
+  gone from the public API. The ring is crate-internal (`TrendRing`), owned by
+  `MemoryTrend<N>` and `HandleWatch<N>` — one owner per ring, one answer per
+  question, instead of two types that could disagree.
+- `MemoryTrend<N>::leaks()` and `HandleWatch<N>::leaks()` are replaced by
+  `samples()` and `newest()`; the ring itself is no longer public.
+
 ## 0.7.1 (2026-10-29)
 
 0.7.1. First, four follow-ups from the 2026-10-29 audit of the 0.7.0

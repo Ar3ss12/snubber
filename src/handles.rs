@@ -13,7 +13,7 @@
 //! recorded**: feeding `0` instead would be a dip that clears the window and
 //! silently disarms the detector on the one platform whose probe failed.
 
-use crate::memory::{LeakClassification, LeakWatch};
+use crate::memory::{LeakClassification, TrendRing};
 
 /// Monotonic window over an externally sampled handle count.
 ///
@@ -35,7 +35,7 @@ use crate::memory::{LeakClassification, LeakWatch};
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HandleWatch<const N: usize> {
-    leaks: LeakWatch<N>,
+    ring: TrendRing<N>,
     trip: u64,
     sample_interval_ms: u64,
 }
@@ -47,7 +47,7 @@ impl<const N: usize> HandleWatch<N> {
     #[must_use]
     pub const fn new(trip: u64, sample_interval_ms: u64) -> Self {
         Self {
-            leaks: LeakWatch::new(),
+            ring: TrendRing::new(),
             trip,
             sample_interval_ms,
         }
@@ -69,14 +69,14 @@ impl<const N: usize> HandleWatch<N> {
     /// Record one count and return the window's shape. For callers that
     /// already have the number (a snapshot, a test, a replay).
     pub fn note(&mut self, handles: u64) -> LeakClassification {
-        self.leaks.push(handles);
+        self.ring.push(handles);
         self.classification()
     }
 
     /// Current shape against the configured trip mark.
     #[must_use]
     pub fn classification(&self) -> LeakClassification {
-        self.leaks.classify(self.trip, self.sample_interval_ms)
+        self.ring.classify(self.trip, self.sample_interval_ms)
     }
 
     /// `true` only for a full, rising window that crossed the trip mark.
@@ -89,13 +89,19 @@ impl<const N: usize> HandleWatch<N> {
     /// short, not monotonic, or the caller armed no interval.
     #[must_use]
     pub fn growth_rate_per_sec(&self) -> Option<u64> {
-        self.leaks.growth_rate_kb_sec(self.sample_interval_ms)
+        self.ring.growth_rate_kb_sec(self.sample_interval_ms)
     }
 
-    /// The window itself, for callers that keep their own policy.
+    /// Samples currently held in the window (`N` once it has wrapped).
     #[must_use]
-    pub const fn leaks(&self) -> &LeakWatch<N> {
-        &self.leaks
+    pub const fn samples(&self) -> usize {
+        self.ring.len()
+    }
+
+    /// Newest count in the window; `None` before the first readable sample.
+    #[must_use]
+    pub const fn newest(&self) -> Option<u64> {
+        self.ring.newest()
     }
 
     /// Configured trip mark, in handles (`0` = disabled).
@@ -183,10 +189,10 @@ mod tests {
             None,
             "a probe that cannot read says nothing"
         );
-        assert_eq!(watch.leaks().len(), 2, "and records no sample either");
+        assert_eq!(watch.samples(), 2, "and records no sample either");
         assert_eq!(
-            watch.leaks().window().newest,
-            200,
+            watch.newest(),
+            Some(200),
             "a zero would have been a false dip"
         );
 

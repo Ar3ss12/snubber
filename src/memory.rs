@@ -52,88 +52,6 @@ impl MemoryVerdict {
     }
 }
 
-/// Verdict for one **[`MemoryTrend`] sample**: a level verdict, or a leak.
-///
-/// A separate type on purpose. `MemoryVerdict` is a public enum with no
-/// `repr`, so a field-carrying variant would leave its discriminants
-/// unspecified — a major change for anyone who casts or matches on it.
-/// Composing instead of extending keeps `MemoryVerdict` exactly as it was:
-/// `level()` always yields a value of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[non_exhaustive]
-pub enum MemoryTrendVerdict {
-    /// `used < soft` and no leak: admit normally.
-    #[default]
-    Ok,
-    /// `used >= soft_kb`.
-    Soft,
-    /// `used >= hard_kb`.
-    Hard,
-    /// Under both limits, but a full window rose without one dip by more
-    /// than the trip mark: refuse new admissions until the window goes
-    /// quiet. A level says where the process is, this says where it is
-    /// going; a healthy process may sit near the soft limit forever, a
-    /// leaking one crosses it eventually.
-    Leaking {
-        /// Growth per second over the window (`0` when the caller armed no
-        /// sample interval, so no rate could be computed).
-        growth_rate_kb_sec: u64,
-    },
-}
-
-impl MemoryTrendVerdict {
-    /// `true` for every verdict but [`Ok`](Self::Ok): soft, hard and leaking
-    /// all refuse a new admission.
-    #[must_use]
-    pub const fn is_pressured(self) -> bool {
-        !matches!(self, Self::Ok)
-    }
-
-    /// `true` only for [`Hard`](Self::Hard).
-    #[must_use]
-    pub const fn is_hard(self) -> bool {
-        matches!(self, Self::Hard)
-    }
-
-    /// `true` only for [`Leaking`](Self::Leaking).
-    #[must_use]
-    pub const fn is_leaking(self) -> bool {
-        matches!(self, Self::Leaking { .. })
-    }
-
-    /// Growth named by [`Leaking`](Self::Leaking), KiB/s; `None` otherwise.
-    #[must_use]
-    pub const fn growth_rate_kb_sec(self) -> Option<u64> {
-        match self {
-            Self::Leaking { growth_rate_kb_sec } => Some(growth_rate_kb_sec),
-            _ => None,
-        }
-    }
-
-    /// The level half of this verdict; a leak is `Ok` for the level, which
-    /// is the truth: the process is under both limits.
-    #[must_use]
-    pub const fn level(self) -> MemoryVerdict {
-        match self {
-            Self::Soft => MemoryVerdict::Soft,
-            Self::Hard => MemoryVerdict::Hard,
-            Self::Ok | Self::Leaking { .. } => MemoryVerdict::Ok,
-        }
-    }
-
-    /// Static text for diagnostics (`"ok"` / `"soft"` / `"hard"` /
-    /// `"leaking"`).
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Soft => "soft",
-            Self::Hard => "hard",
-            Self::Leaking { .. } => "leaking",
-        }
-    }
-}
-
 /// Soft/hard limits plus the last sample and its peak (KiB).
 ///
 /// `Copy` integers only — PHASE A/C safe. `new` clamps `hard` up to
@@ -232,41 +150,28 @@ const _: () = {
     );
 };
 
-/// A leak is a DERIVATIVE, not a level: [`MemoryWatch`] answers "over
-/// budget yet", this answers "rising without a single dip".
+/// The trend ring behind [`MemoryTrend`] and `HandleWatch`: one fixed
+/// window of `N` samples, oldest-overwritten, no clock and no allocation.
 ///
-/// One ring of `N` samples, oldest-overwritten. A verdict exists only when
-/// the ring is full AND every sample is strictly greater than the one
-/// before it; the growth is then `newest - oldest`. One sample that fails
-/// to beat its predecessor clears the window, because a healthy process is
-/// allowed to oscillate (a collection, a tray collapse, a pool draining).
+/// A leak is a DERIVATIVE, not a level. A verdict exists only when the ring
+/// is full AND every sample is strictly greater than the one before it; the
+/// growth is then `newest - oldest`. One sample that fails to beat its
+/// predecessor clears the window, because a healthy process is allowed to
+/// oscillate (a collection, a tray collapse, a pool draining).
 ///
-/// The crate still does not measure: the caller feeds one external sample
-/// per tick, exactly like `note_memory_kb`. `N` is the caller's choice —
-/// ten 30 s samples are five minutes of evidence; the number belongs to the
-/// policy, not to the detector.
-///
-/// ```
-/// use snubber::LeakWatch;
-///
-/// let mut watch: LeakWatch<4> = LeakWatch::new();
-/// assert_eq!(watch.push(100), None, "a partial window says nothing");
-/// assert_eq!(watch.push(200), None);
-/// assert_eq!(watch.push(300), None);
-/// assert_eq!(watch.push(420), Some(320), "full, strictly rising: 420 - 100");
-/// assert_eq!(watch.push(400), None, "one dip clears the window");
-/// ```
+/// Crate-internal on purpose: the public types that own a ring are
+/// [`MemoryTrend`] and [`crate::HandleWatch`], so there is exactly one way
+/// to ask "is this rising", not two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LeakWatch<const N: usize> {
+pub(crate) struct TrendRing<const N: usize> {
     ring: [u64; N],
     len: usize,
     next: usize,
 }
 
-impl<const N: usize> LeakWatch<N> {
-    /// Empty window. `N = 0` is a watch that can never report a leak.
-    #[must_use]
-    pub const fn new() -> Self {
+impl<const N: usize> TrendRing<N> {
+    /// Empty window. `N = 0` is a ring that can never report a leak.
+    pub(crate) const fn new() -> Self {
         Self {
             ring: [0; N],
             len: 0,
@@ -277,7 +182,7 @@ impl<const N: usize> LeakWatch<N> {
     /// Push one sample and return the growth of a strictly rising FULL
     /// window (`newest - oldest`), or `None` while the window is short or
     /// not monotonic.
-    pub fn push(&mut self, sample: u64) -> Option<u64> {
+    pub(crate) fn push(&mut self, sample: u64) -> Option<u64> {
         if N == 0 {
             return None;
         }
@@ -293,9 +198,9 @@ impl<const N: usize> LeakWatch<N> {
     /// is full, whether it rose without a dip, and its ends. One pass, no
     /// allocation — the caller decides what the shape means.
     #[must_use]
-    pub fn window(&self) -> LeakWindow {
+    pub(crate) fn window(&self) -> TrendWindow {
         if N == 0 || self.len == 0 {
-            return LeakWindow {
+            return TrendWindow {
                 samples: 0,
                 full: false,
                 rising: false,
@@ -323,7 +228,7 @@ impl<const N: usize> LeakWatch<N> {
                 previous = sample;
             }
         }
-        LeakWindow {
+        TrendWindow {
             samples: self.len,
             full: self.len == N,
             rising,
@@ -336,7 +241,7 @@ impl<const N: usize> LeakWatch<N> {
     /// `None` while the window is short, not monotonic, or the interval or
     /// the window width cannot span time (`N < 2`, `sample_interval_ms == 0`).
     #[must_use]
-    pub fn growth_rate_kb_sec(&self, sample_interval_ms: u64) -> Option<u64> {
+    pub(crate) fn growth_rate_kb_sec(&self, sample_interval_ms: u64) -> Option<u64> {
         if N < 2 || sample_interval_ms == 0 {
             return None;
         }
@@ -348,10 +253,10 @@ impl<const N: usize> LeakWatch<N> {
     /// growth, so the same absolute level classifies differently on a short
     /// and a long window.
     #[must_use]
-    pub fn classify(&self, trip_kb: u64, sample_interval_ms: u64) -> LeakClassification {
+    pub(crate) fn classify(&self, trip_kb: u64, sample_interval_ms: u64) -> LeakClassification {
         let window = self.window();
         match window.growth_kb() {
-            Some(growth) if growth_crosses(growth, trip_kb) => LeakClassification::Rising {
+            Some(growth) if crosses_trip(growth, trip_kb) => LeakClassification::Rising {
                 growth_kb: growth,
                 rate_kb_sec: self.growth_rate_kb_sec(sample_interval_ms),
             },
@@ -365,51 +270,57 @@ impl<const N: usize> LeakWatch<N> {
 
     /// Samples currently in the window (`N` once it has wrapped).
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.len
     }
 
-    /// `true` while more samples are needed before a verdict is possible.
+    /// Newest sample in the window, if any.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// `true` once the window is full and a verdict is possible at all.
-    #[must_use]
-    pub const fn is_full(&self) -> bool {
-        self.len == N && N != 0
+    pub(crate) const fn newest(&self) -> Option<u64> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(self.ring[(self.next + N - 1) % N])
+        }
     }
 }
 
-/// One read of a [`LeakWatch`] window.
+/// One read of a [`TrendRing`] window. Crate-internal: the public owner of
+/// a ring is [`MemoryTrend`] / `crate::HandleWatch`, and it exposes the
+/// answer, not the ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct LeakWindow {
+pub(crate) struct TrendWindow {
     /// Samples held (`N` once the ring has wrapped).
-    pub samples: usize,
+    pub(crate) samples: usize,
     /// `true` when the ring holds `N` samples: a verdict is possible.
-    pub full: bool,
+    pub(crate) full: bool,
     /// `true` only for a full window whose every sample beat the one before
     /// it. Equality counts as a dip, like a fall does.
-    pub rising: bool,
+    pub(crate) rising: bool,
     /// Oldest sample in the window, KiB.
-    pub oldest: u64,
+    pub(crate) oldest: u64,
     /// Newest sample in the window, KiB.
-    pub newest: u64,
+    pub(crate) newest: u64,
 }
 
-impl LeakWindow {
+impl TrendWindow {
     /// `newest - oldest` when the window is full and rising; `None` otherwise.
     /// A partial window can look steep and still say nothing — one more
     /// sample may be the dip that ends it.
     #[must_use]
-    pub const fn growth_kb(self) -> Option<u64> {
+    pub(crate) const fn growth_kb(self) -> Option<u64> {
         if self.full && self.rising {
             Some(self.newest - self.oldest)
         } else {
             None
         }
     }
+}
+
+/// Does a monotonic window that grew this much name a leak? `trip_kb == 0`
+/// disables the verdict.
+const fn crosses_trip(growth_kb: u64, trip_kb: u64) -> bool {
+    trip_kb > 0 && growth_kb >= trip_kb
 }
 
 /// What a full window looks like against a trip mark. [`Warming`] is the
@@ -481,34 +392,113 @@ pub const fn rate_kb_sec(growth_kb: u64, intervals: u64, sample_interval_ms: u64
     }
 }
 
-/// Level and trend in one cold-path value: [`MemoryWatch`] answers "over
-/// budget yet", [`LeakWatch`] answers "rising without a dip", and this
-/// composes them so a caller keeps ONE ring and gets ONE verdict.
+/// Both halves of one memory verdict: where the process is ([`MemoryVerdict`])
+/// and where it is going ([`LeakClassification`]).
 ///
-/// The level outranks the trend: `Hard` is not softened into `Leaking`, and
-/// `Soft` stays `Soft` while the window is still warming. The trend is fed
-/// on every sample regardless, so a level episode does not blind the ring.
+/// One type on purpose. The level and the trend answer different questions,
+/// and a verdict that reported only one of them hid the other: a `Soft`
+/// level used to be handed back before the window was read, so a caller that
+/// trusted the single value never saw the rising ring underneath. [`level`]
+/// and [`trend`] are independent fields — read both, or use
+/// [`is_pressured`](Self::is_pressured), which is true for either.
+///
+/// [`level`]: Self::level
+/// [`trend`]: Self::trend
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MemoryReport {
+    /// Level: `Ok` / `Soft` / `Hard` against the configured limits.
+    pub level: MemoryVerdict,
+    /// Trend: the shape of the sample window, against the trip mark.
+    pub trend: LeakClassification,
+}
+
+impl Default for MemoryReport {
+    fn default() -> Self {
+        Self {
+            level: MemoryVerdict::Ok,
+            trend: LeakClassification::Warming { samples: 0 },
+        }
+    }
+}
+
+impl MemoryReport {
+    /// `true` when this report refuses a new admission: a soft/hard level OR
+    /// a full rising window over the trip mark.
+    #[must_use]
+    pub const fn is_pressured(self) -> bool {
+        self.level.is_pressured() || self.trend.is_rising()
+    }
+
+    /// `true` only for the hard level.
+    #[must_use]
+    pub const fn is_hard(self) -> bool {
+        self.level.is_hard()
+    }
+
+    /// `true` only for a full rising window that crossed the trip mark; a
+    /// leak is UNDER both limits, which is why it is not a `MemoryVerdict`.
+    #[must_use]
+    pub const fn is_leaking(self) -> bool {
+        self.trend.is_rising()
+    }
+
+    /// Static text for diagnostics: `"hard"` / `"soft"` / `"leaking"` /
+    /// `"ok"` — the most urgent half wins.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        if self.level.is_hard() {
+            "hard"
+        } else if self.level.is_pressured() {
+            "soft"
+        } else if self.trend.is_rising() {
+            "leaking"
+        } else {
+            "ok"
+        }
+    }
+
+    /// Growth per second named by a rising window; `None` otherwise.
+    #[must_use]
+    pub const fn growth_rate_kb_sec(self) -> Option<u64> {
+        match self.trend {
+            LeakClassification::Rising { rate_kb_sec, .. } => rate_kb_sec,
+            _ => None,
+        }
+    }
+}
+
+/// Level and trend in one cold-path value: [`MemoryWatch`] answers "over
+/// budget yet", the ring answers "rising without a dip", and this owns both
+/// so a caller keeps ONE structure and asks ONE question.
+///
+/// [`sample`](Self::sample) feeds the ring and hands back a [`MemoryReport`];
+/// [`verdict`](Self::verdict) re-reads the same report without feeding. Both
+/// halves are always computed — the level never masks the trend, because
+/// neither is a substitute for the other.
 ///
 /// ```
-/// use snubber::{MemoryTrend, MemoryTrendVerdict, MemoryVerdict};
+/// use snubber::{LeakClassification, MemoryTrend, MemoryVerdict};
 ///
 /// let mut trend: MemoryTrend<4> = MemoryTrend::new(1_000, 2_000, 120, 500);
-/// assert_eq!(trend.sample(100), MemoryTrendVerdict::Ok, "a short window says nothing");
-/// assert_eq!(trend.sample(200), MemoryTrendVerdict::Ok);
-/// assert_eq!(trend.sample(300), MemoryTrendVerdict::Ok);
+/// assert_eq!(trend.sample(100).code(), "ok", "a short window says nothing");
+/// assert_eq!(trend.sample(200).code(), "ok");
+/// assert_eq!(trend.sample(300).code(), "ok");
 /// assert_eq!(
 ///     trend.sample(500),
-///     MemoryTrendVerdict::Leaking { growth_rate_kb_sec: 266 },
+///     snubber::MemoryReport {
+///         level: MemoryVerdict::Ok,
+///         trend: LeakClassification::Rising { growth_kb: 400, rate_kb_sec: Some(266) },
+///     },
 ///     "400 KiB over three 500 ms intervals"
 /// );
 /// let hard = trend.sample(2_100);
-/// assert_eq!(hard, MemoryTrendVerdict::Hard, "the level outranks the trend");
-/// assert_eq!(hard.level(), MemoryVerdict::Hard);
+/// assert_eq!(hard.level, MemoryVerdict::Hard, "the level fires on its own");
+/// assert!(hard.is_pressured());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MemoryTrend<const N: usize> {
     levels: MemoryWatch,
-    leaks: LeakWatch<N>,
+    ring: TrendRing<N>,
     trip_kb: u64,
     sample_interval_ms: u64,
 }
@@ -521,7 +511,7 @@ impl<const N: usize> MemoryTrend<N> {
     pub const fn new(soft_kb: u64, hard_kb: u64, trip_kb: u64, sample_interval_ms: u64) -> Self {
         Self {
             levels: MemoryWatch::new(soft_kb, hard_kb),
-            leaks: LeakWatch::new(),
+            ring: TrendRing::new(),
             trip_kb,
             sample_interval_ms,
         }
@@ -533,35 +523,36 @@ impl<const N: usize> MemoryTrend<N> {
         Self::new(soft_kb, hard_kb, 0, 0)
     }
 
-    /// Record one external sample (KiB) and return the verdict for it. The
-    /// level is reported first; the ring is fed either way.
-    pub fn sample(&mut self, used_kb: u64) -> MemoryTrendVerdict {
-        let level = self.levels.note(used_kb);
-        let growth = self.leaks.push(used_kb);
-        if level.is_hard() {
-            return MemoryTrendVerdict::Hard;
-        }
-        if level.is_pressured() {
-            return MemoryTrendVerdict::Soft;
-        }
-        match growth {
-            Some(growth) if growth_crosses(growth, self.trip_kb) => MemoryTrendVerdict::Leaking {
-                growth_rate_kb_sec: self.rate_kb_sec(growth),
-            },
-            _ => MemoryTrendVerdict::Ok,
+    /// Record one external sample (KiB) and return both halves for it.
+    pub fn sample(&mut self, used_kb: u64) -> MemoryReport {
+        let _ = self.levels.note(used_kb);
+        self.ring.push(used_kb);
+        self.verdict()
+    }
+
+    /// Both halves of the current state, without feeding the ring. The level
+    /// and the trend are computed independently: a `Soft` level does not hide
+    /// a rising window.
+    #[must_use]
+    pub fn verdict(&self) -> MemoryReport {
+        MemoryReport {
+            level: self.levels.verdict(),
+            trend: self.ring.classify(self.trip_kb, self.sample_interval_ms),
         }
     }
 
     /// Growth per second over the current window, when it is full and rising.
     #[must_use]
     pub fn growth_rate_kb_sec(&self) -> Option<u64> {
-        self.leaks.growth_rate_kb_sec(self.sample_interval_ms)
+        self.ring.growth_rate_kb_sec(self.sample_interval_ms)
     }
 
-    /// Current window shape against the configured trip mark.
+    /// Current window shape against the configured trip mark — the same value
+    /// as [`verdict`](Self::verdict)`.trend`, for callers that only branch on
+    /// the shape.
     #[must_use]
     pub fn classification(&self) -> LeakClassification {
-        self.leaks.classify(self.trip_kb, self.sample_interval_ms)
+        self.ring.classify(self.trip_kb, self.sample_interval_ms)
     }
 
     /// The level half, for callers that only need `used_kb` / `peak_kb`.
@@ -570,10 +561,16 @@ impl<const N: usize> MemoryTrend<N> {
         self.levels
     }
 
-    /// The trend half, for callers that scan the raw window themselves.
+    /// Samples currently held in the window (`N` once it has wrapped).
     #[must_use]
-    pub const fn leaks(&self) -> &LeakWatch<N> {
-        &self.leaks
+    pub const fn samples(&self) -> usize {
+        self.ring.len()
+    }
+
+    /// Newest sample in the window, KiB; `None` before the first sample.
+    #[must_use]
+    pub const fn newest_kb(&self) -> Option<u64> {
+        self.ring.newest()
     }
 
     /// Configured leak trip mark, KiB (`0` = disabled).
@@ -581,26 +578,6 @@ impl<const N: usize> MemoryTrend<N> {
     pub const fn trip_kb(&self) -> u64 {
         self.trip_kb
     }
-
-    fn rate_kb_sec(&self, growth_kb: u64) -> u64 {
-        if N < 2 || self.sample_interval_ms == 0 {
-            return 0;
-        }
-        rate_kb_sec(growth_kb, N as u64 - 1, self.sample_interval_ms)
-    }
-}
-
-impl<const N: usize> Default for LeakWatch<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Does a monotonic window that grew this much name a leak? `trip_kb == 0`
-/// disables the verdict.
-#[must_use]
-pub const fn growth_crosses(growth_kb: u64, trip_kb: u64) -> bool {
-    trip_kb > 0 && growth_kb >= trip_kb
 }
 
 // COMPILE-TIME GATE: 10 samples + two usizes (96 B on a 64-bit target,
@@ -609,8 +586,8 @@ pub const fn growth_crosses(growth_kb: u64, trip_kb: u64) -> bool {
 const _: () = {
     const EXPECTED: usize = 10 * 8 + 2 * core::mem::size_of::<usize>();
     assert!(
-        core::mem::size_of::<LeakWatch<10>>() == EXPECTED,
-        "CRITICAL: LeakWatch<10> must stay 10 x u64 + 2 x usize"
+        core::mem::size_of::<TrendRing<10>>() == EXPECTED,
+        "CRITICAL: TrendRing<10> must stay 10 x u64 + 2 x usize"
     );
 };
 
@@ -656,16 +633,16 @@ mod tests {
     }
 
     #[test]
-    fn leak_watch_reports_only_a_full_monotonic_window() {
-        let mut w: LeakWatch<4> = LeakWatch::new();
-        assert!(w.is_empty());
+    fn trend_ring_reports_only_a_full_monotonic_window() {
+        let mut w: TrendRing<4> = TrendRing::new();
+        assert_eq!(w.window().samples, 0);
         // A short window is not evidence, however steep.
         assert_eq!(w.push(10), None);
         assert_eq!(w.push(1_000), None);
         assert_eq!(w.push(10_000), None);
-        assert!(!w.is_full());
+        assert!(!w.window().full);
         assert_eq!(w.push(20_000), Some(19_990));
-        assert!(w.is_full());
+        assert!(w.window().full);
         assert_eq!(w.len(), 4);
 
         // The window keeps wrapping: oldest is evicted, growth is recomputed
@@ -674,8 +651,8 @@ mod tests {
     }
 
     #[test]
-    fn leak_watch_clears_on_one_dip_and_needs_a_full_new_window() {
-        let mut w: LeakWatch<3> = LeakWatch::new();
+    fn trend_ring_clears_on_one_dip_and_needs_a_full_new_window() {
+        let mut w: TrendRing<3> = TrendRing::new();
         assert_eq!(w.push(100), None);
         assert_eq!(w.push(200), None);
         assert_eq!(w.push(300), Some(200));
@@ -683,17 +660,17 @@ mod tests {
         // A dip is not a leak, and it empties the evidence: the next two
         // samples cannot revive a verdict even though both rise again.
         assert_eq!(w.push(250), None);
-        assert!(w.is_full());
+        assert!(w.window().full);
         assert_eq!(w.push(260), None);
         assert_eq!(w.push(270), Some(20), "a fresh, full rising window");
 
         // A plateau is not a leak either: equality must fail the same test
         // a dip does, or a flat working set reads as rising forever.
-        let mut flat: LeakWatch<3> = LeakWatch::new();
+        let mut flat: TrendRing<3> = TrendRing::new();
         assert_eq!(flat.push(500), None);
         assert_eq!(flat.push(500), None);
         assert_eq!(flat.push(500), None);
-        let mut flat_then_rise: LeakWatch<3> = LeakWatch::new();
+        let mut flat_then_rise: TrendRing<3> = TrendRing::new();
         assert_eq!(flat_then_rise.push(500), None);
         assert_eq!(flat_then_rise.push(500), None);
         assert_eq!(
@@ -704,46 +681,21 @@ mod tests {
     }
 
     #[test]
-    fn leak_watch_of_zero_can_never_report() {
-        let mut w: LeakWatch<0> = LeakWatch::new();
+    fn trend_ring_of_zero_can_never_report() {
+        let mut w: TrendRing<0> = TrendRing::new();
         assert_eq!(w.push(1), None);
         assert_eq!(w.push(2), None);
         assert_eq!(w.len(), 0);
-        assert!(w.is_empty());
-        assert!(!w.is_full());
-    }
-
-    #[test]
-    fn growth_crosses_is_the_trip_mark_not_a_level() {
-        // The mark is a GROWTH: same absolute number, different verdicts.
-        assert!(!growth_crosses(0, 120));
-        assert!(!growth_crosses(119, 120));
-        assert!(growth_crosses(120, 120));
-        assert!(growth_crosses(4_096, 120));
-        // Zero disables the verdict rather than tripping on everything.
-        assert!(!growth_crosses(1_000_000, 0));
-    }
-
-    #[test]
-    fn leak_watch_feeds_growth_crosses() {
-        let mut w: LeakWatch<3> = LeakWatch::new();
-        let mut verdicts = [None; 4];
-        for (slot, sample) in verdicts.iter_mut().zip([1_000u64, 2_000, 3_000, 2_999]) {
-            *slot = w.push(sample).filter(|&growth| growth_crosses(growth, 120));
-        }
-        assert_eq!(
-            verdicts,
-            [None, None, Some(2_000), None],
-            "3000 - 1000 crosses, one dip below 3000 clears the window"
-        );
+        assert_eq!(w.window().samples, 0);
+        assert!(!w.window().full);
     }
 
     #[test]
     fn window_reads_ends_and_shape_without_consuming_evidence() {
-        let mut w: LeakWatch<4> = LeakWatch::new();
+        let mut w: TrendRing<4> = TrendRing::new();
         assert_eq!(
             w.window(),
-            LeakWindow {
+            TrendWindow {
                 samples: 0,
                 full: false,
                 rising: false,
@@ -776,7 +728,7 @@ mod tests {
 
     #[test]
     fn growth_rate_divides_by_the_span_the_caller_owns() {
-        let mut w: LeakWatch<4> = LeakWatch::new();
+        let mut w: TrendRing<4> = TrendRing::new();
         for sample in [1_000u64, 2_000, 3_000, 4_000] {
             w.push(sample);
         }
@@ -785,12 +737,12 @@ mod tests {
         assert_eq!(w.growth_rate_kb_sec(1_000), Some(1_000));
         // No interval, or a window that spans no time, names no rate.
         assert_eq!(w.growth_rate_kb_sec(0), None);
-        let mut one: LeakWatch<1> = LeakWatch::new();
+        let mut one: TrendRing<1> = TrendRing::new();
         one.push(7);
         assert_eq!(one.growth_rate_kb_sec(500), None, "N < 2 spans no time");
 
         // A dip clears the rate with the verdict.
-        let mut dipped: LeakWatch<3> = LeakWatch::new();
+        let mut dipped: TrendRing<3> = TrendRing::new();
         dipped.push(10);
         dipped.push(20);
         dipped.push(19);
@@ -799,7 +751,7 @@ mod tests {
 
     #[test]
     fn classification_names_every_shape() {
-        let mut warming: LeakWatch<3> = LeakWatch::new();
+        let mut warming: TrendRing<3> = TrendRing::new();
         warming.push(1);
         warming.push(2);
         assert_eq!(
@@ -807,7 +759,7 @@ mod tests {
             LeakClassification::Warming { samples: 2 }
         );
 
-        let mut steady: LeakWatch<3> = LeakWatch::new();
+        let mut steady: TrendRing<3> = TrendRing::new();
         for sample in [100u64, 150, 200] {
             steady.push(sample);
         }
@@ -816,7 +768,7 @@ mod tests {
             LeakClassification::Stable { growth_kb: 100 }
         );
 
-        let mut rising: LeakWatch<3> = LeakWatch::new();
+        let mut rising: TrendRing<3> = TrendRing::new();
         for sample in [100u64, 200, 300] {
             rising.push(sample);
         }
@@ -839,7 +791,7 @@ mod tests {
         assert!(rising.classify(120, 500).is_rising());
 
         // The sawtooth: a real leak that the monotonic trip can never see.
-        let mut saw: LeakWatch<4> = LeakWatch::new();
+        let mut saw: TrendRing<4> = TrendRing::new();
         for sample in [100u64, 400, 200, 500] {
             saw.push(sample);
         }
@@ -861,68 +813,113 @@ mod tests {
     }
 
     #[test]
-    fn trend_puts_the_level_above_the_verdict() {
+    fn verdict_carries_both_halves_and_never_masks_the_trend() {
         let mut trend: MemoryTrend<3> = MemoryTrend::new(1_000, 2_000, 120, 500);
-        assert_eq!(trend.sample(100), MemoryTrendVerdict::Ok);
-        assert_eq!(trend.sample(200), MemoryTrendVerdict::Ok);
         assert_eq!(
-            trend.sample(300),
-            MemoryTrendVerdict::Leaking {
-                growth_rate_kb_sec: 200
+            trend.sample(100).trend,
+            LeakClassification::Warming { samples: 1 }
+        );
+        assert_eq!(trend.sample(200).code(), "ok");
+        let leak = trend.sample(300);
+        assert_eq!(
+            leak,
+            MemoryReport {
+                level: MemoryVerdict::Ok,
+                trend: LeakClassification::Rising {
+                    growth_kb: 200,
+                    rate_kb_sec: Some(200),
+                },
             }
         );
-        assert!(trend.classification().is_rising());
+        assert!(leak.is_pressured(), "a leak refuses admissions");
+        assert!(leak.is_leaking());
+        assert!(!leak.is_hard());
+        assert_eq!(leak.code(), "leaking");
+        assert_eq!(leak.growth_rate_kb_sec(), Some(200));
         assert_eq!(trend.levels().used_kb(), 300);
         assert_eq!(trend.trip_kb(), 120);
 
-        // The level outranks: Soft is never reported as Leaking.
-        assert_eq!(trend.sample(1_500), MemoryTrendVerdict::Soft);
-        assert_eq!(trend.sample(2_500), MemoryTrendVerdict::Hard);
+        // The level fires on its own, and the trend stays readable: a Soft
+        // report over a still-rising ring shows BOTH halves (0.7 masked the
+        // trend behind the level; that is the trap this test pins).
+        let soft = trend.sample(1_500);
+        assert_eq!(soft.level, MemoryVerdict::Soft);
+        assert_eq!(
+            soft.trend,
+            LeakClassification::Rising {
+                growth_kb: 1_300,
+                rate_kb_sec: Some(1_300),
+            },
+            "a level episode must not blind the window"
+        );
+        assert_eq!(soft.code(), "soft");
+        assert_eq!(trend.sample(2_500).level, MemoryVerdict::Hard);
         assert_eq!(trend.levels().peak_kb(), 2_500);
 
-        // The ring kept sampling through the level episode: it still sees.
-        let mut blind: MemoryTrend<3> = MemoryTrend::new(1_000, 2_000, 0, 500);
-        for sample in [10u64, 20, 30] {
-            assert_eq!(blind.sample(sample), MemoryTrendVerdict::Ok);
-        }
-        assert_eq!(
-            blind.classification(),
-            LeakClassification::Stable { growth_kb: 20 },
-            "trip 0 disables the verdict, not the ring"
-        );
-    }
-
-    #[test]
-    fn leaking_verdict_carries_its_rate_and_flags() {
-        let leaking = MemoryTrendVerdict::Leaking {
-            growth_rate_kb_sec: 42,
-        };
-        assert_eq!(leaking.code(), "leaking");
-        assert!(leaking.is_pressured(), "a leak refuses admissions");
-        assert!(leaking.is_leaking());
-        assert!(!leaking.is_hard());
-        assert_eq!(leaking.growth_rate_kb_sec(), Some(42));
-        assert_eq!(
-            leaking.level(),
-            MemoryVerdict::Ok,
-            "a leak is under both limits; the level half says so"
-        );
-        assert_eq!(MemoryTrendVerdict::Ok.growth_rate_kb_sec(), None);
-        assert_eq!(MemoryTrendVerdict::Soft.growth_rate_kb_sec(), None);
-        assert!(!MemoryTrendVerdict::Soft.is_leaking());
-        assert!(!MemoryTrendVerdict::Ok.is_pressured());
-        assert_eq!(MemoryTrendVerdict::Soft.level(), MemoryVerdict::Soft);
-        assert_eq!(MemoryTrendVerdict::Hard.level(), MemoryVerdict::Hard);
+        // `verdict()` reads without feeding: the same report twice.
+        let read = trend.verdict();
+        assert_eq!(read, trend.verdict());
+        assert_eq!(trend.samples(), 3);
+        assert_eq!(trend.newest_kb(), Some(2_500));
 
         // A level-only trend can never report a leak.
         let mut levels: MemoryTrend<3> = MemoryTrend::levels_only(1_000, 2_000);
         for sample in [10u64, 20, 30, 40] {
             assert!(!levels.sample(sample).is_leaking());
         }
+        let soft_only = levels.sample(1_001);
         assert_eq!(
-            levels.sample(1_001),
-            MemoryTrendVerdict::Soft,
-            "limits still fire with the trend disabled"
+            soft_only.level,
+            MemoryVerdict::Soft,
+            "limits still fire with the leak verdict disabled"
+        );
+        assert!(
+            !soft_only.is_leaking(),
+            "trip 0 disables the verdict even over a rising window"
+        );
+    }
+
+    #[test]
+    fn report_defaults_and_flags_cover_every_half() {
+        let ok = MemoryReport::default();
+        assert_eq!(ok.level, MemoryVerdict::Ok);
+        assert_eq!(ok.trend, LeakClassification::Warming { samples: 0 });
+        assert!(!ok.is_pressured());
+        assert_eq!(ok.code(), "ok");
+        assert_eq!(ok.growth_rate_kb_sec(), None);
+
+        let hard = MemoryReport {
+            level: MemoryVerdict::Hard,
+            trend: LeakClassification::Rising {
+                growth_kb: 400,
+                rate_kb_sec: Some(42),
+            },
+        };
+        assert!(hard.is_hard());
+        assert!(hard.is_pressured());
+        assert_eq!(hard.code(), "hard", "the level outranks the trend text");
+        assert_eq!(hard.growth_rate_kb_sec(), Some(42));
+
+        let soft = MemoryReport {
+            level: MemoryVerdict::Soft,
+            ..MemoryReport::default()
+        };
+        assert_eq!(soft.code(), "soft");
+        assert!(soft.is_pressured());
+        assert!(!soft.is_leaking());
+
+        let leaking = MemoryReport {
+            trend: LeakClassification::Rising {
+                growth_kb: 400,
+                rate_kb_sec: None,
+            },
+            ..MemoryReport::default()
+        };
+        assert_eq!(leaking.code(), "leaking");
+        assert_eq!(
+            leaking.growth_rate_kb_sec(),
+            None,
+            "no interval, no rate — the verdict still stands"
         );
     }
 }
