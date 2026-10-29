@@ -571,10 +571,16 @@ fn test_quick_ref_layer_column_matches_chapters() {
         ("node.enter_async_auto` |", "3 / std"),
         ("guard.settle_async", "3 / std"),
         ("node.rollback_phase()", "1 / std"),
+        ("node.rollback_budget_ms()", "1 / std"),
         ("node.builder(..).rollback_budget_ms(n)", "1 / std"),
         ("RollbackReentrancy::{Allow, Refuse}", "1 / std"),
-        ("snubber::watchdog::poll_rollback", "1 / std"),
+        ("snubber::watchdog::poll_rollback_node(&node)", "1 / std"),
+        (
+            "snubber::watchdog::poll_rollback(&node, budget_ms)",
+            "1 / std",
+        ),
         ("MemoryPolicy::new", "4 / std"),
+        ("LeakWatch<N>::push(sample)", "4 / core"),
         ("Supervisor::run_supervised_guard_with_memory", "4 / std"),
         ("`PipeDrain` + `ProcessToken`", "4 / std"),
         ("lane.attach", "4 / std"),
@@ -858,6 +864,288 @@ fn test_bench_erased_row_names_the_api_the_bench_calls() {
              wrong lifetime"
         );
     }
+}
+
+/// The erased row was ONE instance of a class: the label of every other row
+/// was pinned by nothing either, and the two exporters that render
+/// `target/bench/snapshot.md` carried their own, third copy of every label.
+/// This gate closes the class:
+///
+/// 1. `scripts/bench.sh` and `scripts/bench.ps1` publish the SAME 50+ labels
+///    (a fix applied to one exporter only is a drift).
+/// 2. Every literal `bench_function("key")` in the bench source is mapped, so
+///    no row is published under a bare snake_case key.
+/// 3. For each mapped bench, its closure CALLS at least one function whose
+///    name appears in its label. This is what fails when an API is renamed
+///    but its row is not: the label names something the bench never runs.
+/// 4. The committed artifact and BENCHMARKS.md carry that same spelling, so
+///    the doc, the exporter and the frozen numbers cannot label one
+///    measurement three ways. Contended rows are listed in BENCHMARKS.md by
+///    their Criterion key, so only the artifact arm applies to them.
+///
+/// Not covered: a label may name a real API the closure calls and still
+/// describe it badly (`node.enter + commit` for a scoped cycle passes). The
+/// gate catches wrong NAMES, not imprecise prose.
+#[test]
+fn test_bench_labels_name_what_the_bench_calls() {
+    let bench_src = read_doc("benches/admission_bench.rs");
+    let sh_map = exporter_labels(&read_doc("scripts/bench.sh"), "labels = {", ":");
+    let ps_map = exporter_labels(&read_doc("scripts/bench.ps1"), "$labels = @{", "=");
+    assert!(
+        sh_map.len() >= 50,
+        "the exporter label maps shrank to {} entries — the parser or the map broke",
+        sh_map.len()
+    );
+    assert_eq!(
+        sh_map, ps_map,
+        "TRIPWIRE FIRED: scripts/bench.sh and scripts/bench.ps1 publish different \
+         labels for the same Criterion keys; one snapshot table, one spelling"
+    );
+
+    let bench_bodies = bench_bodies(&bench_src);
+    assert!(
+        bench_bodies.len() >= 40,
+        "closure parser found only {} literal bench functions — the bench file \
+         changed shape and this oracle is going vacuously green",
+        bench_bodies.len()
+    );
+
+    for (key, _) in &bench_bodies {
+        assert!(
+            sh_map.iter().any(|(k, _)| k == key),
+            "TRIPWIRE FIRED: bench `{key}` is not mapped in either exporter — it \
+             would publish under its snake_case function name next to mapped rows"
+        );
+    }
+    let loop_prefixes = format_bench_prefixes(&bench_src);
+    assert!(
+        !loop_prefixes.is_empty(),
+        "no loop-built bench found — the contended group changed shape"
+    );
+
+    for (key, body) in &bench_bodies {
+        let label = &sh_map
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, l)| l)
+            .expect("every literal key is mapped (asserted above)");
+        let calls = called_names(body);
+        let label_lc = label.to_lowercase();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.len() > 2 && label_lc.contains(&c.to_lowercase())),
+            "TRIPWIRE FIRED: bench `{key}` is labelled {label:?}, but its closure \
+             calls only {calls:?} — the row names an API the bench never runs \
+             (measured 2026-10-28: the erased row said `enter_erased_auto` while \
+             the bench called `probe_erased_auto`)"
+        );
+    }
+
+    let artifact_cells = operation_cells(&read_doc("docs/evidence/2026-10-26_bench_snapshot.md"));
+    let doc_cells = operation_cells(&read_doc("BENCHMARKS.md"));
+    for (key, label) in &sh_map {
+        let wanted = normalize_cell(label);
+        assert!(
+            artifact_cells.iter().any(|c| c.starts_with(&wanted)),
+            "TRIPWIRE FIRED: the committed bench artifact has no row labelled \
+             {label:?} (key `{key}`) — the exporter label moved but the snapshot \
+             was not refreshed, or the artifact was hand-edited away from it"
+        );
+        if loop_prefixes.iter().any(|p| key.starts_with(p)) {
+            continue;
+        }
+        // The contended table lists a row by its Criterion key instead of the
+        // exporter label; that is still one row for one bench, spelled once.
+        assert!(
+            doc_cells
+                .iter()
+                .any(|c| c.starts_with(&wanted) || c.starts_with(key.as_str())),
+            "TRIPWIRE FIRED: BENCHMARKS.md has no row labelled {label:?} (key \
+             `{key}`) — either add the row or rename it to the exporter's \
+             spelling; a reader cannot match the doc to the artifact otherwise"
+        );
+    }
+}
+
+/// `<key> -> <label>` pairs from an exporter's label map, parsed without a
+/// regex crate: the block runs from `opener` to the first line that is `}`.
+fn exporter_labels(src: &str, opener: &str, sep: &str) -> Vec<(String, String)> {
+    let start = src
+        .find(opener)
+        .unwrap_or_else(|| panic!("export label map `{opener}` missing"));
+    let block = &src[start + opener.len()..];
+    let end = block
+        .lines()
+        .scan(0usize, |offset, line| {
+            let at = *offset;
+            *offset += line.len() + 1;
+            Some((at, line))
+        })
+        .find(|(_, line)| line.trim() == "}")
+        .map(|(at, _)| at)
+        .unwrap_or_else(|| panic!("export label map `{opener}` never closes"));
+    let mut out = Vec::new();
+    for line in block[..end].lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix('"') else {
+            continue;
+        };
+        let Some((key, rest)) = rest.split_once('"') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix(sep) else {
+            continue;
+        };
+        let Some(rest) = rest.trim().strip_prefix('"') else {
+            continue;
+        };
+        let Some((label, _)) = rest.split_once('"') else {
+            continue;
+        };
+        out.push((key.to_string(), label.to_string()));
+    }
+    out
+}
+
+/// `(key, closure body)` for every `bench_function("key", |b| { … })`, found
+/// by brace matching that skips string literals (bodies contain `{:?}`).
+fn bench_bodies(src: &str) -> Vec<(String, String)> {
+    const CALL: &str = "bench_function(\"";
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while let Some(hit) = src[pos..].find(CALL) {
+        let key_start = pos + hit + CALL.len();
+        let Some(key_len) = src[key_start..].find('"') else {
+            break;
+        };
+        let key = &src[key_start..key_start + key_len];
+        let Some(pipe) = src[key_start..].find("|b|") else {
+            break;
+        };
+        let pipe = key_start + pipe;
+        let Some(brace) = src[pipe..].find('{') else {
+            break;
+        };
+        let brace = pipe + brace;
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut end = None;
+        for (off, ch) in src[brace..].char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(brace + off);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        out.push((key.to_string(), src[brace..=end].to_string()));
+        pos = end;
+    }
+    out
+}
+
+/// Literal prefixes of the loop-built bench names (`format!("key_{n}")`).
+fn format_bench_prefixes(src: &str) -> Vec<String> {
+    const FMT: &str = "format!(\"";
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while let Some(hit) = src[pos..].find(FMT) {
+        let start = pos + hit + FMT.len();
+        let Some(open) = src[start..].find('{').map(|i| start + i) else {
+            break;
+        };
+        let prefix = &src[start..open];
+        if !prefix.is_empty() {
+            out.push(prefix.to_string());
+        }
+        pos = open;
+    }
+    out
+}
+
+/// Identifiers immediately followed by `(`, wherever they are called.
+fn called_names(body: &str) -> Vec<String> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    for (i, ch) in chars.iter().enumerate() {
+        if *ch != '(' || i == 0 {
+            continue;
+        }
+        let mut j = i;
+        while j > 0 && (chars[j - 1].is_ascii_alphanumeric() || chars[j - 1] == '_') {
+            j -= 1;
+        }
+        if j == i {
+            continue;
+        }
+        let name: String = chars[j..i].iter().collect();
+        if name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
+            && !out.contains(&name)
+        {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// First cell of every markdown table row, backticks stripped, arrow folded
+/// to ASCII, whitespace collapsed — comparable across the three files.
+fn operation_cells(doc: &str) -> Vec<String> {
+    doc.lines()
+        .filter(|line| line.starts_with("| "))
+        .filter_map(|line| line.split('|').nth(1))
+        .map(normalize_cell)
+        .filter(|cell| {
+            !cell.is_empty() && cell != "Operation" && cell.chars().any(|c| c.is_alphanumeric())
+        })
+        .collect()
+}
+
+fn normalize_cell(cell: &str) -> String {
+    let mut out = String::with_capacity(cell.len());
+    let mut pending_space = false;
+    for ch in cell.chars() {
+        if ch == '`' {
+            continue;
+        }
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        match ch {
+            '→' => out.push_str("->"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Any `manual_with_clock` snippet in the public docs must declare the

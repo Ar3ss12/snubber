@@ -4,6 +4,61 @@ All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.
 the audit-batch fix tables live at the bottom of this file, and the
 current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
+## Unreleased
+
+Four follow-ups from the 2026-10-29 audit of the 0.7.0 integration. Two
+close a class of drift (a threshold and a label that could disagree with
+the code they describe), one publishes a measurement that was missing,
+and one moves a detector the consumer had already written twice.
+
+### Added
+
+- `SnubberNode::rollback_budget_ms()`: the budget the node was built
+  with, `0` when the clock is unarmed. The observer no longer has to keep
+  its own copy of a number the builder owns — that copy is how a watcher
+  ends up timing bodies against a budget no node ever armed.
+- `watchdog::poll_rollback_node(&node)`: the same read as `poll_rollback`,
+  timed against the node's own budget. This is the form a supervisor tick
+  should call; the 0.6-shaped `poll_rollback(&node, budget_ms)` stays
+  exactly as it was (a public signature is a contract, and the semver gate
+  treats an arity change as breaking even under the 0.x minor rule), so
+  the threshold can come from the caller but the default can no longer
+  drift from the builder.
+- `LeakWatch<const N: usize>` + `growth_crosses(growth_kb, trip_kb)` in
+  `memory` (core, `Copy`, 96 B at `N = 10` on 64-bit, 88 B on 32-bit): the leak is a DERIVATIVE,
+  not a level. `push` returns `Some(newest − oldest)` only when the ring
+  is full and every sample beats its predecessor; one sample below its
+  predecessor clears the window, because a healthy process oscillates.
+  `N` and the trip mark stay caller policy (`N = 0` never reports,
+  `trip_kb == 0` disables the verdict). The crate still measures nothing:
+  the caller feeds one external sample per tick. Tests: partial window,
+  full strictly-rising window, wrap-around recompute, one dip, `N = 0`,
+  the trip mark as a growth, and the two composed. Doc-synced into
+  `USER_GUIDE.md` §6 and the quick reference; `INVARIANTS.md`
+  Invariant 8 states the rule.
+- Contended bench row `enter_erased_holding_auto + commit (6 threads)`:
+  the holding erased path had no saturation number, so its cost under
+  contention was unquoted. Measured 2026-10-29 on the same host and
+  settings as the 2026-10-26 table: 1157.9 / 1180.2 ns on two full runs
+  (~1158 ns published in `BENCHMARKS.md` and the evidence snapshot).
+
+### Changed
+
+- `watchdog::poll_rollback_node(node)` is the form a supervisor tick
+  should call: it reads the node's own budget. `tests/rollback_guardrails.rs`
+  pins both directions (unarmed node → `None` even with a caller budget;
+  armed node → `budget_ms` equals the builder's), and NanoClick's 1 Hz
+  watcher and release latch were migrated to it.
+- `tests/doc_sync.rs` now pins bench row LABELS, not only numbers. A
+  wrong label (`enter_erased_auto` naming the `probe_erased_auto` row)
+  survived the 2026-10-28 doc fix because the exporters carried a third
+  copy of every label: the next bench run would have restored it. The
+  gate reads the literal closures out of `benches/admission_bench.rs`,
+  requires every label to name a function its closure actually calls,
+  requires both exporter maps to agree, and requires the artifact and
+  `BENCHMARKS.md` cells to start with that label (or the Criterion key).
+  It catches wrong NAMES, not imprecise prose.
+
 ## 0.7.0 (2026-10-28)
 
 Four seams the first consumer had already worked around in application

@@ -2171,6 +2171,17 @@ impl SnubberNode {
         stats
     }
 
+    /// The rollback budget this node was built with, in milliseconds.
+    ///
+    /// `0` means the clock is not armed: no body is timed, and
+    /// [`crate::watchdog::poll_rollback`] can never name a stall. Read by
+    /// the observer so its threshold cannot drift from the builder's.
+    #[must_use]
+    #[inline]
+    pub fn rollback_budget_ms(&self) -> u64 {
+        self.rollback_budget_ms
+    }
+
     /// Lock-free rollback-phase view: is a rollback body running, for how
     /// long, and for which transaction?
     ///

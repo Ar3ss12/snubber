@@ -56,20 +56,22 @@ reads as an operation rather than a Criterion key. Differences below
 | `IsrBridge::trip` + `take_trips` | Layer 1.5 (`core`) | **~9.3 ns** | 32-bit latch swap; trip bypasses a full ring |
 | `node.enter + commit` | Layer 2 (`std`) | **~91 ns** | Full bulkhead, circuit breaker, auto-commit; no clock read when neither the token bucket nor a deadline is armed (unstamped guard) |
 | `node.enter_auto + commit` | Layer 2 (`std`) | **~93 ns** | + atomic sequence minting |
+| `node.scoped (work + auto-commit)` | Layer 2 (`std`) | **~88 ns** | Canonical closure entry: admission + work + auto-commit in one call |
 | `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~87 ns** | Priority lane; same band as plain enter (one measurement) |
 | `node.transition` | Layer 2 (`std`) | **~90 ns** | ONE-enum state machine, zero flag drift |
 | `node.transition_checked` + `LegalMove` | Layer 2 (`std`) | same path, no extra work | Compile-time only: the `LegalMove` proof erases to the same `transition` call; illegal moves fail at compile (E0277) |
 | `probe_erased_auto` + `commit` | Layer 2 (`alloc`) | **~205 ns** | ONE boxed transaction (rollback + commit hook + node clone in a single allocation; 0.6.8 moved the breaker outcome onto the guard's real `commit`). 301.6 → ~205 ns after folding two boxes and two `Arc` clones into one |
-| `node_passthrough_enter + commit` | Layer 2 (`std` canary) | **~55 ns** | Open-doors transit: lock-free count + unstamped dummy guard, no slots/breaker/`EpochGate`/clock |
-| `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~51 ns** | Same transit through `scoped()` — work runs, books stay clean |
+| `node_passthrough.enter + commit` | Layer 2 (`std` canary) | **~55 ns** | Open-doors transit: lock-free count + unstamped dummy guard, no slots/breaker/`EpochGate`/clock |
+| `node_passthrough.scoped + commit` | Layer 2 (`std` canary) | **~51 ns** | Same transit through `scoped()` — work runs, books stay clean |
 | `ConflateSender::publish + take_latest` | Layer 2 (`std`) | **~21.7 ns** | One-slot latest wins, no allocation, no `Clone` bound |
 | `ConflateSender::publish` (occupied slot) | Layer 2 (`std`) | **~15.7 ns** | Replaced value counted, never queued |
-| `guard.commit_enveloped(64)` | Layer 2 (`std`) | **~142 ns** | Payload corridor exact; wall corridor only for profiled guards |
+| `guard.commit_enveloped(64 B)` | Layer 2 (`std`) | **~142 ns** | Payload corridor exact; wall corridor only for profiled guards |
 | `TaskConduit::check_directive` | Layer 2 (`std`) | **~1.0 ns** | One atomic load per poll, no lock |
 | `gateway send -> recv roundtrip` | Layer 2 (`std`) | **~50.8 ns** | Bounded MPSC send plus receiver wake |
 | `gateway send` (HWM/LWM throttled) | Layer 2 (`std`) | **~16.8 ns** | Latch fast path while inside the high/low horizon |
-| `node.next_sequence()` | Layer 2 (`std`) | **~4.8 ns** | One atomic `fetch_add` ticket, shared across clones |
+| `node.next_sequence (auto ticket)` | Layer 2 (`std`) | **~4.8 ns** | One atomic `fetch_add` ticket, shared across clones |
 | `node.stats()` snapshot | Layer 2 (`std`) | **~58.4 ns** | One short lock, fold into `SnubberStats` |
+| `SnubberStats::shed_total + success_rate_per_mille` | Layer 2 (`std`, cold) | **~28.4 ns** | One fold over the stats card: shed totals and the success permille |
 | `enter_async_auto` | Layer 3 (`std`) | **0% CPU** | Pure `core::task::Waker` parking, no runtime deps |
 | `enter_async_auto_profiled` | Layer 3 (`std`, opt-in) | structural: 1 `Box` + 2 clock reads | Same waker parking, profile arms on the admitting poll |
 | `enter_async_auto` (ready poll) | Layer 3 (`std`) | **~156 ns** | Full admission through the future; the ready path allocates nothing |
@@ -80,12 +82,13 @@ reads as an operation rather than a Criterion key. Differences below
 | `process_token.to_bytes()` | Layer 4 (`core`) | **~7.9 ns** | 44-byte framed wire serialization (`to_le_bytes`) |
 | `ProcessToken::from_bytes()` | Layer 4 (`core`) | **~7.4 ns** | 40-byte body parse, no allocation |
 | `state_digest.crc()` | Layer 4 (`core`) | **~266 ns** | 64-byte hardware cache line digest verification |
-| `PipeDrain::drain_sync` | Layer 4 (`std`) | **~44.5 ns/frame** | 256 frames: 11.4 µs, 22.4M frames/s; the per-sample `PipeDrain` construction is included, so this is a pipeline cost, not a steady-state frame cost (see `feed` below) |
-| `PipeDrain::feed` (one 44 B frame) | Layer 4 (`std`) | **~98 ns** | Caller-pushed chunk: scanner + lock + dispatch, no reader thread |
-| `PipeDrain::feed` (256 frames/chunk) | Layer 4 (`std`) | **~10.7 µs** (42.0 ns/frame) | Same scanner: one ingest lock per chunk + one short state lock per token (0.6.8 took the clock read outside the lock) |
+| `PipeDrain::drain_sync (256 frames)` | Layer 4 (`std`) | **~44.5 ns/frame** | 256 frames: 11.4 µs, 22.4M frames/s; the per-sample `PipeDrain` construction is included, so this is a pipeline cost, not a steady-state frame cost (see `feed` below) |
+| `PipeDrain::feed (one frame)` | Layer 4 (`std`) | **~98 ns** | Caller-pushed chunk (one 44 B frame): scanner + lock + dispatch, no reader thread |
+| `PipeDrain::feed (256 frames)` | Layer 4 (`std`) | **~10.7 µs** (42.0 ns/frame) | Same scanner: one ingest lock per chunk + one short state lock per token (0.6.8 took the clock read outside the lock) |
 | `ProcessToken::write_to(&mut sink)` | Layer 4 (`std`) | **~1.8 ns** | 44 B `write_all` into any real `Write` (copy included): no env, no stdout lock |
 | `StateDigest::write_to(&mut sink)` | Layer 4 (`std`) | **~615 ns** | Three `OP_STATE` frames + CRC32 seals |
-| `namespace_task` pack / unpack | Layer 4 (`std`) | **~1.0 / 1.0 ns** | `task = lane << 48 \| local`; two shifts + mask, no branch |
+| `namespace_task::pack` | Layer 4 (`std`) | **~1.0 ns** | `task = lane << 48 \| local`; two shifts + mask, no branch |
+| `namespace_task::unpack (task_lane + task_local)` | Layer 4 (`std`) | **~1.0 ns** | The reverse: two masks, no branch |
 | `lane.attach` + `note_death` (ambush) → `PoolReap` | Layer 4 (`std`) | **~225 ns** | Full rescue path: drain EOF, token take, generation bump, restart math, per-class counters (drain built in setup; the shared idle lane is re-attached each sample) |
 | `lane.attach` + `note_death` (escape) → `PoolReap` | Layer 4 (`std`) | **~187 ns** | Same path when the child settled (commit parsed, no token) |
 | `pool.report()` (4 lanes) | Layer 4 (`std`) | **~107 ns** | Rows (`LaneSnapshot`) + `PoolTotals::of`: four short lane locks, totals fold, one `Vec<LaneSnapshot>` allocation (`lanes.len()` rows) included in the number |
@@ -98,9 +101,11 @@ reads as an operation rather than a Criterion key. Differences below
 | `enter_auto_profiled` + `checkpoint_timed` + `commit_profiled` | Layer 2 (`std`, opt-in) | structural: 1 `Box` + 1 clock/stage | Stage wall/CPU breakdown; default `enter*` reads no profile clock |
 | `snapshot_v1.encode()` | Layer 5 (`core`) | **~1.11 µs** | 512-byte zero-allocation snapshot CRC32 codec |
 | `friction_fn` handler call (`Arc<dyn Fn>`) | Layer 2 (`std`) | **~1.8 ns** | Capture-capable friction: one dynamic dispatch outside the node lock |
-| `friction_wait_ms` (adaptive, Arc handler) | Layer 2 (`std`) | **~21.7 ns** | Lock + `Arc` clone + handler; identical to the legacy fn-pointer path (~21.8 ns) |
+| `friction_wait_ms` (adaptive, Arc handler) | Layer 2 (`std`) | **~21.7 ns** | Lock + `Arc` clone + handler; identical to the legacy fn-pointer path below |
+| `friction_wait_ms (adaptive, fn)` | Layer 2 (`std`) | **~21.8 ns** | Same wait through a plain `fn` pointer: no clone, same band |
 | `NodeName::Static` clone | Layer 2 (`alloc`) | **~1.5 ns** | Fat-pointer copy, no allocation |
-| `NodeName::Owned` clone | Layer 2 (`alloc`) | **~10.0 ns** | One `Arc<str>` increment; `as_str` ~1.0 ns |
+| `NodeName::Owned` clone | Layer 2 (`alloc`) | **~10.0 ns** | One `Arc<str>` increment |
+| `NodeName::as_str` | Layer 2 (`alloc`) | **~1.0 ns** | Deref to the borrowed str; no copy, no allocation |
 | `snapshot_v1()` + `find_anomalies()` | Layer 5 (cold) | structural: 512 B, CRC32 | Zero-allocation telemetry; `assert_no_anomalies!()` CI gate |
 | `before.diff(&after)` + `write_triage` | Layer 5 (cold) | structural: pure `Copy` math + `fmt::Write` | Counter deltas since last sample; one ASCII verdict card |
 | `memory_limits(soft, hard)` + admission | Layer 2 (`std`) | structural: 1 relaxed load | Over soft → `EnterError::MemoryPressure` without taking the mutex |
@@ -125,6 +130,7 @@ Measured with 6 concurrent OS threads under contention (no CPU affinity pinning)
 |---|---|---|---|
 | `contended_node_enter_threads_6` | 6 threads | **~971 ns** | Mutex contention: cache-line transfer between threads |
 | `contended_node_scoped_threads_6` | 6 threads | **~923 ns** | Full transactional cycle under contention (entry + work + auto-commit) |
+| `enter_erased_holding_auto + commit (6 threads)` | 6 threads | **~1158 ns** | Holding erased admission: slot booked until `commit`, so each iteration pays admission + boxed transaction + release; the probe path beside it frees at entry and never shows this cost (measured 2026-10-29, read 1158 / 1180 ns on two full runs) |
 | `contended_gateway_mpsc_threads_6` | 6 threads | **~184 ns** | Bounded multi-producer channel write under parallel thread load |
 | `cross_thread_isr_bridge_push_pop` | 2 threads | **~40 ns** | Lock-free SPSC ring: cache-line handoff between threads |
 

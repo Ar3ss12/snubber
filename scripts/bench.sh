@@ -121,7 +121,7 @@ labels = {
     "node_next_sequence": "node.next_sequence (auto ticket)",
     "node_stats_snapshot": "node.stats() snapshot",
     "stats_telemetry_math": "SnubberStats::shed_total + success_rate_per_mille",
-    "erased_enter_auto_commit": "enter_erased_auto",
+    "erased_enter_auto_commit": "probe_erased_auto + commit",
     "drain_feed_frame": "PipeDrain::feed (one frame)",
     "drain_feed_256_frames": "PipeDrain::feed (256 frames)",
     "drain_sync_256_frames": "PipeDrain::drain_sync (256 frames)",
@@ -142,13 +142,14 @@ labels = {
     "lane_attach_reap_ambush": "lane.attach + note_death (ambush) -> PoolReap",
     "lane_attach_reap_escape": "lane.attach + note_death (escape) -> PoolReap",
     "namespace_task_pack": "namespace_task::pack",
-    "namespace_task_unpack": "namespace_task::unpack",
+    "namespace_task_unpack": "namespace_task::unpack (task_lane + task_local)",
     "note_memory_kb": "lane.note_memory_kb",
     "report_snapshot_4_lanes": "pool.report() (4 lanes)",
+    "contended_erased_holding_threads_6": "enter_erased_holding_auto + commit (6 threads)",
     "contended_node_enter_threads_6": "node.enter + commit (6 threads)",
     "contended_node_scoped_threads_6": "node.scoped (6 threads)",
     "contended_gateway_mpsc_threads_6": "gateway send (6 threads)",
-    "cross_thread_isr_bridge_push_pop": "IsrBridge push/pop (2 threads)",
+    "cross_thread_isr_bridge_push_pop": "IsrBridge::try_push + try_pop (2 threads)",
 }
 
 print("| Operation | Average Latency | Notes |")

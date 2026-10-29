@@ -23,7 +23,8 @@ frame/lane count; the doc test skips those tokens by rule.
 | `gateway send (6 threads)` | **183.7 ns** | contended_multithreaded bench |
 | `node.enter + commit (6 threads)` | **971.2 ns** | contended_multithreaded bench |
 | `node.scoped (6 threads)` | **923.0 ns** | contended_multithreaded bench |
-| `IsrBridge push/pop (2 threads)` | **40.0 ns** | contended_multithreaded bench |
+| `enter_erased_holding_auto + commit (6 threads)` | **1157.9 ns** | contended_multithreaded bench (2026-10-29 row, same host and settings) |
+| `IsrBridge::try_push + try_pop (2 threads)` | **40.0 ns** | contended_multithreaded bench |
 | `classify_stall_ceiling` | **2.0 ns** | layer1_5_hang_isr bench |
 | `IsrBridge::try_push + try_pop` | **7.1 ns** | layer1_5_hang_isr bench |
 | `IsrBridge::trip + take_trips` | **9.3 ns** | layer1_5_hang_isr bench |
@@ -48,7 +49,7 @@ frame/lane count; the doc test skips those tokens by rule.
 | `node.next_sequence (auto ticket)` | **4.8 ns** | layer2_telemetry bench |
 | `node.stats() snapshot` | **58.4 ns** | layer2_telemetry bench |
 | `SnubberStats::shed_total + success_rate_per_mille` | **28.4 ns** | layer2_telemetry bench |
-| `enter_erased_auto` | **205.4 ns** | layer3_alloc bench |
+| `probe_erased_auto + commit` | **205.4 ns** | layer3_alloc bench |
 | `PipeDrain::feed (256 frames)` | **10.74 us** | layer4_drain_feed bench |
 | `PipeDrain::feed (one frame)` | **98.5 ns** | layer4_drain_feed bench |
 | `friction_fn handler call (Arc<dyn Fn>)` | **1.8 ns** | layer4_extensibility bench |
@@ -69,6 +70,6 @@ frame/lane count; the doc test skips those tokens by rule.
 | `lane.attach + note_death (ambush) -> PoolReap` | **225.3 ns** | layer4_worker_pool bench |
 | `lane.attach + note_death (escape) -> PoolReap` | **186.9 ns** | layer4_worker_pool bench |
 | `namespace_task::pack` | **1.0 ns** | layer4_worker_pool bench |
-| `namespace_task::unpack` | **1.0 ns** | layer4_worker_pool bench |
+| `namespace_task::unpack (task_lane + task_local)` | **1.0 ns** | layer4_worker_pool bench |
 | `lane.note_memory_kb` | **11.9 ns** | layer4_worker_pool bench |
 | `pool.report() (4 lanes)` | **106.9 ns** | layer4_worker_pool bench |

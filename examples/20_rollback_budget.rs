@@ -5,8 +5,9 @@
 //! (`#![forbid(unsafe_code)]`) and does not kill caller threads; what it can
 //! do is say so from another thread without the node lock.
 //!
-//! `snubber::watchdog::poll_rollback` reads the phase atomics and returns
-//! `RollbackStall` once the body outlives the budget armed on the node.
+//! `snubber::watchdog::poll_rollback_node` reads the phase atomics and returns
+//! `RollbackStall` once the body outlives the budget armed on the node —
+//! the same number the builder took, so the observer cannot drift from it.
 //! This process finishes in under two seconds even though the worker thread
 //! never returns: `main` reports the verdict and exits.
 //!
@@ -15,7 +16,7 @@
 //! cargo run --example 20_rollback_budget
 //! ```
 
-use snubber::watchdog::poll_rollback;
+use snubber::watchdog::poll_rollback_node;
 use snubber::SnubberNode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,7 +52,7 @@ fn main() {
     // the library enforces — it reports what it measured.
     let deadline = Instant::now() + GIVE_UP;
     loop {
-        if let Some(stall) = poll_rollback(&node, BUDGET_MS) {
+        if let Some(stall) = poll_rollback_node(&node) {
             println!(
                 "RollbackStall epoch={} task_id={} elapsed_ms={} budget_ms={}",
                 stall.epoch, stall.task_id, stall.elapsed_ms, stall.budget_ms

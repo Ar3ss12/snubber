@@ -776,6 +776,64 @@ fn bench_contended(c: &mut Criterion) {
             });
         });
     }
+    // IDEAL-4: the HOLDING erased admission under contention. Separate from
+    // IDEAL-2 because its cost shape differs: the slot stays booked until
+    // `commit`, so every iteration pays a real admission and a real release
+    // in addition to the boxed transaction — the probe path beside it frees
+    // the slot at entry and never shows that cost.
+    {
+        let node = Arc::new(
+            SnubberNode::builder("bench_contended_erased_holding")
+                .max_in_flight(65536)
+                .trip_after_failures(0)
+                .build(),
+        );
+        let name = format!("contended_erased_holding_threads_{concurrency}");
+        g.bench_function(name, |b| {
+            let node = Arc::clone(&node);
+            b.iter_custom(|iters| {
+                let iters_per_thread = (iters as usize / concurrency).max(1);
+                let barrier = Arc::new(Barrier::new(concurrency + 1));
+                let admitted = Arc::new(AtomicU64::new(0));
+                let mut handles = Vec::with_capacity(concurrency);
+                for _ in 0..concurrency {
+                    let n = Arc::clone(&node);
+                    let a = Arc::clone(&admitted);
+                    let br = Arc::clone(&barrier);
+                    handles.push(thread::spawn(move || {
+                        br.wait();
+                        for _ in 0..iters_per_thread {
+                            let mut entered = false;
+                            for _ in 0..64 {
+                                match n.enter_erased_holding_auto(|| {}) {
+                                    Ok(guard) => {
+                                        guard.commit();
+                                        a.fetch_add(1, Ordering::Relaxed);
+                                        entered = true;
+                                        break;
+                                    }
+                                    Err(_) => thread::yield_now(),
+                                }
+                            }
+                            assert!(entered, "holding erased retry exhausted after 64 attempts");
+                        }
+                    }));
+                }
+                let start = std::time::Instant::now();
+                barrier.wait();
+                for h in handles {
+                    h.join().expect("bench worker panicked");
+                }
+                let elapsed = start.elapsed();
+                assert_eq!(
+                    admitted.load(Ordering::Relaxed),
+                    (iters_per_thread * concurrency) as u64,
+                    "iter_custom multiplies by `iters`; every iteration must admit"
+                );
+                elapsed
+            });
+        });
+    }
     // IDEAL-3: MPSC gateway flood, N producers + 1 drain core.
     {
         let name = format!("contended_gateway_mpsc_threads_{concurrency}");

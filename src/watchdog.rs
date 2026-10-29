@@ -16,7 +16,6 @@
 //! The module also carries [`poll_rollback`], the outside-the-lock observer
 //! that names a rollback body which never returned (a read-only companion
 //! to [`isolate_once`], not another thread).
-
 #[cfg(feature = "std")]
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -64,23 +63,14 @@ pub struct RollbackStall {
     pub budget_ms: u64,
 }
 
-/// Names a rollback body that has run past `budget_ms`, from outside the
-/// node lock.
+/// Names a rollback body that has run past a threshold the CALLER sets.
 ///
-/// A pure read: no lock, no thread, no allocation — one pass over the
-/// node's phase atomics (see [`crate::RollbackPhase`]). The caller decides
-/// where to poll from (a supervisor tick, a `main` loop, a watchdog task)
-/// and how often; the verdict reports what was measured, not a deadline
-/// the library enforces.
-///
-/// Returns `None` when no body is active, when `budget_ms == 0` (no
-/// threshold), or while the body is still inside the budget. The elapsed
-/// clock belongs to the node, so the node must arm
-/// [`crate::SnubberNodeBuilder::rollback_budget_ms`] with any non-zero
-/// value; otherwise `elapsed_ms` stays `0` by design and a 1 ms body is
-/// indistinguishable from a wedged one. Nothing is booked into
-/// [`crate::SnubberStats`] or the flight ring by this call — it is an
-/// observation, and observing a stall must not change the books.
+/// The 0.6 shape, kept because a public signature is a contract: the budget
+/// is a parameter, `0` means "not armed here". It cannot manufacture age —
+/// the node's clock must still be armed, otherwise `elapsed_ms` stays `0`
+/// and nothing is ever named. Prefer [`poll_rollback_node`] from a
+/// supervisor tick: a caller-side constant is exactly the number that drifts
+/// away from the builder.
 #[cfg(feature = "std")]
 #[inline]
 pub fn poll_rollback(node: &crate::SnubberNode, budget_ms: u64) -> Option<RollbackStall> {
@@ -97,4 +87,24 @@ pub fn poll_rollback(node: &crate::SnubberNode, budget_ms: u64) -> Option<Rollba
         elapsed_ms: phase.elapsed_ms,
         budget_ms,
     })
+}
+
+/// Names a rollback body that has run past the budget THE NODE WAS BUILT
+/// WITH, from outside the node lock.
+///
+/// This is the form to call from a supervisor tick: the threshold is read
+/// from the node ([`crate::SnubberNode::rollback_budget_ms`]) on the same
+/// pass that reads the phase, so a watcher cannot outlive a builder change
+/// and time a body against a number the node never armed. A node built
+/// without `rollback_budget_ms` has no threshold — `None`, never an
+/// invented age.
+///
+/// A pure read: no lock, no thread, no allocation. Nothing is booked into
+/// [`crate::SnubberStats`] or the flight ring — observing a stall must not
+/// change the books. Use [`poll_rollback`] only when the caller's threshold
+/// deliberately differs from the builder's.
+#[cfg(feature = "std")]
+#[inline]
+pub fn poll_rollback_node(node: &crate::SnubberNode) -> Option<RollbackStall> {
+    poll_rollback(node, node.rollback_budget_ms())
 }

@@ -67,7 +67,7 @@ capacity with `BulkheadFull`, async parks as `Pending`, erased scopes are
 granted because their slot was released at admission). The invariant is
 about OUR lock; a rollback that re-takes a FOREIGN mutex the caller's
 `work()` already holds hangs anyway: no counter books it, and only an
-external `watchdog::poll_rollback` names the still-active body.
+external `watchdog::poll_rollback_node` names the still-active body.
 The open-call window itself is observable from any thread without the
 lock: `SnubberNode::rollback_phase()` reads plain atomics (two writes per
 body, a clock stamp only when `rollback_budget_ms` is armed) and names the
@@ -123,6 +123,13 @@ only move a `Copy` verdict; the crate never measures memory itself.
   tmp + `sync_all` + `rename`, page-cache eviction (`posix_fadvise`) and
   validation of the file body are app-owned. A kill mid-write leaves no
   sealed file, hence no valid ticket.
+- A leak is judged by its derivative, never its level: `LeakWatch<N>::push`
+  returns a growth only for a FULL ring whose every sample beats its
+  predecessor, and one sample below its predecessor clears the window. A
+  rising 2 MiB step is not a leak at any absolute size, and an oscillation
+  is not evidence, so neither `soft_kb` nor a single high sample can be
+  dressed up as one. `N` and the trip mark (`growth_crosses`) are caller
+  policy; `N = 0` and `trip_kb == 0` are disabled, not "zero bytes".
 
 ### Invariant 9: Impedance Is Explicit (One Slot, Two Walls)
 Mismatched producer/consumer rates are handled by named primitives, never
@@ -329,13 +336,17 @@ library may kill a caller thread), so the guarantee is detect-and-report:
   `max_ms`, `stalls`).
 - When the body RETURNS past its budget, the node books the overrun as
   `FaultKind::RollbackStall` (Invariant 6).
-- While the body is STILL running past an observer's budget,
-  `watchdog::poll_rollback(node, budget_ms)` returns
-  `RollbackStall { epoch, task_id, elapsed_ms, budget_ms }`. It is a pure
-  read: it books no counter, appends no flight entry and mints no fault.
-  The observer supplies the cadence; the node supplies the clock.
+- While the body is STILL running past its budget,
+  `watchdog::poll_rollback_node(node)` returns
+  `RollbackStall { epoch, task_id, elapsed_ms, budget_ms }`, timed against
+  the budget the node was built with (`node.rollback_budget_ms()`), so a
+  watcher cannot drift from the builder. It is a pure read: it books no
+  counter, appends no flight entry and mints no fault. The observer
+  supplies the cadence; the node supplies the clock and the threshold.
+  `poll_rollback(node, budget_ms)` keeps the 0.6 shape with the threshold
+  from the caller, for an observer that outranks the builder.
 - The clock has one owner: without `rollback_budget_ms` the phase reports
-  `active` but `elapsed_ms == 0`, and `poll_rollback` returns `None`
+  `active` but `elapsed_ms == 0`, and neither form returns a verdict
   instead of inventing age. The `no_std` build keeps the same law; the
   observer itself lives under `std` (it needs no more than a thread the
   caller already has).
@@ -467,9 +478,9 @@ flavor) and `tests/doc_sync.rs` classify as follows:
 | `scripts/check_test_count.sh` | The suite that ran is green, its parsed counts clear the floor, and README.md publishes no test count | Oracle | Parses `cargo test` output; fails on any failure, on a suspiciously low parse, or on a `tests-N passed` badge / "N passing tests" claim returning to the README (0.6.11: the vanity badge was deleted, so the gate guards its absence) |
 | README snippets compile | Every runnable Rust block in README.md type-checks against the real API, so a pasted quick start cannot be stale | Oracle (the compile) with tripwire anchors | `cargo test --doc` compiles the fences through the `#[cfg(doctest)] #[doc = include_str!("../README.md")]` hook in `src/lib.rs` — the compiler is the oracle, so no assertion text is needed (0.6.11, after doc-bug H5: a README snippet carried a wrong arity). Two tripwires keep the mechanism itself from vanishing: `test_readme_is_wired_into_doctests` (a deleted hook would silently drop the README out of the doctest run) and `test_readme_fences_have_a_compile_verdict` (3 `rust,no_run` fences, `rust,ignore` capped at the one registered WITHOUT block, no modifier-free fence at all) |
 | README assets resolve off-GitHub | The README renders identically on crates.io / docs.rs, not only on GitHub | Tripwire | `cargo package` excludes `assets/` and the registry pages have no repository tree behind them, so a relative `src="assets/…"` is a broken picture there; `test_readme_assets_are_absolute` requires an `https://` href and checks that a raw.githubusercontent.com path still exists in the tree at the named branch (0.6.11) |
-| `rollback_guardrails` wedge canary | A rollback body that never returns is nameable from outside and never finishes | Oracle (real subprocess run) | The child arms `rollback_budget_ms`; a second thread of the child calls `watchdog::poll_rollback`; the parent requires the `RollbackStall` verdict BEFORE it kills the process. A child that only hangs fails the gate, so the assertion got stronger when the verdict arrived (0.6.12) |
+| `rollback_guardrails` wedge canary | A rollback body that never returns is nameable from outside and never finishes | Oracle (real subprocess run) | The child arms `rollback_budget_ms`; a second thread of the child calls `watchdog::poll_rollback_node`; the parent requires the `RollbackStall` verdict BEFORE it kills the process. A child that only hangs fails the gate, so the assertion got stronger when the verdict arrived (0.6.12) |
 | `lock_hierarchy::rollback_bodies_never_run_under_the_node_lock` | Rollback bodies never run under the node ledger lock | Tripwire (static scan, doc-comments stripped) | No stable lint names "a lock is held across this user callback"; the scan asserts its own site inventory (13), so a renamed or reformatted call site fails the gate instead of silently shrinking it (0.6.12) |
-| `rollback_guardrails` phase tests | A running rollback is observable from any thread without the lock | Oracle (real run) | Real threads park a body; a second thread reads `epoch`/`task_id`/`elapsed_ms` and `watchdog::poll_rollback`, including the unarmed-clock refusal (0.6.12) |
+| `rollback_guardrails` phase tests | A running rollback is observable from any thread without the lock | Oracle (real run) | Real threads park a body; a second thread reads `epoch`/`task_id`/`elapsed_ms` and `watchdog::poll_rollback_node`, including the unarmed-clock refusal (0.6.12) |
 | `rollback_guardrails::rollback_reentrancy_policy_refuse_returns_error` | Re-entrant admission is a per-thread policy: `Allow` counts, `Refuse` fails before any lock | Oracle (real run) | Sync arms a real bulkhead and async polls a real future; `classify()`/`backpressure()` pin the refusal class, and another thread is asserted unaffected (0.6.12) |
 
 Two rules follow for the next refactor: do not add a hand-maintained list of

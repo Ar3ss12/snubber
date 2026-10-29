@@ -91,7 +91,7 @@ How it works: the guard owns your rollback closure. `commit()` disarms it (succe
 ### Rules for the rollback closure:
 1. **Safe to run twice:** Releasing a button twice is fine; sending money twice is not — put terminal forward actions in `commit()`.
 2. **Fast and non-blocking:** Atomic stores, event flags, non-blocking sends.
-3. **Re-entrancy is allowed, not free:** the rollback body runs *outside* the node lock (Invariant 6, open-call), so calling back into the same node's admission from it does **not** deadlock — measured in `tests/rollback_guardrails.rs`. What actually happens: `scoped`/`scoped_checked` re-admission succeeds while a slot is free and returns `SnubberError::Admission(EnterError::BulkheadFull)` when the node is at capacity, because **your own rollback still holds its slot until it returns**; the async path returns `Poll::Pending` and wakes only when the body finishes. So a retry loop inside a rollback is a livelock of your thread, not a hang of the node. What is forbidden: re-locking a mutex that `work()` already holds (same thread → real hang, and the node books no verdict on its own — an outside `watchdog::poll_rollback` names the still-active body), and assuming the erased path will refuse you — `probe_erased_auto` releases admission at arm time, so nested erased scopes are granted by design.
+3. **Re-entrancy is allowed, not free:** the rollback body runs *outside* the node lock (Invariant 6, open-call), so calling back into the same node's admission from it does **not** deadlock — measured in `tests/rollback_guardrails.rs`. What actually happens: `scoped`/`scoped_checked` re-admission succeeds while a slot is free and returns `SnubberError::Admission(EnterError::BulkheadFull)` when the node is at capacity, because **your own rollback still holds its slot until it returns**; the async path returns `Poll::Pending` and wakes only when the body finishes. So a retry loop inside a rollback is a livelock of your thread, not a hang of the node. What is forbidden: re-locking a mutex that `work()` already holds (same thread → real hang, and the node books no verdict on its own — an outside `watchdog::poll_rollback_node` names the still-active body), and assuming the erased path will refuse you — `probe_erased_auto` releases admission at arm time, so nested erased scopes are granted by design.
 4. **Memory ordering:** The node's mutex protects node books only. Every guard runs a `SeqCst` fence before the rollback body (free on x86/x64) — but a fence pairs with NOTHING. If your rollback publishes to shared state that another thread reads, pair it yourself: store with `Release`, load with `Acquire` (or guard the state with your own lock). `Relaxed`×2 reads stale data.
 5. **Bind resource to guard:** Wrap the handle in `Protected::new(res, guard)` — `commit()` disarms the guard and returns the resource; any other exit executes rollback and drops the resource. Post-crash access becomes a compile error, not a forgotten `if`.
 6. **Seal the scope:** Prefer `node.scoped_sealed(rb, work)` where thread-leakage is the threat — the `!Send` `ScopeToken` makes `spawn` with context a compile error (E0277).
@@ -110,13 +110,14 @@ if phase.active && phase.elapsed_ms > my_budget_ms {
 }
 ```
 
-`watchdog::poll_rollback(node, budget_ms)` packages that read into a typed
-verdict for the "it never returned" case — still no lock, no thread, no
-allocation, and it books nothing:
+`watchdog::poll_rollback_node(node)` packages that read into a typed verdict
+for the "it never returned" case — still no lock, no thread, no allocation,
+and it books nothing. The threshold is the budget the node was built with,
+so a watcher cannot time a body against a number the node never armed:
 
 ```rust
-use snubber::watchdog::poll_rollback;
-if let Some(stall) = poll_rollback(&node, 200) {
+use snubber::watchdog::poll_rollback_node;
+if let Some(stall) = poll_rollback_node(&node) {
     // stall.epoch / stall.task_id / stall.elapsed_ms / stall.budget_ms
 }
 ```
@@ -124,7 +125,11 @@ if let Some(stall) = poll_rollback(&node, 200) {
 You choose where to poll from (a supervisor tick, a `main` loop) and how
 often. The elapsed clock belongs to the node, so `rollback_budget_ms(..)`
 must be armed as well; otherwise `elapsed_ms` stays `0` and the function
-returns `None` instead of inventing age.
+returns `None` instead of inventing age. When your observer's threshold
+must differ from the builder's (an external SLA, a test that has to see
+the body sooner), the 0.6-shaped `poll_rollback(&node, my_budget_ms)` still
+takes it explicitly — it can be stricter than the builder, but it can no
+more manufacture age than the node form.
 
 **What to do instead of re-locking the foreign mutex.** Queue the
 compensating action (a lock-free send, an atomic flag) and let the thread
@@ -822,6 +827,28 @@ match verdict {
   streak, never trips the breaker); `stats().memory_pressure` mirrors the flag.
 * **`MemoryWatch` / `MemoryVerdict`** are `core`-only and `Copy` (32 B), so
   firmware can reuse the verdict math without the `std` node.
+* **`LeakWatch<N>` is the derivative, not the level.** `MemoryWatch` answers
+  "over budget yet"; a leak is a working set that rises on every sample of a
+  full window without one dip. Feed it the same 1 Hz (or 30 s) sample:
+
+  ```rust
+  use snubber::{growth_crosses, LeakWatch};
+
+  // 10 samples = five minutes of evidence at 30 s.
+  let mut leak: LeakWatch<10> = LeakWatch::new();
+  if let Some(growth_kb) = leak.push(rss_kb) {
+      if growth_crosses(growth_kb, 120 * 1024) {
+          // strictly rising for the whole window and +120 MiB: name a leak
+      }
+  }
+  ```
+
+  `push` returns `Some(newest - oldest)` only when the ring is FULL and every
+  sample beats its predecessor; one sample below its predecessor clears the
+  window, because a healthy process is allowed to oscillate. `N` is policy,
+  not the detector's; `N = 0` never reports. `growth_crosses` is the trip mark
+  (`trip_kb == 0` disables it) and stays caller policy: the crate names the
+  growth, your app names the threshold.
 * **Snapshot v6** carries `memory_used_kb`, `memory_peak_kb`,
   `memory_soft_kb`, `memory_hard_kb`, `memory_rejections`, `memory_pressure`,
   `queue_depth` and `queue_capacity`. Still 512 B (330/508 payload bytes used).
@@ -878,7 +905,7 @@ and return `Err`; when it still unwinds, `checkpoint` names the last
 completed stage on the fault record and `state_snapshot` gives the live
 view. The rollback body runs on the executor thread: keep it short, and
 when it can block, arm `rollback_budget_ms` and poll
-`snubber::watchdog::poll_rollback` from a supervisor tick.
+`snubber::watchdog::poll_rollback_node` from a supervisor tick.
 
 **Rayon.** Wrap one batch in one `scoped`: the rollback runs after Rayon
 has joined the workers, so it never races in-flight items, and a panic
@@ -1824,7 +1851,9 @@ never disagree with the chapter map above.
 | `guard.with_cpu_sampler_shared(Arc<dyn Fn() -> u64 + Send + Sync + UnwindSafe + RefUnwindSafe>)` | 1.5 / std | +16 B on the guard (304 → 320); caller's `Arc` is the only allocation | Same verdicts for per-thread state (thread handle, worker counter); wins over the plain `fn` when both are attached |
 | `guard.stall_kind()` | 1.5 / std | 1 clock + 1 sample | Non-destructive hang verdict (no settle) |
 | `guard.check_timeout()` | 1.5 / std | 1 clock + 1 sample | Cooperative watchdog: `WithinBudget` / `TimedOut` / `SpinDetected` / `DeadlockSuspected` |
-| `snubber::watchdog::poll_rollback(&node, budget_ms)` | 1 / std | 1 pass over phase atomics, no lock/alloc | Outside verdict: a rollback body older than `budget_ms`, with `epoch`/`task_id`; books nothing |
+| `snubber::watchdog::poll_rollback_node(&node)` | 1 / std | 1 pass over phase atomics, no lock/alloc | Outside verdict: a rollback body older than the node's own `rollback_budget_ms`, with `epoch`/`task_id`; books nothing |
+| `snubber::watchdog::poll_rollback(&node, budget_ms)` | 1 / std | same read, caller's threshold | 0.6 shape, kept for callers that outrank the builder; cannot manufacture age |
+| `node.rollback_budget_ms()` | 1 / std | 1 field read | The armed budget, so the watcher and the builder cannot disagree |
 | `node.rollback_phase()` | 1 / std | 7 relaxed atomic loads (+1 clock read only while a body is armed), no lock/alloc | Live rollback view: `active`, `epoch`, `task_id`, `elapsed_ms`, `budget_ms`, `max_ms`, `stalls`, `reentries` |
 | `node.builder(..).rollback_budget_ms(n)` | 1 / std | 2 atomic writes per body; 1 clock read only when `n > 0` | Arms the rollback clock; off by default, so `abort`/drop stays clock-free |
 | `RollbackReentrancy::{Allow, Refuse}` + `.rollback_reentrancy(..)` | 1 / std | 1 relaxed load per admission; TLS marker read only while a body is active | Policy for an admission attempted from this node's own rollback thread: `Refuse` returns `EnterError::RollbackReentrant` before any lock |
@@ -1835,6 +1864,7 @@ never disagree with the chapter map above.
 | `node.note_pulse_stall(lag_ms)` | 1.5 / std | structural: 1 atomic max | Record missed pulse into `SnapshotV1` (pulse fields since v3; frame is v6) + `AnomalyKind::PulseStall` |
 | `node.note_memory_kb(used_kb)` + `memory_verdict()` | 3 / std | 1 lock + 1 atomic store | External RSS sample → `MemoryVerdict` (Ok/Soft/Hard); admissions refuse lock-free above soft |
 | `MemoryWatch` + `MemoryVerdict` | 4 / core | 32 B, `Copy` | Verdict math for firmware; `hard < soft` clamps up |
+| `LeakWatch<N>::push(sample)` + `growth_crosses(growth, trip)` | 4 / core | 96 B on 64-bit at `N = 10` (88 B on 32-bit), `Copy`, no clock | Leak as a derivative: `Some(newest − oldest)` only on a full, strictly rising window; one dip clears it |
 | `MemoryPolicy::new(soft, hard)` + `note(used)` | 4 / std | pure integer compares | Supervisor verdict: soft drains, hard kills; `death_cause()` names `MemoryLimit` |
 | `Supervisor::run_supervised_guard_with_memory(..)` | 4 / std | 1 sampler call / 10 ms tick | Lease + RSS watchdog; soft logs `MEMORY_DRAIN`, hard `kill()` without draining |
 | `node.transition(&mut s, next, rb, work)` | 2 / std | one enum write; zero flag drift | ONE enum state machine, no flag drift |

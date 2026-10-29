@@ -264,7 +264,7 @@ pub use drain::{
     TOKEN_MAGIC, TOKEN_PAYLOAD_LEN,
 };
 
-pub use memory::{MemoryVerdict, MemoryWatch};
+pub use memory::{growth_crosses, LeakWatch, MemoryVerdict, MemoryWatch};
 
 pub use protect::Protected;
 

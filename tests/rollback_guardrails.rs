@@ -19,7 +19,7 @@
 //! rollback body: bodies publish a verdict code into an `AtomicU8`, and the
 //! test thread — whose panic is NOT swallowed — reads it.
 
-use snubber::watchdog::poll_rollback;
+use snubber::watchdog::{poll_rollback, poll_rollback_node};
 use snubber::{
     classify, classify_rollback, classify_stall_ceiling, EnterError, FaultAction, FaultKind,
     LogLevel, Refusal, RollbackReentrancy, SnubberError, SnubberNode, StallKind, DEFAULT_POLICIES,
@@ -890,13 +890,14 @@ fn poll_rollback_names_a_body_from_outside_without_touching_the_books() {
 
     spin_until_started(&entered);
     assert_eq!(poll_rollback(&node, 0), None, "no threshold, no verdict");
-    assert!(
-        poll_rollback(&node, 10_000).is_none(),
-        "a body inside the budget is not a stall"
+    assert_eq!(
+        poll_rollback(&node, 10_000),
+        None,
+        "a caller's looser threshold: the body is inside it"
     );
 
     std::thread::sleep(Duration::from_millis(BUDGET_MS + 120));
-    let stall = poll_rollback(&node, BUDGET_MS).expect("the body outlived the budget");
+    let stall = poll_rollback_node(&node).expect("the body outlived the budget the node armed");
     assert_eq!(
         (stall.epoch, stall.task_id),
         (4, 9),
@@ -906,7 +907,15 @@ fn poll_rollback_names_a_body_from_outside_without_touching_the_books() {
         stall.elapsed_ms > BUDGET_MS,
         "the verdict reports the measured age: {stall:?}"
     );
-    assert_eq!(stall.budget_ms, BUDGET_MS);
+    assert_eq!(
+        stall.budget_ms, BUDGET_MS,
+        "the threshold comes from the node, not from the caller"
+    );
+    assert_eq!(
+        node.rollback_budget_ms(),
+        BUDGET_MS,
+        "the builder's budget is readable from the node"
+    );
     assert_eq!(
         node.rollback_phase().stalls,
         0,
@@ -931,7 +940,8 @@ fn poll_rollback_names_a_body_from_outside_without_touching_the_books() {
 
 /// Honest limit: the verdict's clock belongs to the node. Without
 /// `rollback_budget_ms(..)` the phase stays `active: true, elapsed_ms: 0`
-/// by design, and `poll_rollback` returns `None` instead of inventing age.
+/// by design, and `poll_rollback_node` returns `None` instead of inventing
+/// age.
 #[test]
 fn poll_rollback_needs_the_node_clock_armed() {
     let node = SnubberNode::builder("guardrails/watchdog/unarmed")
@@ -961,9 +971,19 @@ fn poll_rollback_needs_the_node_clock_armed() {
     assert!(node.rollback_phase().active, "the body is visible");
     assert_eq!(node.rollback_phase().elapsed_ms, 0);
     assert_eq!(
-        poll_rollback(&node, 1),
+        node.rollback_budget_ms(),
+        0,
+        "an unarmed builder value reads back as 0"
+    );
+    assert_eq!(
+        poll_rollback_node(&node),
         None,
         "an unarmed node clock cannot age a body, so no verdict is minted"
+    );
+    assert_eq!(
+        poll_rollback(&node, 1),
+        None,
+        "a caller's threshold cannot manufacture age either"
     );
 
     drop(gate_tx);
@@ -1031,7 +1051,7 @@ fn wedged_rollback_wedges_the_node_forever() {
             std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + Duration::from_millis(5_000);
                 while std::time::Instant::now() < deadline {
-                    if let Some(stall) = snubber::watchdog::poll_rollback(&node, WEDGE_BUDGET_MS) {
+                    if let Some(stall) = snubber::watchdog::poll_rollback_node(&node) {
                         let line = format!(
                             "RollbackStall epoch={} task_id={} elapsed_ms={} budget_ms={}\n",
                             stall.epoch, stall.task_id, stall.elapsed_ms, stall.budget_ms

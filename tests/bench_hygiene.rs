@@ -145,6 +145,7 @@ const COVERED: &[&str] = &[
     "contended_node_enter_threads_",
     "contended_node_scoped_threads_",
     "contended_gateway_mpsc_threads_",
+    "contended_erased_holding_threads_",
     "cross_thread_isr_bridge_push_pop",
     "friction_handler_arc_call",
     "friction_wait_adaptive_arc",
@@ -257,7 +258,7 @@ fn bench_setup_outside_hot_loop() {
     // Sized contended benches build their name with format! and pass the
     // variable; each prefix must have its IDEAL pin.
     let sized = source.matches("g.bench_function(name,").count();
-    assert_eq!(sized, 3, "sized contended bench count changed");
+    assert_eq!(sized, 4, "sized contended bench count changed");
     assert_eq!(
         COVERED.iter().filter(|n| n.ends_with('_')).count(),
         sized,
@@ -271,6 +272,7 @@ fn bench_setup_outside_hot_loop() {
                 "contended_node_enter_threads_" => "IDEAL-1",
                 "contended_node_scoped_threads_" => "IDEAL-2",
                 "contended_gateway_mpsc_threads_" => "IDEAL-3",
+                "contended_erased_holding_threads_" => "IDEAL-4",
                 _ => continue,
             };
             let pos = source.find(block_marker).expect("IDEAL block missing");
