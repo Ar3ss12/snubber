@@ -59,7 +59,7 @@ reads as an operation rather than a Criterion key. Differences below
 | `node.enter_with_priority(Critical)` | Layer 2 (`std`) | **~87 ns** | Priority lane; same band as plain enter (one measurement) |
 | `node.transition` | Layer 2 (`std`) | **~90 ns** | ONE-enum state machine, zero flag drift |
 | `node.transition_checked` + `LegalMove` | Layer 2 (`std`) | same path, no extra work | Compile-time only: the `LegalMove` proof erases to the same `transition` call; illegal moves fail at compile (E0277) |
-| `enter_erased_auto` | Layer 2 (`alloc`) | **~205 ns** | ONE boxed transaction (rollback + commit hook + node clone in a single allocation; 0.6.8 moved the breaker outcome onto the guard's real `commit`). 301.6 → ~205 ns after folding two boxes and two `Arc` clones into one |
+| `probe_erased_auto` + `commit` | Layer 2 (`alloc`) | **~205 ns** | ONE boxed transaction (rollback + commit hook + node clone in a single allocation; 0.6.8 moved the breaker outcome onto the guard's real `commit`). 301.6 → ~205 ns after folding two boxes and two `Arc` clones into one |
 | `node_passthrough_enter + commit` | Layer 2 (`std` canary) | **~55 ns** | Open-doors transit: lock-free count + unstamped dummy guard, no slots/breaker/`EpochGate`/clock |
 | `node_passthrough_scoped + commit` | Layer 2 (`std` canary) | **~51 ns** | Same transit through `scoped()` — work runs, books stay clean |
 | `ConflateSender::publish + take_latest` | Layer 2 (`std`) | **~21.7 ns** | One-slot latest wins, no allocation, no `Clone` bound |

@@ -829,6 +829,37 @@ fn test_bench_numbers_match_evidence_artifact() {
     }
 }
 
+/// A BENCHMARKS row is labelled with the API it measured. The number oracle
+/// above matches VALUES only, so a renamed API leaves a stale label that no
+/// test notices: measured 2026-10-28 the erased row still said
+/// `enter_erased_auto` while `benches/admission_bench.rs` calls
+/// `probe_erased_auto` — same ~205 ns, opposite lifetime (the probe releases
+/// its admission slot at entry; the holding path keeps it until settle).
+#[test]
+fn test_bench_erased_row_names_the_api_the_bench_calls() {
+    let bench_doc = read_doc("BENCHMARKS.md");
+    let bench_src = read_doc("benches/admission_bench.rs");
+    assert!(
+        bench_src.contains("probe_erased_auto"),
+        "the erased bench no longer calls probe_erased_auto — update this pin \
+         together with the bench, never the doc alone"
+    );
+    assert!(
+        bench_doc.contains("| `probe_erased_auto` + `commit` |"),
+        "TRIPWIRE FIRED: the erased row must be labelled with the API the \
+         bench calls (`probe_erased_auto`), not a sync/holding namesake"
+    );
+    for stale in ["`enter_erased_auto`", "`enter_holding_auto`"] {
+        assert!(
+            !bench_doc.contains(stale),
+            "TRIPWIRE FIRED: {stale} is not what any bench measures — \
+             `enter_erased_auto` holds the slot for the whole transaction and \
+             `enter_holding_auto` does not exist; a reader would benchmark the \
+             wrong lifetime"
+        );
+    }
+}
+
 /// Any `manual_with_clock` snippet in the public docs must declare the
 /// `ClockFn` shape (`fn() -> u64`) in the same fence. `ClockFn` is a fn
 /// pointer, not a `u64`; a snippet that shows only the call makes a reader
