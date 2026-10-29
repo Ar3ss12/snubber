@@ -4,7 +4,7 @@ All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.
 the audit-batch fix tables live at the bottom of this file, and the
 current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
-## 0.7.5 — unreleased
+## 0.7.5 — 2026-10-29
 
 One type per concept, typed erased slots, and the flight tape inside the
 cold frame. Breaking: the public surface loses the duplicate trend types and
