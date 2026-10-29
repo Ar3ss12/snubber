@@ -4,7 +4,7 @@ All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.
 the audit-batch fix tables live at the bottom of this file, and the
 current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
-## Unreleased
+## 0.7.1 — Unreleased
 
 0.7.1. First, four follow-ups from the 2026-10-29 audit of the 0.7.0
 integration: two close a class of drift (a threshold and a label that could
