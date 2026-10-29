@@ -20,7 +20,7 @@ Zero deps · `#![forbid(unsafe_code)]` · MSRV 1.70 · one crate from `core`-onl
 
 ```toml
 [dependencies]
-snubber = "0.8"
+snubber = "0.7"
 ```
 
 Wrap critical work in **`scoped`**: two closures, rollback and action. It

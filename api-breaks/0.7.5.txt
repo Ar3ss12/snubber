@@ -1,8 +1,8 @@
-# Declared breaking changes for 0.8.0 — one name per removed or renamed
+# Declared breaking changes for 0.7.5 — one name per removed or renamed
 # public item, matched as a substring against the cargo-semver-checks report.
 # check_api_diff.sh stays red for a break that is not named here, and red for
 # an entry that no longer breaks. tests/doc_sync.rs requires each name to
-# appear in the CHANGELOG section for 0.8.0.
+# appear in the CHANGELOG section for 0.7.5.
 LeakWatch
 LeakWindow
 MemoryTrendVerdict

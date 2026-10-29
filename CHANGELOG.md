@@ -4,11 +4,16 @@ All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.
 the audit-batch fix tables live at the bottom of this file, and the
 current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
-## 0.8.0 — unreleased
+## 0.7.5 — unreleased
 
 One type per concept, typed erased slots, and the flight tape inside the
 cold frame. Breaking: the public surface loses the duplicate trend types and
 the 0.7 deprecated erased aliases; nothing is renamed for taste.
+
+**This release carries those breaks under a patch number, by the owner's
+decision** — upgrading from 0.7.1 needs the migration below. Every reported
+item is declared in `api-breaks/0.7.5.txt`; the semver gate refuses an
+undeclared break and refuses a declared one that stopped breaking.
 
 ### Added
 
