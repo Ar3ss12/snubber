@@ -886,6 +886,33 @@ match verdict {
   variant makes it nameable instead of invisible. Rates divide by the span
   the caller owns: `growth * 1000 / ((N - 1) * interval_ms)`, `None` when
   `interval_ms == 0` or `N < 2`.
+* **`HandleWatch<N>` is that rule for counts, not bytes.** A leaked `HANDLE`,
+  file descriptor or socket is kernel state — a few bytes of a table, never a
+  resident page — so RSS stays flat while the process inches toward its
+  per-process limit. The detector is the same derivative, and the crate still
+  makes no OS call: the caller passes a probe.
+
+  ```rust
+  use snubber::HandleWatch;
+
+  let mut handles: HandleWatch<10> = HandleWatch::new(256, 30_000);
+  // Winsock sockets, opened fds, whatever this platform can read.
+  let mut probe = || kernel_handle_count();
+  if let Some(shape) = handles.sample(&mut probe) {
+      if shape.is_rising() {
+          refuse_new_starts();
+      }
+  }
+  ```
+
+  `sample` returns `None` **and records nothing** when the probe returns
+  `None`: a platform that cannot read a count at that moment must not look
+  like a dip, because a `0` would clear the window and silently disarm the
+  detector on exactly the host whose probe failed. `note(count)` is the same
+  step for callers that already hold the number (a snapshot, a replay).
+  `classification()` / `is_leaking()` / `growth_rate_per_sec()` mirror
+  `MemoryTrend`, including the `Sawtooth` gap; `trip == 0` disables the
+  verdict but keeps the window.
 * **Snapshot v6** carries `memory_used_kb`, `memory_peak_kb`,
   `memory_soft_kb`, `memory_hard_kb`, `memory_rejections`, `memory_pressure`,
   `queue_depth` and `queue_capacity`. Still 512 B (330/508 payload bytes used).
@@ -1904,6 +1931,7 @@ never disagree with the chapter map above.
 | `LeakWatch<N>::push(sample)` + `growth_crosses(growth, trip)` | 4 / core | 96 B on 64-bit at `N = 10` (88 B on 32-bit), `Copy`, no clock | Leak as a derivative: `Some(newest − oldest)` only on a full, strictly rising window; one dip clears it |
 | `LeakWatch<N>::window()` / `classify(trip, interval_ms)` + `LeakClassification` | 4 / core | one pass over ≤ `N` samples, no allocation | Names the shape instead of a bare `Option`: `Warming` / `Stable` / `Rising { growth_kb, rate_kb_sec }` / `Sawtooth` (the leak a monotonic trip can never see) |
 | `MemoryTrend<N>::sample(used_kb)` + `classification()` | 4 / core | 32 B level watch + the ring; the level outranks the trend | One ring, one verdict: `Hard`/`Soft` stay themselves, a rising window under both limits is `MemoryTrendVerdict::Leaking { growth_rate_kb_sec }`; `level()` keeps the `MemoryVerdict` half |
+| `HandleWatch<N>::sample(probe)` / `note(count)` | 4 / core | the ring plus two `u64`s, no clock, no allocation | Handle/fd/socket leak by derivative; an unreadable probe returns `None` and records **no** sample (a `0` would be a false dip that disarms the detector) |
 | `MemoryPolicy::new(soft, hard)` + `note(used)` | 4 / std | pure integer compares | Supervisor verdict: soft drains, hard kills; `death_cause()` names `MemoryLimit` |
 | `Supervisor::run_supervised_guard_with_memory(..)` | 4 / std | 1 sampler call / 10 ms tick | Lease + RSS watchdog; soft logs `MEMORY_DRAIN`, hard `kill()` without draining |
 | `node.transition(&mut s, next, rb, work)` | 2 / std | one enum write; zero flag drift | ONE enum state machine, no flag drift |

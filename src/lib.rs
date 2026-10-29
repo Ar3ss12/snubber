@@ -193,6 +193,8 @@ pub mod diagnostics;
 
 pub mod memory;
 
+pub mod handles;
+
 pub mod protect;
 
 #[cfg(feature = "alloc")]
@@ -268,6 +270,8 @@ pub use memory::{
     growth_crosses, rate_kb_sec, LeakClassification, LeakWatch, LeakWindow, MemoryTrend,
     MemoryTrendVerdict, MemoryVerdict, MemoryWatch,
 };
+
+pub use handles::HandleWatch;
 
 pub use protect::Protected;
 

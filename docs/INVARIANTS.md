@@ -145,6 +145,12 @@ only move a `Copy` verdict; the crate never measures memory itself.
   that climbs and drops never trips a monotonic mark, and the shape is
   named instead of invisible. Naming it is not a verdict — the crate says
   what the window looks like, the caller decides whether that is a fault.
+- A leaked handle is invisible to RSS, so `HandleWatch<N>` applies the same
+  derivative to an externally sampled count (handles, fds, sockets). An
+  unreadable probe returns `None` and records nothing: substituting `0`
+  would be a false dip that clears the window and disarms the detector on
+  the one host whose probe failed. The crate never reads a count itself —
+  same seam as `note_memory_kb`, one caller-supplied closure.
 
 ### Invariant 9: Impedance Is Explicit (One Slot, Two Walls)
 Mismatched producer/consumer rates are handled by named primitives, never

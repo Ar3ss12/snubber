@@ -12,7 +12,8 @@ disagree with the code they describe), one publishes a measurement that was
 missing, and one moves a detector the consumer had already written twice.
 Then the memory-trend batch: the leak detector gains a shape, a rate and a
 composed verdict, so a consumer no longer keeps a ring and a level watch
-side by side and reconciles them by hand.
+side by side and reconciles them by hand, and the same derivative is
+applied to handle counts, which RSS can never show.
 
 ### Added
 
@@ -47,6 +48,18 @@ side by side and reconciles them by hand.
   disabled. Tests: level priority, warming/stable/rising/sawtooth shapes,
   rate over two intervals, saturation, a dip clearing the rate, and a
   level-only trend that can never report a leak.
+- `HandleWatch<const N: usize>` (`handles`, core, `Copy`): the derivative
+  rule applied to a count RSS cannot see — handles, file descriptors,
+  sockets. A leaked handle is a few bytes of a kernel table, never a
+  resident page, so a memory watch is blind to it. The crate still makes no
+  OS call: `sample(probe)` takes a caller-supplied `FnMut() -> Option<u64>`,
+  and a probe that returns `None` records NOTHING and reports `None` —
+  substituting `0` would be a false dip that clears the window and disarms
+  the detector on exactly the host whose probe failed. `note(count)` is the
+  same step for callers that already hold the number. Tests: a flat
+  baseline reads `Sawtooth` and a slow drift `Stable`, a rising window
+  names its rate, an unreadable probe leaves the ring untouched, and a dip
+  clears the evidence.
 
 - `SnubberNode::rollback_budget_ms()`: the budget the node was built
   with, `0` when the clock is unarmed. The observer no longer has to keep
