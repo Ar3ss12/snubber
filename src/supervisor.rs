@@ -169,6 +169,276 @@ impl Default for MemoryPolicy {
     }
 }
 
+/// When the supervisor retires a child BEFORE the hard wall (preventive rotation).
+///
+/// [`MemoryPolicy`] answers "is memory a problem?"; this answers "what does
+/// the supervisor do while there is still headroom?". A soft sample opens a
+/// window of `grace_ms` in which the child may still drain itself and exit on
+/// its own clean path. A child still alive when the window closes is rotated:
+/// killed, and replaced by `generation + 1` carrying the last verified
+/// [`StateDigest`] the retired child published.
+///
+/// Plain `Copy` data — no logic lives here; [`Rotation`] interprets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RotationPolicy {
+    /// How long the child owns the drain after the soft mark, ms.
+    /// `0` disables rotation: soft stays telemetry only (the hard limit still
+    /// kills, and a child that never drains itself dies there).
+    pub grace_ms: u64,
+    /// Ceiling on rotations in one supervisor run (`0` = unlimited).
+    /// Once spent, soft is telemetry again and the hard wall is the only stop.
+    pub max_rotations: u32,
+}
+
+impl RotationPolicy {
+    /// Rotate after `grace_ms` of soft pressure, at most `max_rotations` times.
+    #[must_use]
+    pub const fn new(grace_ms: u64, max_rotations: u32) -> Self {
+        Self {
+            grace_ms,
+            max_rotations,
+        }
+    }
+
+    /// Rotation disabled: soft is logged and nothing moves.
+    #[must_use]
+    pub const fn off() -> Self {
+        Self {
+            grace_ms: 0,
+            max_rotations: 0,
+        }
+    }
+
+    /// `grace_ms == 0` — no window, so there is nothing to rotate.
+    #[must_use]
+    pub const fn is_off(&self) -> bool {
+        self.grace_ms == 0
+    }
+}
+
+impl Default for RotationPolicy {
+    #[inline]
+    fn default() -> Self {
+        Self::off()
+    }
+}
+
+/// What one memory sample means for the rotation window.
+#[must_use = "a RotationStep orders a generation change — match it, never drop it"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum RotationStep {
+    /// Nothing armed: under the soft mark, rotation disabled, or hard — a hard
+    /// verdict belongs to [`MemoryPolicy::should_kill`], never here.
+    #[default]
+    Watch,
+    /// Soft mark observed at `soft_at_ms`: the child owns the drain until
+    /// `deadline_ms` and may still leave on its own.
+    Draining {
+        /// When the soft mark was first seen, caller clock.
+        soft_at_ms: u64,
+        /// `soft_at_ms + grace_ms`: the last millisecond the child keeps the pipe.
+        deadline_ms: u64,
+    },
+    /// The window closed with the child alive: retire this generation now and
+    /// hand its last verified digest to the successor.
+    Rotate {
+        /// When the soft mark was first seen, caller clock.
+        soft_at_ms: u64,
+        /// Time elapsed since the soft mark (`>= grace_ms`).
+        waited_ms: u64,
+    },
+    /// The rotation budget is spent; soft is telemetry and the hard wall stops
+    /// a child that never drains.
+    Exhausted,
+}
+
+/// Preventive-rotation accountant for one supervised lineage.
+///
+/// Pure state over a caller clock — no sampler, no spawn, no sleep. The
+/// supervisor feeds the SAME sample it gives
+/// [`MemoryPolicy::note`](MemoryPolicy::note) and acts on the step:
+///
+/// ```text
+/// match rotation.observe(verdict, now_ms()) {
+///     Watch | Draining | Exhausted => {}
+///     Rotate { .. } => {
+///         child.kill(); child.wait();          // caller owns the kill
+///         let handoff = rotation.handoff(&drain, &mut clock);
+///         let cmd = successor_command();       // caller builds exe + args
+///         child = Supervisor::spawn_successor(cmd, &handoff)?;
+///         drain = PipeDrain::spawn(child.stdout.take()?);
+///     }
+/// }
+/// ```
+///
+/// The window resets on every sample below soft: a spike that recovers before
+/// the deadline never rotates. An unplanned death under soft does not consume
+/// the budget — call [`Rotation::restart`] when the replacement child owns the
+/// pipe, [`Rotation::handoff`] when the supervisor itself retired the child.
+///
+/// ```
+/// use snubber::{MemoryVerdict, Rotation, RotationPolicy, RotationStep};
+///
+/// let mut rotation = Rotation::new(RotationPolicy::new(250, 1));
+/// assert_eq!(rotation.observe(MemoryVerdict::Ok, 0), RotationStep::Watch);
+///
+/// let step = rotation.observe(MemoryVerdict::Soft, 1_000);
+/// assert_eq!(
+///     step,
+///     RotationStep::Draining { soft_at_ms: 1_000, deadline_ms: 1_250 }
+/// );
+///
+/// // Still soft at the deadline: rotate instead of waiting for the hard wall.
+/// let step = rotation.observe(MemoryVerdict::Soft, 1_250);
+/// assert_eq!(
+///     step,
+///     RotationStep::Rotate { soft_at_ms: 1_000, waited_ms: 250 }
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Rotation {
+    policy: RotationPolicy,
+    soft_at_ms: Option<u64>,
+    rotations: u32,
+}
+
+impl Rotation {
+    /// Build an accountant. A disabled policy ([`RotationPolicy::is_off`])
+    /// never reports anything but [`RotationStep::Watch`].
+    #[must_use]
+    pub const fn new(policy: RotationPolicy) -> Self {
+        Self {
+            policy,
+            soft_at_ms: None,
+            rotations: 0,
+        }
+    }
+
+    /// Declared policy.
+    #[must_use]
+    pub const fn policy(&self) -> RotationPolicy {
+        self.policy
+    }
+
+    /// Rotations recorded so far.
+    #[must_use]
+    pub const fn rotations(&self) -> u32 {
+        self.rotations
+    }
+
+    /// Report one memory sample at `now_ms` and get the next step.
+    ///
+    /// [`MemoryVerdict::Hard`] is not a rotation trigger: the process is
+    /// already over budget and [`MemoryPolicy::should_kill`] owns that path.
+    /// A hard sample closes the window like any other non-soft sample.
+    pub fn observe(&mut self, verdict: MemoryVerdict, now_ms: u64) -> RotationStep {
+        if self.policy.is_off() || verdict.is_hard() || verdict == MemoryVerdict::Ok {
+            self.soft_at_ms = None;
+            return RotationStep::Watch;
+        }
+        if self.policy.max_rotations > 0 && self.rotations >= self.policy.max_rotations {
+            self.soft_at_ms = None;
+            return RotationStep::Exhausted;
+        }
+        let soft_at_ms = match self.soft_at_ms {
+            Some(soft_at_ms) => soft_at_ms,
+            None => {
+                self.soft_at_ms = Some(now_ms);
+                now_ms
+            }
+        };
+        let deadline_ms = soft_at_ms.saturating_add(self.policy.grace_ms);
+        if now_ms >= deadline_ms {
+            RotationStep::Rotate {
+                soft_at_ms,
+                waited_ms: now_ms.saturating_sub(soft_at_ms),
+            }
+        } else {
+            RotationStep::Draining {
+                soft_at_ms,
+                deadline_ms,
+            }
+        }
+    }
+
+    /// A replacement child now owns the pipe (it left on its own path).
+    /// The window closes; the rotation budget is untouched.
+    pub fn restart(&mut self) {
+        self.soft_at_ms = None;
+    }
+
+    /// Retire the current generation: take the last verified digest off the
+    /// retired child's drain, bump the lineage and count the rotation.
+    ///
+    /// The digest is consumed from `drain` ([`PipeDrain::take_state`]): it
+    /// belongs to the successor, and a successor is spawned exactly once.
+    /// `None` is honest — a child killed before publishing a complete
+    /// three-frame digest leaves nothing to restore, so the successor starts
+    /// from its own defaults instead of a hybrid. The generation is retired
+    /// either way: a stale worker must never settle into the new lineage.
+    ///
+    /// ```
+    /// use snubber::{
+    ///     GenerationClock, MemoryVerdict, PipeDrain, Rotation, RotationPolicy, StateDigest,
+    ///     STATE_LEN,
+    /// };
+    ///
+    /// let drain = PipeDrain::manual();
+    /// let mut rotation = Rotation::new(RotationPolicy::new(100, 1));
+    /// let _ = rotation.observe(MemoryVerdict::Soft, 0);
+    /// let _ = rotation.observe(MemoryVerdict::Soft, 100); // Rotate
+    ///
+    /// let mut bytes = [0u8; STATE_LEN];
+    /// bytes[0] = 42;
+    /// for frame in StateDigest::new(bytes).to_frames() {
+    ///     assert_eq!(drain.feed(&frame.to_bytes()), 1);
+    /// }
+    ///
+    /// let mut clock = GenerationClock::new();
+    /// let handoff = rotation.handoff(&drain, &mut clock);
+    /// assert_eq!(handoff.generation, 2, "the successor enters at gen + 1");
+    /// assert_eq!(handoff.digest.map(|d| d.bytes[0]), Some(42));
+    /// assert_eq!(handoff.rotations, 1);
+    /// assert!(drain.take_state().is_none(), "the digest moved to the successor");
+    /// ```
+    pub fn handoff(&mut self, drain: &PipeDrain, clock: &mut GenerationClock) -> RotationHandoff {
+        let digest = drain.take_state();
+        let generation = clock.restart();
+        self.rotations = self.rotations.saturating_add(1);
+        self.soft_at_ms = None;
+        RotationHandoff {
+            digest,
+            generation,
+            rotations: self.rotations,
+        }
+    }
+}
+
+/// What a successor generation inherits from a retired child.
+///
+/// Built by [`Rotation::handoff`]; consumed by
+/// [`Supervisor::spawn_successor`]. `generation` is the generation the
+/// successor must enter with (`enter_with_generation`), so every packet from
+/// the retired worker is rejected as stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RotationHandoff {
+    /// Last verified 64 B digest the retired child published, if any.
+    pub digest: Option<StateDigest>,
+    /// Generation the successor enters with (`retired + 1`).
+    pub generation: u64,
+    /// Rotations counted so far, including this one.
+    pub rotations: u32,
+}
+
+impl RotationHandoff {
+    /// `true` when there is a digest to restore.
+    #[must_use]
+    pub const fn has_digest(&self) -> bool {
+        self.digest.is_some()
+    }
+}
+
 /// When the supervisor restarts an exited worker process (Phase 2).
 ///
 /// Plain `Copy` data — no logic lives here. The [`RestartTracker`]
@@ -1202,6 +1472,30 @@ impl Supervisor {
             // EOF: child's read_exact completes without deadlock.
         }
         Ok(child)
+    }
+
+    /// Spawn the successor a [`RotationHandoff`] describes.
+    ///
+    /// `Some(digest)` — identical to [`Self::spawn_with_digest`]: 64 B on the
+    /// child's stdin, then EOF.
+    /// `None` — the retired child never published a complete digest, so the
+    /// successor's stdin is NULL: `take_stdin_digest` reads EOF immediately
+    /// and the process starts from its own defaults instead of blocking on
+    /// the supervisor's inherited terminal.
+    ///
+    /// Caller owns the command line (exe, args, `SNUBBER_GEN` from
+    /// [`RotationHandoff::generation`]) and the successor's stdout drain.
+    pub fn spawn_successor(
+        mut cmd: std::process::Command,
+        handoff: &RotationHandoff,
+    ) -> std::io::Result<std::process::Child> {
+        match handoff.digest {
+            Some(digest) => Self::spawn_with_digest(cmd, &digest),
+            None => {
+                cmd.stdin(std::process::Stdio::null());
+                cmd.spawn()
+            }
+        }
     }
 
     /// Inspect command line args and run the child process supervisor loop if `--supervisor` is present.

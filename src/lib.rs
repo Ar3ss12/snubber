@@ -292,8 +292,8 @@ pub use protect::SafeLockExt;
 pub use supervisor::{
     await_post_mortem, now_ms, take_stdin_digest, Backoff, ClockFn, DeathCause, DrainCounters,
     GenerationClock, MemoryPolicy, NoOrphanGuard, OrphanGuard, PipeDrain, RestartDecision,
-    RestartPolicy, RestartTracker, RestartWindow, StateDigest, Supervisor, TokenRollback,
-    STATE_LEN,
+    RestartPolicy, RestartTracker, RestartWindow, Rotation, RotationHandoff, RotationPolicy,
+    RotationStep, StateDigest, Supervisor, TokenRollback, STATE_LEN,
 };
 
 #[cfg(feature = "std")]

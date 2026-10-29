@@ -16,7 +16,9 @@ side by side and reconciles them by hand, and the same derivative is
 applied to handle counts, which RSS can never show. Then the ordering and
 pacing batch: teardown order becomes a type, the concurrency ceiling learns
 the sustainable limit instead of a build-time guess, and retries spread
-without an RNG.
+without an RNG. Last, supervision: a child that ignores the soft memory mark
+is now retired before the hard wall, with its last verified state handed to
+the successor generation.
 
 ### Added
 
@@ -112,6 +114,26 @@ without an RNG.
   because one set holds entries of many `RANK` types. Tests: ordering by
   rank rather than registration, tie stability, refusal on a full set, and
   the rank being a type parameter.
+- `Rotation` + `RotationPolicy` + `RotationStep` + `RotationHandoff`
+  (`supervisor`, `std`, all `Copy`): preventive rotation. `MemoryPolicy`
+  says when memory is a problem; this says what to do while there is still
+  headroom. The first soft sample opens `grace_ms` in which the child may
+  still drain itself and exit on its own path; the deadline is fixed there
+  and never extended by later samples, and a sample below soft closes the
+  window, so a spike that recovers never rotates. A child still alive at
+  the deadline gets a standing `Rotate` order (a missed tick cannot read an
+  overdue child as healthy). `handoff` then takes the last verified 64 B
+  digest off the retired drain, bumps the generation and counts the
+  rotation in one call; `Supervisor::spawn_successor` spawns the successor
+  with that digest on stdin — or a NULL stdin (immediate EOF, never a
+  block on the inherited terminal, never a hybrid state) when the child was
+  killed before publishing a complete three-frame digest. `max_rotations`
+  (`0` = unlimited) bounds the churn, and a `Hard` sample is never a
+  rotation trigger — that path belongs to `MemoryPolicy::should_kill`.
+  Tests: window boundary, no deadline extension, recovery below soft, hard
+  path, budget exhaustion, unlimited budget, disabled policy, an unplanned
+  death that keeps the budget, digest handoff, torn digest, and two real
+  successor processes (digest bit-exact on stdin / immediate EOF).
 - `SnubberNode::rollback_budget_ms()`: the budget the node was built
   with, `0` when the clock is unarmed. The observer no longer has to keep
   its own copy of a number the builder owns — that copy is how a watcher

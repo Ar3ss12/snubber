@@ -1211,6 +1211,55 @@ Supervisor::run_supervised_guard_with_memory(
   (64 KiB streaming vs `--naive` clone) runs in
   `examples/16_streaming_checkpoint.rs`.
 
+#### Preventive rotation: retire the child before the wall
+
+The soft mark above relies on the child draining itself. A child that never
+does — a third-party binary, a busy loop, a drain bug — marches to the hard
+limit and is killed with nothing handed off. `Rotation` closes that gap: it
+gives the child a bounded window, then retires it and moves its last verified
+`StateDigest` to a successor generation.
+
+```rust
+use snubber::{
+    GenerationClock, MemoryPolicy, PipeDrain, Rotation, RotationPolicy, RotationStep, Supervisor,
+};
+
+let policy = MemoryPolicy::new(64 * 1024, 96 * 1024);
+let mut rotation = Rotation::new(RotationPolicy::new(250, 4)); // 250 ms, 4 max
+let mut clock = GenerationClock::new();
+
+// One sample per tick, fed to BOTH accountants:
+let verdict = policy.note(sample(pid)?);
+if policy.should_kill() { /* hard: kill without draining */ }
+match rotation.observe(verdict, now_ms()) {
+    RotationStep::Watch | RotationStep::Draining { .. } | RotationStep::Exhausted => {}
+    RotationStep::Rotate { .. } => {
+        let _ = child.kill();
+        let _ = child.wait();
+        let handoff = rotation.handoff(&drain, &mut clock); // digest + gen + 1
+        let mut cmd = std::process::Command::new(exe);      // caller owns argv
+        cmd.arg("--worker").env("SNUBBER_GEN", handoff.generation.to_string());
+        child = Supervisor::spawn_successor(cmd, &handoff)?; // stdin: digest or EOF
+        drain = PipeDrain::spawn(child.stdout.take()?);
+    }
+}
+```
+
+* The window opens at the first soft sample and is never extended; a sample
+  below soft closes it, so a spike that recovers never rotates.
+* `Rotate` is a standing order until `handoff`/`restart` records the new
+  generation — a missed tick cannot read an overdue child as healthy.
+* `max_rotations` (`0` = unlimited) bounds the lineage churn; once spent,
+  soft is telemetry again and the hard wall is the only stop. An unplanned
+  death (`rotation.restart()`) never spends the budget.
+* `handoff` consumes the digest (`PipeDrain::take_state`) and bumps the
+  generation in one call. No verified digest (killed mid-publish) means
+  `None`: `spawn_successor` then gives the successor a NULL stdin, an
+  immediate EOF, so it starts from its own defaults instead of blocking or
+  restoring a hybrid.
+* The crate still owns no process: the loop above is the APP's. The crate
+  owns the decision, the lineage bump and the stdin delivery.
+
 ### 4.6c Checkpoint physics: 64 B is a ticket, not storage
 
 `StateDigest` is exactly 64 bytes (`STATE_LEN`, compile-time gate
@@ -2045,6 +2094,8 @@ never disagree with the chapter map above.
 | `HandleWatch<N>::sample(probe)` / `note(count)` | 4 / core | the ring plus two `u64`s, no clock, no allocation | Handle/fd/socket leak by derivative; an unreadable probe returns `None` and records **no** sample (a `0` would be a false dip that disarms the detector) |
 | `MemoryPolicy::new(soft, hard)` + `note(used)` | 4 / std | pure integer compares | Supervisor verdict: soft drains, hard kills; `death_cause()` names `MemoryLimit` |
 | `Supervisor::run_supervised_guard_with_memory(..)` | 4 / std | 1 sampler call / 10 ms tick | Lease + RSS watchdog; soft logs `MEMORY_DRAIN`, hard `kill()` without draining |
+| `Rotation::new(policy)` + `observe(verdict, now)` | 4 / std | pure integer compares, caller clock | Preventive rotation: a soft window of `grace_ms`, then bounded generation retirements; `Hard` stays the kill path |
+| `Rotation::handoff(&drain, &mut clock)` / `Supervisor::spawn_successor` | 4 / std | one 64 B digest copy + one spawn | Retire gen N: last verified digest + `generation + 1`; no digest → NULL stdin (immediate EOF), never a hybrid |
 | `node.transition(&mut s, next, rb, work)` | 2 / std | one enum write; zero flag drift | ONE enum state machine, no flag drift |
 | `node.transition_checked(s, rb, work)` + `LegalMove` | 2 / std | compile-time only (E0277) | Closed graphs: illegal edges rejected at compile (E0277) |
 | `node.enter_with_priority(prio)` | 2 / std | same band as plain enter | Critical over Background yields cooperatively |

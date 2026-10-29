@@ -402,6 +402,33 @@ orders compile and both "pass". So the order is carried by the type:
 
 Verification: `cargo test --lib rank` (ordering, tie stability, refusal).
 
+### Invariant 16: A Preventive Rotation Hands Off Verified State, Never a Hybrid
+
+A child can be retired before the hard wall only if the successor inherits
+exactly what the retired child published — no more.
+- `Rotation` opens one window on the first `Soft` sample and never extends
+  it: later samples of the same window report the same `deadline_ms`, so a
+  steady child is rotated on schedule, not on every tick. A sample below
+  soft closes the window, so a spike that recovers never rotates.
+- `Hard` is not a rotation trigger. The process is already over budget and
+  `MemoryPolicy::should_kill` owns that path; a hard sample closes the
+  window like any other non-soft sample.
+- `Rotate` is a standing order until the caller records the new generation
+  (`handoff` / `restart`), so a loop that misses a tick cannot read an
+  overdue child as healthy.
+- `max_rotations` bounds the lineage churn (`0` = unlimited). Once spent,
+  soft is telemetry again and the hard wall is the only stop. An unplanned
+  death (`restart`) never spends the budget.
+- `handoff` consumes the last verified digest (`PipeDrain::take_state`) and
+  bumps the generation in the same call: the successor enters at
+  `retired + 1`, so every packet from the retired worker is stale. A torn
+  (two-chunk) digest yields `None`, and `Supervisor::spawn_successor` then
+  gives the successor a NULL stdin — an immediate EOF, never a hybrid
+  state and never a block on the inherited terminal.
+
+Verification: `cargo test --test rotation` (fake clock for the window, a
+real successor process re-exec for the stdin handoff).
+
 ## 2. Verification Protocol
 
 The continuous integration suite validates these invariants under sustained chaos testing:
@@ -590,7 +617,7 @@ gate instead of hanging the runner.
 
 ## 3. Reporting a Discrepancy
 
-If you identify a scenario where any of the fifteen invariants above fails using purely Safe Rust:
+If you identify a scenario where any of the sixteen invariants above fails using purely Safe Rust:
 
 1. **Minimal Reproduction:** Construct an isolated integration test demonstrating the violation (failing an explicit `assert!`).
 2. **Deterministic Trigger:** The test must run and fail within 30 seconds without requiring external infrastructure.
