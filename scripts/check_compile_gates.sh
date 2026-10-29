@@ -204,6 +204,13 @@ echo -n "[5/7] Auditing true no_std on bare metal... "
 if ! grep -q '^#!\[cfg_attr(not(feature = "std"), no_std)\]' "${REPO_ROOT}/src/lib.rs"; then
     echo "FAIL (missing #![cfg_attr(not(feature = \"std\"), no_std)] in src/lib.rs)"
     FAILURES=$((FAILURES + 1))
+elif ! (cd "${REPO_ROOT}" && cargo test --locked --quiet --no-default-features --lib \
+    && cargo test --locked --quiet --no-default-features --features alloc --lib); then
+    # The #[cfg(test)] blocks are part of the layer: a std type or macro in
+    # them compiles under the default-feature run and fails only the core
+    # lane. 0.7.1 shipped exactly that (a `Vec` in the tape tests).
+    echo "FAIL (core-only unit tests do not build or pass with --no-default-features)"
+    FAILURES=$((FAILURES + 1))
 elif ! rustup target list --installed 2>/dev/null | grep -qx "thumbv7em-none-eabihf"; then
     if in_ci; then
         echo "FAIL (CI: bare-metal target missing — workflow must run: rustup target add thumbv7em-none-eabihf)"

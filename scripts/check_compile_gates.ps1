@@ -179,8 +179,24 @@ if ($MetaphorMatches.Count -gt 0) {
 # Gate 5: TRUE no_std - crate attribute + bare-metal target compile
 Write-Host "[5/7] Auditing true no_std on bare metal..." -NoNewline
 $BareMetalTarget = "thumbv7em-none-eabihf"
+# The #[cfg(test)] blocks are part of the layer: a std type or macro in them
+# compiles under the default-feature run and fails only the core lane. 0.7.1
+# shipped exactly that (a `Vec` in the tape tests). This half needs no
+# bare-metal target, so it runs before the target check.
+Push-Location $RepoRoot
+cargo test --locked --quiet --no-default-features --lib
+$CoreTestsOk = ($LASTEXITCODE -eq 0)
+if ($CoreTestsOk) {
+    cargo test --locked --quiet --no-default-features --features alloc --lib
+    $CoreTestsOk = ($LASTEXITCODE -eq 0)
+}
+Pop-Location
+
 if ($LibContent -cnotmatch '(?m)^#!\[cfg_attr\(not\(feature = "std"\), no_std\)\]') {
     Write-Host " FAIL (missing #![cfg_attr(not(feature = `"std`"), no_std)] in src/lib.rs)" -ForegroundColor Red
+    $Failures++
+} elseif (-not $CoreTestsOk) {
+    Write-Host " FAIL (core-only unit tests do not build or pass with --no-default-features)" -ForegroundColor Red
     $Failures++
 } elseif (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
     if ($InCi) {

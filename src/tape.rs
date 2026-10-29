@@ -208,8 +208,10 @@ mod tests {
         for code in [1u32, 2, 3] {
             tape.record_code(7, 100 + u64::from(code), code);
         }
-        let codes: Vec<u32> = tape.iter().map(|e| e.code).collect();
-        assert_eq!(codes, vec![1, 2, 3], "the tape reads in event order");
+        assert!(
+            tape.iter().map(|e| e.code).eq([1u32, 2, 3]),
+            "the tape reads in event order"
+        );
         assert_eq!(tape.len(), 3);
         assert!(!tape.is_full());
         assert_eq!(tape.capacity(), 5);
@@ -225,8 +227,10 @@ mod tests {
         for code in 1u32..=5 {
             tape.record_code(u64::from(code), u64::from(code) * 10, code);
         }
-        let codes: Vec<u32> = tape.iter().map(|e| e.code).collect();
-        assert_eq!(codes, vec![3, 4, 5], "only the last N events survive");
+        assert!(
+            tape.iter().map(|e| e.code).eq([3u32, 4, 5]),
+            "only the last N events survive"
+        );
         assert_eq!(tape.len(), 3);
         assert!(tape.is_full());
         assert_eq!(tape.oldest().map(|e| e.epoch), Some(3));
@@ -275,7 +279,7 @@ mod tests {
         assert!(tape.newest().is_none());
 
         tape.record_code(9, 9, 9);
-        assert_eq!(tape.iter().map(|e| e.code).collect::<Vec<_>>(), vec![9]);
+        assert!(tape.iter().map(|e| e.code).eq([9u32]));
         assert_eq!(tape.len(), 1, "a cleared tape starts over, not half-full");
     }
 }

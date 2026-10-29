@@ -180,6 +180,17 @@ the successor generation.
   `BENCHMARKS.md` cells to start with that label (or the Criterion key).
   It catches wrong NAMES, not imprecise prose.
 
+### Fixed
+
+- A `#[cfg(test)]` block in `src/tape.rs` collected into a `Vec`, so the
+  core-only lane (`cargo test --no-default-features --lib`) did not compile
+  while every default-feature run passed; CI caught it after the release
+  cut. The assertions now compare against fixed arrays through
+  `Iterator::eq`. Gate 5 runs that lane on the host before the bare-metal
+  compile in both the `.sh` and `.ps1` flavors, so a std type in a test block
+  can no longer ship from a locally green tree: injecting the `Vec` back
+  fails the gate with `core-only unit tests do not build or pass`.
+
 ## 0.7.0 (2026-10-28)
 
 Four seams the first consumer had already worked around in application
