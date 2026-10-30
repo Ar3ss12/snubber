@@ -4,7 +4,7 @@ All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.
 the audit-batch fix tables live at the bottom of this file, and the
 current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
-## 0.7.6 — unreleased
+## 0.7.6 — 2026-10-30
 
 Additive: the trend window names a steep partial slope, the README states what
 the crate cannot see, and a breaking-change declaration now travels in this

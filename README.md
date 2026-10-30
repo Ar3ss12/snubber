@@ -94,7 +94,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   framed 44-byte token when it arms; if it dies (`kill -9`, `TerminateProcess`,
   OOM euthanasia) the parent reads the pipe to EOF and classifies every reap as
   **true ambush**, **clean escape** or **stillborn**, with
-  `ambush + escape + stillborn == reaped` gated on every run.
+  `ambush + escape + stillborn == reaped` gated on every run. A commit settles
+  only the arm whose `task` it names, so a frame for one transaction cannot
+  erase another transaction's rescue token.
 * **Refusals carry telemetry.** Bulkhead, sliding-window breaker and three
   priority lanes answer with `retry_after_ms` and queue depth; shedding is
   counted as silent discard, never a fake success, and under the default
