@@ -844,6 +844,12 @@ fn artifact_measurements(text: &str) -> Vec<(f64, bool, String)> {
     out
 }
 
+/// The committed bench evidence the doc numbers are checked against. One
+/// constant, two oracles: BENCHMARKS.md used to carry its own copy of the
+/// path in prose and `doc_sync` carried it twice, so a refreshed snapshot
+/// could be pointed at by one reader and missed by the other.
+const BENCH_ARTIFACT: &str = "docs/evidence/2026-10-30_bench_snapshot.md";
+
 /// Measured latencies have exactly one home in the public docs:
 /// BENCHMARKS.md. Every `~<number>` citation there must round or truncate
 /// from the committed bench evidence artifact — no doc carries an
@@ -853,16 +859,25 @@ fn artifact_measurements(text: &str) -> Vec<(f64, bool, String)> {
 /// row must also share a value, so one section cannot be refreshed alone.
 #[test]
 fn test_bench_numbers_match_evidence_artifact() {
-    const ARTIFACT: &str = "docs/evidence/2026-10-26_bench_snapshot.md";
-    let rows = artifact_measurements(&read_doc(ARTIFACT));
+    let artifact = BENCH_ARTIFACT;
+    let rows = artifact_measurements(&read_doc(artifact));
     assert!(
         rows.len() >= 40,
-        "artifact parser found only {} measurement rows in {ARTIFACT} — the \
+        "artifact parser found only {} measurement rows in {artifact} — the \
          committed table shape changed and this oracle is going vacuously green",
         rows.len()
     );
 
     let bench_doc = read_doc("BENCHMARKS.md");
+
+    // The doc must point at the very file this oracle reads. Two paths that
+    // drift mean a reader checks numbers against one snapshot while the gate
+    // checks them against another.
+    assert!(
+        bench_doc.contains(artifact),
+        "TRIPWIRE FIRED: BENCHMARKS.md does not link {artifact} — the artifact \
+         this oracle reads and the one the reader is sent to must be one file"
+    );
 
     let mut checked = 0usize;
     let citations = tilde_citations(&bench_doc);
@@ -879,7 +894,7 @@ fn test_bench_numbers_match_evidence_artifact() {
              BENCHMARKS.md citation to the artifact value — never the \
              artifact to the docs.",
             c.raw,
-            ARTIFACT
+            artifact
         );
         checked += 1;
     }
@@ -910,7 +925,84 @@ fn test_bench_numbers_match_evidence_artifact() {
     }
 }
 
-/// A BENCHMARKS row is labelled with the API it measured. The number oracle
+/// The oracle above proves a number is REAL SOMEWHERE in the artifact; it does
+/// not prove the number belongs to the row that quotes it. Measured 2026-10-30:
+/// `pool.expired_lanes(lease) (4 lanes)` was published as `~5.4 ns` while the
+/// committed artifact reads **516.2 ns** and the suite stayed green, because a
+/// different row — `SnubberGuard::new + commit` — measures 5.4 ns. A 96x
+/// misquote survives an existence check forever.
+///
+/// This test pairs each BENCHMARKS.md row with the artifact row it names and
+/// requires every citation inside that row to round or truncate from THAT
+/// measurement. Rows the artifact has no label for (prose-only rows,
+/// structural costs) stay under the existence oracle; contended rows, which
+/// the doc lists by their Criterion key, are resolved through the exporter's
+/// key-to-label map so they are paired too.
+#[test]
+fn test_bench_rows_quote_their_own_measurement() {
+    let artifact_text = read_doc(BENCH_ARTIFACT);
+    let bench_doc = read_doc("BENCHMARKS.md");
+
+    let mut by_label: Vec<(String, f64, bool)> = Vec::new();
+    for line in artifact_text.lines().filter(|line| line.starts_with("| `")) {
+        let label = normalize_cell(line.split('|').nth(1).unwrap_or(""));
+        if let Some((value, micros, _)) = artifact_measurements(line).into_iter().next() {
+            by_label.push((label, value, micros));
+        }
+    }
+    assert!(
+        by_label.len() >= 40,
+        "row parser found only {} labelled measurements in {BENCH_ARTIFACT} — \
+         the artifact table changed shape and this oracle is going vacuously \
+         green",
+        by_label.len()
+    );
+
+    let sh_map = exporter_labels(&read_doc("scripts/bench.sh"), "labels = {", ":");
+
+    let mut paired = 0usize;
+    for line in bench_doc.lines().filter(|line| line.starts_with("| `")) {
+        let cell = normalize_cell(line.split('|').nth(1).unwrap_or(""));
+        let measurement = by_label
+            .iter()
+            .find(|(label, _, _)| cell.starts_with(label))
+            .map(|(_, value, micros)| (*value, *micros))
+            // Contended rows are keyed by their Criterion key: the exporter
+            // map says which published label that key carries.
+            .or_else(|| {
+                let label = sh_map
+                    .iter()
+                    .find(|(key, _)| cell == normalize_cell(key))
+                    .map(|(_, label)| normalize_cell(label))?;
+                by_label
+                    .iter()
+                    .find(|(row_label, _, _)| *row_label == label)
+                    .map(|(_, value, micros)| (*value, *micros))
+            });
+        let Some((value, micros)) = measurement else {
+            continue;
+        };
+        for citation in tilde_citations(line) {
+            if citation.skip.is_some() {
+                continue;
+            }
+            assert!(
+                citation_matches(&citation, value, micros),
+                "TRIPWIRE FIRED: the BENCHMARKS.md row {cell:?} quotes {} but \
+                 its own artifact measurement is {value} — the number came from \
+                 a different row. Refresh the row to its own measurement, never \
+                 borrow a value that happens to exist elsewhere in the artifact.",
+                citation.raw
+            );
+            paired += 1;
+        }
+    }
+    assert!(
+        paired >= 30,
+        "only {paired} citations were paired to their own row — the row parser \
+         or the table shape broke and a green result here means nothing"
+    );
+}
 /// above matches VALUES only, so a renamed API leaves a stale label that no
 /// test notices: measured 2026-10-28 the erased row still said
 /// `enter_erased_auto` while `benches/admission_bench.rs` calls
@@ -1017,7 +1109,7 @@ fn test_bench_labels_name_what_the_bench_calls() {
         );
     }
 
-    let artifact_cells = operation_cells(&read_doc("docs/evidence/2026-10-26_bench_snapshot.md"));
+    let artifact_cells = operation_cells(&read_doc(BENCH_ARTIFACT));
     let doc_cells = operation_cells(&read_doc("BENCHMARKS.md"));
     for (key, label) in &sh_map {
         let wanted = normalize_cell(label);

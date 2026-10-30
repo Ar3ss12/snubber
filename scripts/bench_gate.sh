@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Bench threshold gate for the scheduled bench-full lane: fails on a ~10x
 # regression of a key operation. Ceilings are deliberately coarse (~10x the
-# 2026-10-27 local Criterion means) so runner noise cannot flake the lane;
-# precision stays with the README benchmark table. A missing estimates.json
-# is a FAIL, not a SKIP -- an unexecuted bench proves nothing.
+# local Criterion means; the watchdog and cold-evidence rows carry the
+# 2026-10-30 means) so runner noise cannot flake the lane; precision stays
+# with the BENCHMARKS.md table. A missing estimates.json is a FAIL, not a
+# SKIP -- an unexecuted bench proves nothing.
 #
 # Usage: bash scripts/bench_gate.sh [criterion-root]
 set -euo pipefail
@@ -29,6 +30,18 @@ KEYS=(
   layer4_drain_feed/drain_feed_frame:1500
   layer4_layer5_diagnostics/process_token_to_bytes:150
   layer4_worker_pool/report_snapshot_4_lanes:1500
+  layer4_worker_pool/expired_lanes_4_lanes:6000
+  layer2_watchdogs/memory_trend_sample:100
+  layer2_watchdogs/memory_trend_verdict:150
+  layer2_watchdogs/handle_watch_sample:200
+  layer2_watchdogs/jitter_ms_band_math:120
+  layer2_watchdogs/aimd_limit_cycle:50
+  layer5_cold_evidence/flight_tape_record_newest:70
+  layer5_cold_evidence/flight_tape_last_with_code:50
+  layer5_cold_evidence/snapshot_v1_decode:15000
+  layer5_cold_evidence/snapshot_v1_diff:300
+  layer5_cold_evidence/write_triage_card:8000
+  layer5_cold_evidence/ranked_set_insert:300
 )
 
 if [ ! -d "$ROOT" ]; then

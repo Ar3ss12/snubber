@@ -155,6 +155,17 @@ const COVERED: &[&str] = &[
     "node_name_as_str",
     "async_enter_ready_poll",
     "async_park_wake_admit_roundtrip",
+    "memory_trend_sample",
+    "memory_trend_verdict",
+    "handle_watch_sample",
+    "jitter_ms_band_math",
+    "aimd_limit_cycle",
+    "flight_tape_record_newest",
+    "flight_tape_last_with_code",
+    "snapshot_v1_decode",
+    "snapshot_v1_diff",
+    "write_triage_card",
+    "ranked_set_insert",
 ];
 
 /// Split `b.iter_batched(setup, routine, size)` arguments at top-level

@@ -107,6 +107,17 @@ $labels = @{
     "contended_node_scoped_threads_6"   = "node.scoped (6 threads)"
     "contended_gateway_mpsc_threads_6"  = "gateway send (6 threads)"
     "cross_thread_isr_bridge_push_pop"  = "IsrBridge::try_push + try_pop (2 threads)"
+    "memory_trend_sample"               = "MemoryTrend<10>::sample"
+    "memory_trend_verdict"              = "MemoryTrend<10>::verdict"
+    "handle_watch_sample"               = "HandleWatch<10>::sample (probe)"
+    "jitter_ms_band_math"               = "jitter_ms (20 % spread)"
+    "aimd_limit_cycle"                  = "AimdLimit::on_success + on_pressure"
+    "flight_tape_record_newest"         = "FlightTape<6>::record_code + newest"
+    "flight_tape_last_with_code"        = "FlightTape<6>::last_with_code"
+    "snapshot_v1_decode"                = "snapshot_v1.decode()"
+    "snapshot_v1_diff"                  = "snapshot_v1.diff (counter deltas)"
+    "write_triage_card"                 = "write_triage(card)"
+    "ranked_set_insert"                 = "RankedSet::insert (teardown order)"
 }
 
 $rows = [System.Collections.Generic.List[string]]::new()

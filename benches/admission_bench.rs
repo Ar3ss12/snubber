@@ -1072,9 +1072,162 @@ fn bench_async_waiters(c: &mut Criterion) {
     g.finish();
 }
 
+/// The 0.7.x watchdogs: the derivative detectors and the two policy-math
+/// primitives a caller runs on its maintenance tick. All four are `core`
+/// code — no lock, no allocation, no OS call — so the numbers are pure fold
+/// cost, which is exactly what a 1 Hz tick pays on top of its own sampler.
+fn bench_watchdogs(c: &mut Criterion) {
+    use snubber::{jitter_ms, AimdLimit, HandleWatch, MemoryTrend};
+
+    let mut g = c.benchmark_group("layer2_watchdogs");
+
+    // One external RSS sample: ring push + both halves of the report. The
+    // window is flat, which is the shape a healthy process shows on every
+    // tick — the `Stable` classification, not the tripping one.
+    g.bench_function("memory_trend_sample", |b| {
+        let mut trend = MemoryTrend::<10>::new(8_000_000, 16_000_000, 120_000, 30_000);
+        for index in 0..10u64 {
+            trend.sample(4_000_000 + index);
+        }
+        b.iter(|| black_box(trend.sample(black_box(4_000_005))));
+    });
+
+    // The same report without feeding the ring — the read a status surface
+    // takes when the tick already has a sample in hand.
+    g.bench_function("memory_trend_verdict", |b| {
+        let mut trend = MemoryTrend::<10>::new(8_000_000, 16_000_000, 120_000, 30_000);
+        for index in 0..10u64 {
+            trend.sample(4_000_000 + index);
+        }
+        b.iter(|| black_box(trend.verdict()));
+    });
+
+    // One handle-count sample through the caller's probe: the probe call, the
+    // `Option` gate, the ring push and the classification. A probe that
+    // answers `None` records nothing, so it must stay a real closure.
+    g.bench_function("handle_watch_sample", |b| {
+        let mut watch = HandleWatch::<10>::new(64, 30_000);
+        let mut count = 1_000u64;
+        let mut probe = move || {
+            count = count.wrapping_add(1);
+            Some(count)
+        };
+        b.iter(|| black_box(watch.sample(&mut probe)));
+    });
+
+    // Retry spread: salted integer math, deterministic for one salt.
+    g.bench_function("jitter_ms_band_math", |b| {
+        let mut salt = 0u64;
+        b.iter(|| {
+            salt = salt.wrapping_add(1);
+            black_box(jitter_ms(black_box(500), black_box(20), black_box(salt)))
+        });
+    });
+
+    // One AIMD round: additive up, multiplicative down, on the same ceiling.
+    g.bench_function("aimd_limit_cycle", |b| {
+        let mut limit = AimdLimit::new(4, 1, 16, 1, 50);
+        b.iter(|| {
+            black_box(limit.on_success());
+            black_box(limit.on_pressure());
+        });
+    });
+
+    g.finish();
+}
+
+/// The cold evidence path: what a process writes when something goes wrong,
+/// and what the reader does with the frame afterwards. Nothing here runs on
+/// an admission — these are the 30 s flush, the triage card and the peer
+/// parsing a dead child's snapshot.
+fn bench_cold_evidence(c: &mut Criterion) {
+    use snubber::{write_triage, FlightTape, RankedNode, RankedSet, SnapshotV1, SNAPSHOT_LEN};
+
+    let mut g = c.benchmark_group("layer5_cold_evidence");
+
+    // One edge event on the tape + the read the triage card asks for.
+    g.bench_function("flight_tape_record_newest", |b| {
+        let mut tape = FlightTape::<6>::new();
+        let mut epoch = 1u64;
+        b.iter(|| {
+            epoch = epoch.wrapping_add(1);
+            tape.record_code(black_box(epoch), black_box(7), black_box(3));
+            black_box(tape.newest()).map(|entry| entry.epoch)
+        });
+    });
+
+    // Scanning the window for the last event of one code, on a full tape.
+    g.bench_function("flight_tape_last_with_code", |b| {
+        let mut tape = FlightTape::<6>::new();
+        for index in 0..6u64 {
+            tape.record_code(index, 1, if index % 2 == 0 { 4 } else { 9 });
+        }
+        b.iter(|| black_box(tape.last_with_code(black_box(4))).map(|entry| entry.epoch));
+    });
+
+    // Reading a 512-byte frame back: magic, version, hostile `len` clamp and
+    // the CRC over the declared range. This is the survivor's side of a crash.
+    g.bench_function("snapshot_v1_decode", |b| {
+        let node = SnubberNode::builder("bench/decode").build();
+        let _ = node.enter_auto(|| {}).map(|guard| guard.commit());
+        let bytes = node.snapshot_v1().encode();
+        b.iter(|| black_box(SnapshotV1::decode(black_box(&bytes))));
+    });
+
+    // Counter deltas between two samples, on two snapshots taken in setup:
+    // the fold alone, without the `snapshot_v1()` lock cost beside it.
+    g.bench_function("snapshot_v1_diff", |b| {
+        let node = SnubberNode::builder("bench/diff").build();
+        let before = node.snapshot_v1();
+        for _ in 0..1_000 {
+            if let Ok(guard) = node.enter_auto(|| {}) {
+                guard.commit();
+            }
+        }
+        let after = node.snapshot_v1();
+        b.iter(|| black_box(before.diff(&after)));
+    });
+
+    // The ASCII verdict card. A reusable String keeps the timed window
+    // allocation-free after the first sample, which is the shape of a real
+    // flush: one buffer, many cards.
+    g.bench_function("write_triage_card", |b| {
+        let node = SnubberNode::builder("bench/triage").build();
+        for _ in 0..100 {
+            if let Ok(guard) = node.enter_auto(|| {}) {
+                guard.commit();
+            }
+        }
+        let snap = node.snapshot_v1();
+        let mut card = String::with_capacity(SNAPSHOT_LEN * 4);
+        b.iter(|| {
+            card.clear();
+            black_box(write_triage(&mut card, "bench/triage", &snap)).is_ok()
+        });
+    });
+
+    // Teardown ordering: one ranked insert into a fresh set. Criterion calls
+    // the batched setup outside the timed window, so only the insert and the
+    // set's drop land in the number.
+    g.bench_function("ranked_set_insert", |b| {
+        let node = SnubberNode::builder("bench/rank").build();
+        b.iter_batched(
+            RankedSet::<8>::new,
+            |mut set| {
+                set.insert(RankedNode::<3>::new(&node))
+                    .expect("room in a fresh set");
+                black_box(set.len())
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    g.finish();
+}
+
 criterion_group!(
     name = benches;
     config = fast();
-    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_impedance, bench_layer4_layer5, bench_pipe_drain, bench_drain_feed, bench_pool, bench_extensibility, bench_async_waiters, bench_contended
+    targets = bench_layer1, bench_layer15, bench_layer2, bench_telemetry, bench_layer3, bench_impedance, bench_layer4_layer5, bench_pipe_drain, bench_drain_feed, bench_pool, bench_extensibility, bench_async_waiters, bench_watchdogs, bench_cold_evidence, bench_contended
 );
 criterion_main!(benches);

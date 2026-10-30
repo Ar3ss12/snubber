@@ -4,6 +4,45 @@ All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.
 the audit-batch fix tables live at the bottom of this file, and the
 current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
+## 0.7.7 — unreleased
+
+No library change: `src/` is untouched since 0.7.6. The bench suite got the
+rows that were missing and the doc gate that reads it got a second law, so
+numbers cannot be borrowed across rows any more.
+
+### Added
+
+- Two bench groups for the APIs the docs carried as structure without a
+  measurement: `layer2_watchdogs` (`MemoryTrend::sample`,
+  `MemoryTrend::verdict`, `HandleWatch::sample`, `jitter_ms`,
+  `AimdLimit::on_success` + `on_pressure`) and `layer5_cold_evidence`
+  (`FlightTape::record_code` + `newest`, `FlightTape::last_with_code`,
+  `snapshot_v1.decode()`, `snapshot_v1.diff`, `write_triage`,
+  `RankedSet::insert`). `scripts/bench.sh` and `scripts/bench.ps1` carry the
+  same 11 new labels — the map went from 52 keys to 64 and the published
+  table from 53 rows to 64.
+- `tests/doc_sync.rs::test_bench_rows_quote_their_own_measurement` pairs each
+  BENCHMARKS.md row with the snapshot row it names (contended rows resolve
+  through the exporter's key-to-label map) and requires every citation in
+  that row to round or truncate from THAT measurement. The existing oracle
+  only proved a number was real somewhere in the artifact.
+- The snapshot path is one constant, `BENCH_ARTIFACT`, and BENCHMARKS.md must
+  link the file that constant names — a doc pointing at yesterday's artifact
+  while the gate reads today's is how a stale row survives a refresh.
+
+### Fixed
+
+- BENCHMARKS.md published `pool.expired_lanes(lease) (4 lanes)` as 5.4 ns for
+  four days. That is `SnubberGuard::new` + `commit`'s measurement; the sweep
+  is **516.2 ns** (129 ns per lane), and the existence-only oracle could not
+  see the borrow because 5.4 ns really exists in the artifact. The row's
+  prose was wrong too: `expired()` and `idle_ms()` each take the lane state
+  lock, so an expired lane costs two locks and two clock reads plus the
+  result `Vec` — not "one state lock per lane".
+- The whole matrix and the contended table re-pointed at the 2026-10-30
+  run pair; `docs/evidence/2026-10-30_bench_snapshot.md` is the frozen
+  evidence, with 2026-10-26 kept as the record of the earlier tree.
+
 ## 0.7.6 — 2026-10-30
 
 Additive: the trend window names a steep partial slope, the README states what
