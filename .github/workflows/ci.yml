@@ -442,6 +442,10 @@ jobs:
           cargo miri test --locked --test isr_bridge
           cargo miri test --locked --test fault_classification
           cargo miri test --locked --test async_gate
+          # 19 of the 20 lanes below run under Miri; the twentieth
+          # (concurrent_parked_wakers_all_wake_inside_their_deadline) is
+          # `cfg_attr(miri, ignore)` because its assertion is a wall-clock
+          # deadline and Miri interprets the slot holder's spins.
           cargo miri test --locked --test async_primitives
           cargo miri test --locked --test supervisor
           cargo miri test --locked --test supervisor_restart

@@ -82,6 +82,13 @@ Nothing is removed and nothing is renamed.
   empty queue measures nothing — the first version of this test did exactly
   that and finished in `0.00s`. Suppressing the wake in
   `TrackedGuard::commit` turns it red in 5.00 s.
+- That lane asserts a WALL-CLOCK property, so Miri is not its audience and it
+  carries `cfg_attr(miri, ignore)`: on the CI-pinned `nightly-2026-10-09`, four
+  threads stranded at iteration 0 after 169.24 s while the wake path itself
+  never misbehaved — the interpreter spends the five seconds inside the slot
+  holder's spins. The other 19 lanes of `async_primitives` still run under
+  Miri, so the queue's atomics stay audited there, and the concurrent park/wake
+  is audited natively by the release suite. (CI #233 was red on exactly this.)
 - The `will_wake` comment in `enter_async_repeated_polls_do_not_bloat_waiter_queue`
   named the wrong mechanism: the queue dedups by the entry's own
   `Arc<AtomicBool>` identity (`will_wake` would cross-match two futures

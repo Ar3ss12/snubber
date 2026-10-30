@@ -816,6 +816,16 @@ fn a_parked_future_refused_on_a_stale_epoch_drains_its_queue_entry() {
 /// re-park replaced, shows up as the bounded deadline expiring. A busy
 /// re-poll loop cannot pass this test by accident — it never waits.
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "the assertion is a WALL-CLOCK property (a wake must land within 5 s of \
+              real time) and Miri interprets the holder's spin budget, so the deadline \
+              expires while the wake path is behaving: measured on the CI-pinned \
+              nightly-2026-10-09, four threads stranded at iteration 0 after 169.24 s \
+              with the other 19 lanes of this suite passing. Miri still audits this \
+              queue's atomics through those lanes; the concurrent park/wake is audited \
+              natively by the release suite."
+)]
 fn concurrent_parked_wakers_all_wake_inside_their_deadline() {
     const THREADS: usize = 6;
     const PER_THREAD: usize = 25;
