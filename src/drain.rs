@@ -30,9 +30,10 @@ const _: () = assert!(TOKEN_BODY_LEN == 40, "token body is a 40 B format contrac
 
 /// Last-armed 40-byte token: `[task u64 | opcode u32 | payload [u8;28]]`.
 ///
-/// `OP_COMMIT` clears the armed token (settled clean). Any other opcode
-/// arms it until commit or `EOF`. Fixed bytes only — codes + ids, no
-/// paths. `Copy`, no alloc.
+/// `OP_COMMIT` clears the armed token, but only when its `task` matches the
+/// armed token's `task` (settled clean). Any other opcode arms it until
+/// commit or `EOF`. Fixed bytes only — codes + ids, no paths. `Copy`, no
+/// alloc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessToken {
     /// Correlation id (`task_id` of the `TransactionHeader`).
@@ -47,7 +48,9 @@ pub struct ProcessToken {
 /// Prevents unaligned byte drift if arbitrary text (println!) is sent through stdout.
 pub const TOKEN_MAGIC: [u8; 4] = *b"SNUB";
 
-/// Settle-clean marker: clears `last_armed_token` in the drain.
+/// Settle-clean marker: clears the drain's armed token when `task` names it.
+/// A commit for a different task leaves that arm in place — the rule is
+/// applied by `apply_token` in the std drain, the wire is the same here.
 pub const OP_COMMIT: u32 = 0;
 
 /// Idle heartbeat: worker sends `[task=0, OP_HEARTBEAT, zero]` every
@@ -104,7 +107,8 @@ impl ProcessToken {
         }
     }
 
-    /// Settle-clean marker for `task`.
+    /// Settle-clean marker for `task`: the drain clears its armed token only
+    /// when this id matches the armed token's `task`.
     #[inline]
     #[must_use]
     pub const fn commit(task: u64) -> Self {

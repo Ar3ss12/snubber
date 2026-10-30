@@ -1045,7 +1045,7 @@ When a process is vaporized instantly (`kill -9`, `Stop-Process -Force`, `std::p
 1. **Generation Clock (`GenerationClock`):** The supervisor starts workers with `gen=N`. If the worker dies, the supervisor increments to `gen=N+1`. Any delayed zombie packets from the dead worker are cut off at the gate.
 2. **Framed Pipe Intercom (`ProcessToken`):** The worker emits framed 44-byte packets (`b"SNUB"` sync magic + a 40-byte body: `u64` task, `u32` opcode, 28-byte payload).
 3. **PipeDrain:** The supervisor drains the stream continuously in a background reader with sliding-window sync, filtering out arbitrary `println!` noise. The same parser is reachable without a reader thread — `drain_sync` (blocking `Read`) and `feed` + `finish` (caller-pushed chunks) — and the liveness clock is injectable (`ClockFn`).
-4. **Emergency Rescue on EOF:** If the worker is killed mid-transaction while holding an armed token, the pipe closes (`EOF`), and the supervisor immediately executes the registered emergency hardware release outside the dead process.
+4. **Emergency Rescue on EOF:** If the worker is killed mid-transaction while holding an armed token, the pipe closes (`EOF`), and the supervisor immediately executes the registered emergency hardware release outside the dead process. A commit (`OP_COMMIT`) settles only the arm whose `task` it names, so a commit belonging to another transaction cannot erase a pending rescue; the slot holds one token, so two transactions armed on one pipe at the same time rescue only the last — run independent transactions on separate lanes (4.6d).
 
 ### Single-Line Supervised Wire-Up:
 ```rust
@@ -1442,12 +1442,13 @@ process chains.
 
 ### 4.6d Worker pool (`WorkerPool`): N lineages, one pipe per worker
 
-One `Supervisor` is one lineage. Its `PipeDrain` keeps ONE armed slot and
-ONE `OP_STATE` scratch slot, and `take_armed()` returns a token without a
-lineage id — two workers behind one supervisor would merge rescue
-accounting, and one silent child would stall every waiter behind
-`child.wait()`. The pool keeps the wire format and the drain semantics
-intact and scales the COUNT:
+One `Supervisor` is one lineage. Its `PipeDrain` keeps ONE armed slot —
+settled only by the `OP_COMMIT` whose `task` names the armed token, so a
+foreign commit cannot turn an ambush into an escape — and ONE `OP_STATE`
+scratch slot, and `take_armed()` returns a token without a lineage id — two
+workers behind one supervisor would merge rescue accounting, and one silent
+child would stall every waiter behind `child.wait()`. The pool keeps the
+wire format and the drain semantics intact and scales the COUNT:
 
 | Part | Single lineage | Pool |
 |---|---|---|

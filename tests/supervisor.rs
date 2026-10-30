@@ -168,7 +168,8 @@ fn drain_holds_last_armed_and_eof_fires_it() {
         spins += 1;
     }
     assert!(drain.eof(), "drain must observe EOF after death");
-    // Last-armed token survived: the 7777/9 live one (commits cleared).
+    // Last-armed token survived: the 7777/9 live one. The 0..2000 commits
+    // name no arm, so they settled nothing; the re-arm replaced 4242.
     let fired = drain.take_armed().expect("un-settled token fires");
     assert_eq!(fired.task, 7777);
     assert_eq!(fired.opcode, 9);

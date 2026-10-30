@@ -8,9 +8,10 @@ current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
 Additive: the trend window names a steep partial slope, the README states what
 the crate cannot see, and a breaking-change declaration now travels in this
-file instead of a folder. One writer law is tightened inside the node: the
-rollback clock can no longer be erased by a body that never claimed it.
-Nothing is removed and nothing is renamed.
+file instead of a folder. Two single-writer laws are tightened: the rollback
+clock can no longer be erased by a body that never claimed it, and a drain
+commit can no longer settle an arm it does not name. Nothing is removed and
+nothing is renamed.
 
 ### Added
 
@@ -57,6 +58,21 @@ Nothing is removed and nothing is renamed.
   second writer instead of relying on that measurement. Tripwires:
   `a_closer_leaves_the_clock_it_did_not_claim`,
   `concurrent_bodies_share_one_clock_a_closer_cannot_take`.
+- The drain's armed token is settled only by the commit that names it.
+  `apply_token` cleared `DrainState::armed` for any `OP_COMMIT` frame and
+  ignored that frame's `task`, so a commit belonging to a different
+  transaction — a shared `task = 0`, a settle from a second subsystem on the
+  same pipe, a replayed commit — erased the rescue token of the transaction
+  that actually was armed. The reap then classified a genuine ambush as
+  **clean escape**, the emergency handler never ran, and the hardware stayed
+  held. The clear now requires `armed.task == token.task`, and the commit
+  still counts: `DrainCounters::commits` keeps reporting the frame census,
+  which is a statement about the stream, not about one transaction. The
+  single slot itself is unchanged and now published as the boundary it is: an
+  arm replaces the token before it, so one pipe rescues one un-settled
+  transaction and concurrent independent transactions are one lane each
+  (`WorkerPool`) with `task` ids unique per un-settled transaction — the 44 B
+  frame carries no generation of its own.
 - `RUSTDOCFLAGS="-D warnings"` broke `cargo doc` (CI #232): `handles.rs`
   linked `MemoryTrend::is_leaking`, whose private path stopped resolving when
   the trend verdict moved to `MemoryReport`, and `memory.rs` documented the
@@ -100,6 +116,17 @@ Nothing is removed and nothing is renamed.
   law. The assert is gone; the same law is pinned where a ghost waiter is
   reachable, by the two post-park refusal lanes above and
   `dropped_parked_future_deregisters_its_queue_slot`.
+- The armed-token clear is asserted from both ends. `drain_feed` pins the
+  rule (`a_commit_settles_only_the_arm_it_names`), that the guard shape the
+  crate itself emits still settles (`sequential_arms_settle_on_their_own_commit`),
+  that a lone commit does nothing (`a_lone_commit_neither_arms_nor_settles`)
+  and what the single slot costs (`a_second_arm_replaces_the_first_unsettled_token`),
+  and `supervisor_pool` pins the consequence a caller acts on: a foreign
+  commit on a lane must reap `ReapClass::Ambush`, not `Escape`
+  (`a_foreign_commit_cannot_turn_an_ambush_into_an_escape`). With the
+  unconditional clear back in `apply_token`, the drain lane fails
+  `left: None, right: Some(11)` and the pool lane
+  `left: Escape, right: Ambush`.
 
 ### Documentation
 

@@ -238,6 +238,21 @@ outlives every transaction.
   after the first arm frame, so `-MinAmbushPct 70` / `--min-ambush-pct 70`
   proves the killer terminates armed workers instead of shooting during
   process startup.
+- The armed slot is settled only by the commit that NAMES it: `OP_COMMIT`
+  clears `DrainState::armed` when the frame's `task` equals the armed
+  token's `task`, and leaves any other arm in place while still counting the
+  frame. Clearing unconditionally let one transaction's commit erase another
+  transaction's rescue token, which reported a genuine ambush as a clean
+  escape and skipped the emergency handler. The slot holds ONE token: a
+  second arm replaces the first, so only the last un-settled transaction of
+  that pipe is rescued. Concurrent independent transactions therefore need
+  one lane each (`WorkerPool`), and `task` ids must stay unique per
+  un-settled transaction because the frame carries no generation.
+  Tripwires: `a_commit_settles_only_the_arm_it_names`,
+  `sequential_arms_settle_on_their_own_commit`,
+  `a_lone_commit_neither_arms_nor_settles`,
+  `a_second_arm_replaces_the_first_unsettled_token`,
+  `a_foreign_commit_cannot_turn_an_ambush_into_an_escape`.
 - The POSIX harness verifies process identity before `SIGKILL`: starttime
   plus image basename from `/proc/<pid>/stat` and `/proc/<pid>/exe` (Linux)
   or `ps -o lstart=,comm=` (macOS). A failed read is never cached, a killed

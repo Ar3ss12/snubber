@@ -48,6 +48,45 @@ fn stuck() -> PipeDrain {
     PipeDrain::spawn(Stuck)
 }
 
+/// The reap class is what an application acts on, so a commit that belongs
+/// to a different transaction must not flip a genuine ambush into a clean
+/// escape: the armed task still holds hardware at death and its rescue is
+/// the entire reason the drain exists.
+#[test]
+fn a_foreign_commit_cannot_turn_an_ambush_into_an_escape() {
+    let pool = WorkerPool::new(PoolConfig::new(1)).expect("one lane");
+    let lane = pool.lane(0).expect("lane 0");
+    let task = namespace_task(0, 7);
+    let drain = drain_of(&[
+        ProcessToken::simple(task, 9, 1),
+        ProcessToken::commit(task + 1),
+    ]);
+    let counters = drain.counters();
+
+    lane.attach(2_001, drain).expect("attach lane 0");
+    let reap = lane.note_death(None, 1_000).expect("reap lane 0");
+
+    assert_eq!(
+        reap.class,
+        ReapClass::Ambush,
+        "the armed task never settled"
+    );
+    assert_eq!(reap.token.map(|t| t.task), Some(task));
+    assert_eq!(
+        (counters.arms, counters.commits),
+        (1, 1),
+        "both frames stay in the census; only the slot is guarded"
+    );
+
+    // The matching commit does settle, so the crate's own guard shape still
+    // reaches the escape bucket.
+    let settled = drain_of(&[ProcessToken::simple(task, 9, 1), ProcessToken::commit(task)]);
+    lane.attach(2_002, settled).expect("re-attach lane 0");
+    let reap = lane.note_death(Some(0), 1_000).expect("reap lane 0 again");
+    assert_eq!(reap.class, ReapClass::Escape);
+    assert!(reap.token.is_none(), "the named commit settled the arm");
+}
+
 #[test]
 fn lanes_do_not_share_armed_tokens() {
     let pool = WorkerPool::new(PoolConfig::new(2)).expect("two lanes");

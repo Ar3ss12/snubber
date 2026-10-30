@@ -6,12 +6,14 @@
 //!
 //! PATH 2: Emergency token recovery. The worker maintains an armed 40-byte token over an
 //! anonymous pipe. The supervisor background reader thread drains the pipe in real time.
-//! On clean commit (`OP_COMMIT`), the armed token is cleared. On process abort (`EOF` while
-//! armed), the un-settled token executes emergency rollback on the supervisor side.
+//! On clean commit (`OP_COMMIT` with the armed task id), the armed token is cleared. On
+//! process abort (`EOF` while armed), the un-settled token executes emergency rollback on
+//! the supervisor side.
 //!
 //! PIPE-CHOKE CONTRACT: Drain the pipe in a background reader thread in real time
 //! (OS kernel buffer is 4-64 KB; un-drained stdout stalls the child on `write()`).
-//! Drain retains at most ONE last-armed token, cleared on `OP_COMMIT`.
+//! Drain retains at most ONE last-armed token, cleared only by the
+//! `OP_COMMIT` that names that token's task id.
 //!
 //! RESTART LOGIC: The caller owns process spawn and wait. The supervisor provides
 //! decision math via [`RestartPolicy`], [`Backoff`], and [`RestartTracker`].
@@ -980,6 +982,12 @@ pub fn death_event(header: TransactionHeader, cause: DeathCause) -> SnubberEvent
 /// Drain state: exactly ONE slot (last un-settled token) + liveness clock
 /// + hot handoff (last verified complete `StateDigest` + 3-frame reassembly scratch).
 ///
+/// The one armed slot means one un-settled transaction per pipe: a commit
+/// clears it only when the commit's `task` matches the armed token, and an
+/// arm replaces it. Two concurrent independent transactions on one pipe
+/// therefore cannot both be rescued — that is a lane per transaction, which
+/// is what [`crate::pool::WorkerPool`] provides.
+///
 /// `last_seen_ms`: boot-relative timestamp of the last valid 40 B frame
 /// (token, commit, heartbeat OR state — any traffic proves the worker
 /// pumps). `seen` is separate because timestamp `0` is a valid uptime.
@@ -1236,6 +1244,13 @@ impl PipeDrain {
 
     /// Take the last un-settled token, if any (call AFTER `EOF`/reap).
     ///
+    /// ONE slot: a token is un-settled until the `OP_COMMIT` whose `task`
+    /// matches it arrives, so a commit for another transaction cannot erase
+    /// this rescue. Two transactions armed on one pipe at the same time
+    /// cannot both be reported here — the later arm replaces the earlier
+    /// token, which is why concurrent independent transactions run on
+    /// separate lanes ([`crate::pool::WorkerPool`], one `PipeDrain` each).
+    ///
     /// Poison-safe: `DrainState` is plain counters + `Option` slots (no
     /// cross-field invariants a panic could tear), so a poisoned lock is
     /// recovered through the guard instead of silently dropping the
@@ -1382,7 +1397,15 @@ fn apply_token(state: &mut DrainState, token: ProcessToken, now_ms: u64) {
     if token.opcode == OP_COMMIT || token.opcode == OP_HEARTBEAT {
         if token.opcode == OP_COMMIT {
             state.commits = state.commits.saturating_add(1);
-            state.armed = None;
+            // A commit settles only the arm it NAMES. Clearing the slot
+            // unconditionally let a commit for one transaction erase the
+            // rescue token of another: the reap then classified a still
+            // armed transaction as a clean escape and the emergency handler
+            // never ran. An unmatched commit is still counted — the frame
+            // arrived, the census stays the truth about the stream.
+            if state.armed.is_some_and(|armed| armed.task == token.task) {
+                state.armed = None;
+            }
         }
     } else if token.opcode == OP_STATE {
         // Hot handoff chunk: seq = task (0/1/2).
@@ -1436,6 +1459,12 @@ fn apply_token(state: &mut DrainState, token: ProcessToken, now_ms: u64) {
         // transaction; the next OP_COMMIT or emergency opcode does that.
     } else {
         state.arms = state.arms.saturating_add(1);
+        // One slot, one un-settled transaction per pipe: a second arm
+        // replaces the token the first left, so the replaced transaction's
+        // rescue is lost even with the task-matched clear above. That is
+        // the drain's published boundary — concurrent independent
+        // transactions belong on separate lanes (`WorkerPool`), not on one
+        // pipe.
         state.armed = Some(token);
     }
 }

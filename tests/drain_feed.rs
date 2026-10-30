@@ -52,6 +52,79 @@ fn two_frames_in_one_chunk_are_both_delivered() {
 }
 
 #[test]
+fn a_commit_settles_only_the_arm_it_names() {
+    let drain = PipeDrain::manual();
+
+    assert_eq!(drain.feed(&ProcessToken::simple(11, 5, 9).to_bytes()), 1);
+    // A commit belonging to a different transaction settles nothing: the
+    // arm it does not name is still un-settled.
+    assert_eq!(drain.feed(&ProcessToken::commit(12).to_bytes()), 1);
+    assert_eq!(
+        drain.counters().commits,
+        1,
+        "the frame still counts as a commit"
+    );
+    assert_eq!(
+        drain.take_armed().map(|token| token.task),
+        Some(11),
+        "an un-settled arm survives a commit that does not name it"
+    );
+
+    // The commit that DOES name it settles, exactly once.
+    assert_eq!(drain.feed(&ProcessToken::commit(11).to_bytes()), 1);
+    assert!(drain.take_armed().is_none(), "the named commit settled it");
+}
+
+/// The shape the crate's own guard emits — `commit(token.task)` after each
+/// arm — keeps settling cleanly, cycle after cycle.
+#[test]
+fn sequential_arms_settle_on_their_own_commit() {
+    let drain = PipeDrain::manual();
+    for task in 1..=4u64 {
+        assert_eq!(
+            drain.feed(&ProcessToken::simple(task, 5, 1).to_bytes()),
+            1,
+            "arm task {task}"
+        );
+        assert_eq!(drain.feed(&ProcessToken::commit(task).to_bytes()), 1);
+        assert!(drain.take_armed().is_none(), "task {task} settled clean");
+    }
+    let counters = drain.counters();
+    assert_eq!(
+        (counters.arms, counters.commits, counters.frames),
+        (4, 4, 8)
+    );
+}
+
+/// A commit naming a transaction the drain never armed settles nothing and
+/// arms nothing.
+#[test]
+fn a_lone_commit_neither_arms_nor_settles() {
+    let drain = PipeDrain::manual();
+    assert_eq!(drain.feed(&ProcessToken::commit(7).to_bytes()), 1);
+    let counters = drain.counters();
+    assert_eq!((counters.arms, counters.commits), (0, 1));
+    assert!(drain.take_armed().is_none());
+}
+
+/// The published limit of the single slot: the later arm replaces the
+/// earlier token, so one pipe rescues one un-settled transaction. Pinned so
+/// the boundary stays a tested contract instead of a silent loss —
+/// concurrent independent transactions need one lane each.
+#[test]
+fn a_second_arm_replaces_the_first_unsettled_token() {
+    let drain = PipeDrain::manual();
+    assert_eq!(drain.feed(&ProcessToken::simple(11, 5, 1).to_bytes()), 1);
+    assert_eq!(drain.feed(&ProcessToken::simple(12, 6, 2).to_bytes()), 1);
+    assert_eq!(drain.counters().arms, 2, "both arm frames counted");
+    assert_eq!(
+        drain.take_armed().map(|token| token.task),
+        Some(12),
+        "the one slot holds the LAST un-settled token"
+    );
+}
+
+#[test]
 fn garbage_around_frames_keeps_alignment() {
     let drain = PipeDrain::manual();
     let first = ProcessToken::simple(1, 5, 1).to_bytes();
