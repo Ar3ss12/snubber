@@ -633,6 +633,15 @@ impl SnubberNodeBuilder {
 
     /// Task TTL: maximum allowed wait duration in the queue before admission.
     /// Tasks waiting longer than this fail fast with [`EnterError::QueueTtlExpired`].
+    ///
+    /// SCOPE: the clock runs from the park the waiter is currently sitting in.
+    /// A waiter that is popped as the winner by a settle and then re-parks —
+    /// because its slot was taken in the gap between the wake and the poll —
+    /// starts a fresh clock, because it is queueing for a different slot.
+    /// `task_ttl` therefore bounds one queue wait, not the total wall time an
+    /// unlucky task spends across several losing attempts; the ceiling on
+    /// repeated attempts is the re-park itself, which only happens when a
+    /// real slot was released.
     #[must_use]
     pub fn task_ttl(mut self, ttl: core::time::Duration) -> Self {
         self.task_ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
@@ -1539,11 +1548,17 @@ pub struct RollbackPhase {
     pub epoch: u64,
     /// Task id of the most recently started body (`0` = never observed).
     pub task_id: u64,
-    /// Age of the OLDEST active body, ms.
+    /// Age of the OLDEST active body, ms (`0` while no body runs).
     ///
     /// Always `0` while no budget is armed: the clock stamp is off by
-    /// default (mirror of `needs_stamp`), so an abort costs two atomic
-    /// writes and no OS clock read.
+    /// default (mirror of `needs_stamp`), so an abort costs one atomic
+    /// counter and no OS clock read.
+    ///
+    /// With CONCURRENT bodies the stamp belongs to the oldest body that
+    /// claimed the clock, which may already have settled: `elapsed_ms` then
+    /// over-reports and never under-reports, so a watcher can name a stall
+    /// early but cannot miss one. Per-body billing — `max_ms` and `stalls` —
+    /// always uses that body's own start.
     pub elapsed_ms: u64,
     /// Armed budget, ms (`0` = disabled).
     pub budget_ms: u64,
@@ -1592,7 +1607,8 @@ pub enum RollbackReentrancy {
     Refuse,
 }
 
-/// "No rollback body is being timed" sentinel — see `RollbackMirror::started_ms`.
+/// "No rollback clock has been stamped on this node yet" sentinel —
+/// see `RollbackMirror::started_ms`.
 const IDLE_MS: u64 = u64::MAX;
 
 /// Lock-free rollback mirror, stored NEXT TO the ledger in one allocation.
@@ -1605,10 +1621,16 @@ struct RollbackMirror {
     /// Identity of the most recently started body.
     epoch: AtomicU64,
     task_id: AtomicU64,
-    /// Start of the OLDEST active body (`IDLE_MS` = no clock stamp).
+    /// Start of the OLDEST active body (`IDLE_MS` = never stamped).
     /// NOT `0`: `now_ms()` legitimately returns `0` inside the process's
     /// first millisecond, and a zero sentinel was misread as "no body"
     /// (the same trap `elapsed_since_stamp` documents).
+    ///
+    /// Written only by a body whose `active` increment saw an empty count,
+    /// and never cleared by a closing body: while a body is counted, no other
+    /// begin can reach this word, so a live body's stamp cannot be lost.
+    /// A stamp that outlives its body is answered by the `active == 0` gate
+    /// in [`SnubberNode::rollback_phase`].
     started_ms: AtomicU64,
     max_ms: AtomicU64,
     stalls: AtomicU64,
@@ -1695,24 +1717,23 @@ struct RollbackStamp<'a> {
 
 impl<'a> RollbackStamp<'a> {
     /// Begin a body: always bumps the live counter and marks the rolling
-    /// thread (two atomic RMWs + one TLS write, no clock read); stamps a
-    /// start only when a budget is armed.
+    /// thread (one atomic RMW + one TLS write, no clock read); stamps a
+    /// start only when a budget is armed and no other body is counted.
     fn begin(ledger: &'a NodeLedger, epoch: u64, task_id: u64, budget_ms: u64) -> Self {
         let mirror = &ledger.rollback;
         let armed_at_ms = if budget_ms > 0 { now_ms() } else { 0 };
         mirror.epoch.store(epoch, Ordering::Relaxed);
         mirror.task_id.store(task_id, Ordering::Relaxed);
-        if budget_ms > 0 {
-            // Oldest start wins: a second concurrent body must not reset
-            // the clock a watcher is already measuring.
-            let _ = mirror.started_ms.compare_exchange(
-                IDLE_MS,
-                armed_at_ms,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
+        // Count FIRST, then claim the clock from a count that was empty.
+        // `fetch_add` hands the `prev == 0` answer to exactly one body, and
+        // while that body is counted no other begin can write `started_ms`:
+        // a live body's stamp can never be lost, so no closer has to clear it
+        // (see [`RollbackStamp::close`]). Oldest start wins — a second
+        // concurrent body leaves the clock the first one stamped.
+        let prev_active = mirror.active.fetch_add(1, Ordering::Relaxed);
+        if budget_ms > 0 && prev_active == 0 {
+            mirror.started_ms.store(armed_at_ms, Ordering::Relaxed);
         }
-        mirror.active.fetch_add(1, Ordering::Relaxed);
         let prev_body = rollback_body_enter(ledger);
         Self {
             ledger,
@@ -1740,10 +1761,15 @@ impl<'a> RollbackStamp<'a> {
     /// duration when a budget armed the clock, and name an overrun.
     fn close(&mut self) -> Option<u64> {
         let mirror = &self.ledger.rollback;
-        let prev = mirror.active.fetch_sub(1, Ordering::Relaxed);
-        if prev <= 1 {
-            mirror.started_ms.store(IDLE_MS, Ordering::Relaxed);
-        }
+        // NO clock clear here. The stamp is written only by the body that
+        // counted itself first, so a closing body that reset it could wipe
+        // the stamp a begin had just taken — `fetch_sub` and that store are
+        // adjacent instructions, and the next begin's claim lands inside
+        // them often enough to matter over a process lifetime: the wedged
+        // body then reports `active: true` with `elapsed_ms: 0` forever and
+        // the watchdog never names the stall. A stamp left by a settled body
+        // is answered by the `active == 0` gate in `rollback_phase` instead.
+        mirror.active.fetch_sub(1, Ordering::Relaxed);
         rollback_body_leave(self.prev_body);
         if self.budget_ms == 0 {
             return None;
@@ -2197,12 +2223,13 @@ impl SnubberNode {
     #[must_use]
     pub fn rollback_phase(&self) -> RollbackPhase {
         let mirror = &self.inner.rollback;
+        let active = mirror.active.load(Ordering::Relaxed);
         let started = mirror.started_ms.load(Ordering::Relaxed);
         RollbackPhase {
-            active: mirror.active.load(Ordering::Relaxed) > 0,
+            active: active > 0,
             epoch: mirror.epoch.load(Ordering::Relaxed),
             task_id: mirror.task_id.load(Ordering::Relaxed),
-            elapsed_ms: if started == IDLE_MS {
+            elapsed_ms: if active == 0 || started == IDLE_MS {
                 0
             } else {
                 now_ms().saturating_sub(started)
@@ -6536,5 +6563,85 @@ mod async_poison_tests {
             s.total_started + s.shed_total(),
             "conservation survives recovery"
         );
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// The law is about WHO may write the rollback clock — a race no public call
+// can schedule, so it is pinned on the private stamp API.
+mod rollback_clock_tests {
+    use super::{RollbackStamp, SnubberNode, IDLE_MS};
+    use core::sync::atomic::Ordering;
+
+    /// `started_ms` is written ONLY by a body whose `active` increment found
+    /// an empty count, and never by a closer. The pre-fix pair — `fetch_sub`
+    /// then `store(IDLE_MS)` — put a second writer on that word, and a
+    /// concurrent `begin` could land between its two instructions: the live
+    /// body then kept `active: true` with `elapsed_ms: 0` for its whole life,
+    /// which is exactly the wedge [`crate::watchdog::poll_rollback`] exists
+    /// to name.
+    #[test]
+    fn a_closer_leaves_the_clock_it_did_not_claim() {
+        let node = SnubberNode::builder("unit/rollback/clock-claim")
+            .max_in_flight(2)
+            .rollback_budget_ms(1_000)
+            .build();
+        let ledger = &*node.inner;
+        let mut first = RollbackStamp::begin(ledger, 4, 40, node.rollback_budget_ms());
+        let claimed = ledger.rollback.started_ms.load(Ordering::Relaxed);
+        assert_ne!(claimed, IDLE_MS, "the first counted body stamps the clock");
+        assert_eq!(ledger.rollback.active.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            first.finish(),
+            None,
+            "an instant body cannot overrun 1000 ms"
+        );
+
+        assert_eq!(ledger.rollback.active.load(Ordering::Relaxed), 0);
+        assert_ne!(
+            ledger.rollback.started_ms.load(Ordering::Relaxed),
+            IDLE_MS,
+            "only a claim writes the clock — a closer must not"
+        );
+        assert_eq!(
+            node.rollback_phase().elapsed_ms,
+            0,
+            "the phase view answers `0` from the live count, not from a stamp a closer erased"
+        );
+    }
+
+    /// Oldest start wins and a non-last closer leaves it alone: two
+    /// concurrent bodies share one clock, and the survivor is still timed
+    /// after the first one settles.
+    #[test]
+    fn concurrent_bodies_share_one_clock_a_closer_cannot_take() {
+        let node = SnubberNode::builder("unit/rollback/clock-shared")
+            .max_in_flight(4)
+            .rollback_budget_ms(1_000)
+            .build();
+        let ledger = &*node.inner;
+        let mut older = RollbackStamp::begin(ledger, 1, 10, node.rollback_budget_ms());
+        let stamp = ledger.rollback.started_ms.load(Ordering::Relaxed);
+        let mut younger = RollbackStamp::begin(ledger, 2, 20, node.rollback_budget_ms());
+        assert_eq!(
+            ledger.rollback.started_ms.load(Ordering::Relaxed),
+            stamp,
+            "a second body must not reset the clock a watcher is already measuring"
+        );
+        assert_eq!(ledger.rollback.active.load(Ordering::Relaxed), 2);
+
+        assert_eq!(younger.finish(), None);
+        assert_eq!(ledger.rollback.active.load(Ordering::Relaxed), 1);
+        assert_eq!(ledger.rollback.started_ms.load(Ordering::Relaxed), stamp);
+        let phase = node.rollback_phase();
+        assert!(
+            phase.active && phase.stalls == 0,
+            "the survivor keeps a running clock: {phase:?}"
+        );
+
+        assert_eq!(older.finish(), None);
+        assert_eq!(node.rollback_phase().elapsed_ms, 0, "no body, no age");
     }
 }

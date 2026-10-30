@@ -423,7 +423,7 @@ pub enum LeakClassification {
     /// this variant exists so that shape is nameable instead of invisible.
     Sawtooth,
     /// Partial window that has risen without a dip, for at least half the
-    /// window and at least [`ADVISORY_MIN_SAMPLES`] samples, and whose slope
+    /// window and at least three samples, and whose slope
     /// projected across the full window would cross the trip mark.
     ///
     /// **Advisory, never a latch.** One more sample can still be the dip that

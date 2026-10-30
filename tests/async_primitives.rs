@@ -303,7 +303,10 @@ fn enter_async_repeated_polls_do_not_bloat_waiter_queue() {
         assert!(res.is_pending(), "must stay pending while slot is held");
     }
 
-    // Due to will_wake deduplication, exactly 1 waker remains in the queue.
+    // Identity dedup (an `Arc::ptr_eq` match on the future's own `evicted`
+    // flag) updates this entry in place, so exactly 1 waker remains in the
+    // queue. A `will_wake` scan is NOT the mechanism: two futures polled by
+    // one task share a waker and would cross-match.
     assert_eq!(
         node.waiter_len(),
         1,
@@ -694,4 +697,229 @@ fn async_rate_shedding_files_its_own_kind() {
     assert_eq!(s.reported[FaultKind::RateLimited.index()], 1);
     assert_eq!(s.reported[FaultKind::BulkheadFull.index()], 0);
     assert_eq!(s.bulkhead_rejections, 0);
+}
+
+/// A future that PARKED and is then refused by a pre-lock gate (memory
+/// pressure) must leave no queue entry behind: `EnterFuture::poll` retires
+/// its own entry on every terminal `Ready`, so `queue_limit` is not eaten by
+/// a ghost waiter that no settle will ever pop.
+#[test]
+fn a_parked_future_refused_on_memory_drains_its_queue_entry() {
+    static MEM_WOKEN: AtomicBool = AtomicBool::new(false);
+
+    use std::task::Context;
+
+    let node = SnubberNode::builder("async/memory-drain")
+        .max_in_flight(1)
+        .queue_limit(4)
+        .memory_limits(8, 64)
+        .build();
+    let held = node.enter(1, 1, || {}).expect("hold the only slot");
+
+    let waker = flag_waker(&MEM_WOKEN);
+    let mut cx = Context::from_waker(&waker);
+    let mut parked = Box::pin(node.enter_async(2, 2, || {}));
+    assert!(
+        parked.as_mut().poll(&mut cx).is_pending(),
+        "a full bulkhead parks the waker"
+    );
+    assert_eq!(node.waiter_len(), 1, "one waiter in the queue");
+
+    // Pressure arrives AFTER the park, so the refusal is a terminal `Ready`
+    // on a future that owns a live queue entry.
+    node.note_memory_kb(128);
+    assert!(node.stats().memory_pressure, "128 KiB over 64 hard");
+    match parked.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(Err(EnterError::MemoryPressure)) => {}
+        std::task::Poll::Ready(Err(other)) => panic!("expected MemoryPressure, got {other:?}"),
+        std::task::Poll::Ready(Ok(_)) => panic!("a draining node must admit nothing"),
+        std::task::Poll::Pending => panic!("a draining node must not re-park"),
+    }
+    assert_eq!(
+        node.waiter_len(),
+        0,
+        "the refused future retired its own entry — no ghost squatting queue_limit"
+    );
+    assert_eq!(node.queue_depth(), 0, "the queue is honestly empty");
+
+    // And the node still admits once the slot frees: the parked rollback
+    // never ran, so nothing was burnt by the refusal. The readable sample
+    // under the soft limit is what lifts the flag — the refusal never
+    // clears it by itself.
+    drop(parked);
+    held.commit();
+    node.note_memory_kb(4);
+    assert!(
+        !node.stats().memory_pressure,
+        "a sample under the soft limit ends the drain"
+    );
+    let guard = node
+        .enter(3, 3, || {})
+        .expect("a memory refusal leaves the node usable");
+    guard.commit();
+}
+
+/// Same law for a generation bump: the epoch gate refuses the parked future
+/// AFTER it queued, and the entry it owned must go with the verdict.
+#[test]
+fn a_parked_future_refused_on_a_stale_epoch_drains_its_queue_entry() {
+    static STALE_WOKEN: AtomicBool = AtomicBool::new(false);
+
+    use snubber::TransactionHeader;
+    use std::task::Context;
+
+    let node = SnubberNode::builder("async/stale-drain")
+        .max_in_flight(1)
+        .queue_limit(4)
+        .build();
+    let held = node.enter(1, 1, || {}).expect("hold the only slot");
+
+    let waker = flag_waker(&STALE_WOKEN);
+    let mut cx = Context::from_waker(&waker);
+    let mut parked = Box::pin(node.enter_async(2, 2, || {}));
+    match parked.as_mut().poll(&mut cx) {
+        std::task::Poll::Pending => {}
+        std::task::Poll::Ready(Err(e)) => panic!("a full bulkhead must park, got Err({e:?})"),
+        std::task::Poll::Ready(Ok(_)) => panic!("a full bulkhead must park, got admission"),
+    }
+    assert_eq!(node.waiter_len(), 1, "one waiter in the queue");
+
+    // The generation moves under the parked future (re-handshake).
+    assert!(
+        node.observe(&TransactionHeader::new(5, 9)),
+        "a bump is always fresh"
+    );
+    match parked.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(Err(EnterError::StaleEpoch)) => {}
+        std::task::Poll::Ready(Err(other)) => panic!("expected StaleEpoch, got {other:?}"),
+        std::task::Poll::Ready(Ok(_)) => panic!("a stale generation must admit nothing"),
+        std::task::Poll::Pending => panic!("a stale future must not re-park"),
+    }
+    assert_eq!(
+        node.waiter_len(),
+        0,
+        "the refused future retired its own entry — no ghost squatting queue_limit"
+    );
+
+    // A newer epoch than the adopted one is still admissible: the refusal
+    // burned no coordinates.
+    drop(parked);
+    held.commit();
+    let guard = node
+        .enter(6, 6, || {})
+        .expect("an epoch ahead of the adopted one admits");
+    guard.commit();
+}
+
+/// The wake path itself, under concurrency: every thread polls ONLY when its
+/// own waker fires, so a wake that is lost, or handed to a waker a later
+/// re-park replaced, shows up as the bounded deadline expiring. A busy
+/// re-poll loop cannot pass this test by accident — it never waits.
+#[test]
+fn concurrent_parked_wakers_all_wake_inside_their_deadline() {
+    const THREADS: usize = 6;
+    const PER_THREAD: usize = 25;
+    const WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    // Spins spent inside the guard, holding the slot. Without this the
+    // churn is so cheap that two slots never fill and nobody ever parks —
+    // the run then measures nothing, which the `PARKED` floor below pins.
+    const HOLD_SPINS: u32 = 50_000;
+
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    // A `fn` item, not a closure: the retry below rebuilds the same future
+    // type, and no two closure literals share a type.
+    fn noop() {}
+
+    let node = SnubberNode::builder("async/waker-churn")
+        .max_in_flight(2)
+        .queue_limit(64)
+        .trip_after_failures(u32::MAX)
+        .build();
+    // Global epoch allocator: coordinates only ever move forward, so the
+    // only refusals this run may see are races, never a mis-stamped header.
+    let epoch_alloc = Arc::new(AtomicU64::new(1));
+    let admitted = Arc::new(AtomicU64::new(0));
+    let stale_retries = Arc::new(AtomicU64::new(0));
+    let parked = Arc::new(AtomicU64::new(0));
+
+    let mut joins = Vec::new();
+    for t in 0..THREADS {
+        let node = node.clone();
+        let epoch_alloc = Arc::clone(&epoch_alloc);
+        let admitted = Arc::clone(&admitted);
+        let stale_retries = Arc::clone(&stale_retries);
+        let parked = Arc::clone(&parked);
+        joins.push(std::thread::spawn(move || {
+            // One flag per thread; the raw vtable needs a `&'static`
+            // address and only this thread ever reads it.
+            let fired: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+            let waker = flag_waker(fired);
+            let mut cx = Context::from_waker(&waker);
+            for i in 0..PER_THREAD {
+                let epoch = epoch_alloc.fetch_add(1, Ordering::SeqCst);
+                let mut fut = Box::pin(node.enter_async(epoch, epoch * 8 + t as u64, noop));
+                let deadline = std::time::Instant::now() + WAIT_BUDGET;
+                loop {
+                    // Clear BEFORE the poll: a wake that lands between the
+                    // park and this store must still be seen.
+                    fired.store(false, Ordering::SeqCst);
+                    match fut.as_mut().poll(&mut cx) {
+                        Poll::Ready(Ok(guard)) => {
+                            for _ in 0..HOLD_SPINS {
+                                std::hint::spin_loop();
+                            }
+                            guard.commit();
+                            admitted.fetch_add(1, Ordering::SeqCst);
+                            break;
+                        }
+                        Poll::Ready(Err(EnterError::StaleEpoch)) => {
+                            stale_retries.fetch_add(1, Ordering::SeqCst);
+                            let epoch = epoch_alloc.fetch_add(1, Ordering::SeqCst);
+                            fut = Box::pin(node.enter_async(epoch, epoch * 8 + t as u64, noop));
+                        }
+                        Poll::Ready(Err(other)) => {
+                            panic!("thread {t} iteration {i}: unexpected refusal {other:?}")
+                        }
+                        Poll::Pending => {
+                            parked.fetch_add(1, Ordering::SeqCst);
+                            while !fired.load(Ordering::SeqCst) {
+                                if std::time::Instant::now() >= deadline {
+                                    panic!(
+                                        "thread {t} iteration {i}: parked and never woken inside {WAIT_BUDGET:?}"
+                                    );
+                                }
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    for j in joins {
+        j.join().expect("a parked waker stranded its task");
+    }
+
+    // The lane only proves something if waiters actually queued.
+    assert!(
+        parked.load(Ordering::SeqCst) >= THREADS as u64,
+        "six threads over two slots must park, else no wake is being tested"
+    );
+    assert_eq!(
+        admitted.load(Ordering::SeqCst),
+        (THREADS * PER_THREAD) as u64,
+        "every task was admitted"
+    );
+    assert_eq!(node.waiter_len(), 0, "no waiter outlived the churn");
+    assert_eq!(node.queue_depth(), 0, "the queue is honestly empty");
+    let s = node.stats();
+    assert_eq!(s.committed, (THREADS * PER_THREAD) as u64);
+    assert_eq!(s.implicit_drops, 0, "every guard settled");
+    assert_eq!(
+        s.stale_epochs_rejected,
+        stale_retries.load(Ordering::SeqCst),
+        "every race retry is booked exactly once"
+    );
 }

@@ -8,7 +8,9 @@ current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
 Additive: the trend window names a steep partial slope, the README states what
 the crate cannot see, and a breaking-change declaration now travels in this
-file instead of a folder. Nothing is removed and nothing is renamed.
+file instead of a folder. One writer law is tightened inside the node: the
+rollback clock can no longer be erased by a body that never claimed it.
+Nothing is removed and nothing is renamed.
 
 ### Added
 
@@ -35,6 +37,73 @@ file instead of a folder. Nothing is removed and nothing is renamed.
   without publishing the local `api-breaks/` folder (still gitignored, still
   the audit copy; the two must agree). Tripwire:
   `test_declared_api_breaks_are_in_the_changelog`.
+
+### Fixed
+
+- The rollback clock has one writer class. `RollbackStamp::close` used to
+  answer "this was the last body" by storing `IDLE_MS` into
+  `RollbackMirror::started_ms`, while a concurrent `begin` could claim the same
+  word between that read-modify-write and the store. The body that survived
+  then reported `active: true` with `elapsed_ms: 0` for its whole life —
+  exactly the wedge `watchdog::poll_rollback` exists to name, and nothing on
+  the public surface could see it. `begin` now increments `active` first and
+  stamps the clock only when that increment saw an empty count (the
+  fetch-add hands the `prev == 0` answer to exactly one body), a closing body
+  never writes the clock, and `rollback_phase` answers `0` from the live count
+  rather than from the stamp. Scheduling could not reproduce the handover on
+  x86 (one thread closed 14,649,379 times against 1,758 begins, 0 blind
+  stamps — both RMWs sit on one cache line, so the window is a
+  weak-memory/lower-optimisation hazard, not a local one); the fix removes the
+  second writer instead of relying on that measurement. Tripwires:
+  `a_closer_leaves_the_clock_it_did_not_claim`,
+  `concurrent_bodies_share_one_clock_a_closer_cannot_take`.
+- `RUSTDOCFLAGS="-D warnings"` broke `cargo doc` (CI #232): `handles.rs`
+  linked `MemoryTrend::is_leaking`, whose private path stopped resolving when
+  the trend verdict moved to `MemoryReport`, and `memory.rs` documented the
+  `Advisory` floor by linking the private `ADVISORY_MIN_SAMPLES` from a public
+  item. The first now links `MemoryReport::is_leaking`, the second states the
+  value ("at least three samples").
+
+### Tests
+
+- `EnterFuture::poll` promises to retire its own queue entry on every terminal
+  `Ready`, and the two post-park refusal gates that can fire after a future is
+  already queued — external memory pressure and a generation bump — were never
+  asserted to drain. `a_parked_future_refused_on_memory_drains_its_queue_entry`
+  and `a_parked_future_refused_on_a_stale_epoch_drains_its_queue_entry` now
+  park a future, refuse it on the next poll, and require `waiter_len() == 0`
+  plus a further admission on the same node. Removing the retirement arm in
+  `async_engine/entry.rs` turns both red (`left: 1, right: 0`).
+- `concurrent_parked_wakers_all_wake_inside_their_deadline`: six threads drive
+  150 admissions through a two-slot bulkhead and poll ONLY when their own
+  waker fires, so a wake lost on the settle path shows up as the five-second
+  deadline expiring rather than a busy re-poll. The lane counts its parks and
+  refuses to pass without them (`>= threads`), because the same churn with an
+  empty queue measures nothing — the first version of this test did exactly
+  that and finished in `0.00s`. Suppressing the wake in
+  `TrackedGuard::commit` turns it red in 5.00 s.
+- The `will_wake` comment in `enter_async_repeated_polls_do_not_bloat_waiter_queue`
+  named the wrong mechanism: the queue dedups by the entry's own
+  `Arc<AtomicBool>` identity (`will_wake` would cross-match two futures
+  polled by one task), which is what `node.rs` documents.
+- `breaker_churn_trips_recovers_and_conserves` asserted `queue_depth() == 0`
+  as its ghost-waiter check, but `waiters` is filled only by the async park
+  and that storm is sync-only — the counter is `0` before the first attempt,
+  so the assert could not fail and the comment credited it with covering the
+  law. The assert is gone; the same law is pinned where a ghost waiter is
+  reachable, by the two post-park refusal lanes above and
+  `dropped_parked_future_deregisters_its_queue_slot`.
+
+### Documentation
+
+- `task_ttl` states its real scope: the clock runs from the park the waiter is
+  currently sitting in. A waiter popped as a settle winner and re-parked after
+  losing the slot in the wake-to-poll gap starts a fresh wait, so `task_ttl`
+  bounds one queue wait, not the total wall time across losing attempts. The
+  re-park only happens when a real slot was released, which is what keeps the
+  ceiling from becoming a starvation knob. The idle wording for
+  `RollbackMirror::started_ms` ("no rollback clock has been stamped on this
+  node yet") follows the same law.
 
 ## 0.7.5 — 2026-10-29
 

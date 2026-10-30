@@ -16,9 +16,9 @@
 //! The window may also answer [`LeakClassification::Advisory`] — a partial
 //! window that rose without a dip and would cross the trip mark by the time
 //! it fills. It is an early slope, never a latch: [`HandleWatch::is_leaking`]
-//! stays `false` for it, exactly as [`MemoryTrend::is_leaking`] does.
+//! stays `false` for it, exactly as [`MemoryReport::is_leaking`] does.
 //!
-//! [`MemoryTrend::is_leaking`]: crate::MemoryTrend::is_leaking
+//! [`MemoryReport::is_leaking`]: crate::MemoryReport::is_leaking
 
 use crate::memory::{LeakClassification, TrendRing};
 

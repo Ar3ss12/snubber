@@ -393,6 +393,19 @@ library may kill a caller thread), so the guarantee is detect-and-report:
   instead of inventing age. The `no_std` build keeps the same law; the
   observer itself lives under `std` (it needs no more than a thread the
   caller already has).
+- The clock word has one writer class. `started_ms` is written only by a
+  `begin` whose `active` increment found the count empty, and a closing
+  body never touches it: a `fetch_sub` followed by a clear put a second
+  writer on the same word and a concurrent `begin` could claim it between
+  the two instructions, leaving the surviving body to report `active: true`
+  with `elapsed_ms: 0` for its whole life — the exact wedge
+  `watchdog::poll_rollback_node` exists to name. A stamp that outlives the
+  body that took it is answered by the `active == 0` gate in
+  `rollback_phase()`; while other bodies are still counted it belongs to
+  the oldest claim, so `elapsed_ms` can over-report but never under-report.
+  Per-body billing (`max_ms`, `stalls`) always uses that body's own start.
+  Tripwires: `a_closer_leaves_the_clock_it_did_not_claim`,
+  `concurrent_bodies_share_one_clock_a_closer_cannot_take`.
 - Honest limit — the guarantee is a name, not a cure: nothing here
   prevents the wedge. `tests/rollback_guardrails.rs`
   (`wedged_rollback_wedges_the_node_forever`) proves a child process can

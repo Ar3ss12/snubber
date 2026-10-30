@@ -179,19 +179,17 @@ fn breaker_churn_trips_recovers_and_conserves() {
         "node books must account for every attempt exactly once"
     );
     // Conservation: every admitted guard ends committed or dropped (the
-    // two shapes below); `lane_in_flight` sums to 0 and the async queue is
-    // empty — a leaked slot or a ghost waiter would show here.
+    // two shapes below), and `lane_in_flight` sums to 0 — a leaked slot
+    // would show here. A ghost waiter could NOT: this storm is sync-only
+    // and only the async park ever fills `waiters`, so that law is pinned
+    // by `async_primitives` (`concurrent_parked_wakers_all_wake_inside_their_deadline`,
+    // `dropped_parked_future_deregisters_its_queue_slot`).
     assert_eq!(
         node.lane_in_flight(),
         [0, 0, 0],
         "every admitted slot must be released: committed {} + failed {}",
         committed.load(Ordering::Relaxed),
         failed.load(Ordering::Relaxed)
-    );
-    assert_eq!(
-        node.queue_depth(),
-        0,
-        "no ghost waiter may survive the storm"
     );
     assert!(
         failed.load(Ordering::Relaxed) > 0 && committed.load(Ordering::Relaxed) > 0,
