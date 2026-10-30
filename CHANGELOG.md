@@ -4,6 +4,38 @@ All notable changes to `snubber`. Benchmarks live in [BENCHMARKS.md](BENCHMARKS.
 the audit-batch fix tables live at the bottom of this file, and the
 current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
+## 0.7.6 — unreleased
+
+Additive: the trend window names a steep partial slope, the README states what
+the crate cannot see, and a breaking-change declaration now travels in this
+file instead of a folder. Nothing is removed and nothing is renamed.
+
+### Added
+
+- `LeakClassification::Advisory { growth_kb, projected_growth_kb, samples,
+  rate_kb_sec }`: a partial window that rose for at least
+  `ADVISORY_MIN_SAMPLES` (3) samples and at least half of `N`, whose growth
+  projected across a full window (`growth * (N - 1) / (samples - 1)`) would
+  cross the trip mark. The rate divides by the intervals actually held, not by
+  `N - 1`. It is an early slope, never a latch: `is_rising()`, `is_leaking()`
+  and `is_pressured()` stay `false` for it, `code()` answers `"advisory"`,
+  and only a full window may latch. Tripwires:
+  `advisory_names_a_steep_partial_window_early_and_never_latches`,
+  `advisory_needs_three_samples_and_at_least_half_a_window`,
+  `a_steep_partial_window_is_advisory_and_never_leaking`,
+  `project_growth_extrapolates_and_saturates`.
+- `LeakClassification::is_advisory()`.
+- README *Platform boundary — what the crate cannot see*: a secure desktop, a
+  removed hook, a button held by a dead run and any counter nobody sampled are
+  the application's to detect; the crate owns the shape of the reaction. The
+  "not for" list now says it is not a platform monitor. Tripwire:
+  `test_readme_states_the_platform_boundary`.
+- The release gate reads the `<!-- api-breaks ... -->` block in this file's
+  version section as the declaration channel, so CI sees the declared names
+  without publishing the local `api-breaks/` folder (still gitignored, still
+  the audit copy; the two must agree). Tripwire:
+  `test_declared_api_breaks_are_in_the_changelog`.
+
 ## 0.7.5 — 2026-10-29
 
 One type per concept, typed erased slots, and the flight tape inside the
@@ -14,6 +46,16 @@ the 0.7 deprecated erased aliases; nothing is renamed for taste.
 decision** — upgrading from 0.7.1 needs the migration below. Every reported
 item is named under *Changed (breaking)*; the release gate refuses an
 undeclared break and refuses a declaration that stopped breaking.
+
+<!-- api-breaks
+LeakWatch
+LeakWindow
+MemoryTrendVerdict
+growth_crosses
+::leaks
+SnubberNode::enter_erased
+SnapshotV1.tape
+-->
 
 ### Added
 

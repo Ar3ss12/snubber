@@ -12,6 +12,13 @@
 //! A probe that cannot read its count returns `None`, and **no sample is
 //! recorded**: feeding `0` instead would be a dip that clears the window and
 //! silently disarms the detector on the one platform whose probe failed.
+//!
+//! The window may also answer [`LeakClassification::Advisory`] — a partial
+//! window that rose without a dip and would cross the trip mark by the time
+//! it fills. It is an early slope, never a latch: [`HandleWatch::is_leaking`]
+//! stays `false` for it, exactly as [`MemoryTrend::is_leaking`] does.
+//!
+//! [`MemoryTrend::is_leaking`]: crate::MemoryTrend::is_leaking
 
 use crate::memory::{LeakClassification, TrendRing};
 
@@ -202,6 +209,41 @@ mod tests {
             watch.sample(&mut back).map(LeakClassification::code),
             Some("rising")
         );
+    }
+
+    #[test]
+    fn a_steep_partial_window_is_advisory_and_never_leaking() {
+        let mut watch: HandleWatch<6> = HandleWatch::new(8, 1_000);
+        for count in [100u64, 104, 108] {
+            watch.note(count);
+        }
+        assert_eq!(
+            watch.classification(),
+            LeakClassification::Advisory {
+                growth_kb: 8,
+                projected_growth_kb: 20,
+                samples: 3,
+                rate_kb_sec: Some(4),
+            },
+            "+8 handles over two intervals, projected across five"
+        );
+        assert!(
+            !watch.is_leaking(),
+            "an advisory slope refuses nothing: the window is not full"
+        );
+
+        // Filling the window while the climb continues makes it a real leak.
+        for count in [112u64, 116, 120] {
+            watch.note(count);
+        }
+        assert_eq!(
+            watch.classification(),
+            LeakClassification::Rising {
+                growth_kb: 20,
+                rate_kb_sec: Some(4),
+            }
+        );
+        assert!(watch.is_leaking());
     }
 
     #[test]

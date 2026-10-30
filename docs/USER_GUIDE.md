@@ -867,14 +867,17 @@ match verdict {
   `MemoryReport { level, trend }` is the whole answer: `level` is the
   `MemoryVerdict` (32 B integer math) and `trend` is the window shape
   (`Warming { samples }`, `Stable { growth_kb }`, `Rising { growth_kb,
-  rate_kb_sec }`, `Sawtooth`). Both are computed on every call, so a `Soft`
+  rate_kb_sec }`, `Sawtooth`, `Advisory { growth_kb, projected_growth_kb,
+  samples, rate_kb_sec }`). Both are computed on every call, so a `Soft`
   level can no longer mask a rising window — the 0.7 verdict that reported
   one half is gone. `report.is_pressured()` is the OR of the two;
-  `report.code()` is `"hard"` / `"soft"` / `"leaking"` / `"ok"`.
+  `report.code()` is `"hard"` / `"soft"` / `"leaking"` / `"ok"` (the trend
+  text is `trend.code()`: `"warming"` / `"stable"` / `"rising"` /
+  `"sawtooth"` / `"advisory"`).
   `trend.verdict()` re-reads the same report without feeding the ring, and
   `trend.classification()` returns just the `trend` half.
 
-  The window only reports when it is FULL and every sample beats its
+  The window only decides when it is FULL and every sample beats its
   predecessor; one sample below its predecessor clears it, because a healthy
   process is allowed to oscillate (a collection, a tray collapse, a pool
   draining). `N` is policy, not the detector's; `N = 0` never reports. The
@@ -884,6 +887,15 @@ match verdict {
   drops never trips, and this variant makes it nameable instead of invisible.
   Rates divide by the span the caller owns: `growth * 1000 / ((N - 1) *
   interval_ms)`, `None` when `interval_ms == 0` or `N < 2`.
+
+  A PARTIAL window can still name its slope: when it holds at least
+  `ADVISORY_MIN_SAMPLES` (3) samples — at least half of `N` — rose without a
+  dip, and its growth projected linearly across a full window (`growth *
+  (N - 1) / (samples - 1)`) would cross the trip mark, the shape is
+  `Advisory`. It is an early signal for logs and dashboards, never a latch:
+  one more sample can be the dip that ends the run, so `is_rising()` and
+  `is_leaking()` stay `false` and `is_pressured()` unchanged. The advisory
+  rate divides by the intervals actually held (`samples - 1`), not `N - 1`.
 * **`HandleWatch<N>` is that rule for counts, not bytes.** A leaked `HANDLE`,
   file descriptor or socket is kernel state — a few bytes of a table, never a
   resident page — so RSS stays flat while the process inches toward its
@@ -2109,8 +2121,8 @@ never disagree with the chapter map above.
 | `node.note_pulse_stall(lag_ms)` | 1.5 / std | structural: 1 atomic max | Record missed pulse into `SnapshotV1` (pulse fields since v3; frame is v6) + `AnomalyKind::PulseStall` |
 | `node.note_memory_kb(used_kb)` + `memory_verdict()` | 3 / std | 1 lock + 1 atomic store | External RSS sample → `MemoryVerdict` (Ok/Soft/Hard); admissions refuse lock-free above soft |
 | `MemoryWatch` + `MemoryVerdict` | 4 / core | 32 B, `Copy` | Verdict math for firmware; `hard < soft` clamps up |
-| `MemoryTrend<N>::sample(used_kb)` / `verdict()` | 4 / core | 32 B level watch + a `96` B ring at `N = 10`, `Copy`, no clock | One structure, both halves: `MemoryReport { level, trend }` — a `Soft` level never hides a `Rising { growth_kb, rate_kb_sec }` window (the 0.7 single-verdict trap), `Warming` / `Stable` / `Sawtooth` name the rest |
-| `HandleWatch<N>::sample(probe)` / `note(count)` | 4 / core | the ring plus two `u64`s, no clock, no allocation | Handle/fd/socket leak by derivative; an unreadable probe returns `None` and records **no** sample (a `0` would be a false dip that disarms the detector) |
+| `MemoryTrend<N>::sample(used_kb)` / `verdict()` | 4 / core | 32 B level watch + a `96` B ring at `N = 10`, `Copy`, no clock | One structure, both halves: `MemoryReport { level, trend }` — a `Soft` level never hides a `Rising { growth_kb, rate_kb_sec }` window (the 0.7 single-verdict trap); `Advisory { projected_growth_kb }` names a steep partial window without latching; `Warming` / `Stable` / `Sawtooth` name the rest |
+| `HandleWatch<N>::sample(probe)` / `note(count)` | 4 / core | the ring plus two `u64`s, no clock, no allocation | Handle/fd/socket leak by derivative; the same `Advisory` slope never reads as `is_leaking()`; an unreadable probe returns `None` and records **no** sample (a `0` would be a false dip that disarms the detector) |
 | `MemoryPolicy::new(soft, hard)` + `note(used)` | 4 / std | pure integer compares | Supervisor verdict: soft drains, hard kills; `death_cause()` names `MemoryLimit` |
 | `Supervisor::run_supervised_guard_with_memory(..)` | 4 / std | 1 sampler call / 10 ms tick | Lease + RSS watchdog; soft logs `MEMORY_DRAIN`, hard `kill()` without draining |
 | `Rotation::new(policy)` + `observe(verdict, now)` | 4 / std | pure integer compares, caller clock | Preventive rotation: a soft window of `grace_ms`, then bounded generation retirements; `Hard` stays the kill path |

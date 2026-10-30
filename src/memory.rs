@@ -203,6 +203,7 @@ impl<const N: usize> TrendRing<N> {
             return TrendWindow {
                 samples: 0,
                 full: false,
+                rising_partial: false,
                 rising: false,
                 oldest: 0,
                 newest: 0,
@@ -216,13 +217,17 @@ impl<const N: usize> TrendRing<N> {
             self.ring[self.next]
         };
         let newest = self.ring[(self.next + N - 1) % N];
-        let mut rising = self.len == N;
-        if rising {
+        let mut rising_partial = self.len >= 2;
+        if rising_partial {
             let mut previous = oldest;
-            for i in 1..N {
-                let sample = self.ring[(self.next + i) % N];
+            for i in 1..self.len {
+                let sample = if self.len < N {
+                    self.ring[i]
+                } else {
+                    self.ring[(self.next + i) % N]
+                };
                 if sample <= previous {
-                    rising = false;
+                    rising_partial = false;
                     break;
                 }
                 previous = sample;
@@ -231,7 +236,8 @@ impl<const N: usize> TrendRing<N> {
         TrendWindow {
             samples: self.len,
             full: self.len == N,
-            rising,
+            rising_partial,
+            rising: self.len == N && rising_partial,
             oldest,
             newest,
         }
@@ -255,16 +261,44 @@ impl<const N: usize> TrendRing<N> {
     #[must_use]
     pub(crate) fn classify(&self, trip_kb: u64, sample_interval_ms: u64) -> LeakClassification {
         let window = self.window();
-        match window.growth_kb() {
-            Some(growth) if crosses_trip(growth, trip_kb) => LeakClassification::Rising {
-                growth_kb: growth,
-                rate_kb_sec: self.growth_rate_kb_sec(sample_interval_ms),
-            },
-            Some(growth) => LeakClassification::Stable { growth_kb: growth },
-            None if window.full => LeakClassification::Sawtooth,
-            None => LeakClassification::Warming {
-                samples: window.samples,
-            },
+        if let Some(growth) = window.growth_kb() {
+            return if crosses_trip(growth, trip_kb) {
+                LeakClassification::Rising {
+                    growth_kb: growth,
+                    rate_kb_sec: self.growth_rate_kb_sec(sample_interval_ms),
+                }
+            } else {
+                LeakClassification::Stable { growth_kb: growth }
+            };
+        }
+        if window.full {
+            return LeakClassification::Sawtooth;
+        }
+        // A partial window never decides, but a long enough run of rising
+        // samples that would clear the trip mark by the time the window
+        // fills is worth naming early — advisory, never a latch.
+        if let Some(growth) = window.partial_growth_kb() {
+            let wide_enough = window.samples >= ADVISORY_MIN_SAMPLES && window.samples * 2 >= N;
+            let projected = project_growth(growth, window.samples, N);
+            if wide_enough && crosses_trip(projected, trip_kb) {
+                return LeakClassification::Advisory {
+                    growth_kb: growth,
+                    projected_growth_kb: projected,
+                    samples: window.samples,
+                    rate_kb_sec: if sample_interval_ms == 0 {
+                        None
+                    } else {
+                        Some(rate_kb_sec(
+                            growth,
+                            window.samples as u64 - 1,
+                            sample_interval_ms,
+                        ))
+                    },
+                };
+            }
+        }
+        LeakClassification::Warming {
+            samples: window.samples,
         }
     }
 
@@ -294,6 +328,9 @@ pub(crate) struct TrendWindow {
     pub(crate) samples: usize,
     /// `true` when the ring holds `N` samples: a verdict is possible.
     pub(crate) full: bool,
+    /// `true` when every held sample beat the one before it — for a partial
+    /// window too, which is what an advisory slope is read from.
+    pub(crate) rising_partial: bool,
     /// `true` only for a full window whose every sample beat the one before
     /// it. Equality counts as a dip, like a fall does.
     pub(crate) rising: bool,
@@ -314,6 +351,38 @@ impl TrendWindow {
         } else {
             None
         }
+    }
+
+    /// `newest - oldest` over the held samples of a partial window that rose
+    /// without a dip. `None` once the window is full (use [`growth_kb`]).
+    ///
+    /// [`growth_kb`]: Self::growth_kb
+    #[must_use]
+    pub(crate) const fn partial_growth_kb(self) -> Option<u64> {
+        if !self.full && self.rising_partial && self.samples >= 2 {
+            Some(self.newest - self.oldest)
+        } else {
+            None
+        }
+    }
+}
+
+/// Fewest samples an advisory slope may rest on. Below three a single noisy
+/// tick is extrapolated across the whole window and reads as a trend.
+pub(crate) const ADVISORY_MIN_SAMPLES: usize = 3;
+
+/// Linear extrapolation of a partial window's growth to a full one:
+/// `growth * (width - 1) / (samples - 1)`. Saturates instead of overflowing.
+#[must_use]
+pub(crate) const fn project_growth(growth_kb: u64, samples: usize, width: usize) -> u64 {
+    if samples < 2 || width < 2 || samples > width {
+        return growth_kb;
+    }
+    let projected = (growth_kb as u128) * (width as u128 - 1) / (samples as u128 - 1);
+    if projected > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        projected as u64
     }
 }
 
@@ -353,11 +422,31 @@ pub enum LeakClassification {
     /// A sawtooth leak reads here and never trips the monotonic verdict —
     /// this variant exists so that shape is nameable instead of invisible.
     Sawtooth,
+    /// Partial window that has risen without a dip, for at least half the
+    /// window and at least [`ADVISORY_MIN_SAMPLES`] samples, and whose slope
+    /// projected across the full window would cross the trip mark.
+    ///
+    /// **Advisory, never a latch.** One more sample can still be the dip that
+    /// ends the run, so this variant never answers `is_rising()`; a caller may
+    /// log it, show it or refuse a *start* with its own policy, but a leak
+    /// verdict stays the full window's job.
+    Advisory {
+        /// `newest - oldest` over the held samples, KiB.
+        growth_kb: u64,
+        /// That growth projected linearly across a full window, KiB.
+        projected_growth_kb: u64,
+        /// How many samples the advisory rests on (confidence, not a count of
+        /// entries in the full window).
+        samples: usize,
+        /// KiB per second over the held samples; `None` when the caller armed
+        /// no interval (`0`).
+        rate_kb_sec: Option<u64>,
+    },
 }
 
 impl LeakClassification {
     /// Static text for diagnostics (`"warming"` / `"stable"` / `"rising"` /
-    /// `"sawtooth"`).
+    /// `"sawtooth"` / `"advisory"`).
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
@@ -365,13 +454,22 @@ impl LeakClassification {
             Self::Stable { .. } => "stable",
             Self::Rising { .. } => "rising",
             Self::Sawtooth => "sawtooth",
+            Self::Advisory { .. } => "advisory",
         }
     }
 
-    /// `true` only for [`Rising`](Self::Rising).
+    /// `true` only for [`Rising`](Self::Rising). [`Advisory`](Self::Advisory)
+    /// is a partial window and deliberately answers `false`.
     #[must_use]
     pub const fn is_rising(self) -> bool {
         matches!(self, Self::Rising { .. })
+    }
+
+    /// `true` for [`Advisory`](Self::Advisory): an early slope that has not
+    /// collected a full window yet.
+    #[must_use]
+    pub const fn is_advisory(self) -> bool {
+        matches!(self, Self::Advisory { .. })
     }
 }
 
@@ -480,9 +578,20 @@ impl MemoryReport {
 /// use snubber::{LeakClassification, MemoryTrend, MemoryVerdict};
 ///
 /// let mut trend: MemoryTrend<4> = MemoryTrend::new(1_000, 2_000, 120, 500);
-/// assert_eq!(trend.sample(100).code(), "ok", "a short window says nothing");
-/// assert_eq!(trend.sample(200).code(), "ok");
-/// assert_eq!(trend.sample(300).code(), "ok");
+/// assert_eq!(trend.sample(100).code(), "ok", "one sample is not a slope");
+/// assert!(!trend.sample(200).trend.is_advisory(), "two samples is not a slope");
+/// // Three rising samples in a half-full window project past the mark:
+/// // named early, and still not a latch.
+/// assert_eq!(
+///     trend.sample(300).trend,
+///     LeakClassification::Advisory {
+///         growth_kb: 200,
+///         projected_growth_kb: 300,
+///         samples: 3,
+///         rate_kb_sec: Some(200),
+///     }
+/// );
+/// assert!(!trend.verdict().is_leaking(), "an advisory never refuses");
 /// assert_eq!(
 ///     trend.sample(500),
 ///     snubber::MemoryReport {
@@ -698,19 +807,27 @@ mod tests {
             TrendWindow {
                 samples: 0,
                 full: false,
+                rising_partial: false,
                 rising: false,
                 oldest: 0,
                 newest: 0
             }
         );
 
-        // Partly filled: ends are real, a verdict is not.
+        // Partly filled: ends are real, a verdict is not — but a run with no
+        // dip is readable as a slope.
         assert_eq!(w.push(10), None);
         assert_eq!(w.push(20), None);
         let half = w.window();
         assert_eq!((half.samples, half.oldest, half.newest), (2, 10, 20));
         assert!(!half.full && !half.rising);
+        assert!(half.rising_partial);
         assert_eq!(half.growth_kb(), None, "two samples are not a trend");
+        assert_eq!(
+            half.partial_growth_kb(),
+            Some(10),
+            "the slope is real even when the verdict is not"
+        );
 
         assert_eq!(w.push(30), None);
         assert_eq!(w.push(40), Some(30));
@@ -718,6 +835,11 @@ mod tests {
         assert_eq!(
             (full.full, full.rising, full.growth_kb()),
             (true, true, Some(30))
+        );
+        assert_eq!(
+            full.partial_growth_kb(),
+            None,
+            "a full window answers through growth_kb, not the partial slope"
         );
         assert_eq!((full.oldest, full.newest), (10, 40));
 
@@ -798,6 +920,154 @@ mod tests {
         assert_eq!(saw.push(600), None, "the dip is still in the window");
         assert_eq!(saw.classify(120, 500), LeakClassification::Sawtooth);
         assert_eq!(saw.classify(120, 500).code(), "sawtooth");
+    }
+
+    #[test]
+    fn advisory_names_a_steep_partial_window_early_and_never_latches() {
+        let mut w: TrendRing<6> = TrendRing::new();
+        for sample in [100u64, 200, 300] {
+            w.push(sample);
+        }
+        assert_eq!(
+            w.classify(120, 500),
+            LeakClassification::Advisory {
+                growth_kb: 200,
+                projected_growth_kb: 500,
+                samples: 3,
+                rate_kb_sec: Some(200),
+            },
+            "200 KiB over two intervals, projected across five"
+        );
+        let advisory = w.classify(120, 500);
+        assert!(advisory.is_advisory());
+        assert!(!advisory.is_rising(), "an advisory is not a leak verdict");
+        assert_eq!(advisory.code(), "advisory");
+        assert_eq!(
+            w.classify(120, 0),
+            LeakClassification::Advisory {
+                growth_kb: 200,
+                projected_growth_kb: 500,
+                samples: 3,
+                rate_kb_sec: None,
+            },
+            "no interval, no rate — the slope still stands"
+        );
+
+        // The ring owner agrees: an advisory never refuses an admission.
+        let mut trend: MemoryTrend<6> = MemoryTrend::new(1_000, 2_000, 120, 500);
+        for sample in [100u64, 200, 300] {
+            let report = trend.sample(sample);
+            assert!(!report.is_leaking() && !report.is_pressured());
+            assert_eq!(report.code(), "ok");
+            assert_eq!(report.growth_rate_kb_sec(), None);
+        }
+        assert!(trend.classification().is_advisory());
+
+        // When the window fills and stayed rising, the full verdict fires.
+        for sample in [400u64, 500, 600] {
+            trend.sample(sample);
+        }
+        assert_eq!(
+            trend.classification(),
+            LeakClassification::Rising {
+                growth_kb: 500,
+                rate_kb_sec: Some(200),
+            }
+        );
+        assert!(trend.verdict().is_leaking());
+    }
+
+    #[test]
+    fn advisory_needs_three_samples_and_at_least_half_a_window() {
+        // N = 10: four rising samples project past the mark, but half a
+        // window is five, so the slope is not named yet.
+        let mut narrow: TrendRing<10> = TrendRing::new();
+        for sample in [100u64, 200, 300, 400] {
+            narrow.push(sample);
+        }
+        assert_eq!(
+            narrow.classify(100, 500),
+            LeakClassification::Warming { samples: 4 },
+            "4 of 10 samples are not half a window"
+        );
+        narrow.push(500);
+        assert_eq!(
+            narrow.classify(100, 500),
+            LeakClassification::Advisory {
+                growth_kb: 400,
+                projected_growth_kb: 900,
+                samples: 5,
+                rate_kb_sec: Some(200),
+            },
+            "5 of 10 samples are, and the projection crosses 100"
+        );
+
+        // Two samples is a tick and a half — never a trend, however steep.
+        let mut two: TrendRing<10> = TrendRing::new();
+        two.push(1);
+        two.push(1_000_000);
+        assert_eq!(
+            two.classify(1, 500),
+            LeakClassification::Warming { samples: 2 }
+        );
+
+        // A slope that would NOT cross the mark stays warming.
+        let mut calm: TrendRing<6> = TrendRing::new();
+        for sample in [100u64, 101, 102] {
+            calm.push(sample);
+        }
+        assert_eq!(
+            calm.classify(1_000, 500),
+            LeakClassification::Warming { samples: 3 }
+        );
+
+        // Trip 0 disables the verdict, and the advisory with it.
+        assert_eq!(
+            calm.classify(0, 500),
+            LeakClassification::Warming { samples: 3 }
+        );
+
+        // A dip or a plateau inside the held samples clears the slope.
+        let mut dipped: TrendRing<6> = TrendRing::new();
+        for sample in [100u64, 200, 150] {
+            dipped.push(sample);
+        }
+        assert_eq!(
+            dipped.classify(120, 500),
+            LeakClassification::Warming { samples: 3 }
+        );
+        let mut flat: TrendRing<6> = TrendRing::new();
+        for sample in [100u64, 100, 100] {
+            flat.push(sample);
+        }
+        assert_eq!(
+            flat.classify(120, 500),
+            LeakClassification::Warming { samples: 3 }
+        );
+
+        // A window narrower than the minimum sample count can never advise.
+        let mut tiny: TrendRing<2> = TrendRing::new();
+        tiny.push(1);
+        assert_eq!(
+            tiny.classify(1, 500),
+            LeakClassification::Warming { samples: 1 }
+        );
+    }
+
+    #[test]
+    fn project_growth_extrapolates_and_saturates() {
+        assert_eq!(project_growth(10, 2, 3), 20);
+        assert_eq!(project_growth(200, 3, 4), 300);
+        assert_eq!(project_growth(200, 4, 10), 600);
+        assert_eq!(
+            project_growth(u64::MAX, 2, 3),
+            u64::MAX,
+            "absurd growth saturates instead of wrapping"
+        );
+        // A projection over a shape it cannot widen is the growth itself.
+        assert_eq!(project_growth(10, 1, 3), 10);
+        assert_eq!(project_growth(10, 3, 0), 10);
+        assert_eq!(project_growth(10, 5, 4), 10);
     }
 
     #[test]

@@ -24,6 +24,31 @@ in_ci() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# Names declared by the `<!-- api-breaks ... -->` block inside the
+# `## <version>` section of CHANGELOG.md: one token per line, `#` comments and
+# blank lines skipped. This is the published declaration (CI checks out the
+# repository and sees it); api-breaks/<version>.txt is a local audit copy.
+# Parity with check_api_diff.ps1 `Get-DeclaredBreaks`.
+declared_breaks_block() {
+    local version="$1" changelog="${REPO_ROOT}/CHANGELOG.md"
+    [ -f "${changelog}" ] || return 0
+    # The opener is anchored to the start of the line: prose may mention the
+    # marker inline, and an unanchored match would read the rest of the
+    # section as tokens looking for a terminator.
+    awk -v want="## ${version}" '
+        !inside && index($0, want) == 1 { inside = 1; next }
+        inside && /^## / { exit }
+        inside && /^[[:space:]]*<!--[[:space:]]*api-breaks/ { block = 1; next }
+        block && /^[[:space:]]*-->/ { exit }
+        block {
+            sub(/\r$/, "")
+            sub(/[[:space:]]+$/, "")
+            if ($0 ~ /^[[:space:]]*(#|$)/) next
+            print
+        }
+    ' "${changelog}"
+}
+
 BASELINE="${1:-}"
 if [ -z "${BASELINE}" ]; then
     BASELINE="$(git -C "${REPO_ROOT}" describe --tags --abbrev=0 2>/dev/null || true)"
@@ -115,11 +140,23 @@ if [ "${SEMVER_RC}" -eq 0 ]; then
 fi
 if [ "${SEMVER_RC}" -eq 100 ] || grep -q '^--- failure ' "${SEMVER_LOG}"; then
     # A 0.x minor bump MAY break, but only by declaration: every reported
-    # item must be named by a substring in api-breaks/<version>.txt, and
+    # item must be named by a substring in the declaration channel, and
     # tests/doc_sync.rs requires each of those names to appear in the
-    # CHANGELOG. An undeclared break stays red, and a manifest entry that no
-    # longer breaks is red too, so the file cannot rot into a blanket waiver.
+    # CHANGELOG PROSE (not only in the block that carries it). An undeclared
+    # break stays red, and a declared entry that no longer breaks is red too,
+    # so the list cannot rot into a blanket waiver.
+    #
+    # Two channels, one truth: the `<!-- api-breaks ... -->` block in the
+    # CHANGELOG section for this version is the PUBLISHED declaration (CI
+    # checks out the repository and sees it), and api-breaks/<version>.txt is
+    # the local audit copy (gitignored). The block wins whenever both exist —
+    # a local file must never declare a break the published changelog does
+    # not, and doc_sync fails when the two disagree.
     BREAKS_FILE="${REPO_ROOT}/api-breaks/${CURRENT_VERSION}.txt"
+    DECLARED="$(declared_breaks_block "${CURRENT_VERSION}")"
+    if [ -z "${DECLARED}" ] && [ -f "${BREAKS_FILE}" ]; then
+        DECLARED="$(grep -vE '^[[:space:]]*(#|$)' "${BREAKS_FILE}" | sed 's/[[:space:]]*$//')"
+    fi
     # Every "Failed in:" entry counts, not only those whose item kind is a
     # bare lowercase word: a removed inherent method is printed as
     # `HandleWatch::leaks, previously in file ...` with no kind prefix, and
@@ -137,13 +174,18 @@ if [ "${SEMVER_RC}" -eq 100 ] || grep -q '^--- failure ' "${SEMVER_LOG}"; then
         echo " verdict: cargo-semver-checks reported a semver violation (exit ${SEMVER_RC}) and no affected item could be parsed"
         exit 1
     fi
-    if [ ! -f "${BREAKS_FILE}" ]; then
-        echo " verdict: breaking change vs ${BASELINE} with no api-breaks/${CURRENT_VERSION}.txt manifest"
+    if [ -z "${DECLARED}" ]; then
+        echo " verdict: breaking change vs ${BASELINE} with no declared breaks — add the names below to the"
+        echo "         \`<!-- api-breaks ... -->\` block in the CHANGELOG.md ${CURRENT_VERSION} section"
+        if [ -f "${BREAKS_FILE}" ]; then
+            echo "         (api-breaks/${CURRENT_VERSION}.txt exists but declares nothing)"
+        fi
         printf '%s
 ' "${REPORTED}" | sed 's/^/   undeclared: /'
         exit 1
     fi
-    DECLARED="$(grep -vE '^[[:space:]]*(#|$)' "${BREAKS_FILE}" | sort -u)"
+    DECLARED="$(printf '%s
+' "${DECLARED}" | sort -u)"
     UNDECLARED=""
     while IFS= read -r item; do
         hit=0
@@ -151,7 +193,7 @@ if [ "${SEMVER_RC}" -eq 100 ] || grep -q '^--- failure ' "${SEMVER_LOG}"; then
             case "${item}" in *"${token}"*) hit=1 ;; esac
         done <<< "${DECLARED}"
         if [ "${hit}" -eq 0 ]; then
-            echo " FAIL (undeclared API break: ${item} — add it to api-breaks/${CURRENT_VERSION}.txt and CHANGELOG.md)"
+            echo " FAIL (undeclared API break: ${item} — add it to the <!-- api-breaks --> block in CHANGELOG.md ${CURRENT_VERSION})"
             UNDECLARED=1
         fi
     done <<< "${REPORTED}"
@@ -159,7 +201,7 @@ if [ "${SEMVER_RC}" -eq 100 ] || grep -q '^--- failure ' "${SEMVER_LOG}"; then
         case "${REPORTED}" in
             *"${token}"*) ;;
             *)
-                echo " FAIL (api-breaks/${CURRENT_VERSION}.txt declares '${token}' but the diff no longer breaks it — prune the manifest)"
+                echo " FAIL (the api-breaks declaration names '${token}' but the diff no longer breaks it — prune it from CHANGELOG.md ${CURRENT_VERSION})"
                 UNDECLARED=1
                 ;;
         esac
@@ -169,7 +211,7 @@ if [ "${SEMVER_RC}" -eq 100 ] || grep -q '^--- failure ' "${SEMVER_LOG}"; then
     fi
     count="$(printf '%s
 ' "${REPORTED}" | grep -c .)"
-    echo " verdict: ${count} affected item(s) vs ${BASELINE}, all declared in api-breaks/${CURRENT_VERSION}.txt"
+    echo " verdict: ${count} affected item(s) vs ${BASELINE}, all declared in the CHANGELOG.md ${CURRENT_VERSION} api-breaks block"
     exit 0
 fi
 echo " FAIL (verifier could not run: cargo-semver-checks exit ${SEMVER_RC} — tool/toolchain error, not an API verdict)"

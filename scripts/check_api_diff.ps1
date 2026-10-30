@@ -19,6 +19,45 @@ $RepoRoot = Resolve-Path "$ScriptDir\.."
 $CiFlag = if ($env:CI) { $env:CI.ToLowerInvariant() } else { "" }
 $InCi = ($CiFlag -eq "true" -or $CiFlag -eq "1")
 
+# Names declared by the `<!-- api-breaks ... -->` block inside the
+# `## <version>` section of CHANGELOG.md: one token per line, `#` comments and
+# blank lines skipped. This is the published declaration (CI checks out the
+# repository and sees it); api-breaks\<version>.txt is a local audit copy.
+# Parity with check_api_diff.sh `declared_breaks_block`.
+function Get-DeclaredBreaks([string]$Version) {
+    $Changelog = Join-Path $RepoRoot "CHANGELOG.md"
+    if (Test-Path $Changelog) {
+        $Inside = $false
+        $Block = $false
+        $Tokens = @()
+        # The opener is anchored at the start of the line: prose may mention
+        # the marker inline, and an unanchored match would read the rest of
+        # the section as tokens looking for a terminator.
+        foreach ($Line in (Get-Content $Changelog)) {
+            if (-not $Inside) {
+                if ($Line.StartsWith("## $Version")) { $Inside = $true }
+                continue
+            }
+            if ($Line -match '^## ') { break }
+            if (-not $Block) {
+                if ($Line -match '^\s*<!--\s*api-breaks') { $Block = $true }
+                continue
+            }
+            if ($Line -match '^\s*-->') { break }
+            $Token = $Line.Trim()
+            if ($Token -and -not $Token.StartsWith('#')) { $Tokens += $Token }
+        }
+        if ($Tokens.Count -gt 0) { return $Tokens }
+    }
+    $BreaksFile = Join-Path $RepoRoot "api-breaks\$Version.txt"
+    if (Test-Path $BreaksFile) {
+        return @(Get-Content $BreaksFile |
+            Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*#' } |
+            ForEach-Object { $_.Trim() })
+    }
+    return @()
+}
+
 if (-not $Baseline) {
     # PS 5.1 wraps native stderr in ErrorRecords: under Stop, a
     # tag-less `git describe` writing to stderr would kill the script.
@@ -131,8 +170,10 @@ try {
     $LogText = if (Test-Path $SemverLog) { [string](Get-Content $SemverLog -Raw) } else { "" }
     if ($SemverExit -eq 100 -or $LogText -match '(?m)^--- failure ') {
         # A 0.x minor bump MAY break, but only by declaration. Parity with
-        # check_api_diff.sh: an undeclared break is red, a stale manifest
-        # entry is red, and tests/doc_sync.rs ties each name to CHANGELOG.md.
+        # check_api_diff.sh: the CHANGELOG `<!-- api-breaks -->` block is the
+        # published channel (CI can see it), api-breaks\<version>.txt a local
+        # audit copy; an undeclared break is red, a stale entry is red, and
+        # tests/doc_sync.rs ties each name to the CHANGELOG PROSE.
         $BreaksFile = Join-Path $RepoRoot "api-breaks\$CurrentVersion.txt"
         # Every "Failed in:" entry counts, not only those whose item kind is a
         # bare lowercase word: a removed inherent method is printed as
@@ -154,18 +195,22 @@ try {
             Write-Host " verdict: cargo-semver-checks reported a semver violation (exit $SemverExit) and no affected item could be parsed"
             exit 1
         }
-        if (-not (Test-Path $BreaksFile)) {
-            Write-Host " verdict: breaking change vs $Baseline with no api-breaks\$CurrentVersion.txt manifest"
+        $Declared = @(Get-DeclaredBreaks $CurrentVersion)
+        if ($Declared.Count -eq 0) {
+            Write-Host " verdict: breaking change vs $Baseline with no declared breaks -- add the names below to the"
+            Write-Host "         ``<!-- api-breaks ... -->`` block in the CHANGELOG.md $CurrentVersion section"
+            if (Test-Path $BreaksFile) {
+                Write-Host "         (api-breaks\$CurrentVersion.txt exists but declares nothing)"
+            }
             $Reported | ForEach-Object { Write-Host "   undeclared: $_" }
             exit 1
         }
-        $Declared = @(Get-Content $BreaksFile | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*#' })
         $Undeclared = $false
         foreach ($item in $Reported) {
             $hit = $false
             foreach ($token in $Declared) { if ($item.Contains($token)) { $hit = $true } }
             if (-not $hit) {
-                Write-Host " FAIL (undeclared API break: $item -- add it to api-breaks\$CurrentVersion.txt and CHANGELOG.md)"
+                Write-Host " FAIL (undeclared API break: $item -- add it to the <!-- api-breaks --> block in CHANGELOG.md $CurrentVersion)"
                 $Undeclared = $true
             }
         }
@@ -173,12 +218,12 @@ try {
             $hit = $false
             foreach ($item in $Reported) { if ($item.Contains($token)) { $hit = $true } }
             if (-not $hit) {
-                Write-Host " FAIL (api-breaks\$CurrentVersion.txt declares '$token' but the diff no longer breaks it -- prune the manifest)"
+                Write-Host " FAIL (the api-breaks declaration names '$token' but the diff no longer breaks it -- prune it from CHANGELOG.md $CurrentVersion)"
                 $Undeclared = $true
             }
         }
         if ($Undeclared) { exit 1 }
-        Write-Host " verdict: $($Reported.Count) affected item(s) vs $Baseline, all declared in api-breaks\$CurrentVersion.txt"
+        Write-Host " verdict: $($Reported.Count) affected item(s) vs $Baseline, all declared in the CHANGELOG.md $CurrentVersion api-breaks block"
         exit 0
     }
     Write-Host " FAIL (verifier could not run: cargo-semver-checks exit $SemverExit -- tool/toolchain error, not an API verdict)" -ForegroundColor Red

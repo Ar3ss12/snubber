@@ -153,6 +153,66 @@ fn test_erased_probe_bulkhead_scope_stays_documented() {
     );
 }
 
+/// The "not for" list named three things that are all about scope, none about
+/// BLINDNESS, so a reader could assume a stability layer also watches the
+/// desktop, the hooks and the buttons. It does not: the crate makes no OS call.
+/// The README must keep the platform boundary page, name each blind spot, and
+/// name the piece the crate DOES own, so a missing watchdog reads as a contract
+/// rather than a bug.
+#[test]
+fn test_readme_states_the_platform_boundary() {
+    let readme = read_doc("README.md");
+    const HEADING: &str = "### Platform boundary";
+    let start = readme.find(HEADING).expect(
+        "TRIPWIRE FIRED: README.md lost the platform-boundary page — the \
+                \"not for\" list names scope, not blindness (secure desktop, a \
+                removed hook, a held button)",
+    );
+    let after = start + HEADING.len();
+    let end = readme[after..]
+        .find("\n## ")
+        .map(|n| after + n)
+        .unwrap_or(readme.len());
+    let section = &readme[start..end];
+    assert!(
+        section.len() > 900,
+        "TRIPWIRE FIRED: the platform-boundary section shrank to {} bytes — it \
+         must name each blind spot, not gesture at one",
+        section.len()
+    );
+
+    for token in [
+        "secure desktop",
+        "OpenInputDesktop",
+        "SetWindowsHookEx",
+        "SendInput",
+        "MemoryTrend",
+        "HandleWatch",
+        "poll_rollback",
+    ] {
+        assert!(
+            section.contains(token),
+            "TRIPWIRE FIRED: the platform-boundary page no longer names `{token}` \
+             — the crate detects none of these itself, and a reader must be told \
+             which half is the app's"
+        );
+    }
+
+    let when = readme
+        .find("## When to use / when not")
+        .expect("TRIPWIRE FIRED: README lost the use/not-for section");
+    let when_end = readme[when..]
+        .find("\n## ")
+        .map(|n| when + n)
+        .unwrap_or(readme.len());
+    assert!(
+        readme[when..when_end].contains("Not a platform monitor"),
+        "TRIPWIRE FIRED: the \"not for\" list must point at the platform boundary \
+         — a reader who stops at that list must still learn the crate is blind to \
+         the desktop, the hooks and held buttons"
+    );
+}
+
 /// Rollback re-entrancy must be documented as MEASURED behavior, not as the
 /// old folklore.
 ///
@@ -1207,11 +1267,74 @@ fn normalize_cell(cell: &str) -> String {
     out
 }
 
-/// `scripts/check_api_diff.sh` lets a deliberate break through only when the
-/// removed name is listed in `api-breaks/<version>.txt`. That manifest is a
-/// release artifact, not a scratch note: every name in it must be documented
-/// in the CHANGELOG section for the same version, or a consumer upgrading
-/// reads a changelog that never mentions what vanished.
+/// Body and declared names of a `## <version>` CHANGELOG section: the body has
+/// every `<!-- api-breaks ... -->` block stripped, and the names come from the
+/// first such block (one token per line, `#` comments and blanks skipped).
+/// Stripping matters: a name that only appears inside the block would otherwise
+/// satisfy a `contains` check against the section it lives in.
+fn changelog_section(changelog: &str, version: &str) -> Option<(String, Vec<String>)> {
+    let heading = format!("## {version}");
+    let start = changelog.find(&heading)?;
+    let after_heading = changelog[start + heading.len()..].chars().next();
+    if !matches!(after_heading, None | Some(' ' | '—' | '-')) {
+        return None;
+    }
+    let after = start + heading.len();
+    let end = changelog[after..]
+        .find("\n## ")
+        .map(|n| after + n)
+        .unwrap_or(changelog.len());
+    let section = &changelog[start..end];
+
+    // Line-oriented: a block opens only on a line that STARTS with `<!--` and
+    // names api-breaks, and closes on a line that starts with `-->`. Prose may
+    // mention the marker inline (it does), and a substring scan would swallow
+    // the rest of the section looking for a terminator.
+    let mut body = String::with_capacity(section.len());
+    let mut names = Vec::new();
+    let mut in_block = false;
+    for line in section.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if in_block {
+            if trimmed.starts_with("-->") {
+                in_block = false;
+            } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                names.push(trimmed.to_string());
+            }
+            continue;
+        }
+        if trimmed.starts_with("<!--") && trimmed.contains("api-breaks") {
+            assert!(
+                !trimmed.ends_with("-->"),
+                "TRIPWIRE FIRED: the api-breaks declaration must be one name per \
+                 line inside a multi-line comment — {version} opens and closes it \
+                 on the same line, which the release gate cannot read"
+            );
+            in_block = true;
+            continue;
+        }
+        body.push_str(line);
+    }
+    assert!(
+        !in_block,
+        "TRIPWIRE FIRED: the `<!-- api-breaks` block in CHANGELOG.md {version} \
+         never closes with `-->`"
+    );
+    Some((body, names))
+}
+
+/// `scripts/check_api_diff.{sh,ps1}` let a deliberate break through only when
+/// the removed name is declared. The PUBLISHED channel is the
+/// `<!-- api-breaks ... -->` block in the CHANGELOG section for that version
+/// (CI checks out the repository and sees it); `api-breaks/<version>.txt` is
+/// the local audit copy, gitignored. Three laws:
+///
+/// 1. A local manifest without a published block is a declaration CI cannot
+///    see — the release host would pass a break the runner then fails.
+/// 2. When both exist they must name the same set, or the local copy has
+///    drifted from what a reader (and the gate on CI) can verify.
+/// 3. Every declared name must appear in the CHANGELOG PROSE for the version,
+///    or a consumer upgrading reads silence where the break is.
 #[test]
 fn test_declared_api_breaks_are_in_the_changelog() {
     let cargo = read_doc("Cargo.toml");
@@ -1222,43 +1345,72 @@ fn test_declared_api_breaks_are_in_the_changelog() {
         .and_then(|rest| rest.split('"').next())
         .expect("Cargo.toml has no package version");
 
+    let changelog = read_doc("CHANGELOG.md");
+    let (body, block_names) = changelog_section(&changelog, version).unwrap_or_else(|| {
+        panic!(
+            "TRIPWIRE FIRED: CHANGELOG.md has no `## {version}` section — the \
+             declaration channel and the release gate both look for it"
+        )
+    });
+
     let manifest_path = format!("api-breaks/{version}.txt");
-    let Ok(manifest) = std::fs::read_to_string(&manifest_path) else {
+    // Absent on CI (the folder is gitignored) — that is the normal case and
+    // the published block alone must carry the declaration there.
+    let manifest = std::fs::read_to_string(&manifest_path).ok();
+    let manifest_names: Vec<String> = manifest
+        .as_deref()
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if manifest.is_none() && block_names.is_empty() {
+        // No declaration for this version: nothing to reconcile. A release
+        // that breaks an API fails Gate 6 instead of passing silently.
         return;
-    };
-    let names: Vec<&str> = manifest
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect();
+    }
     assert!(
-        !names.is_empty(),
-        "TRIPWIRE FIRED: {manifest_path} declares nothing — an empty manifest \
-         turns the semver gate into a no-op; delete the file instead"
+        manifest.is_none() || !manifest_names.is_empty(),
+        "TRIPWIRE FIRED: {manifest_path} exists but declares nothing — an empty \
+         manifest turns the semver gate into a no-op; delete the file instead"
+    );
+    assert!(
+        !block_names.is_empty(),
+        "TRIPWIRE FIRED: {manifest_path} declares breaks but the CHANGELOG \
+         `## {version}` section has no `<!-- api-breaks ... -->` block — CI \
+         checks out the repository, sees no declaration, and Gate 6 fails red \
+         on a change the release host passed. Publish the list with the break."
     );
 
-    let changelog = read_doc("CHANGELOG.md");
-    let heading = format!("## {version}");
-    let start = changelog
-        .find(&heading)
-        .unwrap_or_else(|| panic!("TRIPWIRE FIRED: CHANGELOG.md has no `{heading}` section"));
-    let after = start + heading.len();
-    let end = changelog[after..]
-        .find("\n## ")
-        .map(|n| after + n)
-        .unwrap_or(changelog.len());
-    let section = &changelog[start..end];
+    if manifest.is_some() {
+        let mut sorted_block = block_names.clone();
+        sorted_block.sort();
+        sorted_block.dedup();
+        let mut sorted_manifest = manifest_names.clone();
+        sorted_manifest.sort();
+        sorted_manifest.dedup();
+        assert_eq!(
+            sorted_block, sorted_manifest,
+            "TRIPWIRE FIRED: the CHANGELOG `<!-- api-breaks -->` block and \
+             {manifest_path} name different sets — the published declaration \
+             and the audit copy disagree"
+        );
+    }
 
     // cargo-semver-checks names a removed item as `Type::method` but a new
     // field as `Type.field`; the CHANGELOG writes paths with `::`. Compare
     // with the separator normalised so the entry still has to be named.
-    let section_dotted = section.replace("::", ".");
-    for name in names {
+    let body_dotted = body.replace("::", ".");
+    for name in &block_names {
         assert!(
-            section.contains(name) || section_dotted.contains(&name.replace("::", ".")),
-            "TRIPWIRE FIRED: {manifest_path} declares `{name}` as removed, but \
-             the CHANGELOG section `{heading}` never names it — a consumer \
-             upgrading reads silence where the break is"
+            body.contains(name) || body_dotted.contains(&name.replace("::", ".")),
+            "TRIPWIRE FIRED: the {version} api-breaks block declares `{name}`, \
+             but the section prose never names it — a consumer upgrading reads \
+             silence where the break is"
         );
     }
 }

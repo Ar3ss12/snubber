@@ -155,6 +155,13 @@ only move a `Copy` verdict; the crate never measures memory itself.
   that climbs and drops never trips a monotonic mark, and the shape is
   named instead of invisible. Naming it is not a verdict — the crate says
   what the window looks like, the caller decides whether that is a fault.
+- `LeakClassification::Advisory` is the early half of the same honesty and
+  still not a verdict: a partial window that rose for at least three
+  samples and at least half of `N`, whose growth projected across a full
+  window would cross the trip mark. Only a full window may latch, so
+  `is_rising()` / `is_leaking()` / `is_pressured()` are all blind to it by
+  construction; its rate divides by the intervals it actually holds
+  (`samples - 1`), never by `N - 1`.
 - A leaked handle is invisible to RSS, so `HandleWatch<N>` applies the same
   derivative to an externally sampled count (handles, fds, sockets). An
   unreadable probe returns `None` and records nothing: substituting `0`
