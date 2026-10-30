@@ -211,7 +211,7 @@ The same gates run in CI (`.github/workflows/stress.yml`, `--aggressive`, dispat
 | macos-latest (arm64) | armed-hold | 1,000 | 7.19 s | 139.1 | 100% | 0 | 0 | 22–24 / 344–554 µs |
 | macos-latest (arm64) | free-running | 2,000 | 31.82 s | 62.9 | 61.9% | 38.1% | 0 | 13–14 / 57–84 µs |
 
-The 8-lane saturation shape runs in the same workflow on both flavors (4 lanes x 250 armed-hold, 8 x 125 saturation, 4 x 500 free-running on POSIX; armed-hold, saturation and the single-process PS harness on Windows, the last two on the scheduled and manual dispatch only). Its figures arrive in the uploaded run artifacts and are not quoted here: this table only carries numbers a completed CI log states.
+The 8-lane saturation shape runs in the same workflow on both flavors. On POSIX every push runs all three shapes (4 lanes x 250 armed-hold, 8 x 125 saturation, 4 x 500 free-running); the Windows multi-lineage job (armed-hold and saturation) and the single-process PS harness are scheduled and manual-dispatch only, which is why the Windows figures above come from runs committed in `docs/evidence/` rather than from a runner log. The saturation figures arrive in the uploaded run artifacts and are not quoted here: this table only carries numbers a completed CI log states.
 
 ```powershell
 # Single-lineage release gate (10,000 kills)
@@ -243,7 +243,7 @@ python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggres
 
 The lease run is the one that measures the observer: 24 children send exactly one heartbeat and go silent, so every reap is `Stillborn` (a heartbeat proves the pipe, not a settlement), `lease_kills` = 24 and the monitor completed 102,471 `report()` + `expired_lanes()` checks with 0 conservation breaks and 0 `token_lane_mismatch`. The mixed run cycles each lane through `armed → clean → silent → orphan`, which is the only shape that produces all four buckets in one process; the `orphan` leg leaves a grandchild holding the pipe open, and the run reporting `deadlock: true` with 8 deadlocks is the honest bucket — a lane that never settles is named, not counted as a rescue. Tokens: `tokens_seen` 32 / 0 / 8 across the three runs, `token_lane_mismatch` 0 everywhere; `final_generation` is `[9, 9, 9, 9]`, `[7, 7, 7, 7]` and `[9, 9, 9, 9]` — one bump per death per lane.
 
-Artifacts: [`docs/evidence/2026-10-30_pool_stress_report.json`](docs/evidence/2026-10-30_pool_stress_report.json), [`docs/evidence/2026-10-30_pool_lease_stress_report.json`](docs/evidence/2026-10-30_pool_lease_stress_report.json), [`docs/evidence/2026-10-30_pool_mixed_stress_report.json`](docs/evidence/2026-10-30_pool_mixed_stress_report.json); they supersede the 2026-10-26 set.
+Artifacts: [`docs/evidence/2026-10-30_pool_stress_report.json`](docs/evidence/2026-10-30_pool_stress_report.json), [`docs/evidence/2026-10-30_pool_lease_stress_report.json`](docs/evidence/2026-10-30_pool_lease_stress_report.json), [`docs/evidence/2026-10-30_pool_mixed_stress_report.json`](docs/evidence/2026-10-30_pool_mixed_stress_report.json); they supersede the 2026-10-26 set. The same three commands run on every push in CI (`.github/workflows/ci.yml`, the `Release ignored lanes (ubuntu)` job, `cargo test --release --locked --test supervisor_pool_stress{,_lease,_mixed} -- --ignored`); that job reports its own verdict and never rewrites the committed rows, so a CI-green pool lane and a doc row can disagree only on `wall_ms`.
 
 ```bash
 cargo test --release --test supervisor_pool_stress -- --ignored --nocapture
