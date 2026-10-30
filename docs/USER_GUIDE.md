@@ -1502,18 +1502,24 @@ worker that answers once and then never exits.
 
 Measured costs (release, Criterion `layer4_worker_pool`): every lane
 locks only its own state, so per-reap figures scale with lanes, not with
-the pool (per-operation numbers: [BENCHMARKS.md](../BENCHMARKS.md)). The
-storm gates on this machine (debug; 2026-10-26 committed artifacts in
-`docs/evidence/`): 4 lanes × 8 armed kills = 32/32
-ambush, `wall_ms=55`; the mixed storm produces an equal four-way split (A/E/S/D =
-8/8/8/8, 8 rescued) with `deadlock=true` and `wall_ms=474` — the orphan mode
-keeps its pipe open past the 150 ms grace, so the deadlock bucket is
-proven, not simulated. The lease storm kills 24 workers that beat once
-and then hang (4 lanes × 6, 25 ms lease): 24/24 stillborn, `lease_kills=24`,
-0 deadlocks, 0 conservation breaks over 99,628 live `report()` samples
-from the observer thread, `[7,7,7,7]` generations, `wall_ms=194`.
-`wall_ms` and the observer sample count are wall-clock observations and
-move with load; the bucket counters and generations are deterministic.
+the pool (per-operation numbers: [BENCHMARKS.md](../BENCHMARKS.md)).
+The three pool storms run in the release profile
+(`cargo test --release --test supervisor_pool_stress -- --ignored`, plus
+`_mixed` and `_lease`) and are committed as
+`docs/evidence/2026-10-30_pool_*_stress_report.json`: 4 lanes × 8 armed
+kills reap 32/32 into the ambush bucket with `[9, 9, 9, 9]` generations;
+the mixed storm produces an equal four-way split (A/E/S/D = 8/8/8/8, 8
+rescued) with `deadlock=true` — the orphan mode keeps its pipe open past
+the 150 ms grace, so the deadlock bucket is proven, not simulated; the
+lease storm kills 24 workers that answer once and then hang (4 lanes × 6,
+25 ms lease) into 24/24 stillborn, `lease_kills` 24, zero deadlocks and
+zero conservation breaks, with the observer polling the pool throughout.
+The clock columns of those reports — the wall time of the run and the
+number of observer checks — move with load, so this guide quotes neither:
+[BENCHMARKS.md](../BENCHMARKS.md) is the only home for storm figures and
+`test_pool_storm_tables_match_committed_reports` rebuilds every one of
+them from the artifact. The bucket counters and the per-lane generations
+are deterministic.
 
 **Reference:** `examples/19_worker_pool.rs` (supervisor and worker modes,
 `--mixed` four-class storm, `--lease-ms` euthanasia storm, JSON report),

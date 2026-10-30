@@ -1776,165 +1776,1005 @@ fn test_guide_anchors_resolve_to_headings() {
     );
 }
 
-/// The termination-storm tables in BENCHMARKS.md quote the committed
-/// multi-lineage report JSONs in docs/evidence/. Every headline token is
-/// derived from the artifact at test time — the docs never carry an
-/// independent copy of a storm number. The JSONs are read with a tiny
-/// key-number extractor (the crate has no serde in the dev graph); a
-/// changed report shape must fail loudly here, not pass vacuously.
-#[test]
-fn test_storm_tables_match_committed_reports() {
-    fn report_number(text: &str, key: &str) -> f64 {
-        let needle = format!("\"{key}\":");
-        let pos = text.find(&needle).unwrap_or_else(|| {
-            panic!(
-                "storm report lost key `{key}` — the harness report shape \
-                 changed; refresh docs/evidence and this oracle together"
-            )
-        });
-        let rest = text[pos + needle.len()..].trim_start();
-        let end = rest
-            .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
-            .unwrap_or(rest.len());
-        rest[..end]
-            .parse::<f64>()
-            .unwrap_or_else(|_| panic!("storm report key `{key}` is not a plain number"))
-    }
+// ── Storm evidence oracle ───────────────────────────────────────────────
+//
+// Every storm digit in BENCHMARKS.md is re-derived here from the committed
+// artifact, and the doc line must match byte for byte. This lives in code
+// rather than in a reviewer's eye because a report copied out of `target/`
+// and a prose sentence drift the moment one lane is re-run, and the failure
+// mode is a published benchmark nobody can reproduce.
+//
+// No JSON crate: the dev graph stays dependency-free, and the subset needed
+// here (objects, arrays, scalars) is a few dozen lines. The reader is
+// SCOPED — `field` looks inside one object, never the whole file — because
+// `dispatch_us`, `samples`, `p50` and `final_generation` each appear once in
+// the aggregate and once per lane. A first-occurrence reader would answer an
+// aggregate question with lane 0's number and never say so.
 
-    fn dispatch_p50(text: &str) -> f64 {
-        let pos = text
-            .find("\"dispatch_us\":")
-            .expect("storm report lost `dispatch_us`");
-        report_number(&text[pos..], "p50")
-    }
+/// Byte span of one value inside an artifact.
+#[derive(Clone, Copy)]
+struct Span {
+    start: usize,
+    end: usize,
+}
 
-    fn thousands(n: u64) -> String {
-        let digits = n.to_string();
-        let mut out = String::new();
-        for (i, c) in digits.chars().enumerate() {
-            if i > 0 && (digits.len() - i) % 3 == 0 {
-                out.push(',');
+struct StormDoc {
+    path: String,
+    text: String,
+}
+
+fn storm_skip_ws(t: &str, mut i: usize) -> usize {
+    let b = t.as_bytes();
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    i
+}
+
+/// Index just past the closing quote of the string starting at `open`.
+fn storm_string_end(t: &str, open: usize) -> usize {
+    let b = t.as_bytes();
+    let mut i = open + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    panic!("unterminated JSON string at byte {open}")
+}
+
+/// Exclusive end of the value starting at `start` (which is not whitespace).
+fn storm_value_end(t: &str, start: usize) -> usize {
+    let b = t.as_bytes();
+    let open = b[start];
+    if open == b'"' {
+        return storm_string_end(t, start);
+    }
+    if open == b'{' || open == b'[' {
+        let close = if open == b'{' { b'}' } else { b']' };
+        let mut i = start + 1;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'"' {
+                i = storm_string_end(t, i);
+            } else if c == b'{' || c == b'[' {
+                i = storm_value_end(t, i);
+            } else if c == close {
+                return i + 1;
+            } else {
+                i += 1;
             }
-            out.push(c);
+        }
+        panic!("unbalanced JSON container at byte {start}");
+    }
+    let mut i = start;
+    while i < b.len()
+        && !matches!(
+            b[i],
+            b',' | b'}' | b']' | b':' | b' ' | b'\t' | b'\r' | b'\n'
+        )
+    {
+        i += 1;
+    }
+    i
+}
+
+/// `12345` -> `12,345`, the grouping every storm token uses.
+fn storm_group(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Fixed point, half-away-from-zero, grouped integer part. `f64::round` is
+/// the whole point: .NET `Math.Round` and Python `round()` are banker's
+/// rounding, so a tie such as 74.25 % reads 74.2 there and 74.3 here. The
+/// harness prints one thing and this file must quote the same thing.
+fn storm_fixed(value: f64, dp: usize) -> String {
+    let scale = 10f64.powi(dp as i32);
+    let scaled = (value * scale).round();
+    let neg = scaled < 0.0;
+    let mag = scaled.abs() as u64;
+    let whole = mag / scale as u64;
+    let frac = mag % scale as u64;
+    let body = if dp == 0 {
+        storm_group(whole)
+    } else {
+        format!("{}.{:0>width$}", storm_group(whole), frac, width = dp)
+    };
+    if neg && mag > 0 {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
+/// A growth of zero reads `+0`: the sign is the claim that the window moved.
+fn storm_signed(value: f64, dp: usize) -> String {
+    let body = storm_fixed(value, dp);
+    if body.starts_with('-') {
+        body
+    } else {
+        format!("+{body}")
+    }
+}
+
+fn storm_bounds(values: &[f64]) -> (f64, f64) {
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for v in values {
+        if *v < lo {
+            lo = *v;
+        }
+        if *v > hi {
+            hi = *v;
+        }
+    }
+    (lo, hi)
+}
+
+/// `311.1…318.3 µs`, or a single value when every lane reads the same.
+fn storm_range(values: &[f64], dp: usize, unit: &str) -> String {
+    let (lo, hi) = storm_bounds(values);
+    let (a, b) = (storm_fixed(lo, dp), storm_fixed(hi, dp));
+    if a == b {
+        format!("{a}{unit}")
+    } else {
+        format!("{a}…{b}{unit}")
+    }
+}
+
+fn storm_signed_range(values: &[f64], dp: usize, unit: &str) -> String {
+    let (lo, hi) = storm_bounds(values);
+    let (a, b) = (storm_signed(lo, dp), storm_signed(hi, dp));
+    if a == b {
+        format!("{a}{unit}")
+    } else {
+        format!("{a}…{b}{unit}")
+    }
+}
+
+/// `10,000 (100.0%)`, or a bare `0` — an empty bucket is a fact, not a rate.
+fn storm_cell(count: u64, total: u64) -> String {
+    if count == 0 {
+        return "0".to_string();
+    }
+    let pct = 100.0 * count as f64 / total as f64;
+    format!("{} ({}%)", storm_group(count), storm_fixed(pct, 1))
+}
+
+/// Band edges, identical to `HIST_BUCKETS` / `$histBuckets` in the harnesses.
+const STORM_BANDS: [u64; 8] = [50, 100, 200, 500, 1000, 2000, 5000, 10000];
+
+/// `(artifact, table row label, prose label)`
+const STORM_RUNS: [(&str, &str, &str); 3] = [
+    (
+        "docs/evidence/2026-10-30_multi_lineage_armedhold_report.json",
+        "`-ArmedHold`",
+        "armed-hold",
+    ),
+    (
+        "docs/evidence/2026-10-30_multi_lineage_freerun_report.json",
+        "`-Aggressive` (free-running)",
+        "free-running",
+    ),
+    (
+        "docs/evidence/2026-10-30_multi_lineage_saturation_report.json",
+        "`-ArmedHold` at 8 lanes",
+        "saturated",
+    ),
+];
+
+/// `(artifact, row label, which storm the pool example ran)`
+const POOL_RUNS: [(&str, &str, &str); 3] = [
+    (
+        "docs/evidence/2026-10-30_pool_stress_report.json",
+        "`supervisor_pool_stress`",
+        "pool",
+    ),
+    (
+        "docs/evidence/2026-10-30_pool_lease_stress_report.json",
+        "`supervisor_pool_stress_lease`",
+        "lease",
+    ),
+    (
+        "docs/evidence/2026-10-30_pool_mixed_stress_report.json",
+        "`supervisor_pool_stress_mixed`",
+        "mixed",
+    ),
+];
+
+impl StormDoc {
+    fn load(path: &str) -> StormDoc {
+        // Windows PowerShell writes its report with a BOM; it is not JSON.
+        let text = read_doc(path).trim_start_matches('\u{feff}').to_string();
+        StormDoc {
+            path: path.to_string(),
+            text,
+        }
+    }
+
+    fn byte(&self, i: usize) -> u8 {
+        *self
+            .text
+            .as_bytes()
+            .get(i)
+            .unwrap_or_else(|| panic!("{}: JSON ended at byte {i}", self.path))
+    }
+
+    fn expect(&self, i: usize, want: u8) {
+        if self.byte(i) != want {
+            panic!(
+                "{}: expected `{}` at byte {i}, found `{}` — the report shape \
+                 changed; refresh docs/evidence and this oracle together",
+                self.path,
+                want as char,
+                self.byte(i) as char
+            );
+        }
+    }
+
+    fn root(&self) -> Span {
+        let start = storm_skip_ws(&self.text, 0);
+        self.expect(start, b'{');
+        Span {
+            start,
+            end: storm_value_end(&self.text, start),
+        }
+    }
+
+    fn slice(&self, s: Span) -> &str {
+        &self.text[s.start..s.end]
+    }
+
+    fn members(&self, obj: Span) -> Vec<(String, Span)> {
+        let mut out = Vec::new();
+        let mut i = storm_skip_ws(&self.text, obj.start + 1);
+        if self.byte(i) == b'}' {
+            return out;
+        }
+        loop {
+            self.expect(i, b'"');
+            let key_end = storm_string_end(&self.text, i);
+            let key = self.text[i + 1..key_end - 1].to_string();
+            i = storm_skip_ws(&self.text, key_end);
+            self.expect(i, b':');
+            let value = storm_skip_ws(&self.text, i + 1);
+            let end = storm_value_end(&self.text, value);
+            out.push((key, Span { start: value, end }));
+            i = storm_skip_ws(&self.text, end);
+            match self.byte(i) {
+                b',' => i = storm_skip_ws(&self.text, i + 1),
+                b'}' => break,
+                other => panic!(
+                    "{}: expected `,` or `}}` at byte {i}, found `{}`",
+                    self.path, other as char
+                ),
+            }
         }
         out
     }
 
-    fn assert_in_doc(doc: &str, token: &str, artifact: &str) {
+    fn items(&self, arr: Span) -> Vec<Span> {
+        let mut out = Vec::new();
+        let mut i = storm_skip_ws(&self.text, arr.start + 1);
+        if self.byte(i) == b']' {
+            return out;
+        }
+        loop {
+            let value = storm_skip_ws(&self.text, i);
+            let end = storm_value_end(&self.text, value);
+            out.push(Span { start: value, end });
+            i = storm_skip_ws(&self.text, end);
+            match self.byte(i) {
+                b',' => i = storm_skip_ws(&self.text, i + 1),
+                b']' => break,
+                other => panic!(
+                    "{}: expected `,` or `]` at byte {i}, found `{}`",
+                    self.path, other as char
+                ),
+            }
+        }
+        out
+    }
+
+    fn field(&self, obj: Span, key: &str) -> Span {
+        self.members(obj)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: this object has no key `{key}`. The harness report \
+                     shape changed; refresh docs/evidence and this oracle \
+                     together, never the docs alone.",
+                    self.path
+                )
+            })
+    }
+
+    fn nested(&self, obj: Span, outer: &str, key: &str) -> Span {
+        self.field(self.field(obj, outer), key)
+    }
+
+    fn num(&self, s: Span) -> f64 {
+        self.slice(s).parse::<f64>().unwrap_or_else(|err| {
+            panic!(
+                "{}: `{}` is not a number ({err}) — the report is corrupt or truncated",
+                self.path,
+                self.slice(s)
+            )
+        })
+    }
+
+    fn usz(&self, s: Span) -> u64 {
+        self.slice(s).parse::<u64>().unwrap_or_else(|err| {
+            panic!(
+                "{}: `{}` is not an integer ({err}) — a count key was asked for a fractional value",
+                self.path,
+                self.slice(s)
+            )
+        })
+    }
+
+    fn flag(&self, s: Span) -> bool {
+        match self.slice(s) {
+            "true" => true,
+            "false" => false,
+            other => panic!("{}: `{other}` is neither true nor false", self.path),
+        }
+    }
+
+    fn text_of(&self, s: Span) -> String {
+        let raw = self.slice(s);
+        if raw == "null" {
+            return String::new();
+        }
+        raw[1..raw.len() - 1].to_string()
+    }
+
+    fn is_null(&self, s: Span) -> bool {
+        self.slice(s) == "null"
+    }
+
+    /// One number per lane, out of `outer.key`.
+    fn per_lane(&self, lanes: &[Span], outer: &str, key: &str) -> Vec<f64> {
+        lanes
+            .iter()
+            .map(|l| {
+                if outer.is_empty() {
+                    self.num(self.field(*l, key))
+                } else {
+                    self.num(self.nested(*l, outer, key))
+                }
+            })
+            .collect()
+    }
+
+    fn sum_per_lane(&self, lanes: &[Span], outer: &str, key: &str) -> u64 {
+        lanes
+            .iter()
+            .map(|l| {
+                if outer.is_empty() {
+                    self.usz(self.field(*l, key))
+                } else {
+                    self.usz(self.nested(*l, outer, key))
+                }
+            })
+            .sum()
+    }
+}
+
+/// Fail with the artifact, the expected line and the rule, never a bare assert.
+fn storm_assert_line(doc: &str, line: &str, artifact: &str, kind: &str) {
+    let want = line.trim();
+    assert!(
+        doc.lines().any(|have| have.trim() == want),
+        "TRIPWIRE FIRED: BENCHMARKS.md carries no {kind} line matching {artifact}.\n  \
+         expected: {want}\n  \
+         Every storm number has exactly one source: the committed report. Re-run the \
+         storm, refresh the artifact, regenerate the doc from it — never the artifact \
+         from the doc.",
+    );
+}
+
+fn storm_assert_token(doc: &str, token: &str, artifact: &str) {
+    assert!(
+        doc.contains(token),
+        "TRIPWIRE FIRED: BENCHMARKS.md lost the token '{token}' that {artifact} still \
+         carries. Refresh the artifact, then update every storm citation to the \
+         artifact value.",
+    );
+}
+
+/// The termination-storm tables in BENCHMARKS.md quote the committed
+/// multi-lineage reports. Every headline token, per-lane range, band count,
+/// machine-identity fragment and rescue counter is re-derived from the
+/// artifact here, and the artifact is checked against itself first: a doc
+/// that quotes a self-inconsistent report is broken twice over.
+#[test]
+fn test_storm_tables_match_committed_reports() {
+    let bench_doc = read_doc("BENCHMARKS.md");
+    assert!(
+        !bench_doc.contains("2026-10-27_multi_lineage"),
+        "BENCHMARKS.md still cites the 2026-10-27 storm reports as current \
+         storm evidence; the 2026-10-30 set in docs/evidence supersedes them"
+    );
+    let mut checked = 0usize;
+
+    for (path, row_label, run_label) in STORM_RUNS {
+        let doc = StormDoc::load(path);
+        let root = doc.root();
+
+        assert_eq!(
+            doc.text_of(doc.field(root, "verdict")),
+            "PASS",
+            "{path}: committed evidence must carry a PASS verdict"
+        );
+        assert_eq!(
+            doc.usz(doc.field(root, "report_schema")),
+            2,
+            "{path}: report_schema is not 2, so the disjoint `band_*` keys \
+             this oracle reads are not the keys the harness writes"
+        );
+        assert_eq!(doc.text_of(doc.field(root, "model")), "multi_lineage");
+        assert_eq!(
+            doc.text_of(doc.nested(root, "system", "profile")),
+            "release",
+            "{path}: a storm figure quoted in BENCHMARKS.md must come from a release build"
+        );
+        checked += 1;
+
+        // The battery itself: every gate green, and exactly as many gates as
+        // the harness writes (10 per lane under -ArmedHold, 9 without the
+        // ambush-rate gate, plus 4 or 3 aggregates).
+        let armed = doc.flag(doc.field(root, "armed_hold"));
+        let lanes = doc.items(doc.field(root, "lanes"));
+        let checks = doc.items(doc.field(root, "checks"));
+        let per_lane = if armed { 10 } else { 9 };
+        let aggregate = if armed { 4 } else { 3 };
+        assert_eq!(
+            checks.len(),
+            lanes.len() * per_lane + aggregate,
+            "{path}: {}/{} checks is not lanes x {per_lane} + {aggregate} — a lane \
+             gate was added or dropped without moving this oracle",
+            checks.len(),
+            lanes.len()
+        );
+        let red: Vec<String> = checks
+            .iter()
+            .filter(|c| !doc.flag(doc.field(**c, "ok")))
+            .map(|c| doc.text_of(doc.field(*c, "name")))
+            .collect();
         assert!(
-            doc.contains(token),
-            "TRIPWIRE FIRED: BENCHMARKS.md storm table lost '{token}' but \
-             {artifact} still carries it. Re-run the storm, refresh the \
-             artifact, and update every storm citation to the artifact \
-             value — never the artifact to the docs."
+            red.is_empty(),
+            "{path}: {red:?} are red in the artifact, so no doc may quote it"
+        );
+        let readable = checks
+            .iter()
+            .filter(|c| {
+                doc.text_of(doc.field(**c, "name"))
+                    .ends_with("resource window readable")
+            })
+            .count();
+        assert_eq!(
+            readable,
+            lanes.len(),
+            "{path}: only {readable} of {} lanes report a readable resource window",
+            lanes.len()
+        );
+
+        let kills_per_line = doc.usz(doc.field(root, "kills_per_line"));
+        let total = doc.usz(doc.field(root, "kills_completed"));
+        assert_eq!(doc.usz(doc.field(root, "lines")), lanes.len() as u64);
+        assert_eq!(
+            doc.usz(doc.field(root, "kills_requested")),
+            total,
+            "{path}: a lane ended short of its dispatch count"
+        );
+        assert_eq!(doc.usz(doc.nested(root, "dispatch_us", "count")), total);
+
+        let killed = doc.sum_per_lane(&lanes, "", "killed");
+        assert_eq!(
+            killed, total,
+            "{path}: the lanes do not account for every kill"
+        );
+        assert_eq!(
+            doc.sum_per_lane(&lanes, "", "stale"),
+            0,
+            "{path}: a killer shot a recycled pid"
+        );
+        assert_eq!(doc.usz(doc.nested(root, "killers_saw", "stale")), 0);
+        for key in ["duplicates", "retries", "miss_polls"] {
+            assert_eq!(
+                doc.sum_per_lane(&lanes, "", key),
+                doc.usz(doc.field(doc.field(root, "killers_saw"), key)),
+                "{path}: aggregate `{key}` is not the sum over lanes"
+            );
+        }
+        // The root bucket is `clean_escape`; the lane bucket is `escape`.
+        // Reading one name for both is how a doc ends up quoting a number
+        // the harness never wrote.
+        for (aggregate, lane_key) in [
+            ("true_ambush", "true_ambush"),
+            ("clean_escape", "escape"),
+            ("stillborn", "stillborn"),
+        ] {
+            assert_eq!(
+                doc.sum_per_lane(&lanes, "classification", lane_key),
+                doc.usz(doc.field(root, aggregate)),
+                "{path}: the aggregate `{aggregate}` bucket is not the sum of the lanes"
+            );
+        }
+        assert_eq!(
+            doc.sum_per_lane(&lanes, "report", "tokens_rescued"),
+            doc.usz(doc.field(root, "tokens_rescued")),
+            "{path}: tokens_rescued drifted from the lanes that earned them"
+        );
+
+        // Rescue accounting is a partition of the kills, not a tally: a token
+        // is rescued exactly when the death landed in the armed window, and
+        // everything else left through the normal settle path. Together these
+        // two equalities are why a high ambush rate cannot be manufactured by
+        // dropping tokens — an unsettled kill reads as a missing rescue.
+        let rescued = doc.usz(doc.field(root, "tokens_rescued"));
+        let settles = doc.usz(doc.field(root, "clean_settles"));
+        let ambush = doc.usz(doc.field(root, "true_ambush"));
+        assert_eq!(
+            rescued, ambush,
+            "{path}: {rescued} tokens rescued against {ambush} kills classified as true ambush"
+        );
+        assert_eq!(
+            rescued + settles,
+            total,
+            "{path}: `tokens_rescued` + `clean_settles` = {} is not the {total} kills completed",
+            rescued + settles
+        );
+        storm_assert_token(
+            &bench_doc,
+            &format!(
+                "`tokens_rescued` {} of {} kills, `clean_settles` {}",
+                storm_group(rescued),
+                storm_group(total),
+                storm_group(settles)
+            ),
+            path,
+        );
+
+        let buckets = doc.field(root, "dispatch_histogram_us");
+        let mut band_sum = doc.usz(doc.field(buckets, "band_above_10000"));
+        for band in STORM_BANDS {
+            band_sum += doc.usz(doc.field(buckets, &format!("band_{band}")));
+        }
+        assert_eq!(
+            band_sum, total,
+            "{path}: the nine disjoint bands sum to {band_sum}, not to the {total} kills dispatched"
+        );
+
+        let samples = doc.per_lane(&lanes, "resources", "samples");
+        let drops = doc.per_lane(&lanes, "resources", "sample_drops");
+        let handles_last = doc.per_lane(&lanes, "resources", "handles_last");
+        let growth = doc.per_lane(&lanes, "resources", "private_growth_mb");
+        let handle_growth = doc.per_lane(&lanes, "resources", "handles_growth");
+        let p50 = doc.per_lane(&lanes, "dispatch_us", "p50");
+        let p99 = doc.per_lane(&lanes, "dispatch_us", "p99");
+        let generations = doc.per_lane(&lanes, "report", "final_generation");
+        let exits = doc.per_lane(&lanes, "", "supervisor_exit");
+
+        for (index, lane) in lanes.iter().enumerate() {
+            assert_eq!(doc.usz(doc.field(*lane, "index")), index as u64);
+            assert_eq!(
+                doc.usz(doc.field(*lane, "killed")),
+                kills_per_line,
+                "{path}: lane {index} reaped a different count than it dispatched"
+            );
+            assert_eq!(doc.usz(doc.field(*lane, "stale")), 0);
+            assert!(
+                handles_last[index] > 0.0,
+                "{path}: lane {index} published a 0 handle count — the fabricated \
+                 reading that fakes a leak drop"
+            );
+            assert!(
+                samples[index] >= 20.0,
+                "{path}: lane {index} has {} samples, too few to call its window readable",
+                samples[index]
+            );
+            assert!(
+                drops[index] < samples[index],
+                "{path}: lane {index} dropped {} of {} polls",
+                drops[index],
+                samples[index]
+            );
+            assert_eq!(
+                exits[index], 0.0,
+                "{path}: lane {index} supervisor exited nonzero"
+            );
+            let card = doc.field(*lane, "report");
+            assert!(
+                doc.is_null(doc.field(*lane, "error")),
+                "{path}: lane {index} killer reported an error"
+            );
+            assert!(!doc.flag(doc.field(*lane, "stalled")));
+            assert_eq!(doc.usz(doc.field(card, "misclassified_stillborn")), 0);
+            assert_eq!(
+                generations[index] as u64,
+                kills_per_line + 1,
+                "{path}: lane {index} bumped its generation {} times for {kills_per_line} deaths",
+                generations[index] as u64 - 1
+            );
+            assert_eq!(
+                doc.usz(doc.field(card, "ambush_kills"))
+                    + doc.usz(doc.field(card, "escape_kills"))
+                    + doc.usz(doc.field(card, "stillborn_kills")),
+                doc.usz(doc.field(card, "target_kills")),
+                "{path}: lane {index} buckets do not conserve kills"
+            );
+        }
+        if armed {
+            let pct = 100.0 * doc.usz(doc.field(root, "true_ambush")) as f64 / total as f64;
+            assert!(
+                pct >= doc.num(doc.field(root, "min_ambush_pct")),
+                "{path}: an armed-hold artifact only proves rescue if it clears its own ambush gate"
+            );
+        }
+        checked += 5;
+
+        // ── the table row, rebuilt from the artifact
+        let dispatch = doc.field(root, "dispatch_us");
+        let row = format!(
+            "| {row_label} | {} × {} | {} s | {} / {} | {} / {} / {} µs | {} | {} | {} |",
+            doc.usz(doc.field(root, "lines")),
+            storm_group(kills_per_line),
+            storm_fixed(doc.num(doc.field(root, "duration_ms")) / 1000.0, 2),
+            storm_fixed(doc.num(doc.field(root, "rate_per_sec")), 1),
+            storm_fixed(doc.num(doc.field(root, "peak_rate_per_sec")), 1),
+            storm_fixed(doc.num(doc.field(dispatch, "p50")), 1),
+            storm_fixed(doc.num(doc.field(dispatch, "p99")), 1),
+            storm_fixed(doc.num(doc.field(dispatch, "max")), 0),
+            storm_cell(doc.usz(doc.field(root, "true_ambush")), total),
+            storm_cell(doc.usz(doc.field(root, "clean_escape")), total),
+            storm_cell(doc.usz(doc.field(root, "stillborn")), total),
+        );
+        storm_assert_line(&bench_doc, &row, path, "mode");
+
+        // ── the per-lane bullet, its band line and its killer counters
+        let mut parts: Vec<String> = Vec::new();
+        let mut prev = 0u64;
+        for band in STORM_BANDS {
+            let count = doc.usz(doc.field(buckets, &format!("band_{band}")));
+            parts.push(format!("{prev}-{band}: {}", storm_group(count)));
+            prev = band;
+        }
+        parts.push(format!(
+            ">{prev}: {}",
+            storm_group(doc.usz(doc.field(buckets, "band_above_10000")))
+        ));
+        let band_line = parts.join(" | ");
+        let killers = doc.field(root, "killers_saw");
+        let bullet = format!(
+            "- **{run_label}** ({} lineages × {} kills, wall {} s) — per-lane dispatch p50 {}, p99 {}; private-memory growth {}; handle growth {}; samples {} per lane with {} dropped reads; `final_generation` {} = kills + 1; `supervisor_exit` {}.",
+            doc.usz(doc.field(root, "lines")),
+            storm_group(kills_per_line),
+            storm_fixed(doc.num(doc.field(root, "duration_ms")) / 1000.0, 2),
+            storm_range(&p50, 1, " µs"),
+            storm_range(&p99, 1, " µs"),
+            storm_signed_range(&growth, 2, " MB"),
+            storm_signed_range(&handle_growth, 0, ""),
+            storm_range(&samples, 0, ""),
+            storm_range(&drops, 0, ""),
+            storm_range(&generations, 0, ""),
+            storm_range(&exits, 0, ""),
+        );
+        storm_assert_line(&bench_doc, &bullet, path, "per-lane detail");
+        storm_assert_line(
+            &bench_doc,
+            &format!(
+                "Bands (µs, disjoint, sum {}): {band_line}.",
+                storm_group(total)
+            ),
+            path,
+            "band count",
+        );
+        storm_assert_line(
+            &bench_doc,
+            &format!(
+                "Killer counters: {} stale pids, {} duplicate pid-file reads, {} retries, {} pid-miss polls across {} lineages.",
+                storm_group(doc.usz(doc.field(killers, "stale"))),
+                storm_group(doc.usz(doc.field(killers, "duplicates"))),
+                storm_group(doc.usz(doc.field(killers, "retries"))),
+                storm_group(doc.usz(doc.field(killers, "miss_polls"))),
+                doc.usz(doc.field(root, "lines")),
+            ),
+            path,
+            "killer counter",
+        );
+
+        // ── the machine identity, read out of the artifact's system block
+        let system = doc.field(root, "system");
+        let caption = format!(
+            "{}, {} physical / {} logical cores, {} build {}, {}, PowerShell {}, {} profile",
+            doc.text_of(doc.field(system, "cpu_name")),
+            doc.usz(doc.field(system, "physical_cores")),
+            doc.usz(doc.field(system, "logical_cores")),
+            doc.text_of(doc.field(system, "os_caption")),
+            doc.text_of(doc.field(system, "os_build")),
+            doc.text_of(doc.field(system, "rustc")),
+            doc.text_of(doc.field(system, "ps_version")),
+            doc.text_of(doc.field(system, "profile")),
+        );
+        storm_assert_token(&bench_doc, &caption, path);
+        storm_assert_token(&bench_doc, path, path);
+        storm_assert_token(&bench_doc, &path.replace("_report.json", "_run.log"), path);
+        for cited in [path, &path.replace("_report.json", "_run.log")] {
+            assert!(
+                std::path::Path::new(cited).exists(),
+                "BENCHMARKS.md cites {cited} and this oracle reads it, but it is not in \
+                 the tree — the artifact was never committed, so the citation is a link \
+                 to nothing"
+            );
+        }
+        checked += 6;
+    }
+
+    // The prose that explains the schema has to carry the schema, and the
+    // gates this oracle counts by name have to be named in the doc: a bump to
+    // `report_schema: 3` that leaves the sentence saying 2 describes a report
+    // no harness writes, and a renamed lane gate would silently drop out of
+    // the count above.
+    storm_assert_token(&bench_doc, "report_schema: 2", "the harness paragraph");
+    for gate in ["resource window readable", "sample_drops", "band_200"] {
+        storm_assert_token(&bench_doc, gate, "the sampler-coherence paragraph");
+    }
+
+    assert!(
+        checked >= STORM_RUNS.len() * 12,
+        "only {checked} of the {} storm checks ran — the loop broke early, and a \
+         green result here would mean nothing",
+        STORM_RUNS.len() * 12
+    );
+}
+
+/// The pool storm runs the same kill/reap loop inside one pool process. Its
+/// report is a single line of counters, so the whole doc row is pinned.
+#[test]
+fn test_pool_storm_tables_match_committed_reports() {
+    let bench_doc = read_doc("BENCHMARKS.md");
+    assert!(
+        !bench_doc.contains("2026-10-26_pool_"),
+        "BENCHMARKS.md still cites the 2026-10-26 pool artifacts; the 2026-10-30 set \
+         in docs/evidence supersedes them"
+    );
+    for (path, label, mode) in POOL_RUNS {
+        let doc = StormDoc::load(path);
+        let root = doc.root();
+        let lanes = doc.usz(doc.field(root, "lanes"));
+        let reaped = doc.usz(doc.field(root, "reaped"));
+        let ambush = doc.usz(doc.field(root, "ambush"));
+        let escape = doc.usz(doc.field(root, "escape"));
+        let stillborn = doc.usz(doc.field(root, "stillborn"));
+        let deadlocks = doc.usz(doc.field(root, "deadlocks"));
+
+        assert!(
+            doc.flag(doc.field(root, "conserved")),
+            "{path}: the pool report is not conserved"
+        );
+        let breaks = doc.usz(doc.field(root, "conservation_breaks"));
+        assert_eq!(
+            breaks, 0,
+            "{path}: accounting drifted {breaks} times mid-storm"
+        );
+        assert_eq!(
+            doc.usz(doc.field(root, "token_lane_mismatch")),
+            0,
+            "{path}: a token was accounted to the wrong lane"
+        );
+        assert_eq!(
+            ambush + escape + stillborn + deadlocks,
+            reaped,
+            "{path}: the four buckets do not sum to the {reaped} reaps"
+        );
+        assert_eq!(
+            doc.usz(doc.field(root, "rescued")),
+            ambush,
+            "{path}: rescued != ambush"
+        );
+        assert_eq!(
+            doc.usz(doc.field(root, "tokens_seen")),
+            ambush,
+            "{path}: a token was seen without an armed kill"
+        );
+        let generations = doc.items(doc.field(root, "final_generation"));
+        assert_eq!(generations.len(), lanes as usize);
+        for g in &generations {
+            assert_eq!(
+                doc.usz(*g),
+                reaped / lanes + 1,
+                "{path}: a lane bumped {} times for {} deaths",
+                doc.usz(*g),
+                reaped / lanes
+            );
+        }
+        match mode {
+            "lease" => {
+                assert_eq!(doc.usz(doc.field(root, "lease_kills")), reaped);
+                assert_eq!(
+                    stillborn, reaped,
+                    "{path}: a heartbeat proves the pipe, not a settlement"
+                );
+                assert!(
+                    doc.usz(doc.field(root, "monitor_checks")) > 0,
+                    "{path}: the monitor never read the pool during the storm"
+                );
+                assert!(!doc.flag(doc.field(root, "deadlock")));
+                storm_assert_token(
+                    &bench_doc,
+                    &storm_group(doc.usz(doc.field(root, "monitor_checks"))),
+                    path,
+                );
+            }
+            "mixed" => {
+                assert!(
+                    doc.flag(doc.field(root, "deadlock")),
+                    "{path}: the orphan leg must be named as a deadlock, not hidden in a rescue"
+                );
+                assert_eq!(deadlocks, reaped / lanes);
+                assert_eq!(doc.usz(doc.field(root, "lease_kills")), 0);
+            }
+            _ => {
+                assert_eq!(deadlocks, 0);
+                assert_eq!(
+                    ambush, reaped,
+                    "{path}: every kill should land after the arm proof"
+                );
+                assert_eq!(doc.usz(doc.field(root, "lease_kills")), 0);
+                assert_eq!(doc.usz(doc.field(root, "monitor_checks")), 0);
+            }
+        }
+
+        let gens = generations
+            .iter()
+            .map(|g| doc.usz(*g).to_string())
+            .collect::<Vec<String>>()
+            .join(", ");
+        let row = format!(
+            "| {label} | {lanes} | {reaped} | {} | {ambush} / {escape} / {stillborn} | {deadlocks} | `conserved: true`, {breaks} breaks | {} ms |",
+            storm_group(doc.usz(doc.field(root, "rescued"))),
+            storm_group(doc.usz(doc.field(root, "wall_ms"))),
+        );
+        storm_assert_line(&bench_doc, &row, path, "pool");
+        storm_assert_token(&bench_doc, &format!("[{gens}]"), path);
+        storm_assert_token(&bench_doc, path, path);
+        assert!(
+            std::path::Path::new(path).exists(),
+            "BENCHMARKS.md cites {path} and this oracle reads it, but the file is not \
+             in the tree"
         );
     }
 
-    let bench_doc = read_doc("BENCHMARKS.md");
-
-    let armed = read_doc("docs/evidence/2026-10-27_multi_lineage_armedhold_report.json");
-    let hold_pos = armed
-        .find("\"armed_hold\":")
-        .expect("armed-hold artifact lost the `armed_hold` key");
-    let value = armed[hold_pos + "\"armed_hold\":".len()..]
-        .trim_start()
-        .chars()
-        .take(4)
-        .collect::<String>();
+    // The guide describes the current tree, and a storm clock figure copied
+    // into prose is stale on the next run with nothing to re-derive it: this
+    // oracle rebuilds the storm numbers from the artifact, and BENCHMARKS.md
+    // is the single home for them. The superseded 2026-10-26 set is the same
+    // class of defect — a paragraph that names yesterday's artifact while the
+    // evidence folder carries today's.
+    let guide = read_doc("docs/USER_GUIDE.md");
+    for token in ["wall_ms", "monitor_checks", "2026-10-26_pool_"] {
+        assert!(
+            !guide.contains(token),
+            "docs/USER_GUIDE.md carries `{token}` — a wall-clock storm column that every \
+             fresh run invalidates, or the superseded artifact set; state the deterministic \
+             buckets and let BENCHMARKS.md carry the figures"
+        );
+    }
     assert!(
-        value == "true",
-        "armed-hold artifact lost `armed_hold: true` (found `{value}`)"
+        guide.contains("2026-10-30_pool_"),
+        "docs/USER_GUIDE.md does not name the committed pool artifacts its storm paragraph \
+         describes — a guide that quotes a set no longer in docs/evidence reads as a claim \
+         about nothing"
     );
-    assert_in_doc(
-        &bench_doc,
-        &format!("{:.2} s", report_number(&armed, "duration_ms") / 1000.0),
-        "armed-hold",
+}
+
+/// Top-level keys of a report payload, read as the indentation the harness
+/// writes: four spaces inside the PowerShell literal, eight inside the
+/// Python dict. Nested payloads sit deeper, so their keys never enter.
+fn storm_payload_keys(
+    src: &str,
+    marker: &str,
+    stop: &str,
+    key_of: fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let at = src.find(marker).unwrap_or_else(|| {
+        panic!(
+            "harness lost the report payload `{marker}` — this parity tripwire is \
+             the only thing that keeps one oracle able to read both artifacts"
+        )
+    });
+    let mut out = Vec::new();
+    for line in src[at + marker.len()..].split('\n').skip(1) {
+        let bare = line.trim_end();
+        if bare.starts_with(stop) {
+            break;
+        }
+        if let Some(key) = key_of(bare) {
+            out.push(key);
+        }
+    }
+    out
+}
+
+fn ps_key(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("    ")?;
+    if rest.starts_with(' ') || rest.starts_with('#') || rest.is_empty() {
+        return None;
+    }
+    let name = rest.split_whitespace().next()?;
+    rest[name.len()..]
+        .trim_start()
+        .starts_with('=')
+        .then(|| name.to_string())
+}
+
+fn py_key(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("        \"")?;
+    let name = rest.split("\":").next()?;
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+/// The two harnesses must publish one schema. An oracle that reads a Windows
+/// report and a POSIX report by different keys is not one oracle, and the
+/// first asymmetry to appear will be the one nobody notices.
+#[test]
+fn test_storm_harnesses_publish_one_report_schema() {
+    let ps = read_doc("scripts/stress_multi_lineage.ps1");
+    let py = read_doc("scripts/stress_multi_lineage.py");
+
+    let ps_keys = storm_payload_keys(&ps, "$reportDoc = [ordered]@{", "}", ps_key);
+    let py_keys = storm_payload_keys(&py, "report_doc = {", "    }", py_key);
+    assert!(
+        ps_keys.len() >= 25,
+        "only {} PowerShell report keys parsed — the payload reflowed and this \
+         tripwire now reads nothing",
+        ps_keys.len()
     );
-    assert_in_doc(
-        &bench_doc,
-        &format!("{:.1}", report_number(&armed, "rate_per_sec")),
-        "armed-hold",
+    assert!(
+        py_keys.len() >= 25,
+        "only {} Python report keys parsed — the payload reflowed and this \
+         tripwire now reads nothing",
+        py_keys.len()
     );
-    assert_in_doc(
-        &bench_doc,
-        &format!("{:.1}", report_number(&armed, "peak_rate_per_sec")),
-        "armed-hold",
+    let shared = ps_keys.len().min(py_keys.len());
+    assert_eq!(
+        ps_keys,
+        &py_keys[..shared],
+        "the two harnesses emit different top-level report keys; one oracle has \
+         to read both artifacts"
     );
-    assert_in_doc(
-        &bench_doc,
-        &format!("{} µs", dispatch_p50(&armed).round() as u64),
-        "armed-hold",
-    );
-    assert_in_doc(
-        &bench_doc,
-        &format!(
-            "{} ({:.0}%)",
-            thousands(report_number(&armed, "true_ambush") as u64),
-            report_number(&armed, "ambush_pct")
-        ),
-        "armed-hold",
+    assert_eq!(
+        py_keys[shared..].join(","),
+        "platform,kills_dispatched,fd_sampling",
+        "Python-only report keys must stay exactly the POSIX extras, appended \
+         after the shared set (got {:?})",
+        &py_keys[shared..]
     );
 
-    let free = read_doc("docs/evidence/2026-10-27_multi_lineage_freerun_report.json");
-    assert_in_doc(
-        &bench_doc,
-        &format!("{:.2} s", report_number(&free, "duration_ms") / 1000.0),
-        "free-running",
-    );
-    assert_in_doc(
-        &bench_doc,
-        &format!("{:.1}", report_number(&free, "rate_per_sec")),
-        "free-running",
-    );
-    assert_in_doc(
-        &bench_doc,
-        &format!("{:.1}", report_number(&free, "peak_rate_per_sec")),
-        "free-running",
-    );
-    assert_in_doc(
-        &bench_doc,
-        &format!("{} µs", dispatch_p50(&free).round() as u64),
-        "free-running",
-    );
-    let kills = report_number(&free, "kills_completed");
-    let pct = |n: f64| n * 100.0 / kills;
-    assert_in_doc(
-        &bench_doc,
-        &format!(
-            "{} ({:.1}%)",
-            thousands(report_number(&free, "true_ambush") as u64),
-            pct(report_number(&free, "true_ambush"))
-        ),
-        "free-running",
-    );
-    assert_in_doc(
-        &bench_doc,
-        &format!(
-            "{} ({:.1}%)",
-            thousands(report_number(&free, "clean_escape") as u64),
-            pct(report_number(&free, "clean_escape"))
-        ),
-        "free-running",
-    );
-    assert_in_doc(
-        &bench_doc,
-        &format!(
-            "{} ({:.1}%)",
-            thousands(report_number(&free, "stillborn") as u64),
-            pct(report_number(&free, "stillborn"))
-        ),
-        "free-running",
-    );
-
-    for (name, text) in [("armed-hold", &armed), ("free-running", &free)] {
-        let sum = report_number(text, "true_ambush")
-            + report_number(text, "clean_escape")
-            + report_number(text, "stillborn");
-        assert_eq!(
-            sum,
-            report_number(text, "kills_completed"),
-            "{name} artifact buckets do not conserve kills — the artifact \
-             itself is broken, the docs cannot be checked against it"
+    // Band keys are disjoint counts, not running totals. The rename away from
+    // `le_*` is part of report_schema 2, so neither harness may drift back.
+    for (name, src) in [("ps1", &ps), ("py", &py)] {
+        assert!(
+            src.contains("band_") && !src.contains("le_{") && !src.contains("\"le_"),
+            "{name}: the histogram keys are no longer the disjoint `band_*` set"
         );
     }
 }

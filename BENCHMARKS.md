@@ -170,16 +170,37 @@ The two full 50-sample runs of 2026-10-30 read 1.03 / 1.03 µs, 1.04 / 1.04 µs,
 
 ## Multi-Lineage Termination Storm (out-of-process rescue)
 
-`scripts/stress_multi_lineage.ps1` runs N supervisors in parallel, each with its own worker, pid file, pipe and raw Win32 killer. One supervisor = one lineage: isolation needs no library changes because each lane runs in its own working directory. `--armed-hold` parks the worker armed and publishes its pid only after the arm frame, so an ambush-rate gate cannot be satisfied by shooting processes that never armed. `scripts/stress_multi_lineage.py` is the same harness for Linux and macOS: `SIGKILL` instead of `TerminateProcess`, process identity from `/proc/<pid>/stat` starttime (Linux) or `ps -o lstart` (macOS), so a recycled pid is never mistaken for the live worker. Python 3 standard library only, no dependencies.
+`scripts/stress_multi_lineage.ps1` runs N supervisors in parallel, each with its own worker, pid file, pipe and raw Win32 killer. One supervisor = one lineage: isolation needs no library changes, because each lane runs in its own working directory (`-LaneRoot`) and the worker publishes the RELATIVE path `target/supervised_worker.pid`, so the pid file is private to the lane. `-ArmedHold` parks the worker armed and publishes its pid only after the arm frame, so an ambush-rate gate cannot be satisfied by shooting processes that never armed. `scripts/stress_multi_lineage.py` is the same harness for Linux and macOS: `SIGKILL` instead of `TerminateProcess`, process identity from `/proc/<pid>/stat` starttime (Linux) or `ps -o lstart` (macOS), so a recycled pid is never mistaken for the live worker. Python 3 standard library only, no dependencies. Both harnesses emit one report schema — `report_schema: 2`, same keys in the same order — and `test_storm_harnesses_publish_one_report_schema` pins that parity, because one oracle has to read a Windows artifact and a POSIX artifact without branching on which harness wrote it.
 
-Both runs below are the 2026-10-27 Win32 storms on AMD Ryzen 5 4600H, release build, 4 lanes × 2,500 = 10,000 `TerminateProcess` each, quoted from the committed reports [`docs/evidence/2026-10-27_multi_lineage_armedhold_report.json`](docs/evidence/2026-10-27_multi_lineage_armedhold_report.json) and [`docs/evidence/2026-10-27_multi_lineage_freerun_report.json`](docs/evidence/2026-10-27_multi_lineage_freerun_report.json) (raw JSON copies, verdict `PASS` on every per-lane and aggregate gate):
+Each lane samples its supervisor's working set, private bytes, handle count and thread count once per poll, and a poll that returns an incoherent tuple is dropped and counted (`sample_drops`) instead of recorded. The reason is a concrete failure: .NET answers `HandleCount` with 0 for a process that exited between the refresh and the read, while the cached memory fields still report the last live values, and that fabricated 0 lands in the growth arithmetic as a −68-handle drop. A lane therefore fails the `resource window readable` gate unless it can show a first and last reading on both counters. Histogram keys are disjoint band counts (`band_200` = kills whose dispatch landed in `(100, 200]` µs), so the nine bands sum to `kills_completed`; seven percentiles cannot show whether a 14 ms max was one kill or a thousand, and this is the field that tells.
 
-| Mode | Wall | Kills/s (avg / peak) | Dispatch p50 | Ambush | Escape | Stillborn |
-|---|---|---|---|---|---|---|
-| `-Aggressive -ArmedHold` | 23.96 s | 417.4 / 462.2 | 323 µs | 10,000 (100%) | 0 | 0 |
-| `-Aggressive` (free-running) | 14.48 s | 690.7 / 822.0 | 419 µs | 1,800 (18.0%) | 67 (0.7%) | 8,133 (81.3%) |
+The three runs below are the 2026-10-30 Win32 storms, release profile, 10,000 `TerminateProcess` dispatches each, quoted from the committed reports — verdict `PASS` on all 44 / 39 / 84 gates, with the console transcript of each run committed beside it:
 
-Armed-hold run: per-lane dispatch p50 313.9–328.0 µs, private-memory growth +0.93…+1.08 MB, handle growth −3…+6, final generation = kills + 1 (2501) on every lane, no pipe deadlock. Free-running shows what the rate costs: at ~691 kills/s most shots land during process startup, not in the armed window (per-lane p50 415.6–421.0 µs, growth +0.70…+1.01 MB, handles 0…+5, generation 2501). The bucket counters and generations are deterministic; `wall`, `kills/s` and dispatch percentiles are wall-clock observations that move with load.
+| Mode | Shape | Wall | Kills/s (avg / peak) | Dispatch p50 / p99 / max | Ambush | Escape | Stillborn |
+|---|---|---|---|---|---|---|---|
+| `-ArmedHold` | 4 × 2,500 | 19.93 s | 501.8 / 553.3 | 315.4 / 1,170.0 / 13,969 µs | 10,000 (100.0%) | 0 | 0 |
+| `-Aggressive` (free-running) | 4 × 2,500 | 11.87 s | 842.4 / 910.0 | 431.2 / 1,485.3 / 13,310 µs | 2,785 (27.9%) | 55 (0.6%) | 7,160 (71.6%) |
+| `-ArmedHold` at 8 lanes | 8 × 1,250 | 13.49 s | 741.1 / 859.6 | 351.8 / 3,747.0 / 35,985 µs | 10,000 (100.0%) | 0 | 0 |
+
+Per-lane detail, same artifacts — one bullet per run, ranges over lanes:
+
+- **armed-hold** (4 lineages × 2,500 kills, wall 19.93 s) — per-lane dispatch p50 311.1…318.3 µs, p99 960.2…1,222.7 µs; private-memory growth +0.55…+0.97 MB; handle growth -3…+1; samples 164…166 per lane with 0…1 dropped reads; `final_generation` 2,501 = kills + 1; `supervisor_exit` 0.
+  Bands (µs, disjoint, sum 10,000): 0-50: 0 | 50-100: 0 | 100-200: 1,933 | 200-500: 7,287 | 500-1000: 647 | 1000-2000: 126 | 2000-5000: 3 | 5000-10000: 0 | >10000: 4.
+  Killer counters: 0 stale pids, 2,118 duplicate pid-file reads, 20,230 retries, 659 pid-miss polls across 4 lineages.
+
+- **free-running** (4 lineages × 2,500 kills, wall 11.87 s) — per-lane dispatch p50 428.5…436.1 µs, p99 1,471.5…1,557.4 µs; private-memory growth +0.66…+0.97 MB; handle growth +0…+1; samples 96…97 per lane with 0 dropped reads; `final_generation` 2,501 = kills + 1; `supervisor_exit` 0.
+  Bands (µs, disjoint, sum 10,000): 0-50: 0 | 50-100: 0 | 100-200: 772 | 200-500: 6,706 | 500-1000: 2,340 | 1000-2000: 161 | 2000-5000: 14 | 5000-10000: 1 | >10000: 6.
+  Killer counters: 0 stale pids, 631 duplicate pid-file reads, 8,146 retries, 618 pid-miss polls across 4 lineages.
+
+- **saturated** (8 lineages × 1,250 kills, wall 13.49 s) — per-lane dispatch p50 340.5…367.8 µs, p99 3,312.0…3,986.0 µs; private-memory growth +0.21…+0.40 MB; handle growth -1…+5; samples 87…89 per lane with 0 dropped reads; `final_generation` 1,251 = kills + 1; `supervisor_exit` 0.
+  Bands (µs, disjoint, sum 10,000): 0-50: 0 | 50-100: 0 | 100-200: 730 | 200-500: 6,532 | 500-1000: 1,936 | 1000-2000: 105 | 2000-5000: 679 | 5000-10000: 10 | >10000: 8.
+  Killer counters: 0 stale pids, 5,191 duplicate pid-file reads, 13,865 retries, 1,045 pid-miss polls across 8 lineages.
+
+The 8-lane run is what the extra lineages cost a 6-core host: the same 10,000 kills, twice as many supervisors, pipes and killers, and the dispatch p99 goes from 1,170.0 µs to 3,747.0 µs while the average rate goes up (501.8 to 741.1 kills/s) — contention shows in the tail, not in the mean. The free-running run shows what the rate buys back: at 842.4 kills/s most shots land while the process is still starting, so 7,160 kills never reached an armed window and `stillborn` is the honest bucket rather than a lost token. `wall`, `kills/s`, dispatch percentiles and handle growth are wall-clock observations that move between runs; the band counts, generations, stale-pid totals and the conservation gates are deterministic. Machine, taken from the `system` block every report carries: AMD Ryzen 5 4600H with Radeon Graphics, 6 physical / 12 logical cores, Microsoft Windows 10 Pro Education build 10.0.19043.0, rustc 1.99.1 (58cf8f9c3 2026-10-13), PowerShell 5.1.19041.906, release profile.
+
+Rescue accounting, per report: armed-hold reads `tokens_rescued` 10,000 of 10,000 kills, `clean_settles` 0; the saturated run reads `tokens_rescued` 10,000 of 10,000 kills, `clean_settles` 0; the free-running run reads `tokens_rescued` 2,785 of 10,000 kills, `clean_settles` 7,215. `tokens_rescued` equals `true_ambush` in every report and `clean_settles` equals `clean_escape` + `stillborn`, so the two counters partition `kills_completed` — that is what the harness gate `aggregate rescue + clean == reaped` checks, and it is the reason a high ambush rate cannot be manufactured by dropping tokens: an unsettled kill shows up as a missing rescue, not as silence.
+
+Artifacts: [`docs/evidence/2026-10-30_multi_lineage_armedhold_report.json`](docs/evidence/2026-10-30_multi_lineage_armedhold_report.json) with [`_run.log`](docs/evidence/2026-10-30_multi_lineage_armedhold_run.log), [`docs/evidence/2026-10-30_multi_lineage_freerun_report.json`](docs/evidence/2026-10-30_multi_lineage_freerun_report.json) with [`_run.log`](docs/evidence/2026-10-30_multi_lineage_freerun_run.log), [`docs/evidence/2026-10-30_multi_lineage_saturation_report.json`](docs/evidence/2026-10-30_multi_lineage_saturation_report.json) with [`_run.log`](docs/evidence/2026-10-30_multi_lineage_saturation_run.log). They supersede the 2026-10-27 storm pair, which stays committed as the record of that tree. The per-lane raw dispatch series of these runs (`_stats.json`) is not committed: 10,000 wall-clock samples per report, and this file quotes no number the report does not already carry — the 2026-10-27 `_stats.json` pair, by contrast, is a byte-identical duplicate of its report, because that harness wrote one payload to two paths. [`docs/evidence/README.md`](docs/evidence/README.md) records the exact command behind every committed artifact.
 
 The same gates run in CI (`.github/workflows/stress.yml`, `--aggressive`, dispatch latency = `SIGKILL`/`TerminateProcess` call only; runner-local CI-log figures, not repository artifacts):
 
@@ -190,6 +211,8 @@ The same gates run in CI (`.github/workflows/stress.yml`, `--aggressive`, dispat
 | macos-latest (arm64) | armed-hold | 1,000 | 7.19 s | 139.1 | 100% | 0 | 0 | 22–24 / 344–554 µs |
 | macos-latest (arm64) | free-running | 2,000 | 31.82 s | 62.9 | 61.9% | 38.1% | 0 | 13–14 / 57–84 µs |
 
+The 8-lane saturation shape runs in the same workflow on both flavors (4 lanes x 250 armed-hold, 8 x 125 saturation, 4 x 500 free-running on POSIX; armed-hold, saturation and the single-process PS harness on Windows, the last two on the scheduled and manual dispatch only). Its figures arrive in the uploaded run artifacts and are not quoted here: this table only carries numbers a completed CI log states.
+
 ```powershell
 # Single-lineage release gate (10,000 kills)
 powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 10000 -Launch -RawKill -Aggressive
@@ -197,9 +220,33 @@ powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 10000
 powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 1000 -Launch -RawKill -Aggressive -ArmedHold
 # 4 independent lineages, 2,500 kills each
 powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold
+# 8 lineages x 1,250 kills on the same host — the saturation run
+powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 8 -KillsPerLine 1250 -Aggressive -ArmedHold
 ```
 
 ```bash
 # Linux / macOS: same storm, SIGKILL path, JSON gates
-python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggressive --armed-hold
+python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggressive --armed-hold \
+    --report target/multi_lineage_report.json --stats target/multi_lineage_stats.json \
+    --log target/multi_lineage_run.log
+```
+
+## Worker-Pool Storm (one pool process, four lanes)
+
+`examples/19_worker_pool` runs the same four-bucket storm with the pool process itself owning `spawn` / `kill` / respawn for every lane: one process, N lanes, N independent pipes, and a monitor thread calling `pool.report()` + `WorkerPool::expired_lanes()` throughout, so a torn accounting window is observed during the storm rather than inferred from the final card. Three `#[ignore]`d gates drive it — `tests/supervisor_pool_stress.rs`, `_lease.rs`, `_mixed.rs` — and each writes the one-line JSON committed here. Values are counts, not wall-clock observations, so `wall_ms` is the only column that moves between runs:
+
+| Harness | Lanes | Reaped | Rescued | Ambush / escape / stillborn | Deadlocks | Conservation | Wall |
+|---|---|---|---|---|---|---|---|
+| `supervisor_pool_stress` | 4 | 32 | 32 | 32 / 0 / 0 | 0 | `conserved: true`, 0 breaks | 52 ms |
+| `supervisor_pool_stress_lease` | 4 | 24 | 0 | 0 / 0 / 24 | 0 | `conserved: true`, 0 breaks | 195 ms |
+| `supervisor_pool_stress_mixed` | 4 | 32 | 8 | 8 / 8 / 8 | 8 | `conserved: true`, 0 breaks | 471 ms |
+
+The lease run is the one that measures the observer: 24 children send exactly one heartbeat and go silent, so every reap is `Stillborn` (a heartbeat proves the pipe, not a settlement), `lease_kills` = 24 and the monitor completed 102,471 `report()` + `expired_lanes()` checks with 0 conservation breaks and 0 `token_lane_mismatch`. The mixed run cycles each lane through `armed → clean → silent → orphan`, which is the only shape that produces all four buckets in one process; the `orphan` leg leaves a grandchild holding the pipe open, and the run reporting `deadlock: true` with 8 deadlocks is the honest bucket — a lane that never settles is named, not counted as a rescue. Tokens: `tokens_seen` 32 / 0 / 8 across the three runs, `token_lane_mismatch` 0 everywhere; `final_generation` is `[9, 9, 9, 9]`, `[7, 7, 7, 7]` and `[9, 9, 9, 9]` — one bump per death per lane.
+
+Artifacts: [`docs/evidence/2026-10-30_pool_stress_report.json`](docs/evidence/2026-10-30_pool_stress_report.json), [`docs/evidence/2026-10-30_pool_lease_stress_report.json`](docs/evidence/2026-10-30_pool_lease_stress_report.json), [`docs/evidence/2026-10-30_pool_mixed_stress_report.json`](docs/evidence/2026-10-30_pool_mixed_stress_report.json); they supersede the 2026-10-26 set.
+
+```bash
+cargo test --release --test supervisor_pool_stress -- --ignored --nocapture
+cargo test --release --test supervisor_pool_stress_lease -- --ignored --nocapture
+cargo test --release --test supervisor_pool_stress_mixed -- --ignored --nocapture
 ```

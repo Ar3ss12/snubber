@@ -26,6 +26,15 @@ Usage:
 supervisor publishes the pid only after the arm frame, so every kill is a
 true ambush and the default gate is `-MinAmbushPct 70`.
 
+Artifacts (three, each with one job):
+  -ReportPath  headline totals, per-lane gates, checks, verdict, machine
+               identity, dispatch histogram, top-10 slowest kills. This is the
+               file docs/evidence commits and tests/doc_sync.rs pins.
+  -StatsPath   distribution detail: per-lane raw dispatch series and bucket
+               counts, the 250 ms rate trace, per-lane killer counters.
+  -LogPath     full console transcript (Start-Transcript), so a CI failure is
+               readable without re-deriving it from JSON.
+
 Exit code 0 = PASS, 1 = FAIL.
 #>
 [CmdletBinding()]
@@ -46,7 +55,8 @@ param(
     [string]$TargetProcess = "process_termination_loop",
     [string]$LaneRoot = "target/multi_lineage",
     [string]$ReportPath = "target/multi_lineage_report.json",
-    [string]$StatsPath = "target/multi_lineage_stats.json"
+    [string]$StatsPath = "target/multi_lineage_stats.json",
+    [string]$LogPath = "target/multi_lineage_run.log"
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,6 +79,36 @@ if (-not $laneRootFull.StartsWith((Join-Path $repoRoot "target"), [System.String
 $exe = Join-Path $repoRoot ("target/{0}/examples/{1}.exe" -f $Profile, $TargetProcess)
 $exeName = "$TargetProcess.exe"
 $totalTarget = $Lines * $KillsPerLine
+
+# The run transcript: every line the console shows also lands in a file, so a
+# CI artifact is readable without re-deriving it from the JSON. A transcript
+# failure must never fail a storm, so it is recorded rather than thrown.
+$logFull = Resolve-RepoPath $LogPath
+$logDir = Split-Path -Parent $logFull
+if ($logDir -and -not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+$logOk = $false
+try { Start-Transcript -Path $logFull -Force | Out-Null; $logOk = $true } catch { $logOk = $false }
+
+# Provenance the published tables claim: machine, cores, OS build, compiler.
+# Without it "AMD Ryzen 5 4600H, release build" is a doc assertion nothing
+# in the artifact can be checked against.
+$system = [ordered]@{
+    cpu_name       = $null
+    physical_cores = $null
+    logical_cores  = [Environment]::ProcessorCount
+    os_caption     = $null
+    os_build       = [System.Environment]::OSVersion.Version.ToString()
+    rustc          = $null
+    ps_version     = $PSVersionTable.PSVersion.ToString()
+    profile        = $Profile
+}
+try {
+    $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | Select-Object -First 1
+    $system.cpu_name = $cpu.Name.Trim()
+    $system.physical_cores = $cpu.NumberOfCores
+} catch {}
+try { $system.os_caption = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).Caption.Trim() } catch {}
+try { $system.rustc = ((& rustc --version 2>$null) | Select-Object -First 1) } catch {}
 
 if ($Build -or -not (Test-Path $exe)) {
     Write-Host "[BUILD] cargo build --example $TargetProcess ($Profile)..." -ForegroundColor Yellow
@@ -145,6 +185,13 @@ Write-Host ("Workload  : {0}" -f $(if ($Aggressive) { "spin pacing (3 ms armed /
 Write-Host ("Ambush    : {0}   min true-ambush: {1}%" -f $(if ($ArmedHold) { "armed-hold worker (pid published only after arm)" } else { "free-running worker" }), $minAmbush)
 Write-Host ("Kill path : raw OpenProcess + image verify + creation-time identity + TerminateProcess, {0} runspace killer(s)" -f $Lines)
 Write-Host ("Timer     : {0}" -f $(if ($timerRes) { "winmm 1 ms request" } else { "system default" }))
+Write-Host ("Machine   : {0} ({1} physical / {2} logical cores), {3} build {4}" -f `
+    $(if ($system.cpu_name) { $system.cpu_name } else { "cpu name unavailable" }), `
+    $(if ($null -ne $system.physical_cores) { $system.physical_cores } else { "?" }), `
+    $system.logical_cores, `
+    $(if ($system.os_caption) { $system.os_caption } else { "Windows" }), $system.os_build)
+Write-Host ("Toolchain : {0} / PowerShell {1} / profile {2}" -f $(if ($system.rustc) { $system.rustc } else { "rustc unavailable" }), $system.ps_version, $Profile)
+Write-Host ("Transcript: {0}" -f $(if ($logOk) { $logFull } else { "COULD NOT START (see -LogPath)" }))
 Write-Host "----------------------------------------------------------" -ForegroundColor DarkGray
 
 # Clean slate for this run (lane root is generated state under target/)
@@ -177,11 +224,29 @@ for ($i = 0; $i -lt $Lines; $i++) {
         WsPeak    = 0.0; WsFirst = -1.0; WsLast = 0.0
         PrivPeak  = 0.0; PrivFirst = -1.0; PrivLast = 0.0
         HandlePeak = 0; HandleFirst = -1; HandleLast = 0
-        ThreadPeak = 0; Samples = 0
+        ThreadPeak = 0; Samples = 0; SampleDrops = 0
     })
 }
 
 $lanesFinalized = $false
+
+# The captured stdout/stderr of a lane must survive BOTH outcomes. On the
+# abort path the storm throws before the finalize loop, and the run nobody
+# needs to read about is exactly the run that lost its logs.
+function Flush-LaneStreams($lane, [int]$WaitMs) {
+    $deadline = (Get-Date).AddMilliseconds($WaitMs)
+    foreach ($pair in @(@($lane.OutTask, $lane.OutFile), @($lane.ErrTask, $lane.ErrFile))) {
+        $task = $pair[0]
+        $file = $pair[1]
+        if (-not $task) { continue }
+        while (-not $task.IsCompleted -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 20 }
+        # Never block a storm on a stream that will not close: the abort path
+        # passes 0 ms and simply keeps whatever the lane already produced.
+        if (-not $task.IsCompleted) { continue }
+        try { [System.IO.File]::WriteAllText($file, $task.GetAwaiter().GetResult()) } catch {}
+    }
+}
+
 try {
     foreach ($lane in $lanes) {
         $supArgs = "--target-kills $KillsPerLine --report-path `"$($lane.Report)`""
@@ -355,20 +420,26 @@ try {
             $p = $lane.Proc
             try {
                 $p.Refresh()
-                if (-not $p.HasExited) {
-                    $ws = $p.WorkingSet64 / 1MB
-                    $pv = $p.PrivateMemorySize64 / 1MB
-                    $hc = [int]$p.HandleCount
-                    $th = [int]($p.Threads.Count)
-                    if ($lane.Samples -eq 0) { $lane.WsFirst = $ws; $lane.PrivFirst = $pv; $lane.HandleFirst = $hc }
-                    $lane.WsLast = $ws; $lane.PrivLast = $pv; $lane.HandleLast = $hc
-                    if ($ws -gt $lane.WsPeak) { $lane.WsPeak = $ws }
-                    if ($pv -gt $lane.PrivPeak) { $lane.PrivPeak = $pv }
-                    if ($hc -gt $lane.HandlePeak) { $lane.HandlePeak = $hc }
-                    if ($th -gt $lane.ThreadPeak) { $lane.ThreadPeak = $th }
-                    $lane.Samples++
-                }
-            } catch {}
+                if ($p.HasExited) { continue }
+                $ws = $p.WorkingSet64 / 1MB
+                $pv = $p.PrivateMemorySize64 / 1MB
+                $hc = [int]$p.HandleCount
+                $th = [int]($p.Threads.Count)
+                # A live process never reads 0 handles, 0 threads or 0 bytes.
+                # Right after an exit .NET still answers the query: HandleCount
+                # comes back 0 while the cached memory fields hold older values.
+                # That is a failed read, not a resource decrease, so the whole
+                # sample is dropped and counted — a fabricated 0 would become
+                # the dip that disarms the growth gate (a −68 handle "drop").
+                if ($ws -le 0 -or $pv -le 0 -or $hc -le 0 -or $th -le 0) { $lane.SampleDrops++; continue }
+                if ($lane.Samples -eq 0) { $lane.WsFirst = $ws; $lane.PrivFirst = $pv; $lane.HandleFirst = $hc }
+                $lane.WsLast = $ws; $lane.PrivLast = $pv; $lane.HandleLast = $hc
+                if ($ws -gt $lane.WsPeak) { $lane.WsPeak = $ws }
+                if ($pv -gt $lane.PrivPeak) { $lane.PrivPeak = $pv }
+                if ($hc -gt $lane.HandlePeak) { $lane.HandlePeak = $hc }
+                if ($th -gt $lane.ThreadPeak) { $lane.ThreadPeak = $th }
+                $lane.Samples++
+            } catch { $lane.SampleDrops++ }
         }
 
         $now = $overall.Elapsed.TotalSeconds
@@ -414,8 +485,17 @@ try {
         } else {
             $lane.Exit = $lane.Proc.ExitCode
         }
-        try { if ($lane.OutTask) { [System.IO.File]::WriteAllText($lane.OutFile, $lane.OutTask.GetAwaiter().GetResult()) } } catch {}
-        try { if ($lane.ErrTask) { [System.IO.File]::WriteAllText($lane.ErrFile, $lane.ErrTask.GetAwaiter().GetResult()) } } catch {}
+        Flush-LaneStreams $lane 2000
+        if ($lane.Exit -ne 0) {
+            # A failing supervisor's own words are the diagnosis; surface them
+            # instead of burying them in a per-lane file nobody opens.
+            Write-Host ("[LANE {0}] supervisor exit={1}, stderr tail:" -f $lane.Index, $lane.Exit) -ForegroundColor Red
+            try {
+                if (Test-Path $lane.ErrFile) {
+                    Get-Content -Path $lane.ErrFile -Tail 10 | ForEach-Object { Write-Host ("           {0}" -f $_) -ForegroundColor Red }
+                }
+            } catch {}
+        }
         if (Test-Path $lane.Report) {
             try { $lane.ReportObj = Get-Content -Raw $lane.Report | ConvertFrom-Json } catch { $lane.ReportObj = $null }
         }
@@ -442,6 +522,7 @@ try {
                 Write-Host ("[CLEANUP] lane={0} killing supervisor pid={1}" -f $lane.Index, $lane.Proc.Id) -ForegroundColor DarkYellow
                 try { $lane.Proc.Kill() } catch {}
                 try { $null = $lane.Proc.WaitForExit(5000) } catch {}
+                Flush-LaneStreams $lane 0
             }
             try {
                 if (Test-Path $lane.PidFile) {
@@ -483,40 +564,61 @@ $rate = $completed / $durationSec
 $ambushPct = if ($completed -gt 0) { 100.0 * $totalAmbush / $completed } else { 0 }
 
 $checks = New-Object 'System.Collections.Generic.List[object]'
+# The same {name, ok, detail} shape scripts/stress_multi_lineage.py writes, so
+# tests/doc_sync.rs can require "every published check passed" from either
+# harness without branching on which one produced the artifact. `detail` is the
+# measured value, which is what makes a FAIL line in CI readable on its own.
+function Add-Check([string]$Name, [bool]$Ok, [string]$Detail = "") {
+    $checks.Add([pscustomobject]@{ name = $Name; ok = [bool]$Ok; detail = $Detail })
+}
 foreach ($lane in $lanes) {
     $tag = "lane {0}" -f $lane.Index
     if ($lane.ReportObj) {
-        $checks.Add([pscustomobject]@{ Name = "$tag reaped == $KillsPerLine"; Ok = ([int]$lane.ReportObj.total_reaped -eq $KillsPerLine) })
-        $checks.Add([pscustomobject]@{ Name = "$tag rescue + clean == reaped"; Ok = (([int]$lane.ReportObj.tokens_rescued + [int]$lane.ReportObj.clean_settles) -eq [int]$lane.ReportObj.total_reaped) })
-        $checks.Add([pscustomobject]@{ Name = "$tag ambush + escape + stillborn == reaped"; Ok = (($lane.Ambush + $lane.Escape + $lane.Stillborn) -eq [int]$lane.ReportObj.total_reaped) })
+        $r = $lane.ReportObj
+        Add-Check "$tag reaped == $KillsPerLine" ([int]$r.total_reaped -eq $KillsPerLine) "$($r.total_reaped)"
+        Add-Check "$tag rescue + clean == reaped" `
+            (([int]$r.tokens_rescued + [int]$r.clean_settles) -eq [int]$r.total_reaped) `
+            ("{0}+{1}" -f $r.tokens_rescued, $r.clean_settles)
+        Add-Check "$tag ambush + escape + stillborn == reaped" `
+            (($lane.Ambush + $lane.Escape + $lane.Stillborn) -eq [int]$r.total_reaped) `
+            ("{0}+{1}+{2}={3}" -f $lane.Ambush, $lane.Escape, $lane.Stillborn, $r.total_reaped)
         if ($minAmbush -gt 0) {
-            $checks.Add([pscustomobject]@{ Name = ("$tag true ambush rate {0:N1}% >= {1}%" -f $lane.AmbushPct, $minAmbush); Ok = ($lane.AmbushPct -ge $minAmbush) })
+            Add-Check ("$tag true ambush rate {0:N1}% >= {1}%" -f $lane.AmbushPct, $minAmbush) `
+                ($lane.AmbushPct -ge $minAmbush) ("{0:N1}%" -f $lane.AmbushPct)
         }
-        $checks.Add([pscustomobject]@{ Name = "$tag final_generation == kills + 1"; Ok = ([int]$lane.ReportObj.final_generation -eq $KillsPerLine + 1) })
+        Add-Check "$tag final_generation == kills + 1" ([int]$r.final_generation -eq $KillsPerLine + 1) "$($r.final_generation)"
     } else {
-        $checks.Add([pscustomobject]@{ Name = "$tag report present"; Ok = $false })
+        Add-Check "$tag report present" $false "no termination_report.json"
     }
-    $checks.Add([pscustomobject]@{ Name = "$tag supervisor exit == 0"; Ok = ($lane.Exit -eq 0) })
-    $checks.Add([pscustomobject]@{ Name = "$tag killer reported no error/stall"; Ok = ($lane.Kill -and -not $lane.Kill.Error -and -not $lane.Kill.Stalled) })
+    Add-Check "$tag supervisor exit == 0" ($lane.Exit -eq 0) "$($lane.Exit)"
+    Add-Check "$tag killer reported no error/stall" `
+        ($lane.Kill -and -not $lane.Kill.Error -and -not $lane.Kill.Stalled) `
+        $(if ($lane.Kill) { $lane.Kill.Error } else { "killer never ran" })
     if ($lane.Samples -gt 0) {
         $growth = $lane.PrivLast - $lane.PrivFirst
         $handleGrowth = $lane.HandleLast - $lane.HandleFirst
-        $checks.Add([pscustomobject]@{ Name = ("$tag private growth {0:+0.00;-0.00;0.00} MB <= {1:N1} MB" -f $growth, $MaxGrowthMb); Ok = ($growth -le $MaxGrowthMb) })
-        $checks.Add([pscustomobject]@{ Name = ("$tag handle growth {0:+0;-0;0} <= {1}" -f $handleGrowth, $MaxHandleGrowth); Ok = ($handleGrowth -le $MaxHandleGrowth) })
+        Add-Check "$tag resource window readable" `
+            ($lane.HandleFirst -gt 0 -and $lane.HandleLast -gt 0 -and $lane.PrivFirst -gt 0 -and $lane.PrivLast -gt 0) `
+            ("first {0} handles / {1:N2} MB, last {2} handles / {3:N2} MB, {4} samples, {5} dropped reads" -f `
+                $lane.HandleFirst, $lane.PrivFirst, $lane.HandleLast, $lane.PrivLast, $lane.Samples, $lane.SampleDrops)
+        Add-Check ("$tag private growth {0:+0.00;-0.00;0.00} MB <= {1:N1} MB" -f $growth, $MaxGrowthMb) `
+            ($growth -le $MaxGrowthMb) ("{0:+0.00;-0.00;0.00} MB over {1} samples" -f $growth, $lane.Samples)
+        Add-Check ("$tag handle growth {0:+0;-0;0} <= {1}" -f $handleGrowth, $MaxHandleGrowth) `
+            ($handleGrowth -le $MaxHandleGrowth) ("{0:+0;-0;0} handles" -f $handleGrowth)
     } else {
         # Zero sampling turns the leak gates into silent no-ops (e.g. the
         # sampler's catch{} swallowed every poll): fail, don't pass.
-        $checks.Add([pscustomobject]@{ Name = "$tag sampler collected samples"; Ok = $false })
+        Add-Check "$tag sampler collected samples" $false "0 samples"
     }
 }
-$checks.Add([pscustomobject]@{ Name = ("aggregate reaped {0} == {1}" -f $completed, $totalTarget); Ok = ($completed -eq $totalTarget) })
-$checks.Add([pscustomobject]@{ Name = "aggregate rescue + clean == reaped"; Ok = (($totalRescued + $totalClean) -eq $completed) })
-$checks.Add([pscustomobject]@{ Name = "aggregate no cross-lineage accounting drift"; Ok = (($totalRescued + $totalClean) -eq $totalTarget) })
+Add-Check ("aggregate reaped {0} == {1}" -f $completed, $totalTarget) ($completed -eq $totalTarget) "$completed/$totalTarget"
+Add-Check "aggregate rescue + clean == reaped" (($totalRescued + $totalClean) -eq $completed) ("{0}+{1}={2}" -f $totalRescued, $totalClean, $completed)
+Add-Check "aggregate no cross-lineage accounting drift" (($totalRescued + $totalClean) -eq $totalTarget) ("{0}+{1} vs {2}" -f $totalRescued, $totalClean, $totalTarget)
 if ($minAmbush -gt 0) {
-    $checks.Add([pscustomobject]@{ Name = ("aggregate true ambush rate {0:N1}% >= {1}%" -f $ambushPct, $minAmbush); Ok = ($ambushPct -ge $minAmbush) })
+    Add-Check ("aggregate true ambush rate {0:N1}% >= {1}%" -f $ambushPct, $minAmbush) ($ambushPct -ge $minAmbush) ("{0:N1}%" -f $ambushPct)
 }
 
-$failedChecks = @($checks | Where-Object { -not $_.Ok })
+$failedChecks = @($checks | Where-Object { -not $_.ok })
 $verdict = if ($completed -eq $totalTarget -and $failedChecks.Count -eq 0) { "PASS" } else { "FAIL" }
 
 $sorted = @($allLat.ToArray() | Sort-Object)
@@ -526,6 +628,48 @@ function Get-Pctl([double[]]$values, [double]$p) {
     if ($idx -lt 0) { $idx = 0 }
     if ($idx -ge $values.Count) { $idx = $values.Count - 1 }
     return $values[$idx]
+}
+
+# Distribution detail. Seven percentiles cannot show the SHAPE of a tail: a
+# 12 ms max is one sentence whether one kill or a thousand took it, and the
+# only way to tell them apart later is the band counts captured here.
+# A key holds the count of dispatches inside its OWN band (prev, bucket], not a
+# running total: the bands are disjoint and their sum is kills_completed.
+$histBuckets = @(50, 100, 200, 500, 1000, 2000, 5000, 10000)
+function Get-Histogram([double[]]$values) {
+    $h = [ordered]@{}
+    $prev = 0
+    foreach ($b in $histBuckets) {
+        $upTo = @($values | Where-Object { $_ -le $b }).Count
+        $h[("band_{0}" -f $b)] = $upTo - $prev
+        $prev = $upTo
+    }
+    $h["band_above_10000"] = $values.Count - $prev
+    return $h
+}
+$histogram = Get-Histogram $sorted
+
+$allWithLane = New-Object 'System.Collections.Generic.List[object]'
+foreach ($lane in $lanes) {
+    if (-not $lane.Kill) { continue }
+    foreach ($v in $lane.Kill.LatUs) {
+        $allWithLane.Add([pscustomobject]@{ lane = $lane.Index; dispatch_us = $v })
+    }
+}
+$topSlowest = @($allWithLane | Sort-Object -Property dispatch_us -Descending | Select-Object -First 10 |
+    ForEach-Object { [pscustomobject]@{ lane = $_.lane; dispatch_us = [math]::Round($_.dispatch_us, 1) } })
+
+# Cross-lineage contention the killers actually saw: how often a pid file
+# pointed at a process that was not this lane's worker (duplicates/stale) and
+# how many polls found no file at all (miss_polls). These are the numbers that
+# make "no pipe deadlock" checkable instead of asserted.
+$killerStale = 0; $killerDuplicates = 0; $killerRetries = 0; $killerMisses = 0
+foreach ($lane in $lanes) {
+    if (-not $lane.Kill) { continue }
+    $killerStale += [int]$lane.Kill.Stale
+    $killerDuplicates += [int]$lane.Kill.Duplicates
+    $killerRetries += [int]$lane.Kill.Retries
+    $killerMisses += [int]$lane.Kill.Misses
 }
 
 Write-Host "==========================================================" -ForegroundColor Cyan
@@ -539,6 +683,20 @@ Write-Host ("Dispatch us     : min {0:N1} | p50 {1:N1} | p95 {2:N1} | p99 {3:N1}
 Write-Host ("Accounting      : tokens_rescued={0} clean_settles={1} rescue_rate={2:N1}%" -f $totalRescued, $totalClean, $(if ($completed -gt 0) { 100.0 * $totalRescued / $completed } else { 0 }))
 Write-Host ("Kill classes    : true_ambush={0} ({1:N1}%) clean_escape={2} stillborn={3} | armed_hold={4}" -f `
     $totalAmbush, $ambushPct, $totalEscape, $totalStillborn, [bool]$ArmedHold)
+$histPrev = 0
+$histParts = @()
+foreach ($b in $histBuckets) {
+    $histParts += ("{0}-{1}: {2}" -f $histPrev, $b, $histogram[("band_{0}" -f $b)])
+    $histPrev = $b
+}
+$histLine = $histParts -join " | "
+Write-Host ("Dispatch us     : {0} | >{1}: {2}  (disjoint band counts, sum {3})" -f `
+    $histLine, $histPrev, $histogram["band_above_10000"], $sorted.Count)
+Write-Host ("Killers saw     : stale={0} duplicates={1} retries={2} miss_polls={3} across {4} lineages" -f `
+    $killerStale, $killerDuplicates, $killerRetries, $killerMisses, $Lines)
+if ($topSlowest.Count -gt 0) {
+    Write-Host ("Slowest 10      : {0}" -f (($topSlowest | ForEach-Object { "lane {0}={1:N1} us" -f $_.lane, $_.dispatch_us }) -join ", "))
+}
 foreach ($lane in $lanes) {
     $k = $lane.Kill
     $r = $lane.ReportObj
@@ -550,15 +708,17 @@ foreach ($lane in $lanes) {
     Write-Host ("Lane {0} : sup={1} exit={2} killed={3} {4:N1} kills/s | reaped={5} true_ambush={6} ({7:N1}%) escape={8} stillborn={9} final_gen={10}" -f `
         $lane.Index, $(if ($lane.Proc) { $lane.Proc.Id } else { 0 }), $lane.Exit, $(if ($k) { $k.Completed } else { 0 }), $rateL, `
         $(if ($r) { $r.total_reaped } else { 0 }), $lane.Ambush, $lane.AmbushPct, $lane.Escape, $lane.Stillborn, $(if ($r) { $r.final_generation } else { 0 }))
-    Write-Host ("         dispatch us: p50 {0:N1} | p95 {1:N1} | p99 {2:N1} | max {3:N1} | ws_peak {4:N2} MB | priv_growth {5:+0.00;-0.00;0.00} MB | handles first {6} peak {7} last {8} growth {9:+0;-0;0} | stale={10} dup={11} retries={12} miss_polls={13}" -f `
+    Write-Host ("         dispatch us: p50 {0:N1} | p95 {1:N1} | p99 {2:N1} | max {3:N1} | ws_peak {4:N2} MB | priv_growth {5:+0.00;-0.00;0.00} MB | handles first {6} peak {7} last {8} growth {9:+0;-0;0} | stale={10} dup={11} retries={12} miss_polls={13} | samples={14} dropped_reads={15}" -f `
         (Get-Pctl $laneSorted 0.50), (Get-Pctl $laneSorted 0.95), (Get-Pctl $laneSorted 0.99), (Get-Pctl $laneSorted 1.0), `
         $lane.WsPeak, $privGrowth, $lane.HandleFirst, $lane.HandlePeak, $lane.HandleLast, $handleGrowth, `
-        $(if ($k) { $k.Stale } else { 0 }), $(if ($k) { $k.Duplicates } else { 0 }), $(if ($k) { $k.Retries } else { 0 }), $(if ($k) { $k.Misses } else { 0 }))
+        $(if ($k) { $k.Stale } else { 0 }), $(if ($k) { $k.Duplicates } else { 0 }), $(if ($k) { $k.Retries } else { 0 }), $(if ($k) { $k.Misses } else { 0 }), `
+        $lane.Samples, $lane.SampleDrops)
     if ($k -and $k.Error) { Write-Host ("           killer error: {0}" -f $k.Error) -ForegroundColor Red }
 }
 foreach ($c in $checks) {
-    $color = if ($c.Ok) { "Green" } else { "Red" }
-    Write-Host ("Check           : {0} {1}" -f $(if ($c.Ok) { "OK  " } else { "FAIL" }), $c.Name) -ForegroundColor $color
+    $color = if ($c.ok) { "Green" } else { "Red" }
+    Write-Host ("Check           : {0} {1}{2}" -f `
+        $(if ($c.ok) { "OK  " } else { "FAIL" }), $c.name, $(if ($c.detail) { "  (" + $c.detail + ")" } else { "" })) -ForegroundColor $color
 }
 $verdictColor = if ($verdict -eq "PASS") { "Green" } else { "Red" }
 Write-Host ("Verdict         : {0}" -f $verdict) -ForegroundColor $verdictColor
@@ -585,9 +745,11 @@ foreach ($lane in $lanes) {
         error            = $(if ($k) { $k.Error } else { $null })
         elapsed_ms       = $(if ($k) { $k.ElapsedMs } else { 0 })
         dispatch_us      = [ordered]@{
+            min   = [math]::Round((Get-Pctl $laneSorted 0.0), 1)
             p50   = [math]::Round((Get-Pctl $laneSorted 0.50), 1)
             p95   = [math]::Round((Get-Pctl $laneSorted 0.95), 1)
             p99   = [math]::Round((Get-Pctl $laneSorted 0.99), 1)
+            p999  = [math]::Round((Get-Pctl $laneSorted 0.999), 1)
             max   = [math]::Round((Get-Pctl $laneSorted 1.0), 1)
             count = $laneSorted.Count
         }
@@ -607,13 +769,15 @@ foreach ($lane in $lanes) {
             handles_growth = $(if ($lane.HandleFirst -ge 0) { $lane.HandleLast - $lane.HandleFirst } else { 0 })
             threads_peak   = $lane.ThreadPeak
             samples        = $lane.Samples
+            sample_drops   = $lane.SampleDrops
         }
     }
 }
 
-$stats = [ordered]@{
+$reportDoc = [ordered]@{
     timestamp_utc      = (Get-Date).ToUniversalTime().ToString("o")
     model              = "multi_lineage"
+    report_schema      = 2
     lines              = $Lines
     kills_per_line     = $KillsPerLine
     kills_requested    = $totalTarget
@@ -645,12 +809,114 @@ $stats = [ordered]@{
     lanes              = $laneStats
     checks             = $checks.ToArray()
     verdict            = $verdict
+    # Keys below `verdict` are additive. The doc_sync oracle reads a JSON key
+    # by FIRST occurrence and its `dispatch_us` block by first `p50`, so every
+    # headline token must stay above this line or it gets shadowed.
+    system             = $system
+    killers_saw        = [ordered]@{
+        stale       = $killerStale
+        duplicates  = $killerDuplicates
+        retries     = $killerRetries
+        miss_polls  = $killerMisses
+    }
+    dispatch_histogram_us = $histogram
+    slowest_dispatches    = $topSlowest
+    transcript            = [ordered]@{
+        path    = $LogPath
+        written = [bool]$logOk
+    }
 }
+
+# The stats payload answers "what did the distribution look like", which the
+# report deliberately does not: raw per-lane series, band counts and the
+# 250 ms rate trace. Keeping it in its own file means re-deriving a percentile
+# never requires re-running a 10 000-kill storm.
+$laneDetail = @()
+foreach ($lane in $lanes) {
+    $k = $lane.Kill
+    $laneSorted = @()
+    if ($k) { $laneSorted = @($k.LatUs | Sort-Object) }
+    $laneDetail += [ordered]@{
+        index            = $lane.Index
+        dispatch_us      = [ordered]@{
+            min   = [math]::Round((Get-Pctl $laneSorted 0.0), 1)
+            p50   = [math]::Round((Get-Pctl $laneSorted 0.50), 1)
+            p95   = [math]::Round((Get-Pctl $laneSorted 0.95), 1)
+            p99   = [math]::Round((Get-Pctl $laneSorted 0.99), 1)
+            p999  = [math]::Round((Get-Pctl $laneSorted 0.999), 1)
+            max   = [math]::Round((Get-Pctl $laneSorted 1.0), 1)
+            count = $laneSorted.Count
+        }
+        histogram_us     = Get-Histogram $laneSorted
+        dispatch_us_series = $(if ($k) { @($k.LatUs | ForEach-Object { [math]::Round($_, 1) }) } else { @() })
+        killers_saw      = [ordered]@{
+            stale      = $(if ($k) { [int]$k.Stale } else { 0 })
+            duplicates = $(if ($k) { [int]$k.Duplicates } else { 0 })
+            retries    = $(if ($k) { [int]$k.Retries } else { 0 })
+            miss_polls = $(if ($k) { [int]$k.Misses } else { 0 })
+        }
+        resources        = [ordered]@{
+            ws_peak_mb        = [math]::Round($lane.WsPeak, 3)
+            private_growth_mb = [math]::Round($(if ($lane.PrivFirst -ge 0) { $lane.PrivLast - $lane.PrivFirst } else { 0 }), 3)
+            handles_first     = $lane.HandleFirst
+            handles_peak      = $lane.HandlePeak
+            handles_last      = $lane.HandleLast
+            handles_growth    = $(if ($lane.HandleFirst -ge 0) { $lane.HandleLast - $lane.HandleFirst } else { 0 })
+            threads_peak      = $lane.ThreadPeak
+            samples           = $lane.Samples
+            sample_drops      = $lane.SampleDrops
+        }
+    }
+}
+$statsDoc = [ordered]@{
+    timestamp_utc         = (Get-Date).ToUniversalTime().ToString("o")
+    model                 = "multi_lineage"
+    detail_of             = $ReportPath
+    lines                 = $Lines
+    kills_per_line        = $KillsPerLine
+    kills_completed       = $completed
+    verdict               = $verdict
+    system                = $system
+    dispatch_us           = $reportDoc.dispatch_us
+    dispatch_histogram_us = $histogram
+    slowest_dispatches    = $topSlowest
+    killers_saw           = $reportDoc.killers_saw
+    rate_window_ms        = 250
+    rate_window_per_sec   = @($rateWindow | ForEach-Object { [math]::Round($_, 1) })
+    peak_rate_per_sec     = [math]::Round($peakRate, 1)
+    lanes                 = $laneDetail
+    transcript            = [ordered]@{ path = $LogPath; written = [bool]$logOk }
+}
+
 foreach ($f in @($statsFull, $reportFull)) {
     $dir = Split-Path -Parent $f
     if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
 }
-$stats | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $statsFull
-$stats | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $reportFull
+# PS 5.1 `Set-Content -Encoding UTF8` writes a BOM; every reader of these
+# artifacts (tests/doc_sync.rs, scripts/stress_multi_lineage.py, python
+# `encoding="utf-8-sig"`) accounts for it.
+$reportDoc | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 $reportFull
+$statsDoc  | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 $statsFull
 
+if ($logOk) {
+    Write-Host ("Transcript      : {0}" -f $logFull)
+    try { Stop-Transcript | Out-Null } catch { }
+    # Start-Transcript prefixes the file with the machine name and the Windows
+    # account of whoever ran the storm. The committed evidence is a verbatim
+    # copy of this file, so the prefix is dropped here — the identity a reader
+    # needs (cpu, cores, OS build, toolchain) is printed in the banner above.
+    try {
+        $raw = @(Get-Content $logFull)
+        $banner = -1
+        for ($i = 0; $i -lt $raw.Count; $i++) {
+            if ($raw[$i] -match "^={20,}") { $banner = $i; break }
+        }
+        if ($banner -lt 0) {
+            Write-Host "Log hygiene     : WARNING no banner found, transcript left as written" -ForegroundColor Yellow
+        } elseif ($banner -gt 0) {
+            [System.IO.File]::WriteAllText($logFull, (($raw[$banner..($raw.Count - 1)] -join "`n") + "`n"))
+            Write-Host ("Log hygiene     : dropped {0} transcript-header lines (machine name, account)" -f $banner)
+        }
+    } catch { Write-Host ("Log hygiene     : WARNING could not rewrite {0}: {1}" -f $logFull, $_) -ForegroundColor Yellow }
+}
 if ($verdict -eq "PASS") { exit 0 } else { exit 1 }

@@ -6,9 +6,12 @@ current-state contracts live in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
 ## 0.7.7 — unreleased
 
-No library change: `src/` is untouched since 0.7.6. The bench suite got the
-rows that were missing and the doc gate that reads it got a second law, so
-numbers cannot be borrowed across rows any more.
+No library change: `src/` is untouched since 0.7.6. What changed is what the
+project can prove about itself: the bench suite got the rows that were
+missing, the storm harnesses got a declared report schema plus machine
+identity, and the doc gate got three new oracles — so a published number is
+now re-derived from a committed artifact instead of being asserted in prose.
+Nothing here is additive to the public API.
 
 ### Added
 
@@ -29,6 +32,27 @@ numbers cannot be borrowed across rows any more.
 - The snapshot path is one constant, `BENCH_ARTIFACT`, and BENCHMARKS.md must
   link the file that constant names — a doc pointing at yesterday's artifact
   while the gate reads today's is how a stale row survives a refresh.
+- Storm reports now carry their own machine identity: the `system` block
+  (`cpu_name`, physical/logical cores, OS caption and build, `rustc`,
+  PowerShell version, build profile) rides in every multi-lineage report, so a
+  published latency can be attributed to the host that measured it instead of
+  being asserted in prose. Each storm also writes a console transcript
+  (`-LogPath` / `--log`) and per-lane stats (`-StatsPath` / `--stats`);
+  `-LaneRoot` gives every lane its own working directory, which is what makes
+  the worker's relative `target/supervised_worker.pid` private per lineage.
+- Three storm gates in `tests/doc_sync.rs`:
+  `test_storm_tables_match_committed_reports` rebuilds every mode row,
+  per-lane bullet, histogram-band line, killer-counter line, machine caption
+  and rescue-accounting fragment from the committed report and requires an
+  exact line match — after first checking the artifact against itself
+  (verdict, schema, release profile, gate count per lane, conservation across
+  lanes, `final_generation == kills + 1`, zero stale pids).
+  `test_pool_storm_tables_match_committed_reports` does the same for the three
+  `supervisor_pool_stress*` rows.
+  `test_storm_harnesses_publish_one_report_schema` parses the report payload of
+  both harnesses and requires the same top-level keys in the same order,
+  because one oracle has to read a Windows artifact and a POSIX artifact
+  without branching on which harness wrote it.
 
 ### Fixed
 
@@ -42,6 +66,41 @@ numbers cannot be borrowed across rows any more.
 - The whole matrix and the contended table re-pointed at the 2026-10-30
   run pair; `docs/evidence/2026-10-30_bench_snapshot.md` is the frozen
   evidence, with 2026-10-26 kept as the record of the earlier tree.
+- Storm histogram buckets were named `le_50` / `gt_10000` while holding the
+  count of the band `(prev, bucket]` — a disjoint count wearing a cumulative
+  name, so `<=500: 7272` read as "7,272 dispatches under 500 µs" when 8,942
+  of the run's 10,000 were. The keys are now `band_50` … `band_above_10000`,
+  the console prints the band bounds (`100-200: 1,933`), the sum of the nine
+  bands equals `kills_completed` and the oracle checks exactly that. Because
+  this is a report-shape break for anything reading the old keys, the payload
+  now declares `report_schema: 2` and the gate requires it.
+- A lane whose resource window could not be read used to publish a growth
+  computed from a fabricated sample. .NET answers `Process.HandleCount` with
+  `0` for a process that exited between the refresh and the read while the
+  cached memory fields still hold their last live values, so the window ended
+  on a `−68` handle drop that never happened. A poll whose tuple is incoherent
+  is now dropped and counted in `sample_drops`, `handles_first` / `handles_last`
+  are recorded only when readable, and a lane fails the new
+  `resource window readable` gate unless it can show both ends of both
+  counters. Handle growth is printed signed (`-3…+1`), so a real dip is
+  visible instead of being smoothed into a flat line.
+- `docs/USER_GUIDE.md` described the pool storms from the superseded
+  2026-10-26 debug artifacts — `wall_ms=55 / 474 / 194` and "99,628 live
+  `report()` samples" — numbers that are real but belong to a tree this
+  release no longer measures, and that no gate could re-derive because only
+  BENCHMARKS.md is read against the artifact. The paragraph now names the
+  `2026-10-30_pool_*` release set and states the deterministic facts (bucket
+  splits, `[9, 9, 9, 9]` / `[7, 7, 7, 7]` generations, which mode proves the
+  deadlock bucket) while the clock columns move to BENCHMARKS.md, which the
+  oracle rebuilds. `test_pool_storm_tables_match_committed_reports` reads the
+  guide too: `wall_ms`, `monitor_checks` and the superseded set fail it, and
+  so does a guide that stops naming the artifacts it describes.
+- The console transcripts the storm harnesses write matched `.gitignore`'s
+  `*.log`, so the `_run.log` files BENCHMARKS.md links could not be
+  committed: the links would have pointed at nothing on a fresh clone while
+  every local gate stayed green. `!docs/evidence/*.log` makes the evidence
+  tree an exception, and both storm oracles now assert that every artifact
+  path they cite exists in the tree.
 
 ## 0.7.6 — 2026-10-30
 

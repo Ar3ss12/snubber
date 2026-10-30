@@ -64,7 +64,32 @@ jobs:
           path: |
             target/multi_lineage_stats.json
             target/multi_lineage_report.json
+            target/multi_lineage_run.log
             target/multi_lineage/lane_*/supervisor.out
+          if-no-files-found: warn
+          retention-days: 14
+
+      # 8 lanes on a 2 vCPU runner is the shape BENCHMARKS.md publishes as the
+      # saturation run: the dispatch tail, not the mean, is what moves.
+      - name: Storm - saturation (8 lanes x 125 kills, armed hold)
+        run: |
+          python3 scripts/stress_multi_lineage.py \
+            --lines 8 --kills-per-line 125 \
+            --armed-hold --aggressive \
+            --min-ambush-pct 70 \
+            --stats target/multi_lineage_stats_saturation.json \
+            --report target/multi_lineage_report_saturation.json \
+            --log target/multi_lineage_run_saturation.log
+
+      - name: Upload Saturation Artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: multi-lineage-saturation-${{ matrix.os }}
+          path: |
+            target/multi_lineage_stats_saturation.json
+            target/multi_lineage_report_saturation.json
+            target/multi_lineage_run_saturation.log
           if-no-files-found: warn
           retention-days: 14
 
@@ -74,7 +99,8 @@ jobs:
             --lines 4 --kills-per-line 500 \
             --aggressive \
             --stats target/multi_lineage_stats_free.json \
-            --report target/multi_lineage_report_free.json
+            --report target/multi_lineage_report_free.json \
+            --log target/multi_lineage_run_free.log
 
       - name: Upload Free-Running Artifacts
         if: always()
@@ -84,6 +110,7 @@ jobs:
           path: |
             target/multi_lineage_stats_free.json
             target/multi_lineage_report_free.json
+            target/multi_lineage_run_free.log
           if-no-files-found: warn
           retention-days: 14
 
@@ -152,6 +179,11 @@ jobs:
       - name: Storm - armed hold (true ambush gate)
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 250 -ArmedHold -Aggressive -MinAmbushPct 70
 
+      # The saturation shape BENCHMARKS.md quotes from the host: twice the
+      # lineages over the same kill budget, so the dispatch tail is the signal.
+      - name: Storm - saturation (8 lanes x 125 kills, armed hold)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 8 -KillsPerLine 125 -ArmedHold -Aggressive -MinAmbushPct 70 -StatsPath target/multi_lineage_stats_saturation.json -ReportPath target/multi_lineage_report_saturation.json -LogPath target/multi_lineage_run_saturation.log -LaneRoot target/multi_lineage_saturation
+
       # The .ps1 single-process harness is a separate implementation: the
       # Python driver never exercises it, so it rots without this step.
       - name: Single-process harness (PS flavor, 100 kills)
@@ -165,7 +197,21 @@ jobs:
           path: |
             target/multi_lineage_stats.json
             target/multi_lineage_report.json
+            target/multi_lineage_run.log
             target/multi_lineage/lane_*/supervisor.out
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload Saturation Artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: multi-lineage-saturation-windows
+          path: |
+            target/multi_lineage_stats_saturation.json
+            target/multi_lineage_report_saturation.json
+            target/multi_lineage_run_saturation.log
+            target/multi_lineage_saturation/lane_*/supervisor.out
           if-no-files-found: warn
           retention-days: 14
 

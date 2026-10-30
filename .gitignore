@@ -11,6 +11,12 @@ target/chaos_report.json
 target/supervised_worker.pid
 target/termination_report.json
 
+# Committed storm evidence: the console transcript of a storm run is the
+# artifact a CI failure is read from, and BENCHMARKS.md links it next to the
+# report. `*.log` above would keep it out of the index silently — the storm
+# oracle cites these paths, so an ignored transcript is a broken link.
+!docs/evidence/*.log
+
 # Python & scripts cache
 __pycache__/
 *.py[cod]

@@ -18,15 +18,27 @@ at death), clean escape (commit seen) or stillborn (neither). ``--armed-hold``
 parks the worker armed and publishes its pid only after the arm frame, so
 ``--min-ambush-pct 70`` proves armed workers were killed, not startup noise.
 
+Three artifacts, each with one job, with the SAME key names and key order as
+``stress_multi_lineage.ps1`` so tests/doc_sync.rs pins a POSIX run and a
+Windows run through one oracle:
+  ``--report`` headline totals, per-lane gates, checks, verdict, machine
+             identity, dispatch histogram, top-10 slowest kills. This is the
+             file docs/evidence commits.
+  ``--stats``  distribution detail: per-lane raw dispatch series and bucket
+             counts, the 250 ms rate trace, per-lane killer counters.
+  ``--log``    full console transcript (stdout and stderr mirrored to a file).
+
 Exit code 0 = PASS, 1 = FAIL.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import math
 import os
+import platform
 import signal
 import shutil
 import subprocess
@@ -45,6 +57,11 @@ LSOF = shutil.which("lsof") or (
 )
 FD_SAMPLING = IS_LINUX or LSOF is not None
 
+# Set by main() once the transcript is open; both JSON payloads report it, so
+# a run that left no log is visible in the artifact rather than in a terminal
+# someone already closed.
+RUN_LOG: dict = {"path": None, "written": False}
+
 
 def resolve(repo: Path, value: str) -> Path:
     p = Path(value)
@@ -57,6 +74,138 @@ def percentile(values: list[float], pct: float) -> float:
     ordered = sorted(values)
     idx = min(len(ordered) - 1, max(0, math.ceil(pct / 100.0 * len(ordered)) - 1))
     return ordered[idx]
+
+
+# Same buckets and same key names as scripts/stress_multi_lineage.ps1: one
+# doc_sync oracle has to read a POSIX artifact and a Windows artifact without
+# branching on which harness wrote them.
+HIST_BUCKETS = [50, 100, 200, 500, 1000, 2000, 5000, 10000]
+
+
+def histogram_us(values: list[float]) -> dict[str, int]:
+    ordered = sorted(values)
+    out: dict[str, int] = {}
+    prev = 0
+    for bucket in HIST_BUCKETS:
+        up_to = sum(1 for v in ordered if v <= bucket)
+        out[f"band_{bucket}"] = up_to - prev
+        prev = up_to
+    out["band_above_10000"] = len(ordered) - prev
+    return out
+
+
+def dispatch_block(values: list[float]) -> dict[str, float]:
+    return {
+        "min": round(percentile(values, 0.0), 1),
+        "p50": round(percentile(values, 50), 1),
+        "p95": round(percentile(values, 95), 1),
+        "p99": round(percentile(values, 99), 1),
+        "p999": round(percentile(values, 99.9), 1),
+        "max": round(max(values) if values else 0.0, 1),
+        "count": len(values),
+    }
+
+
+def top_slowest(lanes: list["Lane"], limit: int = 10) -> list[dict]:
+    pairs = [(v, lane.index) for lane in lanes for v in lane.latencies_us]
+    pairs.sort(reverse=True)
+    return [{"lane": idx, "dispatch_us": round(v, 1)} for v, idx in pairs[:limit]]
+
+
+def shell_out(cmd: list[str]) -> str | None:
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    text = out.stdout.strip()
+    return text or None
+
+
+def system_identity(profile: str) -> dict:
+    """Machine the storm ran on.
+
+    BENCHMARKS.md has always said "release build on an AMD Ryzen 5 4600H";
+    until this block nothing in the artifact proved it, and a number quoted
+    from a laptop could not be told apart from one quoted from a runner.
+    """
+    info = {
+        "cpu_name": None,
+        "physical_cores": None,
+        "logical_cores": os.cpu_count(),
+        "os_caption": f"{platform.system()} {platform.release()}",
+        "os_build": platform.release(),
+        "rustc": shell_out(["rustc", "--version"]),
+        "python": sys.version.split()[0],
+        "profile": profile,
+    }
+    if IS_LINUX:
+        try:
+            text = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for line in text.splitlines():
+            if line.startswith("model name"):
+                info["cpu_name"] = line.split(":", 1)[1].strip()
+                break
+        cores = [
+            int(line.split(":", 1)[1])
+            for line in text.splitlines()
+            if line.startswith("cpu cores")
+        ]
+        sockets = len({
+            line.split(":", 1)[1].strip()
+            for line in text.splitlines()
+            if line.startswith("physical id")
+        })
+        if cores and sockets:
+            info["physical_cores"] = cores[0] * sockets
+        os_release = Path("/etc/os-release")
+        if os_release.exists():
+            for line in os_release.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("PRETTY_NAME="):
+                    info["os_caption"] = line.split("=", 1)[1].strip('"')
+                    break
+    else:
+        brand = shell_out(["sysctl", "-n", "machdep.cpu.brand_string"]) or shell_out(
+            ["sysctl", "-n", "hw.model"]
+        )
+        info["cpu_name"] = brand
+        phys = shell_out(["sysctl", "-n", "hw.physicalcpu"])
+        if phys and phys.isdigit():
+            info["physical_cores"] = int(phys)
+    return info
+
+
+class Tee:
+    """Mirror a stream into the run log — the Start-Transcript counterpart.
+
+    A CI failure has to be readable without re-deriving it from JSON, and the
+    two harnesses must leave the same kind of artifact on both platforms.
+    """
+
+    def __init__(self, stream, handle) -> None:
+        self.stream = stream
+        self.handle = handle
+
+    def write(self, data: str) -> int:
+        self.stream.write(data)
+        try:
+            self.handle.write(data)
+            self.handle.flush()
+        except (OSError, ValueError):
+            pass
+        return len(data)
+
+    def flush(self) -> None:
+        self.stream.flush()
+
+    def isatty(self) -> bool:
+        try:
+            return self.stream.isatty()
+        except (AttributeError, ValueError):
+            return False
 
 
 def read_pid(path: Path) -> int | None:
@@ -152,7 +301,11 @@ class Sample:
         self.count: int = 0
 
     def note(self, value: float | None) -> None:
-        if value is None:
+        # A live process never reads 0 bytes or 0 file descriptors, so None and
+        # <= 0 are both failed reads. They are dropped instead of recorded: a
+        # post-exit zero kept as the last sample would read as the dip that
+        # disarms the growth gate.
+        if value is None or value <= 0:
             return
         if self.first is None:
             self.first = value
@@ -163,16 +316,9 @@ class Sample:
     def growth(self) -> float:
         if self.first is None or self.last is None:
             return 0.0
-        return max(0.0, self.last - self.first)
-
-    def as_dict(self) -> dict:
-        return {
-            "first": round(self.first, 3) if self.first is not None else None,
-            "peak": round(self.peak, 3),
-            "last": round(self.last, 3) if self.last is not None else None,
-            "growth": round(self.growth(), 3),
-            "samples": self.count,
-        }
+        # Signed: a window that lost memory or descriptors is information, and
+        # the gate is one-sided (only a rise can trip it).
+        return self.last - self.first
 
 
 class Lane:
@@ -186,15 +332,58 @@ class Lane:
         self.stale = 0
         self.duplicates = 0
         self.retries = 0
+        self.misses = 0
         self.stalled = False
         self.error: str | None = None
+        self.elapsed_ms = 0.0
         self.latencies_us: list[float] = []
+        self.sup_poll_drops = 0
         self.last_killed: tuple[int, str] | None = None
         self.report: dict | None = None
         self.sup_rss = Sample()
         self.worker_rss = Sample()
         self.sup_fds = Sample()
         self.lock = threading.Lock()
+
+
+def lane_record(lane: Lane) -> dict:
+    """One lane in the report, with the .ps1 lane-record key names."""
+    report = lane.report or {}
+    reaped = int(report.get("total_reaped", 0))
+    ambush = int(report.get("ambush_kills", 0))
+    return {
+        "index": lane.index,
+        "supervisor_pid": lane.sup.pid if lane.sup else 0,
+        "supervisor_exit": lane.sup_exit,
+        "killed": lane.killed,
+        "stale": lane.stale,
+        "duplicates": lane.duplicates,
+        "retries": lane.retries,
+        "miss_polls": lane.misses,
+        "stalled": bool(lane.stalled),
+        "error": lane.error,
+        "elapsed_ms": lane.elapsed_ms,
+        "dispatch_us": dispatch_block(lane.latencies_us),
+        "classification": {
+            "true_ambush": ambush,
+            "escape": int(report.get("escape_kills", 0)),
+            "stillborn": int(report.get("stillborn_kills", 0)),
+            "ambush_pct": round(100.0 * ambush / reaped if reaped else 0.0, 1),
+        },
+        "report": lane.report,
+        "resources": {
+            "rss_peak_mb": round(lane.sup_rss.peak, 3),
+            "rss_growth_mb": round(lane.sup_rss.growth(), 3),
+            "handles_first": int(lane.sup_fds.first or 0),
+            "handles_peak": int(lane.sup_fds.peak),
+            "handles_last": int(lane.sup_fds.last or 0),
+            "handles_growth": int(lane.sup_fds.growth()),
+            "worker_rss_peak_mb": round(lane.worker_rss.peak, 3),
+            "samples": lane.sup_rss.count,
+            "sample_drops": lane.sup_poll_drops,
+            "fd_sampling": FD_SAMPLING,
+        },
+    }
 
 
 def spawn_supervisor(args: argparse.Namespace, repo: Path, lane: Lane) -> None:
@@ -221,6 +410,7 @@ def spawn_supervisor(args: argparse.Namespace, repo: Path, lane: Lane) -> None:
 def killer(args: argparse.Namespace, lane: Lane, supervisors: set[int], stop: threading.Event) -> None:
     pid_file = lane.dir / "target" / "supervised_worker.pid"
     last_progress = time.monotonic()
+    lane_started = time.monotonic()
     identity_cache: dict[int, tuple[str, str] | None] = {}
 
     try:
@@ -229,9 +419,17 @@ def killer(args: argparse.Namespace, lane: Lane, supervisors: set[int], stop: th
                 lane.error = f"supervisor exited before {args.kills_per_line} kills"
                 return
 
-            pid = read_pid(pid_file)
-            if pid is None or pid in supervisors or pid == os.getpid():
+            published = read_pid(pid_file)
+            if published is None:
+                # Nothing readable this poll: the supervisor had not published
+                # the replacement worker yet. miss_polls is the counter that
+                # says the pid-file handshake, not the kill, set the pace.
+                lane.misses += 1
                 pid = None
+            elif published in supervisors or published == os.getpid():
+                pid = None
+            else:
+                pid = published
 
             if pid is not None:
                 ident = identity_cache.get(pid)
@@ -282,22 +480,41 @@ def killer(args: argparse.Namespace, lane: Lane, supervisors: set[int], stop: th
     except Exception as exc:  # noqa: BLE001 - killer must report, not vanish
         lane.error = f"{type(exc).__name__}: {exc}"
         return
+    finally:
+        lane.elapsed_ms = round((time.monotonic() - lane_started) * 1000.0, 1)
 
     if lane.killed < args.kills_per_line and not stop.is_set():
         lane.stalled = True
         lane.error = "killer exited before reaching kills-per-line"
 
 
-def monitor(args: argparse.Namespace, lanes: list[Lane], supervisors: set[int], stop: threading.Event) -> None:
+def monitor(
+    args: argparse.Namespace,
+    lanes: list[Lane],
+    supervisors: set[int],
+    stop: threading.Event,
+    rate_windows: list[float],
+) -> None:
     started = time.monotonic()
     last_line = 0.0
     last_sample = 0.0
     last_fd_sample = 0.0
+    # Same 250 ms window as the .ps1 harness: an average over the whole storm
+    # hides the burst that actually stresses the drain, so the peak is only
+    # reproducible if the window itself is recorded.
+    last_window = started
+    window_seen = 0
     # lsof enumerates every descriptor; at 10 Hz per lane it would cost more
     # than the storm it measures. One sample per second still spans the run.
     fd_interval = 0.1 if IS_LINUX else 1.0
     while not stop.is_set():
         now = time.monotonic()
+        if now - last_window >= 0.25:
+            total_now = sum(lane.killed for lane in lanes)
+            span = max(now - last_window, 0.001)
+            rate_windows.append(round((total_now - window_seen) / span, 1))
+            window_seen = total_now
+            last_window = now
         # RSS reads spawn `ps` on macOS; sample resources at 10 Hz, print at 2 Hz.
         fd_due = now - last_fd_sample >= fd_interval
         if fd_due:
@@ -306,9 +523,16 @@ def monitor(args: argparse.Namespace, lanes: list[Lane], supervisors: set[int], 
             last_sample = now
             for lane in lanes:
                 if lane.sup and lane.sup.poll() is None:
-                    lane.sup_rss.note(proc_rss_mb(lane.sup.pid))
+                    rss = proc_rss_mb(lane.sup.pid)
+                    fds = proc_fds(lane.sup.pid) if fd_due else None
+                    # One poll, one verdict: a poll of a live supervisor that
+                    # yields no readable metric is counted as dropped, so the
+                    # resource window keeps only real samples.
+                    if rss is None or rss <= 0 or (fd_due and (fds is None or fds <= 0)):
+                        lane.sup_poll_drops += 1
+                    lane.sup_rss.note(rss)
                     if fd_due:
-                        lane.sup_fds.note(proc_fds(lane.sup.pid))
+                        lane.sup_fds.note(fds)
                 worker = read_pid(lane.dir / "target" / "supervised_worker.pid")
                 if worker and worker not in supervisors:
                     # Same identity gate as the killer: a recycled pid must
@@ -391,10 +615,22 @@ def run(args: argparse.Namespace, repo: Path) -> int:
         directory = lane_root / f"lane_{i}"
         lanes.append(Lane(i, directory, directory / "termination_report.json"))
 
+    system = system_identity(args.profile)
     print(
         f"[CONFIG] lines={args.lines} kills_per_line={args.kills_per_line} "
         f"armed_hold={args.armed_hold} aggressive={args.aggressive} "
         f"profile={args.profile} platform={sys.platform}",
+        flush=True,
+    )
+    print(
+        f"[SYSTEM] {system['cpu_name'] or 'unknown cpu'} "
+        f"({system['physical_cores']} physical / {system['logical_cores']} logical cores), "
+        f"{system['os_caption']} build {system['os_build']}",
+        flush=True,
+    )
+    print(
+        f"[TOOLCHAIN] rustc: {system['rustc'] or 'not on PATH'} | "
+        f"python {system['python']} | fd_sampling={FD_SAMPLING}",
         flush=True,
     )
 
@@ -439,7 +675,7 @@ def run(args: argparse.Namespace, repo: Path) -> int:
             for lane in lanes
         ]
         monitor_thread = threading.Thread(
-            target=monitor, args=(args, lanes, supervisors, stop), daemon=True
+            target=monitor, args=(args, lanes, supervisors, stop, rate_windows), daemon=True
         )
         for thread in killers:
             thread.start()
@@ -498,6 +734,8 @@ def run(args: argparse.Namespace, repo: Path) -> int:
     total_ambush = sum(int((lane.report or {}).get("ambush_kills", 0)) for lane in lanes)
     total_escape = sum(int((lane.report or {}).get("escape_kills", 0)) for lane in lanes)
     total_stillborn = sum(int((lane.report or {}).get("stillborn_kills", 0)) for lane in lanes)
+    total_tokens_rescued = sum(int((lane.report or {}).get("tokens_rescued", 0)) for lane in lanes)
+    total_clean_settles = sum(int((lane.report or {}).get("clean_settles", 0)) for lane in lanes)
     total_classes = total_ambush + total_escape + total_stillborn
     expected = args.lines * args.kills_per_line
     min_ambush = args.min_ambush_pct
@@ -541,9 +779,22 @@ def run(args: argparse.Namespace, repo: Path) -> int:
         checks.append(
             (f"{tag} ambush >= {min_ambush:.0f}%", ambush_pct + 1e-9 >= min_ambush, f"{ambush_pct:.1f}%")
         )
+        window_readable = lane.sup_rss.first is not None and lane.sup_rss.last is not None and (
+            not FD_SAMPLING or (lane.sup_fds.first is not None and lane.sup_fds.last is not None)
+        )
+        checks.append(
+            (
+                f"{tag} resource window readable",
+                window_readable,
+                (
+                    f"rss {lane.sup_rss.first}/{lane.sup_rss.last} MB over "
+                    f"{lane.sup_rss.count} samples, {lane.sup_poll_drops} dropped polls"
+                ),
+            )
+        )
         rss_ok = lane.sup_rss.count > 0 and lane.sup_rss.growth() <= args.max_growth_mb
         rss_detail = (
-            f"{lane.sup_rss.growth():.2f} MB"
+            f"{lane.sup_rss.growth():+.2f} MB"
             if lane.sup_rss.count > 0
             else "0 samples (leak gate cannot pass on no data)"
         )
@@ -551,7 +802,7 @@ def run(args: argparse.Namespace, repo: Path) -> int:
         if FD_SAMPLING:
             fds_ok = lane.sup_fds.count > 0 and lane.sup_fds.growth() <= args.max_handle_growth
             fds_detail = (
-                f"{lane.sup_fds.growth():.0f}"
+                f"{lane.sup_fds.growth():+.0f}"
                 if lane.sup_fds.count > 0
                 else "0 samples (leak gate cannot pass on no data)"
             )
@@ -598,9 +849,61 @@ def run(args: argparse.Namespace, repo: Path) -> int:
             f"rss_peak={lane.sup_rss.peak:.2f} MB growth={lane.sup_rss.growth():.2f} MB | "
             f"handles first/peak/last={lane.sup_fds.first or 0:.0f}/"
             f"{lane.sup_fds.peak:.0f}/{lane.sup_fds.last or 0:.0f} | "
-            f"stale={lane.stale} dup={lane.duplicates} retries={lane.retries}",
+            f"stale={lane.stale} dup={lane.duplicates} retries={lane.retries} "
+            f"miss_polls={lane.misses} elapsed={lane.elapsed_ms:.0f} ms",
             flush=True,
         )
+
+    # Distribution detail before the gate table: the buckets and the tail say
+    # what the storm looked like; the checks below only say whether it cleared
+    # its marks. Same lines the .ps1 prints.
+    all_lat = [v for lane in lanes for v in lane.latencies_us]
+    peak_rate = max(rate_windows) if rate_windows else 0.0
+    killers_saw = {
+        "stale": sum(lane.stale for lane in lanes),
+        "duplicates": sum(lane.duplicates for lane in lanes),
+        "retries": sum(lane.retries for lane in lanes),
+        "miss_polls": sum(lane.misses for lane in lanes),
+    }
+    hist = histogram_us(all_lat)
+    print(
+        f"[DISPATCH] min={percentile(all_lat, 0.0):.1f} p50={percentile(all_lat, 50):.1f} "
+        f"p95={percentile(all_lat, 95):.1f} p99={percentile(all_lat, 99):.1f} "
+        f"p99.9={percentile(all_lat, 99.9):.1f} max={max(all_lat) if all_lat else 0.0:.1f} us",
+        flush=True,
+    )
+    print(
+        "           bands: "
+        + " | ".join(
+            f"{lo}-{b}: {hist[f'band_{b}']}"
+            for lo, b in zip([0] + HIST_BUCKETS[:-1], HIST_BUCKETS)
+        )
+        + f" | >{HIST_BUCKETS[-1]}: {hist['band_above_10000']}"
+        + f"  (disjoint band counts, sum {len(all_lat)})",
+        flush=True,
+    )
+    print(
+        f"[KILLERS] stale={killers_saw['stale']} duplicates={killers_saw['duplicates']} "
+        f"retries={killers_saw['retries']} miss_polls={killers_saw['miss_polls']} "
+        f"across {args.lines} lineages | peak {peak_rate:.1f} kills/s (250 ms window)",
+        flush=True,
+    )
+    slowest = top_slowest(lanes)
+    if slowest:
+        print(
+            "[TAIL] " + ", ".join(f"lane {s['lane']}={s['dispatch_us']:.1f} us" for s in slowest),
+            flush=True,
+        )
+    print(
+        "[SAMPLES] "
+        + " | ".join(
+            f"lane {lane.index}: rss {lane.sup_rss.count} samples "
+            f"({lane.sup_rss.first}/{lane.sup_rss.last} MB), fd {lane.sup_fds.count} "
+            f"({lane.sup_fds.first}/{lane.sup_fds.last}), {lane.sup_poll_drops} dropped polls"
+            for lane in lanes
+        ),
+        flush=True,
+    )
 
     # ok is bool or None; None = platform-skipped (never counts as a pass).
     failed = [name for name, ok, _ in checks if ok is False]
@@ -618,64 +921,106 @@ def run(args: argparse.Namespace, repo: Path) -> int:
     verdict = "PASS" if not failed and (not skipped or not in_ci) else "FAIL"
     print(f"[VERDICT] {verdict}", flush=True)
 
-    stats = {
-        "verdict": verdict,
-        "platform": sys.platform,
-        "armed_hold": args.armed_hold,
+    report_doc = {
+        "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "model": "multi_lineage",
+        "report_schema": 2,
+        "lines": args.lines,
+        "kills_per_line": args.kills_per_line,
+        "kills_requested": expected,
+        "kills_completed": total_reaped,
+        "workload": "spin" if args.aggressive else "sleep",
+        "timer_resolution": None,
+        "duration_ms": round(duration_s * 1000.0, 1),
+        "rate_per_sec": round(rate, 1),
+        "peak_rate_per_sec": round(peak_rate, 1),
+        "tokens_rescued": total_tokens_rescued,
+        "clean_settles": total_clean_settles,
+        "armed_hold": bool(args.armed_hold),
         "min_ambush_pct": min_ambush,
+        "true_ambush": total_ambush,
+        "clean_escape": total_escape,
+        "stillborn": total_stillborn,
+        "ambush_pct": round(100.0 * total_ambush / total_reaped if total_reaped else 0.0, 1),
+        "dispatch_us": dispatch_block(all_lat),
         "max_growth_mb": args.max_growth_mb,
         "max_handle_growth": args.max_handle_growth if FD_SAMPLING else None,
-        "lines": [
+        "lanes": [lane_record(lane) for lane in lanes],
+        "checks": [{"name": name, "ok": ok, "detail": detail} for name, ok, detail in checks],
+        "verdict": verdict,
+        # Everything below `verdict` is additive. tests/doc_sync.rs reads a key
+        # by FIRST occurrence and the `dispatch_us` block by its first `p50`, so
+        # a headline token must stay above this line or it gets shadowed. The
+        # key order matches stress_multi_lineage.ps1 exactly, which is what lets
+        # one oracle pin a POSIX artifact and a Windows artifact.
+        "system": system,
+        "killers_saw": killers_saw,
+        "dispatch_histogram_us": hist,
+        "slowest_dispatches": slowest,
+        "transcript": {"path": RUN_LOG["path"], "written": RUN_LOG["written"]},
+        # POSIX-only extras, after the shared set.
+        "platform": sys.platform,
+        "kills_dispatched": total_killed,
+        "fd_sampling": FD_SAMPLING,
+    }
+
+    stats_doc = {
+        "timestamp_utc": report_doc["timestamp_utc"],
+        "model": "multi_lineage",
+        "detail_of": args.report,
+        "lines": args.lines,
+        "kills_per_line": args.kills_per_line,
+        "kills_completed": total_reaped,
+        "verdict": verdict,
+        "system": report_doc["system"],
+        "dispatch_us": report_doc["dispatch_us"],
+        "dispatch_histogram_us": report_doc["dispatch_histogram_us"],
+        "slowest_dispatches": report_doc["slowest_dispatches"],
+        "killers_saw": killers_saw,
+        "rate_window_ms": 250,
+        "rate_window_per_sec": rate_windows,
+        "peak_rate_per_sec": round(peak_rate, 1),
+        "lanes": [
             {
-                "lane": lane.index,
-                "kills": lane.killed,
-                "reaped": int((lane.report or {}).get("total_reaped", 0)),
-                "true_ambush": int((lane.report or {}).get("ambush_kills", 0)),
-                "clean_escape": int((lane.report or {}).get("escape_kills", 0)),
-                "stillborn": int((lane.report or {}).get("stillborn_kills", 0)),
-                "ambush_pct": (
-                    100.0
-                    * int((lane.report or {}).get("ambush_kills", 0))
-                    / max(int((lane.report or {}).get("total_reaped", 0)), 1)
-                ),
-                "dispatch_us": {
-                    "p50": percentile(lane.latencies_us, 50),
-                    "p95": percentile(lane.latencies_us, 95),
-                    "p99": percentile(lane.latencies_us, 99),
-                    "max": max(lane.latencies_us) if lane.latencies_us else 0.0,
+                "index": lane.index,
+                "dispatch_us": dispatch_block(lane.latencies_us),
+                "histogram_us": histogram_us(lane.latencies_us),
+                "dispatch_us_series": [round(v, 1) for v in lane.latencies_us],
+                "killers_saw": {
+                    "stale": lane.stale,
+                    "duplicates": lane.duplicates,
+                    "retries": lane.retries,
+                    "miss_polls": lane.misses,
                 },
                 "resources": {
-                    "rss_mb": lane.sup_rss.as_dict(),
-                    "handles": lane.sup_fds.as_dict() if FD_SAMPLING else None,
-                    "worker_rss_mb_peak": round(lane.worker_rss.peak, 3),
+                    "rss_peak_mb": round(lane.sup_rss.peak, 3),
+                    "rss_growth_mb": round(lane.sup_rss.growth(), 3),
+                    "handles_first": int(lane.sup_fds.first or 0),
+                    "handles_peak": int(lane.sup_fds.peak),
+                    "handles_last": int(lane.sup_fds.last or 0),
+                    "handles_growth": int(lane.sup_fds.growth()),
+                    "worker_rss_peak_mb": round(lane.worker_rss.peak, 3),
+                    "samples": lane.sup_rss.count,
+                    "sample_drops": lane.sup_poll_drops,
+                    "fd_samples": lane.sup_fds.count,
+                    "elapsed_ms": lane.elapsed_ms,
                 },
-                "stale": lane.stale,
-                "duplicates": lane.duplicates,
-                "retries": lane.retries,
-                "error": lane.error,
-                "supervisor_exit": lane.sup_exit,
-                "report": lane.report,
             }
             for lane in lanes
         ],
-        "totals": {
-            "killed": total_killed,
-            "reaped": total_reaped,
-            "true_ambush": total_ambush,
-            "clean_escape": total_escape,
-            "stillborn": total_stillborn,
-            "elapsed_s": duration_s,
-            "kills_per_s": rate,
-        },
-        "checks": [{"name": name, "ok": ok, "detail": detail} for name, ok, detail in checks],
+        "transcript": {"path": RUN_LOG["path"], "written": RUN_LOG["written"]},
     }
-    stats_path = resolve(repo, args.stats)
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-    stats_path.write_text(json.dumps(stats, indent=2))
+
     report_path = resolve(repo, args.report)
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(stats, indent=2))
-    print(f"Stats JSON: {stats_path}\nReport JSON: {report_path}", flush=True)
+    stats_path = resolve(repo, args.stats)
+    for path in (report_path, stats_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report_doc, indent=2))
+    stats_path.write_text(json.dumps(stats_doc, indent=2))
+    print(f"Report JSON     : {report_path}", flush=True)
+    print(f"Stats JSON      : {stats_path}", flush=True)
+    if RUN_LOG["written"]:
+        print(f"Transcript      : {resolve(repo, args.log)}", flush=True)
     return 0 if verdict == "PASS" else 1
 
 
@@ -697,6 +1042,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lane-root", default="target/multi_lineage")
     parser.add_argument("--report", default="target/multi_lineage_report.json")
     parser.add_argument("--stats", default="target/multi_lineage_stats.json")
+    parser.add_argument("--log", default="target/multi_lineage_run.log")
     args = parser.parse_args()
     if not 1 <= args.lines <= 32:
         parser.error("--lines must be in 1..32")
@@ -711,7 +1057,23 @@ def main() -> int:
     # SIGTERM (CI job cancellation) must unwind into run()'s finally so
     # the storm leaves no spinning supervisors or workers behind.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
-    return run(args, repo)
+    RUN_LOG["path"] = args.log
+    log_path = resolve(repo, args.log)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(log_path, "w", encoding="utf-8")
+    except OSError as exc:
+        print(f"[WARN] run log {log_path} unavailable: {exc}", file=sys.stderr)
+        return run(args, repo)
+    out_stream, err_stream = sys.stdout, sys.stderr
+    sys.stdout = Tee(out_stream, handle)
+    sys.stderr = Tee(err_stream, handle)
+    RUN_LOG["written"] = True
+    try:
+        return run(args, repo)
+    finally:
+        sys.stdout, sys.stderr = out_stream, err_stream
+        handle.close()
 
 
 if __name__ == "__main__":

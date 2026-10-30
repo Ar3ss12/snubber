@@ -528,13 +528,14 @@ cargo test --test supervisor_memory_loop
 cargo test --test supervisor_pool
 
 # Verify the pool storm gate (4 lanes x 8 hard kills; ignored by default)
-cargo test --test supervisor_pool_stress -- --ignored --nocapture
+# --release, because the committed evidence in docs/evidence is release-profile.
+cargo test --release --test supervisor_pool_stress -- --ignored --nocapture
 
 # Verify all four reap classes in one run (armed/clean/silent/orphan; ignored)
-cargo test --test supervisor_pool_stress_mixed -- --ignored --nocapture
+cargo test --release --test supervisor_pool_stress_mixed -- --ignored --nocapture
 
 # Verify lease euthanasia of heartbeat-then-hang workers with a live observer
-cargo test --test supervisor_pool_stress_lease -- --ignored --nocapture
+cargo test --release --test supervisor_pool_stress_lease -- --ignored --nocapture
 
 # Verify chunked parsing equivalence, injected clocks and token sinks (invariant 11)
 cargo test --test drain_feed
@@ -561,10 +562,18 @@ cargo test --test guard_alloc_budget
 powershell -ExecutionPolicy Bypass -File scripts/stress_harness.ps1 -Kills 1000 -Launch -RawKill -Aggressive -ArmedHold
 
 # Verify N independent lineages under a parallel death storm (Windows, 4 x 2,500 kills)
+# -LaneRoot gives each lane its own working directory, so the worker's
+# relative pid file cannot be read by another lineage; -ReportPath /
+# -StatsPath / -LogPath name the three artifacts one run writes.
 powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold
 
+# The same 10,000 kills spread over 8 lineages — the saturation run
+powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 8 -KillsPerLine 1250 -Aggressive -ArmedHold
+
 # Same storm on Linux/macOS (SIGKILL path, run by .github/workflows/stress.yml)
-python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggressive --armed-hold
+python3 scripts/stress_multi_lineage.py --lines 4 --kills-per-line 2500 --aggressive --armed-hold \
+    --report target/multi_lineage_report.json --stats target/multi_lineage_stats.json \
+    --log target/multi_lineage_run.log
 ```
 
 ### Gate taxonomy: semantic oracles vs drift tripwires
@@ -595,7 +604,9 @@ flavor) and `tests/doc_sync.rs` classify as follows:
 | `doc_sync` — headings, taglines, layer column, module paths, anchors | Public docs agree with each other and with the source layout | Tripwire | Text policy of prose docs; no oracle outside the text exists. Fails per doc, per heading |
 | `doc_sync` — bench numbers | Measured latencies live in exactly one doc and equal the committed Criterion snapshot | Oracle against artifact | `test_bench_numbers_match_evidence_artifact` checks every `~<number>` citation in BENCHMARKS.md against `docs/evidence/2026-10-30_bench_snapshot.md` (round-or-truncate), and README.md / docs/USER_GUIDE.md fail the suite if they quote any latency figure — they link instead of copying numbers; the guide's API & cost quick reference is a signature/footprint dictionary whose measured cost cells were replaced with structural costs (0.6.11). `test_bench_rows_quote_their_own_measurement` pairs each BENCHMARKS.md row with the snapshot row it names and requires the number to come from THAT measurement: an existence check alone let `pool.expired_lanes` publish another row's 5.4 ns while its own sweep measured 516 ns (2026-10-30) |
 | `doc_sync` — release history | The User Guide describes the current state; release history lives only in CHANGELOG.md | Tripwire | `test_guide_has_no_release_history` rejects the history constructs in the guide — `Fixed in …` / `Fixed after …` headings, a version-labelled Extensibility heading, `v0.…` header teasers — because a guide that narrates past releases reads stale the day after release; the audit tables live in the CHANGELOG appendix (0.6.11) |
-| `doc_sync` — storm numbers | The BENCHMARKS.md termination-storm tables equal the committed harness reports | Oracle against artifact | `test_storm_tables_match_committed_reports` derives every headline token (wall, avg/peak kills/s, dispatch p50, ambush/escape/stillborn) from `docs/evidence/2026-10-27_multi_lineage_*_report.json` at test time — a storm number in the docs that no artifact carries fails the suite; the CI-runner rows are labeled CI-log figures, not repository artifacts |
+| `doc_sync` — storm numbers | The BENCHMARKS.md termination-storm tables equal the committed harness reports | Oracle against artifact | `test_storm_tables_match_committed_reports` rebuilds, for each of the three 2026-10-30 reports (armed-hold, free-running, 8-lane saturation), the mode row, the per-lane bullet, the histogram-band line, the killer-counter line, the machine caption and the rescue-accounting fragment, and requires an exact line match against `docs/evidence/2026-10-30_multi_lineage_*_report.json`. Before quoting anything it checks each artifact against itself: `verdict: PASS`, `report_schema: 2`, release profile, `checks == lanes × 10/9 + 4/3` with none red, one `resource window readable` gate per lane, kills/bands/killer counters/`tokens_rescued` conserved across lanes, `final_generation == kills + 1`, zero stale pids, `tokens_rescued == true_ambush` and `tokens_rescued + clean_settles == kills_completed`. The reader is scoped (one key inside one object) because `dispatch_us`, `samples` and `final_generation` appear once in the aggregate and once per lane — a first-occurrence reader answers an aggregate question with lane 0's number. The doc citing the superseded 2026-10-27 pair, or dropping a `_run.log` link the report names, fails the same gate; the CI-runner rows are labeled CI-log figures, not repository artifacts |
+| `doc_sync` — pool storm numbers | The three `supervisor_pool_stress*` rows equal their committed reports | Oracle against artifact | `test_pool_storm_tables_match_committed_reports` derives every pool row from `docs/evidence/2026-10-30_pool_*_stress_report.json` and re-checks the report's own accounting first: `ambush + escape + stillborn + deadlocks == reaped`, `rescued == ambush == tokens_seen`, `final_generation == reaped/lanes + 1` per lane, 0 `token_lane_mismatch`, 0 conservation breaks — plus the per-mode extras (lease: `lease_kills == reaped` and a monitor that actually ran, whose `monitor_checks` the prose quotes; mixed: `deadlock: true` with `deadlocks == reaped/lanes`, because an orphan leg is named rather than counted as a rescue). It then reads `docs/USER_GUIDE.md`: the guide must name the committed `2026-10-30_pool_` set and must not carry `wall_ms` or `monitor_checks` at all — a clock column copied into prose goes stale on the next run and nothing re-derives it, and the guide did cite the superseded debug set until 0.7.7 |
+| `doc_sync` — one report schema for two harnesses | The PowerShell and Python storms emit the same keys, so one oracle reads a Windows and a POSIX artifact | Tripwire on the harness sources | `test_storm_harnesses_publish_one_report_schema` parses both report payloads indentation-scoped (nested lane blocks cannot join), requires ≥ 25 keys each, compares the shared prefix name by name, and pins the Python-only tail to exactly `platform,kills_dispatched,fd_sampling`; it also fails if either harness drifts back from the disjoint `band_*` histogram keys to a running-total `le_*` name |
 | `scripts/check_test_count.sh` | The suite that ran is green, its parsed counts clear the floor, and README.md publishes no test count | Oracle | Parses `cargo test` output; fails on any failure, on a suspiciously low parse, or on a `tests-N passed` badge / "N passing tests" claim returning to the README (0.6.11: the vanity badge was deleted, so the gate guards its absence) |
 | README snippets compile | Every runnable Rust block in README.md type-checks against the real API, so a pasted quick start cannot be stale | Oracle (the compile) with tripwire anchors | `cargo test --doc` compiles the fences through the `#[cfg(doctest)] #[doc = include_str!("../README.md")]` hook in `src/lib.rs` — the compiler is the oracle, so no assertion text is needed (0.6.11, after doc-bug H5: a README snippet carried a wrong arity). Two tripwires keep the mechanism itself from vanishing: `test_readme_is_wired_into_doctests` (a deleted hook would silently drop the README out of the doctest run) and `test_readme_fences_have_a_compile_verdict` (3 `rust,no_run` fences, `rust,ignore` capped at the one registered WITHOUT block, no modifier-free fence at all) |
 | README assets resolve off-GitHub | The README renders identically on crates.io / docs.rs, not only on GitHub | Tripwire | `cargo package` excludes `assets/` and the registry pages have no repository tree behind them, so a relative `src="assets/…"` is a broken picture there; `test_readme_assets_are_absolute` requires an `https://` href and checks that a raw.githubusercontent.com path still exists in the tree at the named branch (0.6.11) |
