@@ -52,6 +52,17 @@ jobs:
         # the storm step. Compiling them first names the file and the line.
         run: python3 -m py_compile scripts/*.py
 
+      - name: Python binding gate
+        # Compiling proves a script parses; it does not prove that every name it
+        # reads is bound. Both POSIX flavors died on exactly that gap -- a read
+        # of `rate_windows` that nothing assigned -- and it fired after the
+        # supervisors were spawned, so the run left live lanes and no report.
+        # The self-test runs first so a checker that stopped biting cannot
+        # report the tree green.
+        run: |
+          python3 scripts/check_python_bindings.py --self-test
+          python3 scripts/check_python_bindings.py scripts
+
       - name: Build Supervisor Example (release)
         run: cargo build --release --locked --example process_termination_loop
 
@@ -197,6 +208,16 @@ jobs:
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Python binding gate
+        # The .py harness drives the same report schema the PS twin publishes,
+        # and the reporter reads it, so a Python defect is a Windows-lane risk
+        # too. A directory target: PowerShell leaves `scripts/*.py` unexpanded,
+        # and the checker then reads one bogus path instead of silently
+        # checking nothing.
+        run: |
+          python scripts/check_python_bindings.py --self-test
+          python scripts/check_python_bindings.py scripts
 
       - name: Build Supervisor Example (release)
         run: cargo build --release --locked --example process_termination_loop

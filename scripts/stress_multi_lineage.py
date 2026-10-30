@@ -655,6 +655,11 @@ def run(args: argparse.Namespace, repo: Path) -> int:
     supervisors: set[int] = set()
     duration_s = 0.0
     finalized = False
+    # The monitor thread appends the 250 ms rate trace and the report reads it
+    # after the join; without this binding the storm raised NameError at the
+    # thread construction, after the supervisors were already spawned, so the
+    # run left spawned lanes and no report.
+    rate_windows: list[float] = []
     print(f"[LAUNCH] {args.lines} supervisors from {exe} (cwd per lane under {lane_root})", flush=True)
     try:
         for lane in lanes:

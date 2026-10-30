@@ -70,9 +70,31 @@ Nothing here is additive to the public API.
   (a syntax error used to surface as an unexplained exit code 1 inside the
   storm step) and uploads `supervisor.err` beside `supervisor.out`, for every
   shape and with its own `--lane-root` per shape.
+- `scripts/check_python_bindings.py` gates the defect class a syntax check
+  cannot see: a name read in a scope that never binds it. It walks the AST
+  across function, lambda and class scopes and resolves a scope's defaults,
+  annotations and decorators in the scope that encloses them, then exits 1
+  naming file, line, scope and symbol. `--self-test` asserts the reported
+  symbols for 12 planted shapes — the bug itself, its twin inside a lambda, a
+  module-level read, and the nine that must stay quiet (lambda parameter,
+  comprehension target, `except` alias, `for`/`with`/walrus targets, closure,
+  module constant, default value, decorator, and the class-constant-in-method
+  shape it deliberately does not report) — so the checker cannot rot into an
+  always-green step. Both stress jobs run it over `scripts/` before the
+  first storm.
 
 ### Fixed
 
+- `scripts/stress_multi_lineage.py` read `rate_windows` in three places — the
+  monitor thread's argument tuple, `peak_rate`, and the report's
+  `rate_window_per_sec` — and bound it in none, so every POSIX storm died with
+  `NameError: name 'rate_windows' is not defined` inside the first second
+  (Stress #146 and #147, both flavors). It fired after the supervisors were
+  spawned and before any report was written, which is why the run left live
+  processes and no artifact. The binding the monitor appends to and the report
+  reads now exists. `py_compile` stayed green across all of it: a name that is
+  never assigned is not a syntax error, which is what
+  `scripts/check_python_bindings.py` is for.
 - BENCHMARKS.md published `pool.expired_lanes(lease) (4 lanes)` as 5.4 ns for
   four days. That is `SnubberGuard::new` + `commit`'s measurement; the sweep
   is **516.2 ns** (129 ns per lane), and the existence-only oracle could not

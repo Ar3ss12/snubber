@@ -53,6 +53,14 @@ exited before writing a report still publishes the stage it stopped at, and a
 storm that never started says "not attempted" instead of looking like a crash.
 It always exits 0: the storm's own step owns the verdict.
 
+Before the first storm, every `stress.yml` flavor runs two gates on the harness
+itself: `python -m py_compile scripts/*.py` proves each script parses, and
+`scripts/check_python_bindings.py` proves no scope reads a name it never binds
+(`--self-test` first proves that checker still reports a planted unbound read).
+The second gate exists because the POSIX storms died twice on exactly that
+defect -- a `NameError` raised after the supervisors were spawned, so the run
+left live processes and no report while the compile gate stayed green.
+
 The raw per-lane dispatch series (`-StatsPath` / `--stats`) is deliberately not
 committed for the 2026-10-30 runs: it is ~10,000 wall-clock samples per report,
 and BENCHMARKS.md quotes no number that the report does not already carry. The
