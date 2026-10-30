@@ -44,6 +44,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import traceback
 import time
 from pathlib import Path
 
@@ -206,6 +207,23 @@ class Tee:
             return self.stream.isatty()
         except (AttributeError, ValueError):
             return False
+
+
+def lane_stderr(lane: "Lane", limit: int = 12) -> str:
+    """Tail of one supervisor's own error stream.
+
+    A supervisor that dies before publishing a pid leaves the reason in
+    ``supervisor.err`` and nothing printed it: the harness reported an exit
+    code, so the transcript said *that* a lane failed but never *why*.
+    """
+    try:
+        text = (lane.dir / "supervisor.err").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "no supervisor.err on disk"
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return "supervisor.err is empty"
+    return " | ".join(lines[-limit:])
 
 
 def read_pid(path: Path) -> int | None:
@@ -637,6 +655,7 @@ def run(args: argparse.Namespace, repo: Path) -> int:
     supervisors: set[int] = set()
     duration_s = 0.0
     finalized = False
+    print(f"[LAUNCH] {args.lines} supervisors from {exe} (cwd per lane under {lane_root})", flush=True)
     try:
         for lane in lanes:
             try:
@@ -647,6 +666,7 @@ def run(args: argparse.Namespace, repo: Path) -> int:
             supervisors.add(lane.sup.pid)
 
         deadline = time.monotonic() + 15
+        print(f"[ARM] waiting for {args.lines} worker pid files (15 s budget)", flush=True)
         missing: list[int] = []
         while time.monotonic() < deadline:
             missing = [
@@ -660,13 +680,18 @@ def run(args: argparse.Namespace, repo: Path) -> int:
                 if lane.sup and lane.sup.poll() is not None:
                     print(
                         f"lane {lane.index} supervisor exited before publishing a pid "
-                        f"(exit={lane.sup.returncode})",
+                        f"(exit={lane.sup.returncode}): {lane_stderr(lane)}",
                         file=sys.stderr,
                     )
                     return 1
             time.sleep(0.02)
         else:
-            print(f"lanes published no worker pid within 15 s: {missing}", file=sys.stderr)
+            reasons = {lane.index: lane_stderr(lane, 4) for lane in lanes if lane.sup}
+            print(
+                f"lanes published no worker pid within 15 s: {missing}; "
+                f"last supervisor errors: {reasons}",
+                file=sys.stderr,
+            )
             return 1
 
         stop = threading.Event()
@@ -1071,6 +1096,21 @@ def main() -> int:
     RUN_LOG["written"] = True
     try:
         return run(args, repo)
+    except Exception as exc:  # noqa: BLE001 - an aborted storm must name itself
+        # SystemExit (the SIGTERM cancellation path) is deliberately not
+        # caught: it already unwinds through run()'s finally.
+        # Exit code alone cannot be read on a runner without signing in; the
+        # annotation puts the exception and where the transcript stopped on the
+        # public check-run, next to the storm that produced it.
+        traceback.print_exc()
+        print(f"[ABORT] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        if os.environ.get("CI", "").lower() in ("true", "1"):
+            print(
+                f"::error::storm aborted with {type(exc).__name__}: {exc} - "
+                f"see {args.log} (tail above the marker line)",
+                flush=True,
+            )
+        return 1
     finally:
         sys.stdout, sys.stderr = out_stream, err_stream
         handle.close()

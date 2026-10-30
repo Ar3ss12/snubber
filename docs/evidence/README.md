@@ -43,6 +43,16 @@ verbatim except for identity: the only absolute paths in them sit under the
 repository root (`G:\forder\snubber\target\…`), and they contain no account
 name and no profile directory.
 
+On a runner the same `checks[]` table also goes where a reader without a GitHub
+session can reach it: `scripts/ci_storm_summary.py` runs as a step after every
+storm in `.github/workflows/stress.yml` and turns each failed or skipped gate
+into a workflow annotation, which the anonymous
+`/check-runs/<id>/annotations` API returns — the step log and the artifact zip
+of a public repository do not. It reads the transcript too, so a storm that
+exited before writing a report still publishes the stage it stopped at, and a
+storm that never started says "not attempted" instead of looking like a crash.
+It always exits 0: the storm's own step owns the verdict.
+
 The raw per-lane dispatch series (`-StatsPath` / `--stats`) is deliberately not
 committed for the 2026-10-30 runs: it is ~10,000 wall-clock samples per report,
 and BENCHMARKS.md quotes no number that the report does not already carry. The

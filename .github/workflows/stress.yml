@@ -46,6 +46,12 @@ jobs:
         # (a 3.x < 3.8 interpreter would print a version and fail later).
         run: python3 -c 'import sys; assert sys.version_info >= (3, 8), sys.version'
 
+      - name: Compile every Python script
+        # The storms and the reporter are stdlib-only Python: a syntax error
+        # in one of them used to surface as an unexplained exit code 1 inside
+        # the storm step. Compiling them first names the file and the line.
+        run: python3 -m py_compile scripts/*.py
+
       - name: Build Supervisor Example (release)
         run: cargo build --release --locked --example process_termination_loop
 
@@ -55,6 +61,10 @@ jobs:
             --lines 4 --kills-per-line 250 \
             --armed-hold --aggressive \
             --min-ambush-pct 70
+
+      - name: Report armed-hold gates
+        if: always()
+        run: python3 scripts/ci_storm_summary.py armed-hold target/multi_lineage_report.json target/multi_lineage_run.log
 
       - name: Upload Armed-Hold Artifacts
         if: always()
@@ -66,6 +76,7 @@ jobs:
             target/multi_lineage_report.json
             target/multi_lineage_run.log
             target/multi_lineage/lane_*/supervisor.out
+            target/multi_lineage/lane_*/supervisor.err
           if-no-files-found: warn
           retention-days: 14
 
@@ -79,7 +90,12 @@ jobs:
             --min-ambush-pct 70 \
             --stats target/multi_lineage_stats_saturation.json \
             --report target/multi_lineage_report_saturation.json \
-            --log target/multi_lineage_run_saturation.log
+            --log target/multi_lineage_run_saturation.log \
+            --lane-root target/multi_lineage_saturation
+
+      - name: Report saturation gates
+        if: always()
+        run: python3 scripts/ci_storm_summary.py saturation target/multi_lineage_report_saturation.json target/multi_lineage_run_saturation.log
 
       - name: Upload Saturation Artifacts
         if: always()
@@ -90,6 +106,8 @@ jobs:
             target/multi_lineage_stats_saturation.json
             target/multi_lineage_report_saturation.json
             target/multi_lineage_run_saturation.log
+            target/multi_lineage_saturation/lane_*/supervisor.out
+            target/multi_lineage_saturation/lane_*/supervisor.err
           if-no-files-found: warn
           retention-days: 14
 
@@ -100,7 +118,12 @@ jobs:
             --aggressive \
             --stats target/multi_lineage_stats_free.json \
             --report target/multi_lineage_report_free.json \
-            --log target/multi_lineage_run_free.log
+            --log target/multi_lineage_run_free.log \
+            --lane-root target/multi_lineage_free
+
+      - name: Report free-running gates
+        if: always()
+        run: python3 scripts/ci_storm_summary.py free-running target/multi_lineage_report_free.json target/multi_lineage_run_free.log
 
       - name: Upload Free-Running Artifacts
         if: always()
@@ -111,6 +134,8 @@ jobs:
             target/multi_lineage_stats_free.json
             target/multi_lineage_report_free.json
             target/multi_lineage_run_free.log
+            target/multi_lineage_free/lane_*/supervisor.out
+            target/multi_lineage_free/lane_*/supervisor.err
           if-no-files-found: warn
           retention-days: 14
 
@@ -179,10 +204,18 @@ jobs:
       - name: Storm - armed hold (true ambush gate)
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 250 -ArmedHold -Aggressive -MinAmbushPct 70
 
+      - name: Report armed-hold gates
+        if: always()
+        run: python scripts/ci_storm_summary.py armed-hold target/multi_lineage_report.json target/multi_lineage_run.log
+
       # The saturation shape BENCHMARKS.md quotes from the host: twice the
       # lineages over the same kill budget, so the dispatch tail is the signal.
       - name: Storm - saturation (8 lanes x 125 kills, armed hold)
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 8 -KillsPerLine 125 -ArmedHold -Aggressive -MinAmbushPct 70 -StatsPath target/multi_lineage_stats_saturation.json -ReportPath target/multi_lineage_report_saturation.json -LogPath target/multi_lineage_run_saturation.log -LaneRoot target/multi_lineage_saturation
+
+      - name: Report saturation gates
+        if: always()
+        run: python scripts/ci_storm_summary.py saturation target/multi_lineage_report_saturation.json target/multi_lineage_run_saturation.log
 
       # The .ps1 single-process harness is a separate implementation: the
       # Python driver never exercises it, so it rots without this step.
@@ -199,6 +232,7 @@ jobs:
             target/multi_lineage_report.json
             target/multi_lineage_run.log
             target/multi_lineage/lane_*/supervisor.out
+            target/multi_lineage/lane_*/supervisor.err
           if-no-files-found: warn
           retention-days: 14
 
@@ -212,6 +246,7 @@ jobs:
             target/multi_lineage_report_saturation.json
             target/multi_lineage_run_saturation.log
             target/multi_lineage_saturation/lane_*/supervisor.out
+            target/multi_lineage_saturation/lane_*/supervisor.err
           if-no-files-found: warn
           retention-days: 14
 

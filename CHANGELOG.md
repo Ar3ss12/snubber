@@ -53,6 +53,23 @@ Nothing here is additive to the public API.
   both harnesses and requires the same top-level keys in the same order,
   because one oracle has to read a Windows artifact and a POSIX artifact
   without branching on which harness wrote it.
+- `scripts/ci_storm_summary.py` publishes a storm's gate table where a reader
+  without a GitHub session can reach it: `::error::` / `::warning::` /
+  `::notice::` workflow commands (the anonymous
+  `/check-runs/<id>/annotations` API returns them; the step log and the
+  artifact zip do not) plus a Markdown section in `$GITHUB_STEP_SUMMARY`. It
+  reads the transcript as well as the report, so a storm that died before
+  writing one still names the stage it stopped at, and a storm whose step was
+  skipped reports "not attempted" instead of a false crash. It exits 0 whatever
+  it finds: it reports, the storm decides.
+- The POSIX harness now marks the stages it enters (`[LAUNCH]`, `[ARM]`),
+  appends the dead supervisor's own `supervisor.err` tail to the abort line
+  rather than only its exit code, and turns an unhandled exception into
+  `[ABORT] <Type>: <message>` plus a CI annotation before returning 1.
+  `stress.yml` compiles every script under `scripts/` before the first storm
+  (a syntax error used to surface as an unexplained exit code 1 inside the
+  storm step) and uploads `supervisor.err` beside `supervisor.out`, for every
+  shape and with its own `--lane-root` per shape.
 
 ### Fixed
 
