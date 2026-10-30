@@ -12,8 +12,8 @@ the 0.7 deprecated erased aliases; nothing is renamed for taste.
 
 **This release carries those breaks under a patch number, by the owner's
 decision** — upgrading from 0.7.1 needs the migration below. Every reported
-item is declared in `api-breaks/0.7.5.txt`; the semver gate refuses an
-undeclared break and refuses a declared one that stopped breaking.
+item is named under *Changed (breaking)*; the release gate refuses an
+undeclared break and refuses a declaration that stopped breaking.
 
 ### Added
 

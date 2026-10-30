@@ -39,3 +39,9 @@ FUTURE_node_split.md
 RESEARCH_ECOSYSTEM_BINDINGS.md
 PLAN*.md
 .qoder/
+
+# Release-gate manifests: the per-version list of declared API breaks is a
+# local audit artifact. Gate 6 reads it from the working tree, so removing it
+# from the index does not weaken the gate on the host that releases — it only
+# keeps the declaration list out of the published repository.
+api-breaks/
