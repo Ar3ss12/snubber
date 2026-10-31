@@ -190,6 +190,17 @@ Nothing here is additive to the public API.
   runner, where the last byte of each arrives as `U+201D`; the file is pure
   ASCII now, and the new byte-level gate keeps it that way.
 
+### Removed
+
+- README's *Platform boundary — what the crate cannot see* page. It enumerated a
+  secure desktop, a removed low-level hook, a held button and the counters
+  nobody sampled — everything the crate does not do — and a reader takes such a
+  list as the library's feature set. The contract is the reaction the crate
+  builds; the platform edges belong to the application that owns them.
+  `test_readme_does_not_advertise_what_the_crate_cannot_see` fails if the frame
+  returns in any spelling: the heading, `platform monitor`, `blind spot`, or any
+  of `OpenInputDesktop` / `SetWindowsHookEx` / `SendInput` / `mouse_event`.
+
 ## 0.7.6 — 2026-10-30
 
 Additive: the trend window names a steep partial slope, the README states what

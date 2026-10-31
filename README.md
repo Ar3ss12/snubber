@@ -189,33 +189,6 @@ the whole body in both cases.
   one pipe frame, there is no two-phase commit. Not a lock implementation —
   `SafeLockExt` wraps locks in guard ergonomics, it does not replace `Mutex`. Not
   a thread scheduler — pool lanes restart children, they do not place threads.
-  Not a platform monitor — the crate reads no desktop, installs no hook and
-  injects no input; see the boundary below.
-
-### Platform boundary — what the crate cannot see
-
-The `core` surface makes no OS call, and nothing in the crate reads the
-desktop, registers a hook or sends input. That is what makes the verdicts
-portable and testable, and it puts a hard edge on them:
-
-* **A secure desktop.** UAC, Win+L and Ctrl+Alt+Del take input away from the
-  session; `OpenInputDesktop` is never called here. Your app samples that edge
-  and stops its run; the crate supplies the ordered stop (`RankedSet`).
-* **A hook the OS or another process removed.** `WorkerPulse` plus
-  `classify_stall` name a frozen callback (`TimedOut`), but re-registering a
-  low-level hook (`SetWindowsHookEx` on the installing thread) is the app's.
-* **A button still held by a run that is gone.** The guard's rollback runs and
-  its order is structural, yet the release itself is a platform call
-  (`SendInput` / `mouse_event`) the crate does not make.
-* **Any counter you did not sample.** RSS, handles and fds reach the crate as
-  numbers (`MemoryTrend`, `HandleWatch`); a probe that fails records nothing,
-  so "no sample" must never be read as a healthy zero.
-
-What the crate does own in those situations is the shape of the reaction: the
-rollback body, its budget and its outside poller
-(`snubber::watchdog::poll_rollback`), the ranked teardown order, and the
-`SnapshotV1` anomaly that records what was decided. Detecting platform state
-stays with the application; the crate makes the response structural.
 
 ---
 

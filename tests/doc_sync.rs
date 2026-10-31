@@ -153,64 +153,51 @@ fn test_erased_probe_bulkhead_scope_stays_documented() {
     );
 }
 
-/// The "not for" list named three things that are all about scope, none about
-/// BLINDNESS, so a reader could assume a stability layer also watches the
-/// desktop, the hooks and the buttons. It does not: the crate makes no OS call.
-/// The README must keep the platform boundary page, name each blind spot, and
-/// name the piece the crate DOES own, so a missing watchdog reads as a contract
-/// rather than a bug.
+/// The README carried a *Platform boundary — what the crate cannot see* page
+/// that enumerated a secure desktop, a removed low-level hook, a button left
+/// held and the counters nobody sampled. A page that lists what a library does
+/// not do sells absence as a feature: the contract is the reaction the crate
+/// builds (rollback body, its budget, the outside poller, the ranked teardown),
+/// not the platform state it never touches. The page is gone and this tripwire
+/// keeps the frame from returning in any spelling.
 #[test]
-fn test_readme_states_the_platform_boundary() {
+fn test_readme_does_not_advertise_what_the_crate_cannot_see() {
     let readme = read_doc("README.md");
-    const HEADING: &str = "### Platform boundary";
-    let start = readme.find(HEADING).expect(
-        "TRIPWIRE FIRED: README.md lost the platform-boundary page — the \
-                \"not for\" list names scope, not blindness (secure desktop, a \
-                removed hook, a held button)",
-    );
-    let after = start + HEADING.len();
-    let end = readme[after..]
-        .find("\n## ")
-        .map(|n| after + n)
-        .unwrap_or(readme.len());
-    let section = &readme[start..end];
     assert!(
-        section.len() > 900,
-        "TRIPWIRE FIRED: the platform-boundary section shrank to {} bytes — it \
-         must name each blind spot, not gesture at one",
-        section.len()
+        readme.len() > 8_000 && readme.contains("## When to use / when not"),
+        "TRIPWIRE FIRED: README.md is not the document this scan expects — a \
+         truncated or replaced file cannot pass by having nothing to find"
     );
 
+    let lower = readme.to_lowercase();
+    for phrase in [
+        "platform boundary",
+        "what the crate cannot see",
+        "what the crate can't see",
+        "platform monitor",
+        "blind spot",
+    ] {
+        assert!(
+            !lower.contains(phrase),
+            "TRIPWIRE FIRED: README.md carries `{phrase}` — the README does not \
+             enumerate what the crate cannot do. State the guarantee the crate \
+             provides; platform edges belong to the application and to its own \
+             documentation"
+        );
+    }
     for token in [
-        "secure desktop",
         "OpenInputDesktop",
         "SetWindowsHookEx",
         "SendInput",
-        "MemoryTrend",
-        "HandleWatch",
-        "poll_rollback",
+        "mouse_event",
     ] {
         assert!(
-            section.contains(token),
-            "TRIPWIRE FIRED: the platform-boundary page no longer names `{token}` \
-             — the crate detects none of these itself, and a reader must be told \
-             which half is the app's"
+            !readme.contains(token),
+            "TRIPWIRE FIRED: README.md names `{token}` — that API appears only in \
+             a page about what this crate does not call. The README describes the \
+             reaction the crate owns, not the OS calls it leaves to the caller"
         );
     }
-
-    let when = readme
-        .find("## When to use / when not")
-        .expect("TRIPWIRE FIRED: README lost the use/not-for section");
-    let when_end = readme[when..]
-        .find("\n## ")
-        .map(|n| when + n)
-        .unwrap_or(readme.len());
-    assert!(
-        readme[when..when_end].contains("Not a platform monitor"),
-        "TRIPWIRE FIRED: the \"not for\" list must point at the platform boundary \
-         — a reader who stops at that list must still learn the crate is blind to \
-         the desktop, the hooks and held buttons"
-    );
 }
 
 /// Rollback re-entrancy must be documented as MEASURED behavior, not as the
