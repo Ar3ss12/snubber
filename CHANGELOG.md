@@ -103,6 +103,18 @@ Nothing here is additive to the public API.
   BENCHMARKS.md to link the very artifact it re-derives each row from, and
   `test_both_storm_harnesses_gate_the_armed_hold_shape` refuses either harness
   dropping the shape gate or growing a second emission site.
+- `test_powershell_scripts_are_pure_ascii` reads every `scripts/*.ps1` as bytes
+  and names the first non-ASCII offset: the Windows runner decodes a BOM-less
+  UTF-8 file as cp1252, so an em dash arrives as `U+201D` — a quote character
+  to PowerShell — while a local `Parser::ParseFile` decodes as UTF-8 and
+  reports the same file clean. The check requires at least four files, so a
+  reflowed glob cannot leave it vacuously green.
+- `docs/INVARIANTS.md` and `docs/USER_GUIDE.md` describe the current oracle and
+  harness instead of their 2026-10-30 shape: the guide names the per-lane
+  `armed_hold matches flag` gate and the three shapes CI runs per flavor, and
+  the invariants table states the `lanes x 11|10 + 4|3` battery, the
+  shape-gate count, the artifact-link pinning, where the CI rows come from and
+  why the PowerShell sources are held to ASCII.
 - The 2026-10-31 Win32 storm set (`docs/evidence/2026-10-31_multi_lineage_*`)
   and the POSIX figures from Stress #149 replace the 2026-10-30 set and the
   pre-schema-2 CI rows in BENCHMARKS.md; `docs/evidence/README.md` records the
@@ -173,6 +185,10 @@ Nothing here is additive to the public API.
   every local gate stayed green. `!docs/evidence/*.log` makes the evidence
   tree an exception, and both storm oracles now assert that every artifact
   path they cite exists in the tree.
+- `scripts/stress_multi_lineage.ps1` carried three em dashes inside comments.
+  They parse cleanly in local UTF-8 and are decoded as cp1252 on the Windows
+  runner, where the last byte of each arrives as `U+201D`; the file is pure
+  ASCII now, and the new byte-level gate keeps it that way.
 
 ## 0.7.6 — 2026-10-30
 
