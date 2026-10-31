@@ -82,8 +82,41 @@ Nothing here is additive to the public API.
   shape it deliberately does not report) — so the checker cannot rot into an
   always-green step. Both stress jobs run it over `scripts/` before the
   first storm.
+- `scripts/ci_storm_summary.py` now puts the dispatch percentiles in the
+  headline annotation (`dispatch_p50_us`, `dispatch_p99_us`,
+  `dispatch_max_us`, `peak_rate_per_sec` beside the rate and the four buckets),
+  because on a public repository those figures are otherwise reachable only
+  from a step log — which an anonymous request cannot read — and the CI table
+  in BENCHMARKS.md would otherwise have to quote a number no reader can check.
+- `scripts/stress_multi_lineage.ps1` gates the shape it ran, per lane:
+  `lane N armed_hold matches flag` compares the `armed_hold` stamp the worker
+  wrote into its own report against the `-ArmedHold` flag the harness passed.
+  The POSIX harness has had this gate since schema 2; without it in PowerShell
+  a lane that silently lost the flag would still have published a PASS under
+  the armed-hold label — the row both BENCHMARKS.md and the CI annotations
+  quote. The per-lane battery is therefore 11 gates under `-ArmedHold` and 10
+  without it, and the three refreshed Win32 storms carry 48 / 43 / 92 gates.
+- `tests/doc_sync.rs` reads the new battery: the gate count formula moved to
+  `lanes x 11|10 + 4|3`, `test_storm_tables_match_committed_reports` counts the
+  `armed_hold matches flag` checks and requires one per lane (the arithmetic
+  alone cannot say *which* gate the harness wrote), it now also requires
+  BENCHMARKS.md to link the very artifact it re-derives each row from, and
+  `test_both_storm_harnesses_gate_the_armed_hold_shape` refuses either harness
+  dropping the shape gate or growing a second emission site.
+- The 2026-10-31 Win32 storm set (`docs/evidence/2026-10-31_multi_lineage_*`)
+  and the POSIX figures from Stress #148 replace the 2026-10-30 set and the
+  pre-schema-2 CI rows in BENCHMARKS.md; `docs/evidence/README.md` records the
+  exact command behind each new artifact and why the older sets stay.
 
 ### Fixed
+
+- BENCHMARKS.md carried a CI storm table whose rows came from runs predating
+  `report_schema: 2` — `0.91 s / 1,095 kills/s`, `5 / 11–14 µs` — and no oracle
+  could re-derive any of it, because a runner's report is not a repository
+  artifact. The table now quotes Stress run #148, the first POSIX completion of
+  schema 2 on both flavors, names that run in its own caption, and drops the
+  latency column rather than inheriting numbers #148 never published: the
+  reporter started emitting them only in the commit that refreshes this table.
 
 - `scripts/stress_multi_lineage.py` read `rate_windows` in three places — the
   monitor thread's argument tuple, `peak_rate`, and the report's

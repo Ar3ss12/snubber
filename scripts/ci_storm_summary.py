@@ -76,6 +76,18 @@ def headline(payload: dict) -> str:
         "duration_ms": payload.get("duration_ms"),
         "rate_per_sec": payload.get("rate_per_sec"),
     }
+    # The dispatch percentiles ride along because they are otherwise reachable
+    # only in the runner transcript, and the transcript is not: an anonymous
+    # request gets annotations, never a step log or an artifact zip.
+    latency = payload.get("dispatch_us") or {}
+    totals.update(
+        {
+            "dispatch_p50_us": latency.get("p50"),
+            "dispatch_p99_us": latency.get("p99"),
+            "dispatch_max_us": latency.get("max"),
+            "peak_rate_per_sec": payload.get("peak_rate_per_sec"),
+        }
+    )
     return ", ".join(f"{k}={v}" for k, v in totals.items() if v is not None)
 
 

@@ -9,14 +9,15 @@ stays as the record of the tree that produced it.
 
 | Artifact | Command that produced it | Range of interest |
 |---|---|---|
-| `2026-10-30_multi_lineage_armedhold_report.json` + `_run.log` | `powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold -ReportPath target/storm_armedhold_report.json -StatsPath target/storm_armedhold_stats.json -LogPath target/storm_armedhold_run.log -LaneRoot target/multi_lineage_armedhold` | `verdict`, `report_schema: 2`, wall 19.93 s, 501.8/553.3 kills/s, dispatch p50/p99/max, the nine `band_*` counts, per-lane `resources`, `killers_saw`, `system` |
-| `2026-10-30_multi_lineage_freerun_report.json` + `_run.log` | same command without `-ArmedHold` and with the `storm_freerun_*` paths | ambush 2,785 / escape 55 / stillborn 7,160, wall 11.87 s, 842.4 kills/s |
-| `2026-10-30_multi_lineage_saturation_report.json` + `_run.log` | same command at `-Lines 8 -KillsPerLine 1250`, `storm_saturation_*` paths, `-LaneRoot target/multi_lineage_saturation` | 8-lane dispatch p99 3,747.0 µs against the 4-lane 1,170.0 µs, 84 gates |
+| `2026-10-31_multi_lineage_armedhold_report.json` + `_run.log` | `powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive -ArmedHold -ReportPath target/pub_armedhold.json -StatsPath target/pub_armedhold_stats.json -LogPath target/pub_armedhold.log -LaneRoot target/pub_armedhold` | `verdict`, `report_schema: 2`, wall 25.82 s, 387.2/453.3 kills/s, dispatch p50/p99/max, the nine `band_*` counts, per-lane `resources`, `killers_saw`, `system`, 48 gates |
+| `2026-10-31_multi_lineage_freerun_report.json` + `_run.log` | same command without `-ArmedHold` and with the `pub_freerun*` paths | ambush 1,999 / escape 77 / stillborn 7,924, wall 14.13 s, 707.6 kills/s, 43 gates |
+| `2026-10-31_multi_lineage_saturation_report.json` + `_run.log` | same command at `-Lines 8 -KillsPerLine 1250`, `pub_saturation*` paths | 8-lane dispatch p99 5,024.2 µs against the 4-lane 1,360.6 µs, 92 gates |
 | `2026-10-30_pool_stress_report.json` | `cargo test --release --test supervisor_pool_stress -- --ignored --nocapture` | `reaped`/`ambush` 32/32, `tokens_seen`, `final_generation`, `wall_ms` |
 | `2026-10-30_pool_lease_stress_report.json` | `cargo test --release --test supervisor_pool_stress_lease -- --ignored --nocapture` | `stillborn` 24/24, `lease_kills` 24, `monitor_checks` 102,471 |
 | `2026-10-30_pool_mixed_stress_report.json` | `cargo test --release --test supervisor_pool_stress_mixed -- --ignored --nocapture` | `ambush`/`escape`/`stillborn`/`deadlocks` = 8/8/8/8, `deadlock: true` |
 | `2026-10-30_bench_snapshot.md` | `cargo bench --locked --bench admission_bench` (all groups, second of two full runs), table assembled by `bash scripts/bench.sh` | every `**<num> ns/us**` row cited by BENCHMARKS.md |
-| `2026-10-27_multi_lineage_{armedhold,freerun}_report.json` + `_stats.json` | `powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive [-ArmedHold]` | superseded by the 2026-10-30 set; kept as the record of that tree and of the `le_*` histogram schema |
+| `2026-10-30_multi_lineage_{armedhold,freerun,saturation}_report.json` + `_run.log` | the same three commands with the `storm_*` paths | superseded by the 2026-10-31 set; kept as the record of the 44 / 39 / 84-gate battery that had no per-lane `armed_hold matches flag` shape gate |
+| `2026-10-27_multi_lineage_{armedhold,freerun}_report.json` + `_stats.json` | `powershell -ExecutionPolicy Bypass -File scripts/stress_multi_lineage.ps1 -Lines 4 -KillsPerLine 2500 -Aggressive [-ArmedHold]` | superseded by the 2026-10-31 set; kept as the record of that tree and of the `le_*` histogram schema |
 | `2026-10-26_pool_*_stress_report.json` | `cargo test --test supervisor_pool_stress{,_mixed,_lease} -- --ignored --nocapture` (debug profile) | superseded by the 2026-10-30 pool set |
 | `2026-10-26_bench_snapshot.md` | `cargo bench` (all groups), table assembled by `bash scripts/bench.sh` | superseded by `2026-10-30_bench_snapshot.md` |
 
@@ -61,9 +62,23 @@ The second gate exists because the POSIX storms died twice on exactly that
 defect -- a `NameError` raised after the supervisors were spawned, so the run
 left live processes and no report while the compile gate stayed green.
 
+Every lane also gates the shape it ran. The worker stamps `armed_hold` into its
+own report and the harness compares that stamp with the flag it actually passed:
+`lane N armed_hold matches flag` in PowerShell, `lane N armed_hold matches` in
+Python. The POSIX harness has had this gate since schema 2; the PowerShell one
+gained it for the 2026-10-31 set, which is why its per-lane battery is 11 gates
+under `-ArmedHold` and 10 without it rather than the 10 and 9 of 2026-10-30.
+Without it a lane that silently lost the flag would still publish a PASS under
+the armed-hold label, and armed-hold is the row BENCHMARKS.md and the CI
+annotations quote. `test_storm_tables_match_committed_reports` refuses an
+artifact whose gate count does not match `lanes x per_lane + aggregate`, and
+`test_both_storm_harnesses_gate_the_armed_hold_shape` refuses either harness
+dropping the gate.
+
 The raw per-lane dispatch series (`-StatsPath` / `--stats`) is deliberately not
-committed for the 2026-10-30 runs: it is ~10,000 wall-clock samples per report,
-and BENCHMARKS.md quotes no number that the report does not already carry. The
+committed for the 2026-10-30 and 2026-10-31 runs: it is ~10,000 wall-clock
+samples per report, and BENCHMARKS.md quotes no number that the report does not
+already carry. The
 two 2026-10-27 `_stats.json` files stay committed as the byte-identical
 duplicates of their reports that they are — the harness of that tree wrote the
 same payload to both paths, which is one of the reasons it was split.

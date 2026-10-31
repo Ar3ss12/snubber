@@ -429,8 +429,8 @@ try {
                 # Right after an exit .NET still answers the query: HandleCount
                 # comes back 0 while the cached memory fields hold older values.
                 # That is a failed read, not a resource decrease, so the whole
-                # sample is dropped and counted — a fabricated 0 would become
-                # the dip that disarms the growth gate (a −68 handle "drop").
+                # sample is dropped and counted -- a fabricated 0 would become
+                # the dip that disarms the growth gate (a -68 handle "drop").
                 if ($ws -le 0 -or $pv -le 0 -or $hc -le 0 -or $th -le 0) { $lane.SampleDrops++; continue }
                 if ($lane.Samples -eq 0) { $lane.WsFirst = $ws; $lane.PrivFirst = $pv; $lane.HandleFirst = $hc }
                 $lane.WsLast = $ws; $lane.PrivLast = $pv; $lane.HandleLast = $hc
@@ -582,6 +582,14 @@ foreach ($lane in $lanes) {
         Add-Check "$tag ambush + escape + stillborn == reaped" `
             (($lane.Ambush + $lane.Escape + $lane.Stillborn) -eq [int]$r.total_reaped) `
             ("{0}+{1}+{2}={3}" -f $lane.Ambush, $lane.Escape, $lane.Stillborn, $r.total_reaped)
+        # The shape gate: -ArmedHold reaches the supervisor as --armed-hold and
+        # the worker stamps what it actually ran into its own report. Without
+        # this check a lane that silently lost the flag would still publish a
+        # PASS under the armed-hold label, and armed-hold is the row the
+        # benchmarks quote.
+        Add-Check "$tag armed_hold matches flag" `
+            (([bool]$r.armed_hold) -eq [bool]$ArmedHold) `
+            ("report={0} flag={1}" -f [bool]$r.armed_hold, [bool]$ArmedHold)
         if ($minAmbush -gt 0) {
             Add-Check ("$tag true ambush rate {0:N1}% >= {1}%" -f $lane.AmbushPct, $minAmbush) `
                 ($lane.AmbushPct -ge $minAmbush) ("{0:N1}%" -f $lane.AmbushPct)
@@ -903,7 +911,7 @@ if ($logOk) {
     try { Stop-Transcript | Out-Null } catch { }
     # Start-Transcript prefixes the file with the machine name and the Windows
     # account of whoever ran the storm. The committed evidence is a verbatim
-    # copy of this file, so the prefix is dropped here — the identity a reader
+    # copy of this file, so the prefix is dropped here -- the identity a reader
     # needs (cpu, cores, OS build, toolchain) is printed in the banner above.
     try {
         $raw = @(Get-Content $logFull)

@@ -1957,17 +1957,17 @@ const STORM_BANDS: [u64; 8] = [50, 100, 200, 500, 1000, 2000, 5000, 10000];
 /// `(artifact, table row label, prose label)`
 const STORM_RUNS: [(&str, &str, &str); 3] = [
     (
-        "docs/evidence/2026-10-30_multi_lineage_armedhold_report.json",
+        "docs/evidence/2026-10-31_multi_lineage_armedhold_report.json",
         "`-ArmedHold`",
         "armed-hold",
     ),
     (
-        "docs/evidence/2026-10-30_multi_lineage_freerun_report.json",
+        "docs/evidence/2026-10-31_multi_lineage_freerun_report.json",
         "`-Aggressive` (free-running)",
         "free-running",
     ),
     (
-        "docs/evidence/2026-10-30_multi_lineage_saturation_report.json",
+        "docs/evidence/2026-10-31_multi_lineage_saturation_report.json",
         "`-ArmedHold` at 8 lanes",
         "saturated",
     ),
@@ -2203,11 +2203,24 @@ fn storm_assert_token(doc: &str, token: &str, artifact: &str) {
 #[test]
 fn test_storm_tables_match_committed_reports() {
     let bench_doc = read_doc("BENCHMARKS.md");
-    assert!(
-        !bench_doc.contains("2026-10-27_multi_lineage"),
-        "BENCHMARKS.md still cites the 2026-10-27 storm reports as current \
-         storm evidence; the 2026-10-30 set in docs/evidence supersedes them"
-    );
+    for stale in ["2026-10-27_multi_lineage", "2026-10-30_multi_lineage"] {
+        assert!(
+            !bench_doc.contains(stale),
+            "BENCHMARKS.md still cites the {stale} storm reports as current \
+             storm evidence; the set named in STORM_RUNS supersedes them"
+        );
+    }
+    // The numbers may be re-derived without the doc saying where they came
+    // from, so pin the citation too: every artifact this oracle reads must be
+    // linked, and a doc that quotes an unlinked report is quoting a file no
+    // reader can open.
+    for (path, row_label, _) in STORM_RUNS {
+        assert!(
+            bench_doc.contains(path),
+            "BENCHMARKS.md does not link {path} (the `{row_label}` row), so the row and \
+             the artifact this oracle reads are not the same run"
+        );
+    }
     let mut checked = 0usize;
 
     for (path, row_label, run_label) in STORM_RUNS {
@@ -2234,12 +2247,12 @@ fn test_storm_tables_match_committed_reports() {
         checked += 1;
 
         // The battery itself: every gate green, and exactly as many gates as
-        // the harness writes (10 per lane under -ArmedHold, 9 without the
+        // the harness writes (11 per lane under -ArmedHold, 10 without the
         // ambush-rate gate, plus 4 or 3 aggregates).
         let armed = doc.flag(doc.field(root, "armed_hold"));
         let lanes = doc.items(doc.field(root, "lanes"));
         let checks = doc.items(doc.field(root, "checks"));
-        let per_lane = if armed { 10 } else { 9 };
+        let per_lane = if armed { 11 } else { 10 };
         let aggregate = if armed { 4 } else { 3 };
         assert_eq!(
             checks.len(),
@@ -2269,6 +2282,24 @@ fn test_storm_tables_match_committed_reports() {
             readable,
             lanes.len(),
             "{path}: only {readable} of {} lanes report a readable resource window",
+            lanes.len()
+        );
+        // The count formula cannot say *which* gate the harness wrote, so name
+        // the shape gate: a lane that silently lost `-ArmedHold` would still
+        // emit the right number of checks, and armed-hold is the row the
+        // benchmarks quote.
+        let shape = checks
+            .iter()
+            .filter(|c| {
+                doc.text_of(doc.field(**c, "name"))
+                    .ends_with("armed_hold matches flag")
+            })
+            .count();
+        assert_eq!(
+            shape,
+            lanes.len(),
+            "{path}: only {shape} of {} lanes carry the `armed_hold matches flag` gate — \
+             the harness stopped stamping the shape it actually ran",
             lanes.len()
         );
 
@@ -2777,4 +2808,73 @@ fn test_storm_harnesses_publish_one_report_schema() {
             "{name}: the histogram keys are no longer the disjoint `band_*` set"
         );
     }
+}
+
+/// Both harnesses must gate the shape they ran. `-ArmedHold` / `--armed-hold`
+/// reaches the worker as a CLI flag, and the report carries what the worker
+/// actually stamped; without that gate a lane that silently lost the flag
+/// still publishes a PASS under the armed-hold label, which is the row both
+/// BENCHMARKS.md and the CI annotations quote. One emission site per harness:
+/// a second site would double-count against `lanes x per_lane + aggregate`.
+#[test]
+fn test_both_storm_harnesses_gate_the_armed_hold_shape() {
+    let ps = read_doc("scripts/stress_multi_lineage.ps1");
+    let py = read_doc("scripts/stress_multi_lineage.py");
+
+    assert_eq!(
+        ps.match_indices("\"$tag armed_hold matches flag\"").count(),
+        1,
+        "the PowerShell storm harness no longer gates armed_hold exactly once per lane"
+    );
+    assert_eq!(
+        py.match_indices("f\"{tag} armed_hold matches\"").count(),
+        1,
+        "the POSIX storm harness no longer gates armed_hold exactly once per lane"
+    );
+}
+
+/// Every `.ps1` in `scripts/` must be pure ASCII. The CI runner reads a
+/// BOM-less UTF-8 file as cp1252, where an em dash's third byte (`0x94`)
+/// decodes as U+201D and a minus sign's (`0x92`) as U+2019 — quote characters
+/// to the PowerShell parser. Local `Parser::ParseFile` cannot see this because
+/// the local machine's ACP is UTF-8, so the law needs a gate that reads bytes
+/// rather than lines.
+#[test]
+fn test_powershell_scripts_are_pure_ascii() {
+    let mut files: Vec<_> = std::fs::read_dir("scripts")
+        .expect("read scripts dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("ps1"))
+        .collect();
+    files.sort();
+    assert!(
+        files.len() >= 4,
+        "only {} .ps1 scripts scanned — the sweep reads nothing if the layout moved",
+        files.len()
+    );
+
+    let mut offenders: Vec<String> = Vec::new();
+    for path in &files {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let bad: Vec<(usize, u8)> = bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b > 0x7F)
+            .map(|(i, b)| (i + 1, *b))
+            .collect();
+        if !bad.is_empty() {
+            offenders.push(format!(
+                "{}: {} non-ASCII byte(s), first at offset {} ({:02X})",
+                path.display(),
+                bad.len(),
+                bad[0].0,
+                bad[0].1
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "PowerShell scripts carry non-ASCII bytes, which the cp1252 runner decodes as \
+         quote characters: {offenders:?}"
+    );
 }

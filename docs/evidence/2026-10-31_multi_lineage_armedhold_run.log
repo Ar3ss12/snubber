@@ -1,0 +1,122 @@
+==========================================================
+   SNUBBER MULTI-LINEAGE STORM: N INDEPENDENT LINEAGES
+==========================================================
+Lines     : 4   kills/lane: 2500   total: 10000
+Model     : 4 supervisor processes, one pipe each, separate pid files
+Workload  : spin pacing (3 ms armed / 1 ms pace)
+Ambush    : armed-hold worker (pid published only after arm)   min true-ambush: 70%
+Kill path : raw OpenProcess + image verify + creation-time identity + TerminateProcess, 4 runspace killer(s)
+Timer     : winmm 1 ms request
+Machine   : AMD Ryzen 5 4600H with Radeon Graphics (6 physical / 12 logical cores), Microsoft Windows 10 Pro Education build 10.0.19043.0
+Toolchain : rustc 1.99.1 (58cf8f9c3 2026-10-13) / PowerShell 5.1.19041.906 / profile release
+Transcript: G:\forder\snubber\target\pub_armedhold.log
+----------------------------------------------------------
+[LAUNCH] lane=0 supervisor_pid=4932 dir=G:\forder\snubber\target\pub_armedhold\lane_0
+[LAUNCH] lane=1 supervisor_pid=10556 dir=G:\forder\snubber\target\pub_armedhold\lane_1
+[LAUNCH] lane=2 supervisor_pid=3952 dir=G:\forder\snubber\target\pub_armedhold\lane_2
+[LAUNCH] lane=3 supervisor_pid=1752 dir=G:\forder\snubber\target\pub_armedhold\lane_3
+[STORM] 4 killers armed, 4 supervisors live
+[STORM] 0/10000 | 0.0 kills/s aggregate | lanes: 0=2 1=2 2=2 3=2
+[STORM] 312/10000 | 286.2 kills/s aggregate | lanes: 0=80 1=80 2=80 3=80
+[STORM] 694/10000 | 331.1 kills/s aggregate | lanes: 0=177 1=176 2=175 3=176
+[STORM] 1102/10000 | 356.5 kills/s aggregate | lanes: 0=278 1=279 2=276 3=274
+[STORM] 1497/10000 | 367.2 kills/s aggregate | lanes: 0=378 1=377 2=376 3=374
+[STORM] 1856/10000 | 364.3 kills/s aggregate | lanes: 0=470 1=467 2=463 3=461
+[STORM] 2244/10000 | 368.6 kills/s aggregate | lanes: 0=568 1=564 2=561 3=556
+[STORM] 2651/10000 | 372.4 kills/s aggregate | lanes: 0=670 1=666 2=664 3=656
+[STORM] 2984/10000 | 372.4 kills/s aggregate | lanes: 0=755 1=747 2=749 3=739
+[STORM] 3364/10000 | 373.0 kills/s aggregate | lanes: 0=850 1=844 2=845 3=834
+[STORM] 3775/10000 | 375.9 kills/s aggregate | lanes: 0=956 1=945 2=946 3=936
+[STORM] 4180/10000 | 378.7 kills/s aggregate | lanes: 0=1057 1=1045 2=1050 3=1036
+[STORM] 4605/10000 | 382.2 kills/s aggregate | lanes: 0=1164 1=1151 2=1156 3=1142
+[STORM] 5012/10000 | 383.8 kills/s aggregate | lanes: 0=1265 1=1253 2=1258 3=1245
+[STORM] 5417/10000 | 385.7 kills/s aggregate | lanes: 0=1366 1=1353 2=1359 3=1347
+[STORM] 5802/10000 | 386.0 kills/s aggregate | lanes: 0=1464 1=1449 2=1454 3=1444
+[STORM] 6213/10000 | 388.0 kills/s aggregate | lanes: 0=1569 1=1551 2=1556 3=1545
+[STORM] 6618/10000 | 389.1 kills/s aggregate | lanes: 0=1668 1=1655 2=1658 3=1645
+[STORM] 7027/10000 | 390.1 kills/s aggregate | lanes: 0=1771 1=1756 2=1759 3=1749
+[STORM] 7424/10000 | 390.2 kills/s aggregate | lanes: 0=1869 1=1855 2=1861 3=1849
+[STORM] 7836/10000 | 391.3 kills/s aggregate | lanes: 0=1975 1=1955 2=1966 3=1948
+[STORM] 8278/10000 | 393.3 kills/s aggregate | lanes: 0=2088 1=2067 2=2074 3=2057
+[STORM] 8644/10000 | 392.0 kills/s aggregate | lanes: 0=2179 1=2158 2=2169 3=2149
+[STORM] 9022/10000 | 391.5 kills/s aggregate | lanes: 0=2273 1=2246 2=2264 3=2243
+[STORM] 9433/10000 | 392.5 kills/s aggregate | lanes: 0=2379 1=2353 2=2366 3=2346
+[STORM] 9849/10000 | 393.5 kills/s aggregate | lanes: 0=2484 1=2456 2=2471 3=2447
+==========================================================
+   MULTI-LINEAGE STORM RESULTS
+==========================================================
+Kills completed : 10000 / 10000 across 4 lineages
+Duration        : 00:00:25.823
+Aggregate rate  : 387.2 kills/s avg | 453.3 kills/s peak (250 ms window)
+Dispatch us     : min 139.1 | p50 374.7 | p95 637.5 | p99 1,360.6 | p99.9 2,964.7 | max 16,214.2
+Accounting      : tokens_rescued=10000 clean_settles=0 rescue_rate=100.0%
+Kill classes    : true_ambush=10000 (100.0%) clean_escape=0 stillborn=0 | armed_hold=True
+Dispatch us     : 0-50: 0 | 50-100: 0 | 100-200: 988 | 200-500: 7370 | 500-1000: 1489 | 1000-2000: 107 | 2000-5000: 41 | 5000-10000: 0 | >10000: 5  (disjoint band counts, sum 10000)
+Killers saw     : stale=0 duplicates=4043 retries=20600 miss_polls=531 across 4 lineages
+Slowest 10      : lane 2=16,214.2 us, lane 1=15,836.4 us, lane 3=15,813.5 us, lane 0=15,636.5 us, lane 1=15,477.3 us, lane 2=3,809.4 us, lane 2=3,609.0 us, lane 2=3,461.8 us, lane 2=3,332.3 us, lane 1=3,156.6 us
+Lane 0 : sup=4932 exit=0 killed=2500 99.2 kills/s | reaped=2500 true_ambush=2500 (100.0%) escape=0 stillborn=0 final_gen=2501
+         dispatch us: p50 365.2 | p95 630.0 | p99 1,209.7 | max 15,636.5 | ws_peak 4.19 MB | priv_growth +0.97 MB | handles first 64 peak 70 last 64 growth 0 | stale=0 dup=980 retries=5140 miss_polls=85 | samples=200 dropped_reads=0
+Lane 1 : sup=10556 exit=0 killed=2500 98.2 kills/s | reaped=2500 true_ambush=2500 (100.0%) escape=0 stillborn=0 final_gen=2501
+         dispatch us: p50 382.6 | p95 645.7 | p99 1,470.7 | max 15,836.4 | ws_peak 4.24 MB | priv_growth +0.85 MB | handles first 63 peak 70 last 65 growth +2 | stale=0 dup=1021 retries=5165 miss_polls=100 | samples=202 dropped_reads=0
+Lane 2 : sup=3952 exit=0 killed=2500 98.2 kills/s | reaped=2500 true_ambush=2500 (100.0%) escape=0 stillborn=0 final_gen=2501
+         dispatch us: p50 375.5 | p95 647.2 | p99 1,537.5 | max 16,214.2 | ws_peak 4.18 MB | priv_growth +0.95 MB | handles first 65 peak 69 last 64 growth -1 | stale=0 dup=1009 retries=5119 miss_polls=160 | samples=201 dropped_reads=0
+Lane 3 : sup=1752 exit=0 killed=2500 97.3 kills/s | reaped=2500 true_ambush=2500 (100.0%) escape=0 stillborn=0 final_gen=2501
+         dispatch us: p50 374.0 | p95 634.5 | p99 1,259.0 | max 15,813.5 | ws_peak 3.87 MB | priv_growth +0.72 MB | handles first 64 peak 69 last 65 growth +1 | stale=0 dup=1033 retries=5176 miss_polls=186 | samples=202 dropped_reads=0
+Check           : OK   lane 0 reaped == 2500  (2500)
+Check           : OK   lane 0 rescue + clean == reaped  (2500+0)
+Check           : OK   lane 0 ambush + escape + stillborn == reaped  (2500+0+0=2500)
+Check           : OK   lane 0 armed_hold matches flag  (report=True flag=True)
+Check           : OK   lane 0 true ambush rate 100.0% >= 70%  (100.0%)
+Check           : OK   lane 0 final_generation == kills + 1  (2501)
+Check           : OK   lane 0 supervisor exit == 0  (0)
+Check           : OK   lane 0 killer reported no error/stall
+Check           : OK   lane 0 resource window readable  (first 64 handles / 0.72 MB, last 64 handles / 1.70 MB, 200 samples, 0 dropped reads)
+Check           : OK   lane 0 private growth +0.97 MB <= 2.0 MB  (+0.97 MB over 200 samples)
+Check           : OK   lane 0 handle growth 0 <= 16  (0 handles)
+Check           : OK   lane 1 reaped == 2500  (2500)
+Check           : OK   lane 1 rescue + clean == reaped  (2500+0)
+Check           : OK   lane 1 ambush + escape + stillborn == reaped  (2500+0+0=2500)
+Check           : OK   lane 1 armed_hold matches flag  (report=True flag=True)
+Check           : OK   lane 1 true ambush rate 100.0% >= 70%  (100.0%)
+Check           : OK   lane 1 final_generation == kills + 1  (2501)
+Check           : OK   lane 1 supervisor exit == 0  (0)
+Check           : OK   lane 1 killer reported no error/stall
+Check           : OK   lane 1 resource window readable  (first 63 handles / 0.68 MB, last 65 handles / 1.53 MB, 202 samples, 0 dropped reads)
+Check           : OK   lane 1 private growth +0.85 MB <= 2.0 MB  (+0.85 MB over 202 samples)
+Check           : OK   lane 1 handle growth +2 <= 16  (+2 handles)
+Check           : OK   lane 2 reaped == 2500  (2500)
+Check           : OK   lane 2 rescue + clean == reaped  (2500+0)
+Check           : OK   lane 2 ambush + escape + stillborn == reaped  (2500+0+0=2500)
+Check           : OK   lane 2 armed_hold matches flag  (report=True flag=True)
+Check           : OK   lane 2 true ambush rate 100.0% >= 70%  (100.0%)
+Check           : OK   lane 2 final_generation == kills + 1  (2501)
+Check           : OK   lane 2 supervisor exit == 0  (0)
+Check           : OK   lane 2 killer reported no error/stall
+Check           : OK   lane 2 resource window readable  (first 65 handles / 0.71 MB, last 64 handles / 1.66 MB, 201 samples, 0 dropped reads)
+Check           : OK   lane 2 private growth +0.95 MB <= 2.0 MB  (+0.95 MB over 201 samples)
+Check           : OK   lane 2 handle growth -1 <= 16  (-1 handles)
+Check           : OK   lane 3 reaped == 2500  (2500)
+Check           : OK   lane 3 rescue + clean == reaped  (2500+0)
+Check           : OK   lane 3 ambush + escape + stillborn == reaped  (2500+0+0=2500)
+Check           : OK   lane 3 armed_hold matches flag  (report=True flag=True)
+Check           : OK   lane 3 true ambush rate 100.0% >= 70%  (100.0%)
+Check           : OK   lane 3 final_generation == kills + 1  (2501)
+Check           : OK   lane 3 supervisor exit == 0  (0)
+Check           : OK   lane 3 killer reported no error/stall
+Check           : OK   lane 3 resource window readable  (first 64 handles / 0.71 MB, last 65 handles / 1.43 MB, 202 samples, 0 dropped reads)
+Check           : OK   lane 3 private growth +0.72 MB <= 2.0 MB  (+0.72 MB over 202 samples)
+Check           : OK   lane 3 handle growth +1 <= 16  (+1 handles)
+Check           : OK   aggregate reaped 10000 == 10000  (10000/10000)
+Check           : OK   aggregate rescue + clean == reaped  (10000+0=10000)
+Check           : OK   aggregate no cross-lineage accounting drift  (10000+0 vs 10000)
+Check           : OK   aggregate true ambush rate 100.0% >= 70%  (100.0%)
+Verdict         : PASS
+Report JSON     : G:\forder\snubber\target\pub_armedhold.json
+Stats JSON      : G:\forder\snubber\target\pub_armedhold_stats.json
+Lane artifacts  : G:\forder\snubber\target\pub_armedhold
+==========================================================
+Transcript      : G:\forder\snubber\target\pub_armedhold.log
+**********************
+Windows PowerShell transcript end
+End time: 20261031002431
+**********************
