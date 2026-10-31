@@ -95,10 +95,19 @@ with lane 0's number and never says so.
   bullet, band line, killer-counter line, machine caption and rescue-accounting
   fragment is re-derived from the report at test time and must match the doc
   line byte for byte. The artifact is checked against itself first (verdict,
-  schema, release profile, gate count, conservation across lanes,
-  `final_generation == kills + 1`, zero stale pids,
-  `tokens_rescued + clean_settles == kills_completed`), because a doc quoting a
-  self-inconsistent report is broken twice over.
+  schema, release profile, gate count, the `armed_hold matches flag` gate by
+  name on every lane, conservation across lanes, `final_generation == kills + 1`,
+  zero stale pids, `tokens_rescued + clean_settles == kills_completed`), because
+  a doc quoting a self-inconsistent report is broken twice over. It also pins
+  the citation: BENCHMARKS.md must link each artifact it quotes and may not
+  name a superseded set as current.
+- `test_both_storm_harnesses_gate_the_armed_hold_shape` and
+  `test_storm_harnesses_publish_one_report_schema` — the two harness sources
+  against each other: one emission site for the shape gate in each, and the same
+  top-level report keys in the same order.
+- `test_powershell_scripts_are_pure_ascii` — every `scripts/*.ps1` read as
+  bytes, because the cp1252 runner decodes an em dash as a quote character and
+  a local UTF-8 parse cannot see it.
 - `test_pool_storm_tables_match_committed_reports` — the same for the three
   pool rows. It also reads `docs/USER_GUIDE.md`, because the guide is prose
   about these runs: it must name the committed set and must not copy a clock

@@ -104,7 +104,7 @@ Nothing here is additive to the public API.
   `test_both_storm_harnesses_gate_the_armed_hold_shape` refuses either harness
   dropping the shape gate or growing a second emission site.
 - The 2026-10-31 Win32 storm set (`docs/evidence/2026-10-31_multi_lineage_*`)
-  and the POSIX figures from Stress #148 replace the 2026-10-30 set and the
+  and the POSIX figures from Stress #149 replace the 2026-10-30 set and the
   pre-schema-2 CI rows in BENCHMARKS.md; `docs/evidence/README.md` records the
   exact command behind each new artifact and why the older sets stay.
 
@@ -113,10 +113,10 @@ Nothing here is additive to the public API.
 - BENCHMARKS.md carried a CI storm table whose rows came from runs predating
   `report_schema: 2` — `0.91 s / 1,095 kills/s`, `5 / 11–14 µs` — and no oracle
   could re-derive any of it, because a runner's report is not a repository
-  artifact. The table now quotes Stress run #148, the first POSIX completion of
-  schema 2 on both flavors, names that run in its own caption, and drops the
-  latency column rather than inheriting numbers #148 never published: the
-  reporter started emitting them only in the commit that refreshes this table.
+  artifact. The table now quotes one named run — Stress #149, the first whose
+  annotations carry the dispatch percentiles — states that in its own caption,
+  and cites #148 only for the fact it established (the first POSIX completion
+  of schema 2). No cell inherits a figure from a run that did not publish it.
 
 - `scripts/stress_multi_lineage.py` read `rate_windows` in three places — the
   monitor thread's argument tuple, `peak_rate`, and the report's
